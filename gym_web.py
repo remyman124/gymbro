@@ -2212,9 +2212,25 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v3';
-self.addEventListener('install', e => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+const CACHE = 'gym-web-v4';
+self.addEventListener('install', e => {
+  self.skipWaiting();
+  // Force-delete old caches (v1/v2/v3) on install
+  e.waitUntil(
+    caches.keys().then(keys => Promise.all(
+      keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+    ))
+  );
+});
+self.addEventListener('activate', e => e.waitUntil(
+  Promise.all([
+    self.clients.claim(),
+    // Also clean up on activate in case any old caches snuck through
+    caches.keys().then(keys => Promise.all(
+      keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+    ))
+  ])
+));
 self.addEventListener('fetch', e => {
   e.respondWith(
     caches.open(CACHE).then(cache =>
