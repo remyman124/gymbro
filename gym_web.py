@@ -1169,6 +1169,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <!-- Current set: exercise + weight + reps + intensity in one compact row -->
       <div x-show="currentExercise" class="glass mb-2 flex h-16 items-center gap-3 rounded-2xl px-3 shadow-lg shadow-black/20">
+        <button class="tap flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/10 text-base hover:bg-white/20 active:scale-95 transition" @click="resetExercise()" aria-label="揀新 exercise" title="揀新 exercise">
+          ←
+        </button>
         <div class="min-w-0 flex-1">
           <div class="truncate text-base font-black tracking-tight" x-text="currentExercise"></div>
           <div class="mt-0.5 text-xs text-gray-400" x-text="currentSet ? `Set ${currentSet.set}` : 'Set 1'"></div>
@@ -1555,6 +1558,16 @@ function gymApp() {
       this.flash(`Exercise: ${name}`);
     },
 
+    resetExercise() {
+      // Go back to category picker without ending the session.
+      this.currentExercise = '';
+      this.exerciseInput = '';
+      this.weight = 0;
+      this.reps = 10;
+      this.intensity = 'warm-up';
+      this.haptic(20);
+    },
+
     customExercise() {
       if (this.exerciseInput.trim()) this.pickExercise(this.exerciseInput.trim());
     },
@@ -1768,14 +1781,24 @@ function gymApp() {
       try {
         const res = await fetch('/api/end_session', { method: 'POST' });
         this.endSummary = await res.json();
+        // Auto-push to Google Sheet so cheer session can read it immediately.
+        try {
+          await fetch('/api/sync_sheet', { method: 'POST' });
+        } catch (e) { /* sheet push is best-effort */ }
         this.flash('Session ended ✓');
       } catch(e) { this.flash('Error: ' + e.message); }
       this.saving = false;
     },
 
     async resetSession() {
+      // End the "view summary" mode and jump back to category picker for a fresh session.
       this.endSummary = null;
       this.currentExercise = '';
+      this.exerciseInput = '';
+      this.weight = 0;
+      this.reps = 10;
+      this.intensity = 'warm-up';
+      this.tab = 'set';
       const state = await (await fetch('/api/state')).json();
       this.session = state.session;
       this.flash('New session ready');
