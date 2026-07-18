@@ -120,7 +120,7 @@ def healthz():
 # The client script polls this endpoint and forces a hard reload if the
 # version differs from localStorage, bypassing stale SW caches that
 # `controllerchange` events might miss on iOS Safari PWA.
-APP_VERSION = "2026-07-19-v4-stepper"
+APP_VERSION = "2026-07-19-v5-stepper-labels"
 
 
 @app.route("/api/version")
@@ -1505,7 +1505,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('weight', -1)" @pointerup.prevent="endStep('weight', -1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+            <span class="text-base leading-none">−5</span><span class="mt-0.5 text-[8px] text-gray-400">hold −10</span>
           </button>
           <div class="min-w-0 text-center">
             <span class="text-3xl font-black tracking-tighter" x-text="weight"></span><span class="ml-0.5 text-xs text-gray-400">kg</span>
@@ -1513,14 +1513,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('weight', 1)" @pointerup.prevent="endStep('weight', 1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+            <span class="text-base leading-none">+5</span><span class="mt-0.5 text-[8px] text-gray-400">hold +10</span>
           </button>
         </div>
         <div class="glass grid grid-cols-[2.5rem_1fr_2.5rem] items-center rounded-2xl p-1.5">
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('reps', -1)" @pointerup.prevent="endStep('reps', -1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+            <span class="text-base leading-none">−1</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
           </button>
           <div class="min-w-0 text-center">
             <span class="text-3xl font-black tracking-tighter" x-text="reps"></span><span class="ml-0.5 text-xs text-gray-400">×</span>
@@ -1528,7 +1528,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('reps', 1)" @pointerup.prevent="endStep('reps', 1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+            <span class="text-base leading-none">+1</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
           </button>
         </div>
       </div>
@@ -1909,7 +1909,8 @@ function gymApp() {
     startStep(kind, direction) {
       this.cancelStep();
       this.pressHandled = false;
-      // Jim OOB 2026-07-19: hold = ±10 (800ms hold), tap = ±5
+      // Jim OOB 2026-07-19: weight hold = ±10 (800ms hold), weight tap = ±5.
+      // Reps hold = ±5, reps tap = ±1 (no auto-ramp for reps).
       this.pressTimer = setTimeout(() => {
         if (kind === 'weight') this.bumpWeight(direction * 10);
         else this.bumpReps(direction * 5);
@@ -1922,9 +1923,9 @@ function gymApp() {
     endStep(kind, direction) {
       if (this.pressTimer) clearTimeout(this.pressTimer);
       if (!this.pressHandled) {
-        // Tap = ±5 (weight), ±5 (reps) — Jim OOB 2026-07-19
+        // Tap = ±5 (weight), ±1 (reps) — Jim OOB 2026-07-19
         if (kind === 'weight') this.bumpWeight(direction * 5);
-        else this.bumpReps(direction * 5);
+        else this.bumpReps(direction * 1);
       }
       this.pressTimer = null;
       this.pressHandled = false;
