@@ -28,6 +28,15 @@ SESSION_COOKIE = "gym_web_session"
 app = Flask(__name__, static_folder="/home/work/.hermes/image_cache", static_url_path="/img")
 
 
+@app.after_request
+def add_no_cache_headers(response):
+    """Jim OOB 2026-07-19: force no-cache so iPhone PWA picks up every code change immediately."""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 # ---------- Helpers ----------
 def now_hkt():
     return datetime.now(HKT)
@@ -280,10 +289,49 @@ def _recovery_pct():
     return None
 
 
-def _withings_weight():
-    """Latest Withings weight in kg (single number, or None if no body reading today)."""
+def _withings_body_latest():
+    """Latest Withings body comp reading (any date, not just today).
+    Returns dict {date, weight_kg, fat_pct, ...} or {} if none available.
+    Falls back to most recent cache entry so Jim always sees his latest weigh-in."""
     d = _safe_read_json(WITHINGS_CACHE)
-    body = (d.get("body") or {}) if isinstance(d, dict) else {}
+    body = d.get("body") if isinstance(d, dict) else None
+    if isinstance(body, dict) and body.get("weight_kg"):
+        return body
+    # Fallback: most recent weight from `weight_today` or any cached body reading
+    for key in ("weight_kg", "fat_pct", "fat_kg", "muscle_kg", "hydration_pct", "bone_kg"):
+        if body and body.get(key) is not None:
+            return body  # at least some field populated
+    # Last resort: try direct measurement lookup from Withings
+    try:
+        import subprocess, json, re
+        # Try wider windows until we find a reading
+        for window in (7, 14, 30, 90):
+            r = subprocess.run(
+                ["python3", "/home/work/.hermes/skills/withings/withings.py", "body", str(window)],
+                capture_output=True, text=True, timeout=20,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                # Parse CLI table — first data line is most recent
+                for line in r.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
+                        try:
+                            return {
+                                "date": parts[0],
+                                "weight_kg": float(parts[1]),
+                                "fat_pct": float(parts[2]),
+                            }
+                        except (ValueError, IndexError):
+                            continue
+                break  # exit loop if subprocess worked
+    except Exception:
+        pass
+    return {}
+
+
+def _withings_weight():
+    """Latest Withings weight in kg (any date). Jim OOB 2026-07-19: use latest, not just today."""
+    body = _withings_body_latest()
     w = body.get("weight_kg")
     try:
         return round(float(w), 1) if w else None
@@ -291,12 +339,27 @@ def _withings_weight():
         return None
 
 
+def _withings_fat_pct():
+    """Latest Withings body fat percentage (any date). Jim's goal: drive this down."""
+    body = _withings_body_latest()
+    f = body.get("fat_pct")
+    try:
+        return round(float(f), 1) if f else None
+    except (TypeError, ValueError):
+        return None
+
+
 @app.route("/api/health_overlay")
 def api_health_overlay():
-    """Single endpoint for the hero overlay. Minimal: recovery % + weight kg only."""
+    """Single endpoint for the hero overlay.
+    - Top-left: Whoop recovery %
+    - Top-right: Withings weight kg + fat % (latest reading, drives Jim's goal)
+    """
     return jsonify({
         "recovery": _recovery_pct(),
         "weight_kg": _withings_weight(),
+        "fat_pct": _withings_fat_pct(),
+        "weight_date": (_withings_body_latest() or {}).get("date"),
     })
 
 
@@ -537,9 +600,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Top Bar -->
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
-    <div class="flex items-center justify-between">
+    <div class="flex items-center justify-between gap-2">
       <h1 class="text-3xl font-black tracking-tighter">Gym</h1>
-      <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
+      <div class="flex flex-col items-end leading-tight">
+        <span class="text-sm font-bold text-emerald-300 tabular-nums" x-text="clockStr"></span>
+        <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
+      </div>
     </div>
   </header>
 
@@ -576,8 +642,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span>💚</span><span x-text="`${recovery}%`"></span>
         </div>
         <!-- Top-right: Withings weight (single number, minimal) -->
-        <div x-show="weightKg !== null" class="absolute right-2 top-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold text-sky-300 backdrop-blur" :class="recovery !== null ? 'top-9' : 'top-2'">
-          <span>⚖️</span><span x-text="`${weightKg}kg`"></span>
+        <!-- Top-right: Withings weight kg + fat % (Jim's goal: drive fat down) -->
+        <div class="absolute right-2 top-2 z-20 flex flex-col items-end gap-1">
+          <div class="flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold backdrop-blur"
+               :class="weightKg !== null ? 'text-sky-300' : 'text-gray-500'">
+            <span>⚖️</span><span x-text="weightKg !== null ? `${weightKg}kg` : '—'"></span>
+          </div>
+          <div class="flex items-center gap-1 rounded-full border bg-black/55 px-2 py-0.5 text-[10px] font-bold backdrop-blur ring-1"
+               :class="fatPct !== null ? 'border-yellow-400/30 text-yellow-300 ring-yellow-400/20' : 'border-white/15 text-gray-500 ring-transparent'">
+            <span>🔥</span><span x-text="fatPct !== null ? `${fatPct}%` : '—'"></span>
+          </div>
         </div>
       </div>
 
@@ -787,13 +861,18 @@ function gymApp() {
     streak: 0,
     recovery: null,
     weightKg: null,
+    fatPct: null,
+    clockStr: '',
+    elapsedSec: 0,
+    elapsedStr: '0:00',
+    workoutStartMs: null,
     today: '',
     history: [],
     loadingHistory: false,
     pressTimer: null,
     pressHandled: false,
     quote: '努力唔會辜負你',
-    quoteBank: ['今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', 'Aesthetic body, discipline life'],
+    quoteBank: ['努力唔會辜負你', '今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', '慢慢嚟', '穩住', '加油'],
     quickPicks: ['BB Bench Press','Leg Press','Low Row (Cable)','DB OHP','DB Shoulder Raise','Lat Pulldown','Squat'],
 
     async init() {
@@ -822,14 +901,26 @@ function gymApp() {
           this.streak = streakData.streak;
         }
       } catch(e) { /* keep 0 */ }
-      // Pull health overlay (Whoop recovery + Withings weight) — single number each
+      // Pull health overlay (Whoop recovery + Withings weight + fat %) — single number each
       try {
         const healthRes = await fetch('/api/health_overlay');
         const healthData = await healthRes.json();
         this.recovery = (typeof healthData.recovery === 'number') ? healthData.recovery : null;
         this.weightKg = (typeof healthData.weight_kg === 'number') ? healthData.weight_kg : null;
+        this.fatPct = (typeof healthData.fat_pct === 'number') ? healthData.fat_pct : null;
       } catch(e) { /* keep nulls, badges hidden */ }
       this.today = data.today;
+      // Initialize count-up timer from session.start_time if it exists
+      if (data.session && data.session.start_time) {
+        this.workoutStartMs = new Date(data.session.start_time).getTime();
+        this.tickElapsed();
+      }
+      // Tick clock + count-up every 1s
+      setInterval(() => {
+        this.tickClock();
+        this.tickElapsed();
+      }, 1000);
+      this.tickClock();
       // Pre-load history so it's ready when user taps the tab
       this.loadHistory();
       // Rotate quote every 4s
@@ -838,6 +929,34 @@ function gymApp() {
         if (next !== this.quote) this.quote = next;
       }, 4000);
       this.haptic();
+    },
+
+    tickClock() {
+      const d = new Date();
+      const hh24 = d.getHours();
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      const hh12 = ((hh24 + 11) % 12) + 1;
+      const ampm = hh24 < 12 ? 'AM' : 'PM';
+      // Digital clock with blinking colon + AM/PM (Jim OOB 2026-07-19)
+      this.clockStr = `${String(hh12).padStart(2,'0')}:${mm}:${ss} ${ampm}`;
+    },
+
+    tickElapsed() {
+      if (!this.workoutStartMs) { this.elapsedSec = 0; this.elapsedStr = '0:00'; return; }
+      const sec = Math.max(0, Math.floor((Date.now() - this.workoutStartMs) / 1000));
+      this.elapsedSec = sec;
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      this.elapsedStr = h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${m}:${String(s).padStart(2,'0')}`;
+    },
+
+    startCountUp() {
+      if (!this.workoutStartMs) {
+        this.workoutStartMs = Date.now();
+        this.tickElapsed();
+      }
     },
 
     get currentSet() {
@@ -968,6 +1087,9 @@ function gymApp() {
         });
         const data = await res.json();
         if (data.ok) {
+          // Add seconds to elapsed counter (click = work done)
+          this.workoutSeconds += (data.entry.reps || 10);
+          this.tickElapsed();
           // Reload state
           const state = await (await fetch('/api/state')).json();
           this.session = state.session;
