@@ -454,6 +454,62 @@ def serve_image(filename):
     return send_from_directory("/home/work/.hermes/image_cache", filename)
 
 
+@app.route("/audio/<path:filename>")
+def serve_audio(filename):
+    """Serve audio files from audio_cache directory."""
+    return send_from_directory("/home/work/.hermes/audio_cache", filename)
+
+
+@app.route("/api/today_audio")
+def api_today_audio():
+    """Return audio track info for the hero overlay.
+
+    Priority:
+      1. cheer_{today}.mp3   (today's voice summary if generated)
+      2. cheer_{today}.ogg
+      3. Latest cheer_* file in audio_cache (fallback for first-day experience)
+      4. None (UI hides play button)
+    """
+    today = today_iso()
+    audio_dir = Path("/home/work/.hermes/audio_cache")
+    if not audio_dir.exists():
+        return jsonify({"available": False})
+    # 1. Today-specific mp3/ogg.
+    for ext in ("mp3", "ogg"):
+        candidate = audio_dir / f"cheer_{today}.{ext}"
+        if candidate.exists():
+            return jsonify({
+                "available": True,
+                "url": f"/audio/{candidate.name}",
+                "kind": "voice_summary",
+                "title": "今日教練總結",
+                "date": today,
+                "size_kb": round(candidate.stat().st_size / 1024, 1),
+            })
+    # 2. Latest cheer_* file (any date) for fallback.
+    cheer_files = sorted(
+        list(audio_dir.glob("cheer_*.mp3")) + list(audio_dir.glob("cheer_*.ogg")),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    if not cheer_files:
+        cheer_files = sorted(
+            audio_dir.glob("*.mp3"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+    if cheer_files:
+        latest = cheer_files[0]
+        return jsonify({
+            "available": True,
+            "url": f"/audio/{latest.name}",
+            "kind": "voice_summary_fallback",
+            "title": "上次的教練總結",
+            "date": today,
+            "size_kb": round(latest.stat().st_size / 1024, 1),
+            "is_fallback": True,
+        })
+    return jsonify({"available": False})
+
+
 # ---------- Alonso cheer session endpoints ----------
 # Polled by cron */5 * * * * → /tmp/gym_recent.json for cheer consumption.
 SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
@@ -1097,7 +1153,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                :class="fatPct !== null ? 'border-yellow-400/30 text-yellow-300 ring-yellow-400/20' : 'border-white/15 text-gray-500 ring-transparent'">
             <span>🔥</span><span x-text="fatPct !== null ? `${fatPct}%` : '—'"></span>
           </div>
+          <!-- Audio overlay: play/pause/skip — does NOT block image (transparent pill, top-right below stats) -->
+          <div x-show="audioTrack && audioTrack.available" class="flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-1 py-0.5 text-[10px] backdrop-blur">
+            <button @click="togglePlay()" class="flex h-6 w-6 items-center justify-center rounded-full text-white hover:bg-white/15 active:scale-95 transition" :title="audioPlaying ? '暫停' : '播放'">
+              <span x-text="audioPlaying ? '⏸' : '▶'"></span>
+            </button>
+            <button x-show="audioPlaylist.length > 1" @click="audioNext()" class="flex h-6 w-6 items-center justify-center rounded-full text-gray-300 hover:bg-white/15 active:scale-95 transition" title="下一首">
+              <span>⏭</span>
+            </button>
+            <span class="px-1 text-[8px] font-bold text-gray-400" x-text="audioPlaying ? '播' : '⋯'"></span>
+          </div>
         </div>
+        <!-- Hidden audio element (HTML5 audio, no UI chrome, controlled via Alpine) -->
+        <audio x-ref="audioEl" :src="currentAudioUrl" @ended="audioEnded()" @timeupdate="audioProgress = $event.target.currentTime" @loadedmetadata="audioDuration = $event.target.duration" style="display:none"></audio>
       </div>
 
       <!-- Current set: exercise + weight + reps + intensity in one compact row -->
@@ -1317,7 +1385,13 @@ function gymApp() {
     today: '',
     history: [],
     loadingHistory: false,
-    pressTimer: null,
+    // Audio overlay state — fetched from /api/today_audio
+    audioTrack: null,
+    audioPlaylist: [],
+    audioIndex: 0,
+    audioPlaying: false,
+    audioProgress: 0,
+    audioDuration: 0,
     pressHandled: false,
     quote: '努力唔會辜負你',
     quoteBank: ['努力唔會辜負你', '今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', '慢慢嚟', '穩住', '加油'],
@@ -1363,6 +1437,16 @@ function gymApp() {
         this.weightKg = (typeof healthData.weight_kg === 'number') ? healthData.weight_kg : null;
         this.fatPct = (typeof healthData.fat_pct === 'number') ? healthData.fat_pct : null;
       } catch(e) { /* keep nulls, badges hidden */ }
+      // Pull today's audio (non-blocking, fails silently if no audio exists)
+      try {
+        const audioRes = await fetch('/api/today_audio');
+        const audioData = await audioRes.json();
+        if (audioData && audioData.available) {
+          this.audioTrack = audioData;
+          this.audioPlaylist = [audioData];  // Future: backend can return multi-track playlist
+          this.audioIndex = 0;
+        }
+      } catch(e) { /* keep audioTrack null, button hidden */ }
       this.today = data.today;
       // Initialize count-up timer from session.start_time if it exists
       if (data.session && data.session.start_time) {
@@ -1594,6 +1678,46 @@ function gymApp() {
         this.flash('Error: ' + e.message);
       }
       this.saving = false;
+    },
+    // Audio overlay methods — play / pause / next, controlled via hidden <audio> element
+    get currentAudioUrl() {
+      if (!this.audioPlaylist || this.audioPlaylist.length === 0) return '';
+      const item = this.audioPlaylist[this.audioIndex];
+      return item && item.url ? item.url : '';
+    },
+    togglePlay() {
+      const el = this.$refs.audioEl;
+      if (!el || !this.currentAudioUrl) return;
+      if (this.audioPlaying) {
+        el.pause();
+        this.audioPlaying = false;
+      } else {
+        el.play().then(() => {
+          this.audioPlaying = true;
+          if (this.haptic) this.haptic([15]);
+        }).catch((err) => {
+          this.flash('播放失敗: ' + (err.message || '未知'));
+        });
+      }
+    },
+    audioNext() {
+      if (!this.audioPlaylist || this.audioPlaylist.length <= 1) return;
+      this.audioIndex = (this.audioIndex + 1) % this.audioPlaylist.length;
+      this.audioPlaying = false;
+      // Auto-play next track after a tick to let src update.
+      this.$nextTick(() => {
+        if (this.$refs.audioEl) {
+          this.$refs.audioEl.currentTime = 0;
+          this.togglePlay();
+        }
+      });
+    },
+    audioEnded() {
+      this.audioPlaying = false;
+      // Auto-advance if there's a next track.
+      if (this.audioPlaylist && this.audioIndex < this.audioPlaylist.length - 1) {
+        this.audioNext();
+      }
     },
 
     async loadHistory(force = false) {
