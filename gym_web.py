@@ -421,6 +421,294 @@ def serve_image(filename):
     return send_from_directory("/home/work/.hermes/image_cache", filename)
 
 
+# ---------- Alonso cheer session endpoints ----------
+# Polled by cron */5 * * * * → /tmp/gym_recent.json for cheer consumption.
+SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+SHEET_TAB = "Workouts"
+SHEET_HEADER = [
+    "日期", "時間", "運動名稱", "Sets", "Reps", "重量", "每邊",
+    "Bar", "Volume", "備註", "Whoop Strain", "Image"
+]
+LAST_POLL_TS = {"ts": None, "count": 0}
+LAST_SHEET_SYNC = {"ts": None, "rows_added": 0, "status": None, "error": None}
+GOOGLE_TOKEN_PATH = Path("/home/work/.hermes/google_token.json")
+
+
+def _get_google_access_token():
+    """Refresh Google OAuth access token using stored refresh_token."""
+    import urllib.request, urllib.parse
+    with GOOGLE_TOKEN_PATH.open() as f:
+        tok = json.load(f)
+    data = urllib.parse.urlencode({
+        "client_id": tok["client_id"],
+        "client_secret": tok["client_secret"],
+        "refresh_token": tok["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(
+        tok.get("token_uri", "https://oauth2.googleapis.com/token"),
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = json.loads(resp.read().decode())
+    return body["access_token"]
+
+
+def _sheet_append_rows(rows):
+    """Append rows to sheet using Sheets v4 REST API."""
+    import urllib.request
+    access_token = _get_google_access_token()
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/"
+        f"{SHEET_TAB}!A1:L1:append?valueInputOption=USER_ENTERED"
+        f"&insertDataOption=INSERT_ROWS"
+    )
+    body = json.dumps({"values": rows}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _sheet_read_all():
+    """Read all rows from sheet tab. Returns list of row arrays."""
+    import urllib.request
+    access_token = _get_google_access_token()
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/"
+        f"{SHEET_TAB}!A1:L"
+    )
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {access_token}"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read().decode())
+    return body.get("values", [])
+
+
+def _session_to_sheet_rows(date, session):
+    """Convert a single date's session to sheet-ready row arrays (one per set)."""
+    rows = []
+    exercises = session.get("exercises", []) if isinstance(session, dict) else []
+    for ex in exercises:
+        ex_name = ex.get("name", "")
+        muscle = ex.get("muscle_group", "")
+        notes = f"{muscle}" if muscle else ""
+        for s in ex.get("sets", []):
+            reps = s.get("reps", 0)
+            weight = s.get("weight_kg") or s.get("weight") or 0
+            volume = reps * weight if (reps and weight) else 0
+            rows.append([
+                date,                              # 日期
+                s.get("time", ""),                  # 時間
+                ex_name,                            # 運動名稱
+                s.get("n", ""),                     # Sets
+                reps,                               # Reps
+                weight,                             # 重量
+                "",                                 # 每邊
+                "",                                 # Bar
+                volume,                             # Volume
+                notes,                              # 備註
+                "",                                 # Whoop Strain
+                "",                                 # Image
+            ])
+    return rows
+
+
+def _has_sheet_row(date, exercise, set_n):
+    """Check if a (date, exercise, set_n) tuple already exists in sheet."""
+    try:
+        rows = _sheet_read_all()
+    except Exception:
+        return False
+    for row in rows[1:]:  # skip header
+        if len(row) >= 4 and row[0] == date and row[2] == exercise and str(row[3]) == str(set_n):
+            return True
+    return False
+
+
+def _flatten_sessions(log):
+    """Convert {date: {session}} dict into flat list of set rows."""
+    flat = []
+    for date, payload in log.items():
+        if not isinstance(payload, dict):
+            continue
+        session = payload.get("session") if "session" in payload else payload
+        if not isinstance(session, dict):
+            continue
+        exercises = session.get("exercises", [])
+        for ex in exercises:
+            muscle = ex.get("muscle_group") or ex.get("muscle") or ""
+            for s in ex.get("sets", []):
+                flat.append({
+                    "date": date,
+                    "exercise": ex.get("name", ""),
+                    "muscle_group": muscle,
+                    "set_n": s.get("n"),
+                    "reps": s.get("reps"),
+                    "weight_kg": s.get("weight_kg") or s.get("weight"),
+                    "volume_kg": (s.get("reps") or 0) * (s.get("weight_kg") or s.get("weight") or 0),
+                    "intensity": s.get("intensity", ""),
+                    "time": s.get("time", ""),
+                })
+    flat.sort(key=lambda r: (r["date"], r.get("time", "")))
+    return flat
+
+
+@app.route("/api/workout_recent")
+def api_workout_recent():
+    """Return recent workouts summary for Alonso cheer sessions.
+
+    Pulls from Google Sheet first (single source of truth across devices);
+    falls back to local WORKOUT_LOG if sheet read fails.
+    """
+    try:
+        days = int(request.args.get("days", 7))
+    except ValueError:
+        days = 7
+    days = max(1, min(days, 90))
+    cutoff_date = (datetime.now(HKT) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    source = "sheet"
+    rows = []
+    try:
+        sheet_rows = _sheet_read_all()
+        # Header: [日期, 時間, 運動名稱, Sets, Reps, 重量, 每邊, Bar, Volume, 備註, Whoop Strain, Image]
+        for row in sheet_rows[1:]:
+            if not row or len(row) < 3:
+                continue
+            date = row[0]
+            if date < cutoff_date:
+                continue
+            try:
+                reps = int(row[4]) if len(row) > 4 and row[4] else 0
+                weight = float(row[5]) if len(row) > 5 and row[5] else 0.0
+            except (ValueError, TypeError):
+                reps, weight = 0, 0.0
+            try:
+                volume = float(row[8]) if len(row) > 8 and row[8] else reps * weight
+            except (ValueError, TypeError):
+                volume = reps * weight
+            try:
+                set_n = int(row[3]) if len(row) > 3 and row[3] else None
+            except (ValueError, TypeError):
+                set_n = None
+            rows.append({
+                "date": date,
+                "time": row[1] if len(row) > 1 else "",
+                "exercise": row[2] if len(row) > 2 else "",
+                "set_n": set_n,
+                "reps": reps,
+                "weight_kg": weight,
+                "volume_kg": volume,
+                "muscle_group": row[9] if len(row) > 9 else "",
+            })
+    except Exception as e:
+        # Fallback to local log if sheet unreachable.
+        source = "local_fallback"
+        log = load_log()
+        flat = _flatten_sessions(log)
+        rows = [r for r in flat if r["date"] >= cutoff_date]
+
+    total_volume = sum((r.get("volume_kg") or 0) for r in rows)
+    muscle_groups = sorted({r["muscle_group"] for r in rows if r.get("muscle_group")})
+    by_date = {}
+    for r in rows:
+        by_date.setdefault(r["date"], {"sets": 0, "volume": 0.0, "exercises": []})
+        by_date[r["date"]]["sets"] += 1
+        by_date[r["date"]]["volume"] += r.get("volume_kg") or 0
+        if r["exercise"] and r["exercise"] not in by_date[r["date"]]["exercises"]:
+            by_date[r["date"]]["exercises"].append(r["exercise"])
+    sessions_sorted = sorted(by_date.items(), key=lambda kv: kv[0], reverse=True)[:5]
+    last_workout = sorted(rows, key=lambda r: (r["date"], r.get("time", "")))[-1] if rows else None
+    LAST_POLL_TS["ts"] = datetime.now(HKT).isoformat()
+    LAST_POLL_TS["count"] = len(rows)
+    return jsonify({
+        "source": source,
+        "days": days,
+        "cutoff_date": cutoff_date,
+        "set_count": len(rows),
+        "total_volume_kg": round(total_volume, 1),
+        "muscle_groups": muscle_groups,
+        "last_workout": last_workout,
+        "sessions": [
+            {
+                "date": d,
+                "sets": info["sets"],
+                "volume_kg": round(info["volume"], 1),
+                "exercises": info["exercises"][:8],
+            }
+            for d, info in sessions_sorted
+        ],
+        "poll_meta": LAST_POLL_TS,
+    })
+
+
+@app.route("/api/sync_sheet", methods=["POST"])
+def api_sync_sheet():
+    """Push local WORKOUT_LOG entries to Google Sheet (idempotent)."""
+    payload = request.get_json(silent=True) or {}
+    target_date = payload.get("date")  # optional: sync one date, else all
+    log = load_log()
+    dates = [target_date] if target_date else sorted(log.keys())
+    added, skipped, errors = 0, 0, []
+    for date in dates:
+        entry = log.get(date)
+        if not isinstance(entry, dict):
+            continue
+        session = entry.get("session") if "session" in entry else entry
+        if not isinstance(session, dict):
+            continue
+        rows_to_push = []
+        for ex in session.get("exercises", []):
+            for s in ex.get("sets", []):
+                if not _has_sheet_row(date, ex.get("name", ""), s.get("n")):
+                    rows_to_push.extend(_session_to_sheet_rows(date, {"exercises": [ex]}))
+                else:
+                    skipped += 1
+        if rows_to_push:
+            try:
+                _sheet_append_rows(rows_to_push)
+                added += len(rows_to_push)
+            except Exception as e:
+                errors.append({"date": date, "error": str(e)})
+    LAST_SHEET_SYNC.update({
+        "ts": datetime.now(HKT).isoformat(),
+        "rows_added": added,
+        "skipped": skipped,
+        "errors": errors,
+        "status": "ok" if not errors else "partial",
+    })
+    return jsonify(LAST_SHEET_SYNC)
+
+
+@app.route("/api/sync_health")
+def api_sync_health():
+    """Cheer-side sync health probe — local count vs. last poll status."""
+    log = load_log()
+    flat = _flatten_sessions(log)
+    return jsonify({
+        "local_workout_count": len(flat),
+        "local_dates": len(log),
+        "last_poll_ts": LAST_POLL_TS["ts"],
+        "last_poll_set_count": LAST_POLL_TS["count"],
+        "last_sheet_sync": LAST_SHEET_SYNC,
+        "sheet_id": SHEET_ID,
+        "sheet_tab": SHEET_TAB,
+        "status": "healthy" if LAST_POLL_TS["ts"] else "never_polled",
+        "server_pid": os.getpid(),
+        "uptime_note": "Polled every 5 min by cron → /tmp/gym_recent.json",
+    })
+
+
 # ---------- HTML (Uber-inspired) ----------
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-Hant">
