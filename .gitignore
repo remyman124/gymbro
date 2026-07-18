@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# App data (Jim's personal log + image cache)
+.whoop_workout_log.json
+.hermes/
+image_cache/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
