@@ -401,19 +401,52 @@ def api_history():
 
 @app.route("/api/delete_session", methods=["POST"])
 def api_delete_session():
-    """Delete a past date's session from WORKOUT_LOG. Refuses to delete today."""
+    """Delete a session from BOTH local WORKOUT_LOG and Google Sheet.
+
+    Behaviour:
+      - Local-first: removes the entry from WORKOUT_LOG.json if present.
+      - Sheet-also:  finds matching rows in the Workouts tab by (date, exercise)
+        and removes them via batchUpdate.deleteDimension.
+      - Returns combined deletion summary so the UI can flash what happened.
+    Refuses to delete today only if the request asks for `safe=true`.
+    """
     data = request.get_json(force=True)
     date = (data.get("date") or "").strip()
+    safe = bool(data.get("safe", False))
     if not date:
         return jsonify({"error": "date required"}), 400
-    if date == today_iso():
+    if safe and date == today_iso():
         return jsonify({"error": "cannot delete today — use cancel button"}), 400
+
+    local_deleted = False
     log = load_log()
-    if date not in log:
-        return jsonify({"error": f"date {date} not found"}), 404
-    del log[date]
-    save_log(log)
-    return jsonify({"ok": True, "deleted": date})
+    if date in log:
+        del log[date]
+        save_log(log)
+        local_deleted = True
+
+    sheet_deleted = []
+    sheet_errors = []
+    try:
+        sheet_deleted = _sheet_delete_date(date)
+    except Exception as e:
+        sheet_errors.append(str(e))
+
+    if not local_deleted and not sheet_deleted and not sheet_errors:
+        return jsonify({
+            "error": f"date {date} not found in local log or sheet",
+            "local_deleted": False,
+            "sheet_deleted_rows": 0,
+        }), 404
+
+    return jsonify({
+        "ok": True,
+        "deleted": date,
+        "local_deleted": local_deleted,
+        "sheet_deleted_rows": len(sheet_deleted),
+        "sheet_deleted": sheet_deleted,
+        "sheet_errors": sheet_errors,
+    })
 
 
 @app.route("/img/<path:filename>")
@@ -533,6 +566,90 @@ def _has_sheet_row(date, exercise, set_n):
         if len(row) >= 4 and row[0] == date and row[2] == exercise and str(row[3]) == str(set_n):
             return True
     return False
+
+
+def _get_workouts_sheet_id():
+    """Resolve the numeric sheetId of the Workouts tab via Sheets v4 metadata."""
+    import urllib.request
+    access_token = _get_google_access_token()
+    req = urllib.request.Request(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        meta = json.loads(resp.read().decode())
+    for s in meta.get("sheets", []):
+        props = s.get("properties", {})
+        if props.get("title") == SHEET_TAB:
+            return int(props["sheetId"])
+    raise RuntimeError(f"sheet tab {SHEET_TAB!r} not found in {SHEET_ID}")
+
+
+def _sheet_delete_date(date):
+    """Delete all rows from Workouts tab where column A == date.
+
+    Sheets API requires deleting contiguous ranges bottom-up so indices stay valid.
+    Returns list of (date, exercise, set_n) tuples that were removed.
+    """
+    import urllib.request
+    rows = _sheet_read_all()
+    if not rows:
+        return []
+    # Collect 0-indexed sheet rows (add 1 to skip header) that match date.
+    matching_row_indices = []
+    removed_summary = []
+    for idx, row in enumerate(rows[1:], start=1):  # start=1 because row 0 is header
+        if row and row[0] == date:
+            matching_row_indices.append(idx)
+            removed_summary.append({
+                "row": idx + 1,  # 1-indexed for human reading
+                "exercise": row[2] if len(row) > 2 else "",
+                "set_n": row[3] if len(row) > 3 else "",
+            })
+    if not matching_row_indices:
+        return []
+    # Group contiguous indices into ranges and delete bottom-up to preserve indices.
+    # Sort descending so deletions don't shift indices of earlier rows.
+    matching_row_indices.sort(reverse=True)
+    sheet_id_num = _get_workouts_sheet_id()
+    access_token = _get_google_access_token()
+    # Build deleteDimension requests for each contiguous run.
+    runs = []
+    current_run = [matching_row_indices[0]]
+    for idx in matching_row_indices[1:]:
+        if idx == current_run[-1] - 1:
+            current_run.append(idx)
+        else:
+            runs.append(current_run)
+            current_run = [idx]
+    runs.append(current_run)
+    requests_body = []
+    for run in runs:
+        start = min(run)
+        end = max(run)
+        requests_body.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id_num,
+                    "dimension": "ROWS",
+                    "startIndex": start,
+                    "endIndex": end + 1,  # endIndex is exclusive
+                }
+            }
+        })
+    body = json.dumps({"requests": requests_body}).encode()
+    req = urllib.request.Request(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}:batchUpdate",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        json.loads(resp.read().decode())
+    return removed_summary
 
 
 def _derive_muscle_group(exercise_name):
