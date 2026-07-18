@@ -1128,13 +1128,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
              class="absolute inset-0 z-[1] flex h-40 w-full items-center justify-center text-3xl">
           💪🔥🏋️
         </div>
-        <!-- POST button: bottom-right overlay of hero image, doesn't block image subject (right corner, transparent pill) -->
-        <button class="absolute bottom-2 right-2 z-30 flex items-center gap-1 rounded-full bg-emerald-400 px-4 py-3 text-base font-black tracking-wide text-black shadow-lg shadow-emerald-400/40 ring-2 ring-emerald-300/40 active:scale-95 transition-transform backdrop-blur-sm"
-                :class="{'saving': saving, 'opacity-70': saving}" @click="logSet()"
-                x-text="saving ? '💾 Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`">
-        </button>
         <div class="absolute inset-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2">
-          <div class="min-w-0 pr-32">
+          <div class="min-w-0 pr-24">
             <div class="text-[9px] uppercase tracking-[0.2em] text-gray-300">Today</div>
             <div class="quote-line line-clamp-2 text-sm font-medium" x-text="quote"></div>
           </div>
@@ -1158,16 +1153,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                :class="fatPct !== null ? 'border-yellow-400/30 text-yellow-300 ring-yellow-400/20' : 'border-white/15 text-gray-500 ring-transparent'">
             <span>🔥</span><span x-text="fatPct !== null ? `${fatPct}%` : '—'"></span>
           </div>
-          <!-- Audio overlay: play/pause/skip — does NOT block image (transparent pill, top-right below stats) -->
-          <div x-show="audioTrack && audioTrack.available" class="flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-1 py-0.5 text-[10px] backdrop-blur">
-            <button @click="togglePlay()" class="flex h-6 w-6 items-center justify-center rounded-full text-white hover:bg-white/15 active:scale-95 transition" :title="audioPlaying ? '暫停' : '播放'">
-              <span x-text="audioPlaying ? '⏸' : '▶'"></span>
-            </button>
-            <button x-show="audioPlaylist.length > 1" @click="audioNext()" class="flex h-6 w-6 items-center justify-center rounded-full text-gray-300 hover:bg-white/15 active:scale-95 transition" title="下一首">
-              <span>⏭</span>
-            </button>
-            <span class="px-1 text-[8px] font-bold text-gray-400" x-text="audioPlaying ? '播' : '⋯'"></span>
-          </div>
+        </div>
+        <!-- Audio overlay: play/pause/skip — bottom-right of image, doesn't block subject -->
+        <div x-show="audioTrack && audioTrack.available" class="absolute bottom-2 right-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-1.5 py-1 text-[10px] backdrop-blur">
+          <button @click="togglePlay()" class="flex h-7 w-7 items-center justify-center rounded-full text-white hover:bg-white/15 active:scale-95 transition" :title="audioPlaying ? '暫停' : '播放'">
+            <span class="text-sm" x-text="audioPlaying ? '⏸' : '▶'"></span>
+          </button>
+          <button x-show="audioPlaylist.length > 1" @click="audioNext()" class="flex h-7 w-7 items-center justify-center rounded-full text-gray-300 hover:bg-white/15 active:scale-95 transition" title="下一首">
+            <span class="text-sm">⏭</span>
+          </button>
         </div>
         <!-- Hidden audio element (HTML5 audio, no UI chrome, controlled via Alpine) -->
         <audio x-ref="audioEl" :src="currentAudioUrl" @ended="audioEnded()" @timeupdate="audioProgress = $event.target.currentTime" @loadedmetadata="audioDuration = $event.target.duration" style="display:none"></audio>
@@ -1238,20 +1232,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Sticky action dock: intensity chips + undo button. The main LOG SET button
-           is now embedded inside the hero image (bottom-right). Here we keep only
-           the intensity chips (Working / Burn-out / Drop / Partial / Clone). -->
-      <div x-show="currentExercise" class="sticky bottom-[80px] z-30 mt-auto pb-2 pt-2">
-        <div class="mb-2 flex h-8 justify-end gap-2 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <!-- Sticky action dock: always ends above the fixed 64px tab bar. -->
+      <div x-show="currentExercise" class="sticky bottom-[140px] z-40 mt-auto pb-2 pt-2">
+        <div class="mb-2 flex h-8 gap-2 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('working')">🎯 Working</button>
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('drop-set')">⚡ Drop</button>
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="markPartial()">⚠️ Partial</button>
           <button x-show="lastSetForExercise" class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="cloneLastSet()"
                   x-text="lastSetForExercise ? `↓ Clone ${lastSetForExercise.weight_kg}kg × ${lastSetForExercise.reps}` : '↓ Clone'"></button>
-          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="markPartial()">⚠️ Partial</button>
-          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('drop-set')">⚡ Drop</button>
-          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
-          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('working')">🎯 Working</button>
+        </div>
+        <div class="flex items-stretch gap-2 rounded-2xl border border-white/10 bg-black/80 p-1.5 shadow-2xl shadow-emerald-500/20 backdrop-blur-xl">
           <button x-show="session.exercises.length > 0"
-                  class="pill glass shrink-0 px-3 py-1 text-xs tap border-red-400/30 text-red-300"
-                  @click="cancelLastSet()" aria-label="Cancel last set">↶ Undo</button>
+                  class="tap shrink-0 rounded-full border border-red-400/30 bg-red-500/15 px-3 py-2 text-sm font-bold text-red-300"
+                  :class="{'saving': saving}" @click="cancelLastSet()" aria-label="Cancel last set">
+            ↶ Undo
+          </button>
+          <button class="tap glow-ready flex-1 rounded-full bg-emerald-400 py-3 text-base font-black tracking-wide text-black ring-2 ring-emerald-300/30"
+                  :class="{'saving': saving}" @click="logSet()"
+                  x-text="saving ? 'Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`">
+          </button>
         </div>
       </div>
     </section>
