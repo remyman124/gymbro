@@ -2201,7 +2201,20 @@ document.addEventListener('touchend', e => {
 }, {passive:false});
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // Jim OOB 2026-07-19: aggressive SW update — every page load check for
+  // new SW + force-takeover. Standard register() + update() pattern.
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    // Check for updates immediately
+    reg.update();
+    // Re-check every 60s in case PWA is left open
+    setInterval(() => reg.update().catch(() => {}), 60000);
+    // When new SW takes over, hard-reload so old in-memory JS doesn't linger
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (window.__reloadingForSW) return;
+      window.__reloadingForSW = true;
+      window.location.reload();
+    });
+  }).catch(() => {});
 }
 </script>
 
