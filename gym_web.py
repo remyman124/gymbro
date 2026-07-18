@@ -115,6 +115,24 @@ def healthz():
     return jsonify({"status": "ok", "time": now_iso(), "today": today_iso()})
 
 
+# ---------- Version stamp — drives PWA forced reload ----------
+# Bump this every time you ship code that affects the in-page JS bundle.
+# The client script polls this endpoint and forces a hard reload if the
+# version differs from localStorage, bypassing stale SW caches that
+# `controllerchange` events might miss on iOS Safari PWA.
+APP_VERSION = "2026-07-19-v4-stepper"
+
+
+@app.route("/api/version")
+def api_version():
+    """Return the current server-side app version stamp.
+
+    Client compares this to localStorage['app_version']; on mismatch,
+    it clears all caches + unregisters SW + hard reloads.
+    """
+    return jsonify({"version": APP_VERSION, "sw_cache": "gym-web-v4"})
+
+
 @app.route("/api/state")
 def api_state():
     """Return full session state for client sync."""
@@ -2215,6 +2233,39 @@ if ('serviceWorker' in navigator) {
       window.location.reload();
     });
   }).catch(() => {});
+
+  // Nuclear fallback: version-stamp check. Runs in MAIN THREAD, not under
+  // SW control. If server-side /api/version returns a newer stamp than
+  // localStorage, blow away caches + unregister SW + force reload.
+  // This handles iOS Safari PWA cases where controllerchange never fires.
+  (async () => {
+    try {
+      const r = await fetch('/api/version', {cache: 'no-store'});
+      const data = await r.json();
+      const serverVer = data.version;
+      const localVer = localStorage.getItem('app_version');
+      if (localVer && localVer !== serverVer) {
+        console.log('[gymweb] version mismatch — forcing hard reload', {localVer, serverVer});
+        if (window.__reloadingForVer) return;
+        window.__reloadingForVer = true;
+        try {
+          // Nuke all caches
+          const keys = await caches.keys();
+          await Promise.all(keys.map(k => caches.delete(k)));
+          // Unregister all SWs
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map(reg => reg.unregister()));
+        } catch (e) {}
+        localStorage.setItem('app_version', serverVer);
+        // Cache-bust the URL itself so even network cache can't return stale
+        window.location.href = '/?_=' + Date.now();
+        return;
+      }
+      localStorage.setItem('app_version', serverVer);
+    } catch (e) {
+      // Network error — silently keep current version
+    }
+  })();
 }
 </script>
 
