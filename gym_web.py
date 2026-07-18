@@ -120,7 +120,7 @@ def healthz():
 # The client script polls this endpoint and forces a hard reload if the
 # version differs from localStorage, bypassing stale SW caches that
 # `controllerchange` events might miss on iOS Safari PWA.
-APP_VERSION = "2026-07-19-v5-stepper-labels"
+APP_VERSION = "2026-07-19-v6-apple-icon-refresh-btn"
 
 
 @app.route("/api/version")
@@ -272,6 +272,64 @@ def api_today_image():
             cheer_date = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:8]}" if len(parts) > 1 and len(parts[1]) == 8 else today
             return jsonify({"image_url": f"/img/{latest.name}", "date": cheer_date, "source": "cheer_latest"})
     return jsonify({"image_url": None, "date": today, "source": "none"})
+
+
+# Manual refresh — 5-min cooldown, runs gymbro_daily_image.py --force in background
+REFRESH_COOLDOWN_SEC = 300
+_last_refresh_ts = {"ts": None, "pid": None}
+
+
+@app.route("/api/refresh_motivation", methods=["POST"])
+def api_refresh_motivation():
+    """Trigger a fresh motivation image generation (async, returns immediately).
+
+    - 5-min cooldown per server (prevents abuse)
+    - Subprocess runs scripts/gymbro_daily_image.py --force
+    - Returns immediately with status; client polls /api/today_image
+    """
+    import subprocess
+    import time
+    now = time.time()
+    last = _last_refresh_ts["ts"]
+    if last is not None and (now - last) < REFRESH_COOLDOWN_SEC:
+        remaining = int(REFRESH_COOLDOWN_SEC - (now - last))
+        return jsonify({
+            "ok": False,
+            "cooldown_remaining": remaining,
+            "error": f"cooldown {remaining}s",
+        }), 429
+    _last_refresh_ts["ts"] = now
+
+    # Launch async subprocess; do not block the request.
+    env = os.environ.copy()
+    # Ensure MiniMax key is available to the subprocess.
+    if "MINIMAX_API_KEY" not in env:
+        env_file = Path("/home/work/.hermes/.env")
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k not in os.environ:
+                        env[k] = v
+
+    log_path = Path("/tmp/gym_motivation_refresh.log")
+    log_f = open(log_path, "ab")
+    proc = subprocess.Popen(
+        ["/usr/bin/python3", "/home/work/projects/gymbro/scripts/gymbro_daily_image.py", "--force"],
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd="/home/work/projects/gymbro",
+    )
+    _last_refresh_ts["pid"] = proc.pid
+    return jsonify({
+        "ok": True,
+        "status": "generating",
+        "pid": proc.pid,
+        "cooldown_remaining": REFRESH_COOLDOWN_SEC,
+        "log": str(log_path),
+    })
 
 
 @app.route("/api/streak")
@@ -740,7 +798,7 @@ def pwa_manifest():
         "icons": [
             {"src": "/static/gymbro_icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
             {"src": "/static/gymbro_icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
-            {"src": "/static/gymbro_apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
+            {"src": "/static/gymbro_apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any"},
         ],
     })
 
@@ -1223,8 +1281,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#000000">
 <title>Gym · Jim</title>
+<link rel="icon" type="image/x-icon" href="/static/gymbro_favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/gymbro_favicon-16.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/gymbro_favicon-32.png">
 <link rel="icon" type="image/png" sizes="192x192" href="/static/gymbro_icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/static/gymbro_icon-512.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/gymbro_apple-touch-icon.png">
 <link rel="apple-touch-icon" sizes="152x152" href="/static/gymbro_apple-touch-icon.png">
 <link rel="apple-touch-icon" sizes="120x120" href="/static/gymbro_apple-touch-icon.png">
@@ -1440,6 +1501,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div x-show="recovery !== null" class="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold text-emerald-300 backdrop-blur">
           <span>💚</span><span x-text="`${recovery}%`"></span>
         </div>
+        <!-- Refresh motivation image (top-left, below recovery badge) — manual cooldown 5min -->
+        <button @click="refreshMotivation()" :disabled="refreshingMotivation"
+                :title="refreshMotivationCooldown > 0 ? `冷卻中 ${refreshMotivationCooldown}s` : '換新激勵圖'"
+                class="absolute left-2 top-9 z-20 flex h-6 w-6 items-center justify-center rounded-full border border-white/15 bg-black/55 text-[11px] text-white/80 backdrop-blur hover:bg-white/15 active:scale-90 transition disabled:opacity-50 disabled:cursor-not-allowed">
+          <span :class="refreshingMotivation ? 'animate-spin inline-block' : ''" x-text="refreshingMotivation ? '⏳' : '↻'"></span>
+        </button>
         <!-- Top-right: Withings weight (single number, minimal) -->
         <!-- Top-right: Withings weight kg + fat % (Jim's goal: drive fat down) -->
         <div class="absolute right-2 top-2 z-20 flex flex-col items-end gap-1">
@@ -1698,6 +1765,10 @@ function gymApp() {
     recovery: null,
     weightKg: null,
     fatPct: null,
+    // Manual motivation image refresh (NEW 2026-07-19 OOB Jim) — 5min server cooldown
+    refreshingMotivation: false,
+    refreshMotivationCooldown: 0,
+    refreshMotivationTimer: null,
     clockStr: '',
     elapsedSec: 0,
     elapsedStr: '0:00',
@@ -2121,6 +2192,67 @@ function gymApp() {
       if (this.audioPlaylist && this.audioIndex < this.audioPlaylist.length - 1) {
         this.audioNext();
       }
+    },
+    // Manual motivation image refresh — POST /api/refresh_motivation
+    // 5-min server-side cooldown to prevent API abuse.
+    // Polls /api/today_image every 3s while generating; updates banner on success.
+    async refreshMotivation() {
+      if (this.refreshingMotivation || this.refreshMotivationCooldown > 0) return;
+      this.refreshingMotivation = true;
+      this.flash('生成新激勵圖…');
+      try {
+        const r = await fetch('/api/refresh_motivation', { method: 'POST' });
+        const data = await r.json();
+        if (!data.ok) {
+          this.refreshingMotivation = false;
+          if (data.cooldown_remaining) {
+            this.refreshMotivationCooldown = data.cooldown_remaining;
+            this._startCooldownCountdown();
+            this.flash(`冷卻中 ${data.cooldown_remaining}s`);
+          } else {
+            this.flash(data.error || 'Refresh failed');
+          }
+          return;
+        }
+        // Poll for the new image every 3s (max ~90s).
+        let attempts = 0;
+        const maxAttempts = 30;
+        const poll = async () => {
+          attempts++;
+          try {
+            const imgRes = await fetch('/api/today_image?_t=' + Date.now());
+            const imgData = await imgRes.json();
+            // Server signals "fresh" by setting `fresh: true` on the response after gen.
+            // For simple behaviour: if URL changed OR date is today AND new ts param differs, accept.
+            if (imgData && imgData.image_url && imgData.image_url !== this.motivationImage) {
+              this.motivationImage = imgData.image_url + '?v=' + Date.now();
+              this.flash('新激勵圖 ✓');
+              this.refreshingMotivation = false;
+              return;
+            }
+          } catch(e) { /* keep polling */ }
+          if (attempts < maxAttempts) {
+            setTimeout(poll, 3000);
+          } else {
+            this.refreshingMotivation = false;
+            this.flash('Timeout — 用返今日現有圖');
+          }
+        };
+        setTimeout(poll, 3000);
+      } catch(e) {
+        this.refreshingMotivation = false;
+        this.flash('Refresh failed: ' + (e.message || '網絡錯誤'));
+      }
+    },
+    _startCooldownCountdown() {
+      if (this.refreshMotivationTimer) clearInterval(this.refreshMotivationTimer);
+      this.refreshMotivationTimer = setInterval(() => {
+        this.refreshMotivationCooldown--;
+        if (this.refreshMotivationCooldown <= 0) {
+          clearInterval(this.refreshMotivationTimer);
+          this.refreshMotivationTimer = null;
+        }
+      }, 1000);
     },
 
     async loadHistory(force = false) {

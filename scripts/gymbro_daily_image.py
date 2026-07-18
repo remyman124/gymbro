@@ -68,13 +68,13 @@ def fetch_image_url(api_key: str, prompt: str) -> str:
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         body = json.loads(resp.read().decode("utf-8"))
 
     if body.get("base_resp", {}).get("status_code", -1) != 0:
         raise RuntimeError(f"image-01 API error: {body}")
 
-    urls = body.get("image_urls") or []
+    urls = body.get("data", {}).get("image_urls") or []
     if not urls:
         raise RuntimeError(f"no image_urls in response: {body}")
     return urls[0]
@@ -94,7 +94,7 @@ def main() -> int:
     date_iso = today_hkt_iso()
     dest = cache_path_for(date_iso)
 
-    if dest.exists() and dest.stat().st_size > 0:
+    if dest.exists() and dest.stat().st_size > 0 and "--force" not in sys.argv:
         print(f"✓ cache hit: {dest} ({dest.stat().st_size} bytes) — skipping gen")
         return 0
 
