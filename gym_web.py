@@ -239,6 +239,72 @@ def api_streak():
     return jsonify({"streak": streak, "last_workout_date": last_workout_date})
 
 
+@app.route("/api/cancel_last_set", methods=["POST"])
+def api_cancel_last_set():
+    """Pop the last entry from today's session exercises. Returns the removed entry."""
+    session = get_or_create_session()
+    if not session.get("exercises"):
+        return jsonify({"error": "no sets to cancel"}), 400
+    removed = session["exercises"].pop()
+    log = load_log()
+    log[today_iso()] = session
+    save_log(log)
+    return jsonify({"ok": True, "removed": removed, "remaining": len(session["exercises"])})
+
+
+@app.route("/api/history")
+def api_history():
+    """Return all dates with summary stats, sorted DESC. Plus current streak."""
+    log = load_log()
+    history = []
+    for date_key in sorted(log.keys(), reverse=True):
+        s = log[date_key]
+        exercises = s.get("exercises", []) or []
+        total_vol = sum((e.get("weight_kg") or 0) * (e.get("reps") or 0) for e in exercises)
+        history.append({
+            "date": date_key,
+            "sets": len(exercises),
+            "total_vol_kg": total_vol,
+            "exercises": list({e.get("exercise", "") for e in exercises if e.get("exercise")}),
+            "completed": bool(s.get("completed", False)),
+            "start_time": s.get("start_time"),
+            "end_time": s.get("end_time"),
+        })
+    # Reuse streak logic (single source of truth)
+    streak = 0
+    today = today_iso()
+    try:
+        cursor = datetime.strptime(today, "%Y-%m-%d").date()
+        while True:
+            key = cursor.strftime("%Y-%m-%d")
+            ss = log.get(key)
+            if ss and ss.get("completed") and len(ss.get("exercises", [])) >= 3:
+                streak += 1
+                cursor = cursor - timedelta(days=1)
+            else:
+                break
+    except Exception:
+        streak = 0
+    return jsonify({"history": history, "streak": streak, "today": today})
+
+
+@app.route("/api/delete_session", methods=["POST"])
+def api_delete_session():
+    """Delete a past date's session from WORKOUT_LOG. Refuses to delete today."""
+    data = request.get_json(force=True)
+    date = (data.get("date") or "").strip()
+    if not date:
+        return jsonify({"error": "date required"}), 400
+    if date == today_iso():
+        return jsonify({"error": "cannot delete today — use cancel button"}), 400
+    log = load_log()
+    if date not in log:
+        return jsonify({"error": f"date {date} not found"}), 404
+    del log[date]
+    save_log(log)
+    return jsonify({"ok": True, "deleted": date})
+
+
 @app.route("/img/<path:filename>")
 def serve_image(filename):
     return send_from_directory("/home/work/.hermes/image_cache", filename)
@@ -269,46 +335,167 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     --uber-grey-5: #6B6B6B;
     --uber-grey-6: #E2E2E2;
     --uber-green: #06C167;
+    --emerald: #10B981;
+    --gold: #FFD60A;
   }
-  * { -webkit-tap-highlight-color: transparent; }
-  html, body { background: var(--uber-black); color: var(--uber-text); font-family: 'Inter', -apple-system, system-ui, sans-serif; overscroll-behavior: none; }
-  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
-  .tap { transition: transform 0.08s ease-out, background-color 0.15s; }
+  * {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: manipulation;   /* kill double-tap zoom + pinch on iOS Safari */
+  }
+  input, textarea, [contenteditable] {
+    -webkit-user-select: text;
+    user-select: text;            /* allow text input fields to select normally */
+    touch-action: auto;           /* inputs need full touch for selection */
+  }
+  html, body {
+    background: var(--uber-black);
+    color: var(--uber-text);
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    overscroll-behavior: none;
+  }
+  body {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    background: radial-gradient(circle at 20% 0%, rgba(16,185,129,0.10) 0%, transparent 45%),
+                radial-gradient(circle at 80% 100%, rgba(255,214,10,0.06) 0%, transparent 50%),
+                linear-gradient(to bottom right, #000000, #18181b, #000000);
+    background-attachment: fixed;
+    min-height: 100vh;
+    position: relative;
+  }
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(circle at 50% 30%, rgba(255,255,255,0.04) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  main, header, nav { position: relative; z-index: 1; }
+  .tap { transition: transform 0.08s ease-out, background-color 0.15s, box-shadow 0.2s; }
   .tap:active { transform: scale(0.97); }
-  .primary-btn { background: var(--uber-text); color: var(--uber-black); border-radius: 4px; font-weight: 700; letter-spacing: 0.5px; }
+  .primary-btn {
+    background: var(--uber-text);
+    color: var(--uber-black);
+    border-radius: 999px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
   .pill { border-radius: 999px; }
-  input[type="text"], input[type="number"] { background: var(--uber-grey-6); border: 0; padding: 14px 16px; border-radius: 4px; font-size: 16px; width: 100%; outline: none; }
-  input[type="text"]:focus { background: var(--uber-grey-2); }
-  .tab-active { color: var(--uber-text); border-bottom: 2px solid var(--uber-text); }
-  .tab-inactive { color: var(--uber-grey-4); border-bottom: 2px solid transparent; }
-  .num-btn { background: var(--uber-grey-6); color: var(--uber-black); border-radius: 4px; font-weight: 700; font-size: 24px; }
-  .num-btn:active { background: var(--uber-grey-2); }
-  .pyramid { display: flex; flex-direction: column; align-items: center; gap: 2px; }
-  .pyramid-row { background: var(--uber-text); color: var(--uber-black); border-radius: 4px; padding: 8px 14px; font-weight: 600; min-width: 120px; text-align: center; }
+  .glass {
+    background: rgba(255,255,255,0.08);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.18);
+    color: var(--uber-text);
+  }
+  .glass-active {
+    background: var(--uber-text);
+    color: var(--uber-black);
+    border: 1px solid var(--uber-text);
+  }
+  input[type="text"], input[type="number"] {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    padding: 14px 16px;
+    border-radius: 999px;
+    font-size: 16px;
+    width: 100%;
+    outline: none;
+    color: white;
+    backdrop-filter: blur(8px);
+  }
+  input[type="text"]::placeholder, input[type="number"]::placeholder { color: rgba(255,255,255,0.4); }
+  input[type="text"]:focus, input[type="number"]:focus {
+    background: rgba(255,255,255,0.15);
+    border-color: rgba(16,185,129,0.5);
+  }
+  .num-btn {
+    background: rgba(255,255,255,0.08);
+    backdrop-filter: blur(8px);
+    color: var(--uber-text);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: 22px;
+  }
+  .num-btn:active { background: rgba(255,255,255,0.18); }
+  .tab-active {
+    color: var(--uber-text);
+    box-shadow: 0 0 12px rgba(255,255,255,0.4);
+    border-top: 2px solid var(--uber-text);
+  }
+  .tab-inactive { color: var(--uber-grey-4); }
+  .pyramid { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .pyramid-row {
+    background: var(--uber-text);
+    color: var(--uber-black);
+    border-radius: 999px;
+    padding: 8px 18px;
+    font-weight: 600;
+    min-width: 140px;
+    text-align: center;
+  }
   .pyramid-row.warm-up { opacity: 0.55; }
   .pyramid-row.working { font-weight: 900; }
-  .pyramid-row.burn-out { background: var(--uber-green); color: var(--uber-text); }
+  .pyramid-row.burn-out { background: var(--emerald); color: var(--uber-text); }
   .hidden { display: none !important; }
-  @keyframes pulse-fade { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  @keyframes pulse-fade { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
   .saving { animation: pulse-fade 1.2s ease-in-out infinite; }
+  @keyframes fade-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .fade-up { animation: fade-up 0.4s ease-out backwards; }
+  @keyframes glow-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.5), 0 0 24px rgba(16,185,129,0.2); }
+    50% { box-shadow: 0 0 0 8px rgba(16,185,129,0), 0 0 32px rgba(16,185,129,0.4); }
+  }
+  .glow-ready { animation: glow-pulse 2s ease-in-out infinite; }
   .toast {
     position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%);
     background: var(--uber-text); color: var(--uber-black); padding: 12px 24px;
-    border-radius: 24px; font-weight: 600; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    border-radius: 999px; font-weight: 600; box-shadow: 0 4px 20px rgba(0,0,0,0.6);
     z-index: 100; transition: opacity 0.3s;
   }
+  .streak-badge {
+    background: rgba(255,255,255,0.10);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.20);
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-weight: 700;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .quote-line {
+    font-style: italic;
+    color: rgba(255,214,10,0.85);
+    letter-spacing: 0.05em;
+    transition: opacity 0.5s ease-in-out;
+  }
+  [x-cloak] { display: none !important; }
 </style>
 </head>
 <body x-data="gymApp()" x-init="init()">
 
   <!-- Top Bar -->
-  <header class="sticky top-0 z-50 bg-black px-4 pt-3 pb-2">
+  <header class="sticky top-0 z-50 px-4 pt-3 pb-2" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.08);">
     <div class="flex items-baseline justify-between">
-      <h1 class="text-3xl font-black tracking-tight">Gym</h1>
-      <span class="text-xs text-gray-400" x-text="sessionDateStr"></span>
+      <h1 class="text-3xl font-black tracking-tighter">Gym</h1>
+      <div class="flex items-center gap-2">
+        <span class="streak-badge" x-show="streak > 0">
+          <span style="color: var(--gold);">🔥</span>
+          <span x-text="`${streak} day${streak === 1 ? '' : 's'}`"></span>
+        </span>
+        <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
+      </div>
     </div>
-    <div class="mt-2 flex items-center gap-2">
-      <span class="text-2xl font-black" x-text="currentExercise || '—'"></span>
+    <div class="mt-2 flex items-baseline gap-2">
+      <span class="text-2xl font-black tracking-tight" x-text="currentExercise || '—'"></span>
       <span class="text-sm text-gray-400" x-text="currentSet ? `Set ${currentSet.set}/${currentSet.total}` : 'Tap to start'"></span>
     </div>
   </header>
@@ -321,19 +508,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- SET TAB (default) -->
     <section x-show="tab === 'set'">
+
+      <!-- Hero motivation banner -->
+      <div class="relative w-full h-44 rounded-2xl overflow-hidden mb-5 shadow-2xl"
+           style="background: linear-gradient(135deg, #000000 0%, #1f2937 50%, #064e3b 100%); border: 1px solid rgba(255,255,255,0.08);">
+        <img x-show="motivationImage" :src="motivationImage"
+             class="w-full h-44 object-cover"
+             style="position:absolute; inset:0; z-index:1;"
+             @error="motivationImage = ''">
+        <div x-show="!motivationImage"
+             class="w-full h-44 flex items-center justify-center text-6xl"
+             style="position:absolute; inset:0; z-index:1;">
+          💪🔥🏋️
+        </div>
+        <div class="absolute inset-0 z-10 flex flex-col items-center justify-end pb-3 px-4"
+             style="background: linear-gradient(to top, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.25) 60%, transparent 100%);">
+          <div class="text-[10px] uppercase tracking-[0.2em] text-gray-300 mb-1">Today</div>
+          <div class="quote-line text-sm font-medium" x-text="quote"></div>
+        </div>
+      </div>
+
       <div class="text-center my-6">
-        <div class="text-sm uppercase tracking-widest text-gray-400 mb-1">Current</div>
-        <div class="text-6xl font-black my-2" x-text="displayWeight || '—'"></div>
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-1">Current</div>
+        <div class="text-6xl font-black tracking-tighter my-2" x-text="displayWeight || '—'"></div>
         <div class="text-2xl text-gray-300 font-medium" x-text="displayReps ? `${displayReps} reps` : '—'"></div>
-        <div class="mt-1 text-xs uppercase tracking-widest" :class="intensityColor" x-text="intensityLabel"></div>
+        <div class="mt-1 text-[10px] uppercase tracking-[0.2em] font-bold" :class="intensityColor" x-text="intensityLabel"></div>
       </div>
 
       <!-- Exercise name input (only if no exercise yet) -->
       <div x-show="!currentExercise" class="my-6">
-        <label class="block text-sm uppercase tracking-widest text-gray-400 mb-2">Exercise</label>
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-3 text-center">Quick picks</div>
+        <div class="quote-line text-center text-sm mb-4" x-text="quote" data-quote="努力唔會辜負你"></div>
         <div class="grid grid-cols-2 gap-2 mb-3">
-          <template x-for="ex in quickPicks" :key="ex">
-            <button class="pill bg-gray-100 text-black font-semibold py-3 tap" @click="pickExercise(ex)" x-text="ex"></button>
+          <template x-for="(ex, idx) in quickPicks" :key="ex">
+            <button class="pill glass font-semibold py-3 tap fade-up"
+                    :style="`animation-delay: ${idx * 50}ms`"
+                    @click="pickExercise(ex)" x-text="ex"></button>
           </template>
         </div>
         <input type="text" placeholder="或輸入 custom" x-model="exerciseInput" @keyup.enter="customExercise()" />
@@ -341,11 +551,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <!-- Weight stepper -->
       <div x-show="currentExercise" class="my-4">
-        <div class="text-sm uppercase tracking-widest text-gray-400 mb-2 text-center">Weight (kg)</div>
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-2 text-center">Weight (kg)</div>
         <div class="flex items-center justify-between gap-3">
           <button class="num-btn w-14 h-14 tap" @click="bumpWeight(-5)">−5</button>
           <button class="num-btn w-14 h-14 tap" @click="bumpWeight(-2.5)">−2.5</button>
-          <div class="flex-1 text-center text-4xl font-black" x-text="weight"></div>
+          <div class="flex-1 text-center text-4xl font-black tracking-tighter" x-text="weight"></div>
           <button class="num-btn w-14 h-14 tap" @click="bumpWeight(2.5)">+2.5</button>
           <button class="num-btn w-14 h-14 tap" @click="bumpWeight(5)">+5</button>
         </div>
@@ -353,11 +563,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <!-- Reps stepper -->
       <div x-show="currentExercise" class="my-4">
-        <div class="text-sm uppercase tracking-widest text-gray-400 mb-2 text-center">Reps (default 10)</div>
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-2 text-center">Reps (default 10)</div>
         <div class="flex items-center justify-between gap-3">
           <button class="num-btn w-14 h-14 tap" @click="bumpReps(-2)">−2</button>
           <button class="num-btn w-14 h-14 tap" @click="bumpReps(-1)">−1</button>
-          <div class="flex-1 text-center text-4xl font-black" x-text="reps"></div>
+          <div class="flex-1 text-center text-4xl font-black tracking-tighter" x-text="reps"></div>
           <button class="num-btn w-14 h-14 tap" @click="bumpReps(1)">+1</button>
           <button class="num-btn w-14 h-14 tap" @click="bumpReps(2)">+2</button>
         </div>
@@ -365,15 +575,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <!-- Big LOG button -->
       <div x-show="currentExercise" class="mt-8">
-        <button class="primary-btn w-full py-6 text-2xl tap" :class="{'saving': saving}" @click="logSet()" x-text="saving ? 'Saving…' : `✓ Log Set ${currentSet ? currentSet.set : 1}`"></button>
+        <button class="primary-btn w-full py-6 text-2xl tap ring-4 ring-emerald-400/30 glow-ready"
+                :class="{'saving': saving}"
+                @click="logSet()"
+                x-text="saving ? 'Saving…' : `✓ Log Set ${currentSet ? currentSet.set : 1}`">
+        </button>
+        <!-- Cancel last set (undo wrong set) -->
+        <button x-show="session.exercises.length > 0"
+                class="mt-3 w-full py-2 text-sm font-semibold rounded-full tap"
+                style="background: rgba(239,68,68,0.20); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5;"
+                :class="{'saving': saving}"
+                @click="cancelLastSet()">
+          ↶ Cancel Last Set
+        </button>
       </div>
 
       <!-- Quick intensity tags -->
-      <div x-show="currentExercise && hasWorkedAtLeastOneSet" class="mt-4 flex gap-2 justify-center">
-        <button class="pill bg-gray-700 px-4 py-2 text-sm tap" @click="setIntensity('working')">🎯 Working</button>
-        <button class="pill bg-gray-700 px-4 py-2 text-sm tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
-        <button class="pill bg-gray-700 px-4 py-2 text-sm tap" @click="setIntensity('drop-set')">⚡ Drop</button>
-        <button class="pill bg-gray-700 px-4 py-2 text-sm tap" @click="markPartial()">⚠️ Partial</button>
+      <div x-show="currentExercise && hasWorkedAtLeastOneSet" class="mt-5 flex gap-2 justify-center flex-wrap">
+        <button class="pill glass px-4 py-2 text-sm tap" @click="setIntensity('working')">🎯 Working</button>
+        <button class="pill glass px-4 py-2 text-sm tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
+        <button class="pill glass px-4 py-2 text-sm tap" @click="setIntensity('drop-set')">⚡ Drop</button>
+        <button class="pill glass px-4 py-2 text-sm tap" @click="markPartial()">⚠️ Partial</button>
       </div>
 
       <!-- Same as last set -->
@@ -384,10 +606,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- WORKOUT / PYRAMID TAB -->
     <section x-show="tab === 'workout'">
-      <div class="text-sm uppercase tracking-widest text-gray-400 my-2">Today's Pyramid</div>
+      <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 my-3">Today's Pyramid</div>
       <template x-for="(ex, idx) in sessionGrouped" :key="ex.name">
-        <div class="mb-6">
-          <div class="text-xl font-bold mb-2" x-text="ex.name"></div>
+        <div class="mb-6 fade-up" :style="`animation-delay: ${idx * 60}ms`">
+          <div class="text-xl font-bold mb-3 tracking-tight" x-text="ex.name"></div>
           <div class="pyramid">
             <template x-for="entry in ex.entries" :key="entry.set">
               <div class="pyramid-row"
@@ -396,7 +618,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               </div>
             </template>
           </div>
-          <div class="text-xs text-gray-400 mt-2" x-text="`Sub-total: ${ex.vol}kg vol`"></div>
+          <div class="text-xs text-gray-400 mt-3 text-center" x-text="`Sub-total: ${ex.vol}kg vol`"></div>
         </div>
       </template>
       <div x-show="!sessionGrouped.length" class="text-gray-500 text-center py-20">No sets logged yet</div>
@@ -404,40 +626,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- HISTORY TAB -->
     <section x-show="tab === 'history'">
-      <div class="text-sm uppercase tracking-widest text-gray-400 my-2">Recent Sessions</div>
-      <div class="text-gray-500 text-center py-20">Pull previous days from /home/work/.whoop_workout_log.json</div>
+      <div class="flex items-baseline justify-between my-3">
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">Recent Sessions</div>
+        <button class="text-xs text-gray-400 underline tap" @click="loadHistory()" x-show="!loadingHistory">↻ Refresh</button>
+        <span class="text-xs text-gray-400" x-show="loadingHistory">Loading…</span>
+      </div>
+      <div x-show="loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">Loading history…</div>
+      <div x-show="!loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">No sessions yet — go log some 🔥</div>
+      <template x-for="row in history" :key="row.date">
+        <div class="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-4 mb-3 relative fade-up"
+             :class="row.date === today ? 'ring-2 ring-yellow-400/50' : ''">
+          <button class="absolute top-2 right-2 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
+                  style="background: rgba(239,68,68,0.20); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5;"
+                  @click="deleteSession(row.date)"
+                  :aria-label="`Delete ${row.date}`"
+                  title="Delete session">🗑</button>
+          <div class="flex items-baseline gap-2 mb-1 pr-10">
+            <div class="text-2xl font-black tracking-tight" x-text="row.date"></div>
+            <span x-show="row.date === today"
+                  class="text-[10px] uppercase tracking-[0.15em] font-bold px-2 py-0.5 rounded-full"
+                  style="background: rgba(255,214,10,0.15); color: var(--gold); border: 1px solid rgba(255,214,10,0.35);">Today</span>
+            <span x-show="row.completed"
+                  class="text-[10px] uppercase tracking-[0.15em] font-bold px-2 py-0.5 rounded-full text-emerald-400"
+                  style="background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.30);">✓ Done</span>
+          </div>
+          <div class="text-sm text-gray-300">
+            <span class="font-bold" x-text="`${row.sets} set${row.sets === 1 ? '' : 's'}`"></span>
+            <span class="text-gray-500"> · </span>
+            <span class="font-bold" x-text="`${row.total_vol_kg}kg vol`"></span>
+            <span x-show="row.exercises.length" class="text-gray-500" x-text="` · ${row.exercises.length} exercise${row.exercises.length === 1 ? '' : 's'}`"></span>
+          </div>
+          <div x-show="row.exercises.length" class="text-xs text-gray-400 mt-1 truncate" x-text="row.exercises.join(' · ')"></div>
+        </div>
+      </template>
     </section>
 
     <!-- END TAB -->
     <section x-show="tab === 'end'" x-cloak>
       <div class="text-center my-6">
-        <div class="text-sm uppercase tracking-widest text-gray-400">End Session</div>
-        <h2 class="text-3xl font-black mt-2">收檔時間</h2>
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">End Session</div>
+        <h2 class="text-4xl font-black tracking-tighter mt-2">收檔時間</h2>
         <p class="text-gray-400 mt-2">收尾寫入 Google Sheet + Whoop log</p>
       </div>
 
       <div x-show="!endSummary">
         <div class="my-6">
-          <label class="text-sm uppercase tracking-widest text-gray-400 mb-2 block">RPE (1-10)</label>
+          <label class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-2 block">RPE (1-10)</label>
           <input type="number" min="1" max="10" placeholder="例: 7" x-model.number="endRPE" />
         </div>
-        <button class="primary-btn w-full py-6 text-2xl tap mt-8" @click="endSession()" :class="{'saving': saving}">🏁 END SESSION</button>
+        <button class="primary-btn w-full py-6 text-2xl tap mt-8 glow-ready" @click="endSession()" :class="{'saving': saving}">🏁 END SESSION</button>
         <div class="text-xs text-gray-500 text-center mt-3">Telegram 同步 ON by default (Jim 7/19 config)</div>
       </div>
 
       <div x-show="endSummary" class="my-6">
-        <div class="text-sm uppercase tracking-widest text-green-400">✓ Session Ended</div>
+        <div class="text-[10px] uppercase tracking-[0.2em] font-bold text-emerald-400">✓ Session Ended</div>
         <pre class="text-sm text-gray-300 whitespace-pre-wrap mt-4" x-text="endSummary?.pyramid"></pre>
-        <div class="mt-4 text-2xl font-black" x-text="`Total ${endSummary?.total_vol_kg}kg vol`"></div>
+        <div class="mt-4 text-2xl font-black tracking-tight" x-text="`Total ${endSummary?.total_vol_kg}kg vol`"></div>
         <button class="primary-btn w-full py-4 text-lg tap mt-6" @click="resetSession()">New Session</button>
       </div>
     </section>
   </main>
 
   <!-- Bottom Tab Bar -->
-  <nav class="fixed bottom-0 left-0 right-0 bg-black border-t border-gray-700 z-50" style="padding-bottom: env(safe-area-inset-bottom);">
+  <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10"
+       style="background: rgba(0,0,0,0.90); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); padding-bottom: env(safe-area-inset-bottom);">
     <div class="flex justify-around">
-      <button class="flex-1 py-3 tab-active" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
+      <button class="flex-1 py-3" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
         <div class="text-2xl font-black">✓</div>
         <div class="text-xs mt-0.5">Set</div>
       </button>
@@ -471,6 +725,13 @@ function gymApp() {
     toast: '',
     endRPE: 7,
     endSummary: null,
+    motivationImage: '',
+    streak: 0,
+    today: '',
+    history: [],
+    loadingHistory: false,
+    quote: '努力唔會辜負你',
+    quoteBank: ['今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', 'Aesthetic body, discipline life'],
     quickPicks: ['BB Bench Press','Leg Press','Low Row (Cable)','DB OHP','DB Shoulder Raise','Lat Pulldown','Squat'],
 
     async init() {
@@ -483,6 +744,30 @@ function gymApp() {
       const data = await res.json();
       this.session = data.session;
       this.sessionDateStr = data.today;
+      // Pull today's motivation image (non-blocking)
+      try {
+        const imgRes = await fetch('/api/today_image');
+        const imgData = await imgRes.json();
+        if (imgData && imgData.image_url) {
+          this.motivationImage = imgData.image_url;
+        }
+      } catch(e) { /* keep empty, gradient fallback shows */ }
+      // Pull streak (non-blocking)
+      try {
+        const streakRes = await fetch('/api/streak');
+        const streakData = await streakRes.json();
+        if (streakData && typeof streakData.streak === 'number') {
+          this.streak = streakData.streak;
+        }
+      } catch(e) { /* keep 0 */ }
+      this.today = data.today;
+      // Pre-load history so it's ready when user taps the tab
+      this.loadHistory();
+      // Rotate quote every 4s
+      setInterval(() => {
+        const next = this.quoteBank[Math.floor(Math.random() * this.quoteBank.length)];
+        if (next !== this.quote) this.quote = next;
+      }, 4000);
       this.haptic();
     },
 
@@ -513,7 +798,7 @@ function gymApp() {
       return { 'warm-up': 'Warm-up', 'working': 'Working', 'burn-out': 'Burn-out', 'drop-set': 'Drop-set' }[this.intensity] || '';
     },
     get intensityColor() {
-      return { 'warm-up': 'text-gray-400', 'working': 'text-white', 'burn-out': 'text-green-400', 'drop-set': 'text-yellow-400' }[this.intensity] || 'text-gray-400';
+      return { 'warm-up': 'text-gray-400', 'working': 'text-white', 'burn-out': 'text-emerald-400', 'drop-set': 'text-yellow-400' }[this.intensity] || 'text-gray-400';
     },
 
     get sessionGrouped() {
@@ -616,6 +901,66 @@ function gymApp() {
       this.flash('Same as last set');
     },
 
+    async cancelLastSet() {
+      if (!this.session.exercises.length) return;
+      this.saving = true;
+      this.haptic([30, 20, 30]);
+      try {
+        const res = await fetch('/api/cancel_last_set', { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          // Reload state
+          const state = await (await fetch('/api/state')).json();
+          this.session = state.session;
+          const r = data.removed || {};
+          this.flash(`已取消最後一組 (${r.exercise || 'set'} · ${r.weight_kg || '?'}kg×${r.reps || '?'})`);
+          // Refresh history too (today's set count changed)
+          this.loadHistory();
+        } else {
+          this.flash(data.error || 'Cancel failed');
+        }
+      } catch(e) {
+        this.flash('Error: ' + e.message);
+      }
+      this.saving = false;
+    },
+
+    async loadHistory() {
+      this.loadingHistory = true;
+      try {
+        const res = await fetch('/api/history');
+        const data = await res.json();
+        this.history = data.history || [];
+        if (typeof data.streak === 'number') this.streak = data.streak;
+        if (data.today) this.today = data.today;
+      } catch(e) {
+        this.flash('History load failed');
+      }
+      this.loadingHistory = false;
+    },
+
+    async deleteSession(date) {
+      if (!date) return;
+      if (!confirm(`確定刪除 ${date} 的 session?\n(此動作無法復原)`)) return;
+      this.haptic([40, 30, 40]);
+      try {
+        const res = await fetch('/api/delete_session', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ date }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          this.history = this.history.filter(r => r.date !== date);
+          this.flash(`已刪除 ${date}`);
+        } else {
+          this.flash(data.error || 'Delete failed');
+        }
+      } catch(e) {
+        this.flash('Error: ' + e.message);
+      }
+    },
+
     async endSession() {
       this.saving = true;
       this.haptic([80, 50, 80, 50, 80]);
@@ -649,6 +994,16 @@ function gymApp() {
 
 <!-- Service worker registration for PWA install -->
 <script>
+// iOS Safari gesture-block: kill pinch-zoom + double-tap-zoom that bypasses CSS touch-action
+['gesturestart','gesturechange','gestureend'].forEach(ev => document.addEventListener(ev, e => e.preventDefault(), {passive:false}));
+// Last-resort double-tap zoom blocker (some iOS versions ignore user-scalable=no)
+let lastTouch = 0;
+document.addEventListener('touchend', e => {
+  const now = Date.now();
+  if (now - lastTouch < 300) e.preventDefault();
+  lastTouch = now;
+}, {passive:false});
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
