@@ -1111,8 +1111,9 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v2';
+const CACHE = 'gym-web-v3';
 self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
   e.respondWith(
     caches.open(CACHE).then(cache =>
