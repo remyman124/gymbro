@@ -1164,7 +1164,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
         <span class="text-lg leading-none">📊</span><span class="text-xs font-bold">Workout</span>
       </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="tab = 'history'">
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="goToTab('history')">
         <span class="text-lg leading-none">📋</span><span class="text-xs font-bold">History</span>
       </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
@@ -1479,7 +1479,9 @@ function gymApp() {
       this.saving = false;
     },
 
-    async loadHistory() {
+    async loadHistory(force = false) {
+      // Skip if a load is already in flight (prevents double-fetch on rapid tab switches).
+      if (this.loadingHistory && !force) return;
       this.loadingHistory = true;
       try {
         const res = await fetch('/api/history');
@@ -1491,6 +1493,11 @@ function gymApp() {
         this.flash('History load failed');
       }
       this.loadingHistory = false;
+    },
+    goToTab(name) {
+      this.tab = name;
+      // Always re-fetch history on tab entry so user sees freshest data.
+      if (name === 'history') this.loadHistory(true);
     },
 
     async deleteSession(date) {
