@@ -252,6 +252,54 @@ def api_cancel_last_set():
     return jsonify({"ok": True, "removed": removed, "remaining": len(session["exercises"])})
 
 
+# ---------- Health overlay (Whoop recovery + Withings weight) — minimal 2 numbers ----------
+WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
+WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
+
+
+def _safe_read_json(path, default=None):
+    """Read a JSON cache file. Returns default on missing/corrupt — never raises to UI."""
+    try:
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default if default is not None else {}
+
+
+def _recovery_pct():
+    """Latest Whoop recovery score (single number 0-100, or None)."""
+    d = _safe_read_json(WHOOP_CACHE)
+    recs = d.get("recovery", []) if isinstance(d, dict) else []
+    for r in recs:
+        score = (r.get("score") or {})
+        val = score.get("recovery_score")
+        if val is not None and r.get("score_state") == "SCORED":
+            return int(round(float(val)))
+    return None
+
+
+def _withings_weight():
+    """Latest Withings weight in kg (single number, or None if no body reading today)."""
+    d = _safe_read_json(WITHINGS_CACHE)
+    body = (d.get("body") or {}) if isinstance(d, dict) else {}
+    w = body.get("weight_kg")
+    try:
+        return round(float(w), 1) if w else None
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route("/api/health_overlay")
+def api_health_overlay():
+    """Single endpoint for the hero overlay. Minimal: recovery % + weight kg only."""
+    return jsonify({
+        "recovery": _recovery_pct(),
+        "weight_kg": _withings_weight(),
+    })
+
+
 @app.route("/api/history")
 def api_history():
     """Return all dates with summary stats, sorted DESC. Plus current streak."""
@@ -483,20 +531,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body x-data="gymApp()" x-init="init()">
 
   <!-- Top Bar -->
-  <header class="sticky top-0 z-50 px-4 pt-3 pb-2" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.08);">
-    <div class="flex items-baseline justify-between">
+  <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
+    <div class="flex items-center justify-between">
       <h1 class="text-3xl font-black tracking-tighter">Gym</h1>
-      <div class="flex items-center gap-2">
-        <span class="streak-badge" x-show="streak > 0">
-          <span style="color: var(--gold);">🔥</span>
-          <span x-text="`${streak} day${streak === 1 ? '' : 's'}`"></span>
-        </span>
-        <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
-      </div>
-    </div>
-    <div class="mt-2 flex items-baseline gap-2">
-      <span class="text-2xl font-black tracking-tight" x-text="currentExercise || '—'"></span>
-      <span class="text-sm text-gray-400" x-text="currentSet ? `Set ${currentSet.set}/${currentSet.total}` : 'Tap to start'"></span>
+      <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
     </div>
   </header>
 
@@ -504,103 +542,119 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="toast" x-show="toast" x-text="toast" x-transition.opacity></div>
 
   <!-- Tab Content -->
-  <main class="px-4 pt-4 pb-32 min-h-screen">
+  <main class="px-4 pb-20 pt-2">
 
     <!-- SET TAB (default) -->
-    <section x-show="tab === 'set'">
+    <section x-show="tab === 'set'" class="flex min-h-[calc(100dvh-14rem)] flex-col" x-cloak>
 
       <!-- Hero motivation banner -->
-      <div class="relative w-full h-44 rounded-2xl overflow-hidden mb-5 shadow-2xl"
-           style="background: linear-gradient(135deg, #000000 0%, #1f2937 50%, #064e3b 100%); border: 1px solid rgba(255,255,255,0.08);">
+      <div class="relative mb-3 h-24 w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-black via-gray-800 to-emerald-950 shadow-2xl">
         <img x-show="motivationImage" :src="motivationImage"
-             class="w-full h-44 object-cover"
-             style="position:absolute; inset:0; z-index:1;"
+             class="absolute inset-0 z-[1] h-24 w-full object-cover"
              @error="motivationImage = ''">
         <div x-show="!motivationImage"
-             class="w-full h-44 flex items-center justify-center text-6xl"
-             style="position:absolute; inset:0; z-index:1;">
+             class="absolute inset-0 z-[1] flex h-24 w-full items-center justify-center text-3xl">
           💪🔥🏋️
         </div>
-        <div class="absolute inset-0 z-10 flex flex-col items-center justify-end pb-3 px-4"
-             style="background: linear-gradient(to top, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.25) 60%, transparent 100%);">
-          <div class="text-[10px] uppercase tracking-[0.2em] text-gray-300 mb-1">Today</div>
-          <div class="quote-line text-sm font-medium" x-text="quote"></div>
+        <div class="absolute inset-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2">
+          <div class="min-w-0 pr-24">
+            <div class="text-[9px] uppercase tracking-[0.2em] text-gray-300">Today</div>
+            <div class="quote-line truncate text-sm font-medium" x-text="quote"></div>
+          </div>
+        </div>
+        <div x-show="streak > 0" class="streak-badge absolute right-2 top-2 z-20 shadow-lg shadow-black/40">
+          <span class="text-yellow-300">🔥</span>
+          <span x-text="`${streak} day${streak === 1 ? '' : 's'}`"></span>
+        </div>
+        <!-- Top-left: Whoop recovery % (single number, minimal) -->
+        <div x-show="recovery !== null" class="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold text-emerald-300 backdrop-blur">
+          <span>💚</span><span x-text="`${recovery}%`"></span>
+        </div>
+        <!-- Top-right: Withings weight (single number, minimal) -->
+        <div x-show="weightKg !== null" class="absolute right-2 top-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold text-sky-300 backdrop-blur" :class="recovery !== null ? 'top-9' : 'top-2'">
+          <span>⚖️</span><span x-text="`${weightKg}kg`"></span>
         </div>
       </div>
 
-      <div class="text-center my-6">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-1">Current</div>
-        <div class="text-6xl font-black tracking-tighter my-2" x-text="displayWeight || '—'"></div>
-        <div class="text-2xl text-gray-300 font-medium" x-text="displayReps ? `${displayReps} reps` : '—'"></div>
-        <div class="mt-1 text-[10px] uppercase tracking-[0.2em] font-bold" :class="intensityColor" x-text="intensityLabel"></div>
+      <!-- Current set: exercise + weight + reps + intensity in one compact row -->
+      <div x-show="currentExercise" class="glass mb-2 flex h-16 items-center gap-3 rounded-2xl px-3 shadow-lg shadow-black/20">
+        <div class="min-w-0 flex-1">
+          <div class="truncate text-base font-black tracking-tight" x-text="currentExercise"></div>
+          <div class="mt-0.5 text-xs text-gray-400" x-text="currentSet ? `Set ${currentSet.set}` : 'Set 1'"></div>
+        </div>
+        <div class="whitespace-nowrap text-xl font-black tracking-tight" x-text="displayWeight"></div>
+        <div class="whitespace-nowrap text-base font-bold text-gray-300" x-text="`${displayReps}×`"></div>
+        <div class="rounded-full border border-white/10 bg-white/5 px-2 py-1 text-[9px] font-bold uppercase tracking-wider" :class="intensityColor" x-text="intensityLabel"></div>
       </div>
 
       <!-- Exercise name input (only if no exercise yet) -->
-      <div x-show="!currentExercise" class="my-6">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-3 text-center">Quick picks</div>
-        <div class="quote-line text-center text-sm mb-4" x-text="quote" data-quote="努力唔會辜負你"></div>
-        <div class="grid grid-cols-2 gap-2 mb-3">
+      <div x-show="!currentExercise" class="mt-1">
+        <div class="mb-2 text-center text-sm font-semibold text-gray-400">Choose an exercise</div>
+        <div class="mb-2 grid grid-cols-3 gap-2">
           <template x-for="(ex, idx) in quickPicks" :key="ex">
-            <button class="pill glass font-semibold py-3 tap fade-up"
+            <button class="tap fade-up min-w-0 truncate rounded-xl border border-white/15 bg-white/[0.08] px-2 py-2 text-sm font-semibold backdrop-blur"
                     :style="`animation-delay: ${idx * 50}ms`"
                     @click="pickExercise(ex)" x-text="ex"></button>
           </template>
         </div>
-        <input type="text" placeholder="或輸入 custom" x-model="exerciseInput" @keyup.enter="customExercise()" />
+        <input class="!py-2.5 text-base" type="text" placeholder="或輸入 custom" x-model="exerciseInput" @keyup.enter="customExercise()" />
       </div>
 
-      <!-- Weight stepper -->
-      <div x-show="currentExercise" class="my-4">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-2 text-center">Weight (kg)</div>
-        <div class="flex items-center justify-between gap-3">
-          <button class="num-btn w-14 h-14 tap" @click="bumpWeight(-5)">−5</button>
-          <button class="num-btn w-14 h-14 tap" @click="bumpWeight(-2.5)">−2.5</button>
-          <div class="flex-1 text-center text-4xl font-black tracking-tighter" x-text="weight"></div>
-          <button class="num-btn w-14 h-14 tap" @click="bumpWeight(2.5)">+2.5</button>
-          <button class="num-btn w-14 h-14 tap" @click="bumpWeight(5)">+5</button>
+      <!-- Weight + reps steppers share one 80px row. Tap is fine control; hold is coarse control. -->
+      <div x-show="currentExercise" class="mb-2 grid h-20 grid-cols-2 gap-2">
+        <div class="glass grid grid-cols-[2.5rem_1fr_2.5rem] items-center rounded-2xl p-1.5">
+          <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
+                  @pointerdown.prevent="startStep('weight', -1)" @pointerup.prevent="endStep('weight', -1)"
+                  @pointerleave="cancelStep()" @pointercancel="cancelStep()">
+            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+          </button>
+          <div class="min-w-0 text-center">
+            <span class="text-3xl font-black tracking-tighter" x-text="weight"></span><span class="ml-0.5 text-xs text-gray-400">kg</span>
+          </div>
+          <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
+                  @pointerdown.prevent="startStep('weight', 1)" @pointerup.prevent="endStep('weight', 1)"
+                  @pointerleave="cancelStep()" @pointercancel="cancelStep()">
+            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+          </button>
+        </div>
+        <div class="glass grid grid-cols-[2.5rem_1fr_2.5rem] items-center rounded-2xl p-1.5">
+          <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
+                  @pointerdown.prevent="startStep('reps', -1)" @pointerup.prevent="endStep('reps', -1)"
+                  @pointerleave="cancelStep()" @pointercancel="cancelStep()">
+            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+          </button>
+          <div class="min-w-0 text-center">
+            <span class="text-3xl font-black tracking-tighter" x-text="reps"></span><span class="ml-0.5 text-xs text-gray-400">×</span>
+          </div>
+          <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
+                  @pointerdown.prevent="startStep('reps', 1)" @pointerup.prevent="endStep('reps', 1)"
+                  @pointerleave="cancelStep()" @pointercancel="cancelStep()">
+            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+          </button>
         </div>
       </div>
 
-      <!-- Reps stepper -->
-      <div x-show="currentExercise" class="my-4">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-2 text-center">Reps (default 10)</div>
-        <div class="flex items-center justify-between gap-3">
-          <button class="num-btn w-14 h-14 tap" @click="bumpReps(-2)">−2</button>
-          <button class="num-btn w-14 h-14 tap" @click="bumpReps(-1)">−1</button>
-          <div class="flex-1 text-center text-4xl font-black tracking-tighter" x-text="reps"></div>
-          <button class="num-btn w-14 h-14 tap" @click="bumpReps(1)">+1</button>
-          <button class="num-btn w-14 h-14 tap" @click="bumpReps(2)">+2</button>
+      <!-- Sticky action dock: always ends above the fixed 64px tab bar. -->
+      <div x-show="currentExercise" class="sticky bottom-[72px] z-40 mt-auto pb-2 pt-2">
+        <div class="mb-2 flex h-8 gap-2 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('working')">🎯 Working</button>
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('drop-set')">⚡ Drop</button>
+          <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="markPartial()">⚠️ Partial</button>
+          <button x-show="lastSetForExercise" class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="cloneLastSet()"
+                  x-text="lastSetForExercise ? `↓ Clone ${lastSetForExercise.weight_kg}kg × ${lastSetForExercise.reps}` : '↓ Clone'"></button>
         </div>
-      </div>
-
-      <!-- Big LOG button -->
-      <div x-show="currentExercise" class="mt-8">
-        <button class="primary-btn w-full py-6 text-2xl tap ring-4 ring-emerald-400/30 glow-ready"
-                :class="{'saving': saving}"
-                @click="logSet()"
-                x-text="saving ? 'Saving…' : `✓ Log Set ${currentSet ? currentSet.set : 1}`">
-        </button>
-        <!-- Cancel last set (undo wrong set) -->
-        <button x-show="session.exercises.length > 0"
-                class="mt-3 w-full py-2 text-sm font-semibold rounded-full tap"
-                style="background: rgba(239,68,68,0.20); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5;"
-                :class="{'saving': saving}"
-                @click="cancelLastSet()">
-          ↶ Cancel Last Set
-        </button>
-      </div>
-
-      <!-- Quick intensity tags -->
-      <div x-show="currentExercise && hasWorkedAtLeastOneSet" class="mt-5 flex gap-2 justify-center flex-wrap">
-        <button class="pill glass px-4 py-2 text-sm tap" @click="setIntensity('working')">🎯 Working</button>
-        <button class="pill glass px-4 py-2 text-sm tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
-        <button class="pill glass px-4 py-2 text-sm tap" @click="setIntensity('drop-set')">⚡ Drop</button>
-        <button class="pill glass px-4 py-2 text-sm tap" @click="markPartial()">⚠️ Partial</button>
-      </div>
-
-      <!-- Same as last set -->
-      <div x-show="currentExercise && lastSetForExercise" class="mt-3 text-center">
-        <button class="text-sm text-gray-400 underline tap" @click="cloneLastSet()" x-text="`⬇ 上一組同 spec (${lastSetForExercise.weight_kg}kg × ${lastSetForExercise.reps})`"></button>
+        <div class="flex items-stretch gap-2 rounded-2xl border border-white/10 bg-black/80 p-1.5 shadow-2xl shadow-emerald-500/20 backdrop-blur-xl">
+          <button x-show="session.exercises.length > 0"
+                  class="tap shrink-0 rounded-full border border-red-400/30 bg-red-500/15 px-3 py-2 text-sm font-bold text-red-300"
+                  :class="{'saving': saving}" @click="cancelLastSet()" aria-label="Cancel last set">
+            ↶ Undo
+          </button>
+          <button class="tap glow-ready flex-1 rounded-full bg-emerald-400 py-3 text-base font-black tracking-wide text-black ring-2 ring-emerald-300/30"
+                  :class="{'saving': saving}" @click="logSet()"
+                  x-text="saving ? 'Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`">
+          </button>
+        </div>
       </div>
     </section>
 
@@ -688,24 +742,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </main>
 
   <!-- Bottom Tab Bar -->
-  <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10"
-       style="background: rgba(0,0,0,0.90); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); padding-bottom: env(safe-area-inset-bottom);">
-    <div class="flex justify-around">
-      <button class="flex-1 py-3" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
-        <div class="text-2xl font-black">✓</div>
-        <div class="text-xs mt-0.5">Set</div>
+  <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10 bg-black/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-2xl">
+    <div class="flex h-16 justify-around">
+      <button class="flex-1 py-2" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
+        <div class="text-lg font-black leading-5">✓</div>
+        <div class="mt-0.5 text-[11px]">Set</div>
       </button>
-      <button class="flex-1 py-3" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
-        <div class="text-2xl font-black">📊</div>
-        <div class="text-xs mt-0.5">Workout</div>
+      <button class="flex-1 py-2" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
+        <div class="text-lg font-black leading-5">📊</div>
+        <div class="mt-0.5 text-[11px]">Workout</div>
       </button>
-      <button class="flex-1 py-3" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="tab = 'history'">
-        <div class="text-2xl font-black">📋</div>
-        <div class="text-xs mt-0.5">History</div>
+      <button class="flex-1 py-2" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="tab = 'history'">
+        <div class="text-lg font-black leading-5">📋</div>
+        <div class="mt-0.5 text-[11px]">History</div>
       </button>
-      <button class="flex-1 py-3" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
-        <div class="text-2xl font-black">🏁</div>
-        <div class="text-xs mt-0.5">End</div>
+      <button class="flex-1 py-2" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
+        <div class="text-lg font-black leading-5">🏁</div>
+        <div class="mt-0.5 text-[11px]">End</div>
       </button>
     </div>
   </nav>
@@ -727,9 +780,13 @@ function gymApp() {
     endSummary: null,
     motivationImage: '',
     streak: 0,
+    recovery: null,
+    weightKg: null,
     today: '',
     history: [],
     loadingHistory: false,
+    pressTimer: null,
+    pressHandled: false,
     quote: '努力唔會辜負你',
     quoteBank: ['今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', 'Aesthetic body, discipline life'],
     quickPicks: ['BB Bench Press','Leg Press','Low Row (Cable)','DB OHP','DB Shoulder Raise','Lat Pulldown','Squat'],
@@ -760,6 +817,13 @@ function gymApp() {
           this.streak = streakData.streak;
         }
       } catch(e) { /* keep 0 */ }
+      // Pull health overlay (Whoop recovery + Withings weight) — single number each
+      try {
+        const healthRes = await fetch('/api/health_overlay');
+        const healthData = await healthRes.json();
+        this.recovery = (typeof healthData.recovery === 'number') ? healthData.recovery : null;
+        this.weightKg = (typeof healthData.weight_kg === 'number') ? healthData.weight_kg : null;
+      } catch(e) { /* keep nulls, badges hidden */ }
       this.today = data.today;
       // Pre-load history so it's ready when user taps the tab
       this.loadHistory();
@@ -842,6 +906,32 @@ function gymApp() {
     bumpReps(delta) {
       this.reps = Math.max(1, this.reps + delta);
       this.haptic();
+    },
+
+    startStep(kind, direction) {
+      this.cancelStep();
+      this.pressHandled = false;
+      this.pressTimer = setTimeout(() => {
+        if (kind === 'weight') this.bumpWeight(direction * 5);
+        else this.bumpReps(direction * 5);
+        this.pressHandled = true;
+        this.pressTimer = null;
+      }, 500);
+    },
+
+    endStep(kind, direction) {
+      if (this.pressTimer) clearTimeout(this.pressTimer);
+      if (!this.pressHandled) {
+        if (kind === 'weight') this.bumpWeight(direction * 3);
+        else this.bumpReps(direction * 3);
+      }
+      this.pressTimer = null;
+      this.pressHandled = false;
+    },
+
+    cancelStep() {
+      if (this.pressTimer) clearTimeout(this.pressTimer);
+      this.pressTimer = null;
     },
 
     setIntensity(tag) {
@@ -1016,7 +1106,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v1';
+const CACHE = 'gym-web-v2';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('fetch', e => {
   e.respondWith(
