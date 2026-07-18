@@ -11,6 +11,7 @@ PWA: installable, wake-lock enabled
 import json
 import os
 import secrets
+import base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -429,6 +430,220 @@ def api_history():
     except Exception:
         streak = 0
     return jsonify({"history": history, "streak": streak, "today": today})
+
+
+@app.route("/api/export_text")
+def api_export_text():
+    """Export workout history as plain text/markdown for clipboard sharing.
+
+    Use case (Jim OOB 2026-07-19): paste into Whoop AI coach / personal trainer
+    chat. Format optimised for chat-AI ingestion: date headers, set lists,
+    per-day totals, muscle group summary at the end.
+
+    Query params:
+      days   — int, default 7. 0 = today only. -1 = all-time.
+      fmt    — 'txt' (default) | 'md' (markdown headings) | 'json'
+      source — 'sheet' (default) | 'local' | 'both'
+
+    Reads from Google Sheet (single source of truth) when source='sheet',
+    same parsing as /api/workout_recent. Falls back to WORKOUT_LOG.json on
+    failure so the export never returns empty when data exists somewhere.
+    """
+    try:
+        days = int(request.args.get("days", 7))
+    except ValueError:
+        days = 7
+    fmt = request.args.get("fmt", "txt").lower()
+    source = request.args.get("source", "sheet").lower()
+
+    today = today_iso()
+    if days > 0:
+        from datetime import datetime as _dt, timedelta as _td
+        # Match workout_recent convention: cutoff = today - days (inclusive of today)
+        cutoff = (_dt.strptime(today, "%Y-%m-%d") - _td(days=days)).strftime("%Y-%m-%d")
+    elif days == 0:
+        cutoff = today  # today only — match the date exactly
+    else:
+        cutoff = "0000-00-00"  # -1 = all-time
+
+    # Try sheet first (matches /api/workout_recent data path)
+    sessions = []  # list of dict(date, exercises, sets, volume_kg)
+    sheet_debug = {}  # captured for diagnostics
+    if source in ("sheet", "both"):
+        try:
+            import requests as _req
+            gtok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+            auth_str = f"{gtok['client_id']}:{gtok['client_secret']}"
+            auth_b64 = base64.b64encode(auth_str.encode()).decode()
+            tok = _req.post(
+                "https://oauth2.googleapis.com/token",
+                data={"grant_type": "refresh_token", "refresh_token": gtok["refresh_token"]},
+                headers={"Authorization": f"Basic {auth_b64}"}, timeout=10,
+            ).json()
+            sheet_id = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+            tab = "Workouts"
+            sheet_resp = _req.get(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab}",
+                headers={"Authorization": f"Bearer {tok['access_token']}"}, timeout=15,
+            )
+            sheet_debug["status_code"] = sheet_resp.status_code
+            sheet_resp = sheet_resp.json()
+            rows = sheet_resp.get("values", [])
+            sheet_debug["row_count"] = len(rows)
+            if rows:
+                header = rows[0]
+                idx = {h: i for i, h in enumerate(header)}
+                # Sheet columns (canonical): 日期|時間|運動名稱|Sets|Reps|重量 (kg)|每邊 (kg)|Bar (kg)|Volume (kg)|備註|Whoop Strain|Image
+                # Robust field resolution: prefer exact-match then canonical names
+                def _col(name, *fallbacks):
+                    for n in (name, *fallbacks):
+                        if n in idx:
+                            return idx[n]
+                    return -1
+                col_date = _col("日期", "Date", "date")
+                col_time = _col("時間", "Time", "time")
+                col_ex = _col("運動名稱", "Exercise", "exercise")
+                col_sets = _col("Sets", "sets", "Set Count")
+                col_reps = _col("Reps", "reps", "Rep Count")
+                col_weight = _col("重量 (kg)", "重量", "Weight (kg)", "Weight", "weight_kg")
+                col_vol = _col("Volume (kg)", "Volume", "volume_kg")
+                by_date = {}
+                for row in rows[1:]:
+                    try:
+                        def _get(c):
+                            return row[c] if 0 <= c < len(row) else ""
+                        d = _get(col_date) if col_date >= 0 else _get(0)
+                        if not d or d < cutoff:
+                            continue
+                        ex = _get(col_ex) if col_ex >= 0 else _get(2)
+                        weight = _get(col_weight) if col_weight >= 0 else _get(5)
+                        reps = _get(col_reps) if col_reps >= 0 else _get(4)
+                        vol_str = _get(col_vol) if col_vol >= 0 else _get(8)
+                        try:
+                            vol = float((vol_str or "0").replace(",", ""))
+                        except ValueError:
+                            vol = 0.0
+                        try:
+                            w_kg = float((weight or "0").replace(",", ""))
+                        except ValueError:
+                            w_kg = 0.0
+                        try:
+                            # Reps might be "10, 10, 10" (set-by-set list) or "30" (sum)
+                            # or might be empty for bodyweight exercises
+                            if "," in str(reps):
+                                total = sum(int(x.strip()) for x in str(reps).split(",") if x.strip().isdigit())
+                            else:
+                                total = int(float(reps)) if reps else 0
+                        except (ValueError, TypeError):
+                            total = 0
+                        by_date.setdefault(d, {"exercises": [], "sets": 0, "volume_kg": 0.0})
+                        by_date[d]["exercises"].append({
+                            "exercise": ex, "weight_kg": w_kg, "reps": total,
+                            "set_n": len(by_date[d]["exercises"]) + 1,
+                        })
+                        by_date[d]["sets"] += 1
+                        by_date[d]["volume_kg"] += vol
+                    except (IndexError, ValueError, TypeError):
+                        continue
+                for d in sorted(by_date.keys(), reverse=True):
+                    s = by_date[d]
+                    s["date"] = d
+                    sessions.append(s)
+        except Exception as e:
+            sheet_debug["exception"] = repr(e)
+            import traceback
+            sheet_debug["traceback"] = traceback.format_exc()
+
+    # Fallback to local log
+    if not sessions and source in ("local", "both", "sheet"):
+        log = load_log()
+        for d in sorted(log.keys(), reverse=True):
+            if d < cutoff:
+                continue
+            s = log[d]
+            exercises = s.get("exercises", []) or []
+            vol = sum((e.get("weight_kg") or 0) * (e.get("reps") or 0) for e in exercises)
+            sessions.append({
+                "date": d,
+                "exercises": exercises,
+                "sets": len(exercises),
+                "volume_kg": round(vol, 1),
+            })
+
+    # Filter out 0-set sessions unless user explicitly asked for today
+    # (today's empty session might still be in-progress; future days
+    # empty entries are noise when copying for AI ingestion).
+    if days != 0:
+        sessions = [s for s in sessions if s.get("sets", 0) > 0]
+
+    if fmt == "json":
+        return jsonify({"days": days, "cutoff": cutoff, "sessions": sessions,
+                        "total_sets": sum(s["sets"] for s in sessions),
+                        "total_volume_kg": round(sum(s["volume_kg"] for s in sessions), 1),
+                        "sheet_debug": sheet_debug})
+
+    # Build plain text / markdown — concise format tuned for chat AI ingestion
+    # (Jim OOB 2026-07-19: too many underlines, too boring). No separators,
+    # no markdown headers; just date bullets with set lists and a brief tail.
+    lines = []
+    if days == 0:
+        lines.append(f"💪 Workout Log — Today ({today})")
+    elif days < 0:
+        lines.append("💪 Workout Log — All-time")
+    else:
+        lines.append(f"💪 Workout Log — Last {days} days (since {cutoff})")
+    lines.append("")
+
+    if not sessions:
+        lines.append("No workouts in this window.")
+        return jsonify({"text": "\n".join(lines), "sessions": 0,
+                        "total_sets": 0, "total_volume_kg": 0})
+
+    # Muscle group keyword map (same as workout_recent / sheet parser)
+    muscle_kw = {
+        "chest": "CHEST", "bench": "CHEST", "fly": "CHEST", "push": "CHEST",
+        "row": "BACK", "pulldown": "BACK", "pull": "BACK", "lat": "BACK",
+        "squat": "LEG", "leg": "LEG", "rdl": "LEG", "lunge": "LEG", "calf": "LEG",
+        "press": "SHOULDER", "ohp": "SHOULDER", "shoulder": "SHOULDER",
+        "sit": "ABS", "crunch": "ABS", "plank": "ABS", "abs": "ABS", "ab ": "ABS",
+    }
+    muscle_counts = {}
+    total_sets = 0
+    total_vol = 0.0
+
+    for s in sessions:
+        lines.append(f"📅 {s['date']}  ·  {s['sets']} sets · {round(s['volume_kg'], 1)} kg volume")
+        for ex in s["exercises"]:
+            name = ex.get("exercise", "?")
+            w = ex.get("weight_kg", 0)
+            r = ex.get("reps", 0)
+            set_n = ex.get("set_n", "")
+            prefix = f"  Set {set_n} · " if set_n else "  "
+            # Compact one-line per set; show weight+reps
+            lines.append(f"{prefix}{name} — {w}kg × {r}")
+            # Tally muscle group
+            nl = name.lower()
+            for kw, grp in muscle_kw.items():
+                if kw in nl:
+                    muscle_counts[grp] = muscle_counts.get(grp, 0) + 1
+                    break
+        total_sets += s["sets"]
+        total_vol += s["volume_kg"]
+        lines.append("")
+
+    lines.append("─" * 0)  # no separator — empty line only
+    lines.append(f"📊 Totals: {total_sets} sets · {round(total_vol, 1)} kg volume")
+    if muscle_counts:
+        muscle_str = " · ".join(f"{grp} {cnt}" for grp, cnt in muscle_counts.items() if cnt)
+        if muscle_str:
+            lines.append(f"🎯 Muscle split: {muscle_str}")
+    lines.append("")
+    lines.append(f"Copied from gymbro · {today} HKT")
+
+    text = "\n".join(lines)
+    return jsonify({"text": text, "sessions": len(sessions),
+                    "total_sets": total_sets,
+                    "total_volume_kg": round(total_vol, 1)})
 
 
 @app.route("/api/delete_session", methods=["POST"])
@@ -1326,7 +1541,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- WORKOUT / PYRAMID TAB -->
     <section x-show="tab === 'workout'">
-      <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 my-3">Today's Pyramid</div>
+      <div class="flex items-baseline justify-between my-3">
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">Today's Pyramid</div>
+        <!-- Copy buttons: today / 7d / 30d / all (NEW 2026-07-19 OOB Jim) -->
+        <div class="flex items-center gap-1.5">
+          <button class="text-[10px] px-2 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 tap active:scale-95 transition-all"
+                  :class="copyDays === 0 ? 'border-emerald-400 text-emerald-400' : ''"
+                  @click="copyWorkout(0)" :disabled="copying" x-text="copying && copyDays === 0 ? '...' : 'Today'"></button>
+          <button class="text-[10px] px-2 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 tap active:scale-95 transition-all"
+                  :class="copyDays === 7 ? 'border-emerald-400 text-emerald-400' : ''"
+                  @click="copyWorkout(7)" :disabled="copying" x-text="copying && copyDays === 7 ? '...' : '7d'"></button>
+          <button class="text-[10px] px-2 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 tap active:scale-95 transition-all"
+                  :class="copyDays === 30 ? 'border-emerald-400 text-emerald-400' : ''"
+                  @click="copyWorkout(30)" :disabled="copying" x-text="copying && copyDays === 30 ? '...' : '30d'"></button>
+          <button class="text-xs px-2 py-1 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 tap active:scale-95 transition-all font-semibold"
+                  @click="copyWorkout(copyDays)" :disabled="copying || copyingNow"
+                  :title="'Copy to clipboard'">
+            <span x-show="!copyingNow">📋 Copy</span>
+            <span x-show="copyingNow">...</span>
+          </button>
+        </div>
+      </div>
       <template x-for="(ex, idx) in sessionGrouped" :key="ex.name">
         <div class="mb-6 fade-up" :style="`animation-delay: ${idx * 60}ms`">
           <div class="text-xl font-bold mb-3 tracking-tight" x-text="ex.name"></div>
@@ -1452,6 +1687,10 @@ function gymApp() {
     today: '',
     history: [],
     loadingHistory: false,
+    // Copy-to-clipboard (NEW 2026-07-19 OOB Jim): workout export state
+    copyDays: 0,           // 0=today, 7, 30, -1=all
+    copying: false,         // true while one of the range buttons is fetching
+    copyingNow: false,      // true while the main 📋 Copy button writes to clipboard
     // Audio overlay state — fetched from /api/today_audio
     audioTrack: null,
     audioPlaylist: [],
@@ -1755,6 +1994,69 @@ function gymApp() {
         this.flash('Error: ' + e.message);
       }
       this.saving = false;
+    },
+    // ── Copy workout to clipboard (NEW 2026-07-19 OOB Jim) ────────────────
+    // Click 📋 Copy → fetch /api/export_text?days={copyDays} → write to clipboard.
+    // Range buttons (Today/7d/30d) only update copyDays + flash; the main 📋
+    // button does the actual fetch + clipboard write. Format: plain text.
+    async copyWorkout(days) {
+      // Range button click → just update active window
+      if (days !== undefined && days !== this.copyDays) {
+        this.copyDays = days;
+        const labels = { 0: 'Today', 7: '7 days', 30: '30 days', '-1': 'All-time' };
+        this.flash(`Window: ${labels[days] || days + 'd'}`);
+        this.haptic();
+        return;
+      }
+      if (this.copying || this.copyingNow) return;
+      this.copyingNow = true;
+      this.copying = true;
+      this.haptic();
+      try {
+        const d = this.copyDays;  // 0=today, 7, 30, -1=all
+        const res = await fetch(`/api/export_text?days=${d}&fmt=txt`);
+        const data = await res.json();
+        if (!data.text) {
+          this.flash('No data to copy');
+          return;
+        }
+        // Prefer the modern Clipboard API; fall back to execCommand for older iOS
+        let ok = false;
+        try {
+          await navigator.clipboard.writeText(data.text);
+          ok = true;
+        } catch (e) {
+          // Fallback: hidden textarea + execCommand('copy')
+          try {
+            const ta = document.createElement('textarea');
+            ta.value = data.text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            ta.style.pointerEvents = 'none';
+            document.body.appendChild(ta);
+            ta.select();
+            ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+          } catch (e2) {
+            ok = false;
+          }
+        }
+        const windowLabel = d === 0 ? 'today' : (d === -1 ? 'all-time' : `${d}d`);
+        if (ok) {
+          const msg = data.sessions > 0
+            ? `📋 Copied ${data.sessions} session(s) · ${data.total_sets} sets · ${data.total_volume_kg}kg (${windowLabel})`
+            : `📋 Copied (${windowLabel}, no sets)`;
+          this.flash(msg);
+          this.haptic([20, 30, 50]);  // success triple-tap
+        } else {
+          this.flash('Copy failed — try again');
+        }
+      } catch (e) {
+        this.flash('Error: ' + e.message);
+      } finally {
+        this.copying = false;
+        this.copyingNow = false;
+      }
     },
     // Audio overlay methods — play / pause / next, controlled via hidden <audio> element
     get currentAudioUrl() {
