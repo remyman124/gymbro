@@ -535,6 +535,42 @@ def _has_sheet_row(date, exercise, set_n):
     return False
 
 
+def _derive_muscle_group(exercise_name):
+    """Map exercise name to muscle group via keyword matching."""
+    if not exercise_name:
+        return ""
+    n = exercise_name.lower()
+    if any(k in n for k in ["bench", "chest", "pec", "decline", "fly", "crossover"]):
+        return "chest"
+    if any(k in n for k in ["row", "pulldown", "pull-up", "pullup", "lat", "back"]):
+        return "back"
+    if any(k in n for k in ["squat", "leg", "rdl", "deadlift", "calf", "lunge", "hip thrust"]):
+        return "leg"
+    if any(k in n for k in ["shoulder", "ohp", "lateral", "raise", "face pull"]):
+        return "shoulder"
+    if any(k in n for k in ["plank", "crunch", "abs", "ab wheel", "russian twist", "sit up", "leg raise"]):
+        return "abs"
+    if any(k in n for k in ["curl", "tricep", "extension", "pressdown"]):
+        return "arms"
+    return ""
+
+
+def _parse_reps_total(reps_field):
+    """Parse reps field which may be '10', '10, 10, 10', or empty. Return total reps."""
+    if not reps_field:
+        return 0
+    if isinstance(reps_field, (int, float)):
+        return int(reps_field)
+    parts = [p.strip() for p in str(reps_field).replace("x", ",").replace(";", ",").split(",") if p.strip()]
+    total = 0
+    for p in parts:
+        try:
+            total += int(float(p))
+        except (ValueError, TypeError):
+            continue
+    return total
+
+
 def _flatten_sessions(log):
     """Convert {date: {session}} dict into flat list of set rows."""
     flat = []
@@ -581,22 +617,25 @@ def api_workout_recent():
     rows = []
     try:
         sheet_rows = _sheet_read_all()
-        # Header: [日期, 時間, 運動名稱, Sets, Reps, 重量, 每邊, Bar, Volume, 備註, Whoop Strain, Image]
+        # Header: [日期, 時間, 運動名稱, Sets, Reps, 重量 (kg), 每邊 (kg), Bar (kg), Volume (kg), 備註, Whoop Strain, Image]
         for row in sheet_rows[1:]:
             if not row or len(row) < 3:
                 continue
             date = row[0]
             if date < cutoff_date:
                 continue
+            ex_name = row[2] if len(row) > 2 else ""
+            reps_total = _parse_reps_total(row[4] if len(row) > 4 else "")
             try:
-                reps = int(row[4]) if len(row) > 4 and row[4] else 0
                 weight = float(row[5]) if len(row) > 5 and row[5] else 0.0
             except (ValueError, TypeError):
-                reps, weight = 0, 0.0
+                weight = 0.0
             try:
-                volume = float(row[8]) if len(row) > 8 and row[8] else reps * weight
+                sheet_volume = float(row[8]) if len(row) > 8 and row[8] else 0.0
             except (ValueError, TypeError):
-                volume = reps * weight
+                sheet_volume = 0.0
+            # Trust sheet's volume column when present; fallback to reps × weight.
+            volume = sheet_volume if sheet_volume > 0 else reps_total * weight
             try:
                 set_n = int(row[3]) if len(row) > 3 and row[3] else None
             except (ValueError, TypeError):
@@ -604,12 +643,12 @@ def api_workout_recent():
             rows.append({
                 "date": date,
                 "time": row[1] if len(row) > 1 else "",
-                "exercise": row[2] if len(row) > 2 else "",
+                "exercise": ex_name,
                 "set_n": set_n,
-                "reps": reps,
+                "reps": reps_total,
                 "weight_kg": weight,
                 "volume_kg": volume,
-                "muscle_group": row[9] if len(row) > 9 else "",
+                "muscle_group": _derive_muscle_group(ex_name),
             })
     except Exception as e:
         # Fallback to local log if sheet unreachable.
