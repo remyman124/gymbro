@@ -1853,9 +1853,11 @@ function gymApp() {
         this.reps = 10;
         this.intensity = 'warm-up';
       } else {
+        // Jim OOB 2026-07-19: keep SAME weight as last set (no auto +5kg ramp).
+        // Use the exact same weight unless user manually edits it.
         const last = prev[prev.length - 1];
-        this.weight = (last.weight_kg || 20) + 5;  // warm-up ramp
-        this.reps = 10;
+        this.weight = last.weight_kg || 20;
+        this.reps = last.reps || 10;
         this.intensity = prev.length < 2 ? 'warm-up' : (prev.length < 4 ? 'working' : 'burn-out');
       }
       this.haptic();
