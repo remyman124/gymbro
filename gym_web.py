@@ -536,10 +536,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .num-btn:active { background: rgba(255,255,255,0.18); }
   .tab-active {
     color: var(--uber-text);
-    box-shadow: 0 0 12px rgba(255,255,255,0.4);
-    border-top: 2px solid var(--uber-text);
+    background: rgba(255,255,255,0.12);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25), 0 0 12px rgba(255,255,255,0.18);
   }
   .tab-inactive { color: var(--uber-grey-4); }
+  .tab-inactive:active { background: rgba(255,255,255,0.06); }
   .pyramid { display: flex; flex-direction: column; align-items: center; gap: 4px; }
   .pyramid-row {
     background: var(--uber-text);
@@ -666,16 +667,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="rounded-full border border-white/10 bg-white/5 px-2 py-1 text-[9px] font-bold uppercase tracking-wider" :class="intensityColor" x-text="intensityLabel"></div>
       </div>
 
-      <!-- Exercise name input (only if no exercise yet) -->
+      <!-- Exercise name input (only if no exercise yet) — categorized by muscle group -->
       <div x-show="!currentExercise" class="mt-1">
         <div class="mb-2 text-center text-sm font-semibold text-gray-400">Choose an exercise</div>
-        <div class="mb-2 grid grid-cols-3 gap-2">
-          <template x-for="(ex, idx) in quickPicks" :key="ex">
-            <button class="tap fade-up min-w-0 truncate rounded-xl border border-white/15 bg-white/[0.08] px-2 py-2 text-sm font-semibold backdrop-blur"
-                    :style="`animation-delay: ${idx * 50}ms`"
-                    @click="pickExercise(ex)" x-text="ex"></button>
-          </template>
-        </div>
+        <template x-for="cat in exerciseCategories" :key="cat.name">
+          <div class="mb-2">
+            <div class="mb-1 flex items-center gap-2">
+              <span class="text-[10px] font-bold uppercase tracking-[0.15em]" :class="cat.color" x-text="cat.name"></span>
+              <span class="text-[10px] text-gray-500" x-text="`${cat.exercises.length} exercises`"></span>
+            </div>
+            <div class="grid grid-cols-2 gap-1.5">
+              <template x-for="ex in cat.exercises" :key="ex">
+                <button class="tap rounded-lg border border-white/15 bg-white/[0.08] px-2 py-1.5 text-xs font-semibold backdrop-blur active:bg-white/20"
+                        @click="pickExercise(ex)" x-text="ex"></button>
+              </template>
+            </div>
+          </div>
+        </template>
         <input class="!py-2.5 text-base" type="text" placeholder="或輸入 custom" x-model="exerciseInput" @keyup.enter="customExercise()" />
       </div>
 
@@ -714,7 +722,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- Sticky action dock: always ends above the fixed 64px tab bar. -->
-      <div x-show="currentExercise" class="sticky bottom-[72px] z-40 mt-auto pb-2 pt-2">
+      <div x-show="currentExercise" class="sticky bottom-[140px] z-40 mt-auto pb-2 pt-2">
         <div class="mb-2 flex h-8 gap-2 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('working')">🎯 Working</button>
           <button class="pill glass shrink-0 px-3 py-1 text-xs tap" @click="setIntensity('burn-out')">🔥 Burn-out</button>
@@ -820,24 +828,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
   </main>
 
-  <!-- Bottom Tab Bar -->
+  <!-- Bottom Tab Bar — 2x2 grid (Jim OOB 2026-07-19) -->
   <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10 bg-black/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-2xl">
-    <div class="flex h-16 justify-around">
-      <button class="flex-1 py-2" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
-        <div class="text-lg font-black leading-5">✓</div>
-        <div class="mt-0.5 text-[11px]">Set</div>
+    <div class="grid grid-cols-2 grid-rows-2 gap-x-1 gap-y-1 px-2 py-1.5">
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
+        <span class="text-lg leading-none">✓</span><span class="text-xs font-bold">Set</span>
       </button>
-      <button class="flex-1 py-2" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
-        <div class="text-lg font-black leading-5">📊</div>
-        <div class="mt-0.5 text-[11px]">Workout</div>
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
+        <span class="text-lg leading-none">📊</span><span class="text-xs font-bold">Workout</span>
       </button>
-      <button class="flex-1 py-2" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="tab = 'history'">
-        <div class="text-lg font-black leading-5">📋</div>
-        <div class="mt-0.5 text-[11px]">History</div>
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="tab = 'history'">
+        <span class="text-lg leading-none">📋</span><span class="text-xs font-bold">History</span>
       </button>
-      <button class="flex-1 py-2" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
-        <div class="text-lg font-black leading-5">🏁</div>
-        <div class="mt-0.5 text-[11px]">End</div>
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
+        <span class="text-lg leading-none">🏁</span><span class="text-xs font-bold">End</span>
       </button>
     </div>
   </nav>
@@ -873,7 +877,13 @@ function gymApp() {
     pressHandled: false,
     quote: '努力唔會辜負你',
     quoteBank: ['努力唔會辜負你', '今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', '慢慢嚟', '穩住', '加油'],
-    quickPicks: ['BB Bench Press','Leg Press','Low Row (Cable)','DB OHP','DB Shoulder Raise','Lat Pulldown','Squat'],
+    exerciseCategories: [
+      { name: 'CHEST', color: 'text-red-400', exercises: ['BB Bench Press','Incline BB Press','DB Bench Press','Incline DB Press','Pec Deck','Cable Crossover'] },
+      { name: 'BACK',  color: 'text-blue-400', exercises: ['Lat Pulldown','Low Row (Cable)','BB Bent-over Row','Seated Row','T-bar Row','Pull-ups'] },
+      { name: 'LEG',   color: 'text-green-400', exercises: ['Squat','Leg Press','Leg Extension','Leg Curl','Romanian Deadlift','Calf Raise'] },
+      { name: 'SHOULDER', color: 'text-yellow-400', exercises: ['DB OHP','BB OHP','DB Shoulder Raise','Side Lateral Raise','Cable Lateral','Face Pull'] },
+      { name: 'ABS',   color: 'text-purple-400', exercises: ['Plank','Hanging Leg Raise','Crunch','Cable Crunch','Russian Twist','Ab Wheel'] },
+    ],
 
     async init() {
       // Try wake lock
