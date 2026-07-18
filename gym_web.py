@@ -1891,19 +1891,22 @@ function gymApp() {
     startStep(kind, direction) {
       this.cancelStep();
       this.pressHandled = false;
+      // Jim OOB 2026-07-19: hold = ±10 (800ms hold), tap = ±5
       this.pressTimer = setTimeout(() => {
-        if (kind === 'weight') this.bumpWeight(direction * 5);
+        if (kind === 'weight') this.bumpWeight(direction * 10);
         else this.bumpReps(direction * 5);
         this.pressHandled = true;
         this.pressTimer = null;
-      }, 500);
+        this.haptic([30, 50, 30]);  // distinct hold-feedback pattern
+      }, 800);
     },
 
     endStep(kind, direction) {
       if (this.pressTimer) clearTimeout(this.pressTimer);
       if (!this.pressHandled) {
-        if (kind === 'weight') this.bumpWeight(direction * 3);
-        else this.bumpReps(direction * 3);
+        // Tap = ±5 (weight), ±5 (reps) — Jim OOB 2026-07-19
+        if (kind === 'weight') this.bumpWeight(direction * 5);
+        else this.bumpReps(direction * 5);
       }
       this.pressTimer = null;
       this.pressHandled = false;
