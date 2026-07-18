@@ -215,12 +215,44 @@ def api_end_session():
 
 @app.route("/api/today_image")
 def api_today_image():
-    """Return today's daily motivation image (or None if not yet generated)."""
+    """Return today's daily motivation image with fallback chain.
+
+    Lookup order (NEW 2026-07-19 OOB fix — gym_web should never return None
+    while a cheer_*.png exists from earlier cheer fire):
+      1. /gymbro_{today}.png  (canonical — produced by cron 06:00 HKT)
+      2. /cheer_{today}_*.png  (any cheer fire same day)
+      3. Latest /cheer_*.png   (yesterday's cheer fallback if today missing)
+      4. None                   (truly empty)
+
+    Returns None only if image_cache is genuinely empty for today AND no
+    previous cheer image exists either. Caller (Alpine x-init) should
+    default-hide the <img> tag when image_url is null.
+    """
+    import glob
     today = today_iso()
-    img_path = Path("/home/work/.hermes/image_cache") / f"gymbro_{today}.png"
-    if img_path.exists() and img_path.stat().st_size > 50000:
-        return jsonify({"image_url": f"/img/gymbro_{today}.png", "date": today})
-    return jsonify({"image_url": None, "date": today})
+    cache = Path("/home/work/.hermes/image_cache")
+    # 1. Canonical
+    p = cache / f"gymbro_{today}.png"
+    if p.exists() and p.stat().st_size > 50000:
+        return jsonify({"image_url": f"/img/{p.name}", "date": today, "source": "canonical"})
+    # 2. Same-day cheer (compact form YYYYMMDD)
+    cheer_today = cache / f"cheer_{today.replace('-', '')}_*.png"
+    matches = sorted(cache.glob(f"cheer_{today.replace('-', '')}_*.png"))
+    if matches:
+        latest = matches[-1]
+        if latest.stat().st_size > 50000:
+            return jsonify({"image_url": f"/img/{latest.name}", "date": today, "source": "cheer_today"})
+    # 3. Latest cheer (any day)
+    all_cheer = sorted(cache.glob("cheer_*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+    if all_cheer:
+        latest = all_cheer[0]
+        if latest.stat().st_size > 50000:
+            # Extract date from cheer filename "cheer_YYYYMMDD_*"
+            fname = latest.stem  # e.g. cheer_20260719_HKT_pre-dawn
+            parts = fname.split('_')
+            cheer_date = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:8]}" if len(parts) > 1 and len(parts[1]) == 8 else today
+            return jsonify({"image_url": f"/img/{latest.name}", "date": cheer_date, "source": "cheer_latest"})
+    return jsonify({"image_url": None, "date": today, "source": "none"})
 
 
 @app.route("/api/streak")
