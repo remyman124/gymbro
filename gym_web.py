@@ -524,6 +524,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     color: rgba(255,214,10,0.85);
     letter-spacing: 0.05em;
     transition: opacity 0.5s ease-in-out;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.25;
   }
   [x-cloak] { display: none !important; }
 </style>
@@ -559,7 +564,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="absolute inset-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2">
           <div class="min-w-0 pr-24">
             <div class="text-[9px] uppercase tracking-[0.2em] text-gray-300">Today</div>
-            <div class="quote-line truncate text-sm font-medium" x-text="quote"></div>
+            <div class="quote-line line-clamp-2 text-sm font-medium" x-text="quote"></div>
           </div>
         </div>
         <div x-show="streak > 0" class="streak-badge absolute right-2 top-2 z-20 shadow-lg shadow-black/40">
