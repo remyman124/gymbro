@@ -454,6 +454,32 @@ def serve_image(filename):
     return send_from_directory("/home/work/.hermes/image_cache", filename)
 
 
+@app.route("/static/<path:filename>")
+def serve_static(filename):
+    """Serve static assets like favicon, apple-touch-icon, PWA icons."""
+    return send_from_directory("/home/work/.hermes/image_cache", filename)
+
+
+@app.route("/manifest.json")
+def pwa_manifest():
+    """PWA web app manifest — referenced from <link rel=manifest>."""
+    return jsonify({
+        "name": "Gym · Jim",
+        "short_name": "GymBro",
+        "description": "Quick gym workout logger with Whoop + Withings overlay",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#000000",
+        "theme_color": "#000000",
+        "orientation": "portrait",
+        "icons": [
+            {"src": "/static/gymbro_icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/static/gymbro_icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/static/gymbro_apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
+        ],
+    })
+
+
 @app.route("/audio/<path:filename>")
 def serve_audio(filename):
     """Serve audio files from audio_cache directory."""
@@ -932,6 +958,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#000000">
 <title>Gym · Jim</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/gymbro_favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/static/gymbro_icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/gymbro_apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="152x152" href="/static/gymbro_apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="120x120" href="/static/gymbro_apple-touch-icon.png">
+<link rel="apple-touch-icon-precomposed" sizes="180x180" href="/static/gymbro_apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <script src="https://cdn.tailwindcss.com"></script>
 <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
