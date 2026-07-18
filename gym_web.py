@@ -548,12 +548,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <section x-show="tab === 'set'" class="flex min-h-[calc(100dvh-14rem)] flex-col" x-cloak>
 
       <!-- Hero motivation banner -->
-      <div class="relative mb-3 h-24 w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-black via-gray-800 to-emerald-950 shadow-2xl">
+      <div class="relative mb-3 h-40 w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-black via-gray-800 to-emerald-950 shadow-2xl">
         <img x-show="motivationImage" :src="motivationImage"
-             class="absolute inset-0 z-[1] h-24 w-full object-cover"
+             class="absolute inset-0 z-[1] h-40 w-full object-cover"
              @error="motivationImage = ''">
         <div x-show="!motivationImage"
-             class="absolute inset-0 z-[1] flex h-24 w-full items-center justify-center text-3xl">
+             class="absolute inset-0 z-[1] flex h-40 w-full items-center justify-center text-3xl">
           💪🔥🏋️
         </div>
         <div class="absolute inset-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2">
