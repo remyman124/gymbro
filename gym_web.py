@@ -1508,7 +1508,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="quote-line line-clamp-2 text-sm font-medium" x-text="quote"></div>
           </div>
         </div>
-        <div x-show="streak > 0" class="streak-badge absolute right-2 top-2 z-20 shadow-lg shadow-black/40">
+        <div x-show="false" class="streak-badge absolute left-1/2 top-2 -translate-x-1/2 z-20 shadow-lg shadow-black/40" style="display:none">
           <span class="text-yellow-300">🔥</span>
           <span x-text="`${streak} day${streak === 1 ? '' : 's'}`"></span>
         </div>
@@ -2290,7 +2290,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v10';
+const CACHE = 'gym-web-v12';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
