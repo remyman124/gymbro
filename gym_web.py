@@ -1402,7 +1402,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('reps', -1)" @pointerup.prevent="endStep('reps', -1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+            <span class="text-base leading-none">−1</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
           </button>
           <div class="min-w-0 text-center">
             <span class="text-3xl font-black tracking-tighter" x-text="reps"></span><span class="ml-0.5 text-xs text-gray-400">×</span>
@@ -1410,7 +1410,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('reps', 1)" @pointerup.prevent="endStep('reps', 1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+            <span class="text-base leading-none">+1</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
           </button>
         </div>
       </div>
@@ -1785,10 +1785,10 @@ function gymApp() {
     endStep(kind, direction) {
       if (this.pressTimer) clearTimeout(this.pressTimer);
       if (!this.pressHandled) {
-        // Jim OOB 2026-07-19: tap = ±1 (was ±3 / ±5). Fine-grain control for weight.
-        // Reps keep tap = ±3 (small step, common values 8-10).
+        // Jim OOB 2026-07-19: tap = ±1 for BOTH weight AND reps (was ±3 / ±5 for reps).
+        // Fine-grain control across the board.
         if (kind === 'weight') this.bumpWeight(direction * 1);
-        else this.bumpReps(direction * 3);
+        else this.bumpReps(direction * 1);
       }
       this.pressTimer = null;
       this.pressHandled = false;
@@ -2084,7 +2084,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v7';
+const CACHE = 'gym-web-v8';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
