@@ -1214,6 +1214,156 @@ def api_workout_combined():
     })
 
 
+# Jim OOB 2026-07-19: Copy-to-clipboard export endpoint. Returns plain text
+# formatted for chat-AI ingestion (per `text-coach-summary-voice` Rule 15 —
+# "match format to consumer"). NO Markdown clutter, NO `───` separators,
+# NO double-unit. Emoji headers, short bullets, compact one-line-per-set.
+#
+# Query: ?days=N|0|-1  (days back from today, 0=today, -1=all-time)
+#        &fmt=txt|md|json  (txt default — chat-AI friendly)
+@app.route("/api/export_text")
+def api_export_text():
+    try:
+        days = int(request.args.get("days", 7))
+    except (ValueError, TypeError):
+        days = 7
+    fmt = request.args.get("fmt", "txt")
+    cutoff_date = (datetime.now(HKT) - timedelta(days=days)).strftime("%Y-%m-%d") if days >= 0 else "0000-00-00"
+
+    # Sheet pull (preferred, may fail) — falls back to local WORKOUT_LOG.
+    sheet_debug = {"status": "ok", "error": None, "rows": 0}
+    rows = []
+    try:
+        sheet_rows = _sheet_read_all()
+        sheet_debug["rows"] = len(sheet_rows)
+        for r in sheet_rows[1:]:
+            if not r or len(r) < 3:
+                continue
+            date = r[0]
+            if date < cutoff_date:
+                continue
+            ex_name = (r[2] if len(r) > 2 else "").strip()
+            if not ex_name:
+                continue
+            reps_total = _parse_reps_total(r[4] if len(r) > 4 else "")
+            try:
+                weight = float(r[5]) if len(r) > 5 and r[5] else 0.0
+            except (ValueError, TypeError):
+                weight = 0.0
+            try:
+                sheet_volume = float(r[8]) if len(r) > 8 and r[8] else 0.0
+            except (ValueError, TypeError):
+                sheet_volume = 0.0
+            volume = sheet_volume if sheet_volume > 0 else reps_total * weight
+            try:
+                set_n = int(r[3]) if len(r) > 3 and r[3] else None
+            except (ValueError, TypeError):
+                set_n = None
+            rows.append({
+                "date": date,
+                "time": r[1] if len(r) > 1 else "",
+                "exercise": ex_name,
+                "muscle_group": _derive_muscle_group(ex_name),
+                "set_n": set_n,
+                "reps": reps_total,
+                "weight_kg": weight,
+                "volume_kg": volume,
+            })
+    except Exception as e:
+        sheet_debug["status"] = "exception"
+        sheet_debug["error"] = repr(e)
+        # Fallback: local WORKOUT_LOG
+        log = load_log()
+        flat = _flatten_sessions(log)
+        rows = [r for r in flat if r.get("date") and r["date"] >= cutoff_date]
+
+    # Per-date grouping
+    by_date = {}
+    for r in rows:
+        d = r["date"]
+        slot = by_date.setdefault(d, {"date": d, "rows": [], "volume_kg": 0.0, "exercises": []})
+        slot["rows"].append(r)
+        slot["volume_kg"] += r.get("volume_kg") or 0
+        if r.get("exercise") and r["exercise"] not in slot["exercises"]:
+            slot["exercises"].append(r["exercise"])
+
+    # Render text by fmt
+    sessions = sorted(by_date.values(), key=lambda s: s["date"], reverse=True)
+    total_volume = round(sum(s["volume_kg"] for s in sessions), 1)
+    muscle_split = {}
+    for r in rows:
+        mg = r.get("muscle_group") or "other"
+        muscle_split[mg] = muscle_split.get(mg, 0) + 1
+
+    if fmt == "json":
+        text = json.dumps({
+            "range_days": days,
+            "cutoff_date": cutoff_date,
+            "sessions": sessions,
+            "total_volume_kg": total_volume,
+            "muscle_split": muscle_split,
+            "sheet_debug": sheet_debug,
+        }, ensure_ascii=False, indent=2)
+    elif fmt == "md":
+        # Markdown variant for Obsidian / docs ingestion
+        parts = [f"# Workout Log — Last {days} day(s) (since {cutoff_date})", ""]
+        for s in sessions:
+            parts.append(f"## {s['date']}  ·  {len(s['rows'])} sets · {round(s['volume_kg'],1)}kg volume")
+            for r in s["rows"]:
+                weight = r.get("weight_kg", 0)
+                if weight and weight == int(weight):
+                    w = f"{int(weight)}kg"
+                elif weight:
+                    w = f"{weight}kg"
+                else:
+                    w = "BW"
+                reps = r.get("reps", 0)
+                set_n = r.get("set_n") or "?"
+                parts.append(f"- Set {set_n} · {r.get('exercise','')} — {w} × {reps}")
+            parts.append("")
+        parts.append(f"**Totals**: {len(rows)} sets · {total_volume}kg volume")
+        if muscle_split:
+            muscle_str = " · ".join(f"{k.upper()} {v}" for k, v in sorted(muscle_split.items(), key=lambda kv: -kv[1]))
+            parts.append(f"**Muscle split**: {muscle_str}")
+        parts.append("")
+        parts.append(f"Copied from gymbro · {datetime.now(HKT).isoformat()}")
+        text = "\n".join(parts)
+    else:
+        # txt default — chat-AI friendly (per `text-coach-summary-voice` Rule 15)
+        parts = [f"💪 Workout Log — Last {days} day(s) (since {cutoff_date})", ""]
+        for s in sessions:
+            parts.append(f"📅 {s['date']}  ·  {len(s['rows'])} sets · {round(s['volume_kg'],1)}kg volume")
+            for r in s["rows"]:
+                weight = r.get("weight_kg", 0)
+                if weight and weight == int(weight):
+                    w = f"{int(weight)}kg"
+                elif weight:
+                    w = f"{weight}kg"
+                else:
+                    w = "BW"
+                reps = r.get("reps", 0)
+                set_n = r.get("set_n") or "?"
+                parts.append(f"  Set {set_n} · {r.get('exercise','')} — {w} × {reps}")
+            parts.append("")
+        parts.append(f"📊 Totals: {len(rows)} sets · {total_volume}kg volume")
+        if muscle_split:
+            muscle_str = " · ".join(f"{k.upper()} {v}" for k, v in sorted(muscle_split.items(), key=lambda kv: -kv[1]))
+            parts.append(f"🎯 Muscle split: {muscle_str}")
+        parts.append("")
+        parts.append(f"Copied from gymbro · {datetime.now(HKT).isoformat()}")
+        text = "\n".join(parts)
+
+    return jsonify({
+        "text": text,
+        "sessions": len(sessions),
+        "total_sets": len(rows),
+        "total_volume_kg": total_volume,
+        "range_days": days,
+        "fmt": fmt,
+        "sheet_debug": sheet_debug,
+    })
+
+
 @app.route("/api/sync_sheet", methods=["POST"])
 def api_sync_sheet():
     """Push local WORKOUT_LOG entries to Google Sheet (idempotent)."""
@@ -1672,6 +1822,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button class="text-xs text-gray-400 underline tap" @click="refreshHistory(true)" x-show="!loadingHistory">↻ Refresh</button>
         <span class="text-xs text-gray-400" x-show="loadingHistory">Loading…</span>
       </div>
+
+      <!-- Jim OOB 2026-07-19: Copy-to-clipboard for past-log AI ingestion.
+           Range chips (Today / 7d / 30d) + 📋 Copy button. Output is chat-AI
+           friendly (emoji headers, no Markdown clutter) — safe to paste into
+           Whoop AI / personal trainer chat / Notes app. -->
+      <div class="my-3 flex items-center gap-2">
+        <div class="flex h-9 shrink-0 items-center gap-1 rounded-full border border-white/15 bg-white/[0.06] p-1 backdrop-blur">
+          <button class="rounded-full px-3 py-1 text-[11px] font-semibold transition tap"
+                  :class="copyRange === 0 ? 'bg-white text-black' : 'text-gray-300 hover:text-white'"
+                  @click="copyRange = 0">Today</button>
+          <button class="rounded-full px-3 py-1 text-[11px] font-semibold transition tap"
+                  :class="copyRange === 7 ? 'bg-white text-black' : 'text-gray-300 hover:text-white'"
+                  @click="copyRange = 7">7d</button>
+          <button class="rounded-full px-3 py-1 text-[11px] font-semibold transition tap"
+                  :class="copyRange === 30 ? 'bg-white text-black' : 'text-gray-300 hover:text-white'"
+                  @click="copyRange = 30">30d</button>
+        </div>
+        <button class="ml-auto flex h-9 items-center gap-1 rounded-full border border-white/15 bg-black/55 px-3 text-[11px] font-semibold text-gray-100 backdrop-blur hover:bg-white/15 active:scale-95 transition tap disabled:opacity-50"
+                :disabled="copyInFlight"
+                @click="copyWorkoutLog()"
+                title="複製 workout log 落 clipboard">
+          <span x-text="copyInFlight ? '⏳' : '📋'"></span>
+          <span x-text="copyInFlight ? 'Copying…' : 'Copy'"></span>
+        </button>
+      </div>
+
       <div x-show="loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">Loading history…</div>
       <div x-show="!loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">No sessions yet — go log some 🔥</div>
       <template x-for="row in history" :key="row.date">
@@ -1775,6 +1951,10 @@ function gymApp() {
     today: '',
     history: [],
     loadingHistory: false,
+    // Jim OOB 2026-07-19: copy-to-clipboard export state. Range is days back
+    // from today (0 = today only, 7 = last week, 30 = last month).
+    copyRange: 7,
+    copyInFlight: false,
     // Audio overlay state — fetched from /api/today_audio
     audioTrack: null,
     audioPlaylist: [],
@@ -2177,7 +2357,7 @@ function gymApp() {
     // Jim OOB 2026-07-19: Refresh button should ACTUALLY pull freshest data,
     // not just re-read the stale local cache. Pre-sync from Sheet first so
     // any rows that exist on Sheet (from another device, end_session auto-push,
-    // or cheat cron) show up immediately.
+    // or cheer cron) show up immediately.
     async refreshHistory(force = true) {
       if (this.loadingHistory && !force) return;
       this.loadingHistory = true;
@@ -2196,6 +2376,62 @@ function gymApp() {
         this.flash('Refresh failed: ' + (e.message || 'network'));
       }
       this.loadingHistory = false;
+    },
+
+    // Jim OOB 2026-07-19: Copy workout log to clipboard in chat-AI-friendly
+    // format (per `text-coach-summary-voice` Rule 15 — match format to consumer).
+    // Source: /api/export_text endpoint (sheet-pulled, chat-AI friendly).
+    // Uses navigator.clipboard.writeText() with execCommand('copy') fallback
+    // for older iOS Safari. Also calls /api/sync_sheet first to ensure freshness.
+    async copyWorkoutLog() {
+      if (this.copyInFlight) return;
+      this.copyInFlight = true;
+      this.haptic([20]);
+      try {
+        // Best-effort sheet sync first (so most recent sets are in the export)
+        try { await fetch('/api/sync_sheet', { method: 'POST' }); } catch (e) { /* best-effort */ }
+        const res = await fetch(`/api/export_text?days=${this.copyRange}&fmt=txt`);
+        const data = await res.json();
+        const text = (data && data.text) || '';
+        if (!text.trim()) {
+          this.flash('冇 log 可複製');
+          return;
+        }
+        // Modern clipboard API (works on iOS 13.4+ HTTPS contexts)
+        let ok = false;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            ok = true;
+          }
+        } catch (e) { /* fall through to fallback */ }
+        // Fallback: hidden textarea + execCommand('copy') for older iOS or non-HTTPS
+        if (!ok) {
+          try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            ok = document.execCommand && document.execCommand('copy');
+            document.body.removeChild(ta);
+          } catch (e) { /* fallback failed */ }
+        }
+        const sessions = (data && data.sessions) || 0;
+        if (ok) {
+          this.flash(`已複製 · ${sessions} 個 session · 落 clipboard ✓`);
+        } else {
+          this.flash('Copy failed — clipboard 唔俾用');
+          // Show the text in a toast for manual selection
+          console.log('[gym_web] copy text for manual select:\n' + text);
+        }
+      } catch(e) {
+        this.flash('Copy failed: ' + (e.message || 'network'));
+      }
+      this.copyInFlight = false;
     },
     goToTab(name) {
       this.tab = name;
@@ -2290,7 +2526,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v12';
+const CACHE = 'gym-web-v13';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
