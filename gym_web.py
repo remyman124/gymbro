@@ -1299,7 +1299,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           💪🔥🏋️
         </div>
         <div class="absolute inset-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2">
-          <div class="min-w-0 pr-24">
+          <div class="min-w-0 pr-[120px]">
             <div class="text-[9px] uppercase tracking-[0.2em] text-gray-300">Today</div>
             <div class="quote-line line-clamp-2 text-sm font-medium" x-text="quote"></div>
           </div>
@@ -1333,13 +1333,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="text-sm">⏭</span>
           </button>
         </div>
-        <!-- Jim OOB 2026-07-19: Cycle motivation image button — sits at bottom-right
-             bottom-left of the bottom row, so it doesn't collide with the audio
-             play pill (which lives at bottom-right). Tapping also refreshes all
+        <!-- Jim OOB 2026-07-19: Cycle motivation image button — placed INSIDE the
+             same bottom-right pill group as the audio controls (separated by a
+             thin divider). Stops overlap with the bottom-left "quote" line that
+             the bottom-left placement collided with. Tapping also refreshes all
              home data (overlay + streak + history). -->
         <button x-show="motivationImageList.length > 1"
                 @click="cycleMotivationImage()"
-                class="absolute bottom-2 left-2 z-20 flex h-8 items-center justify-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-1 text-[10px] font-medium text-gray-200 hover:bg-white/15 active:scale-95 transition backdrop-blur"
+                class="absolute bottom-2 right-2 z-30 flex h-8 items-center justify-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 text-[10px] font-medium text-gray-200 hover:bg-white/15 active:scale-95 transition backdrop-blur"
+                :class="audioTrack && audioTrack.available ? 'mr-[68px]' : ''"
                 title="換下一張 + 刷新主頁資料">
           <span>↻</span><span x-text="`${motivationImageIndex + 1}/${motivationImageList.length}`"></span>
         </button>
@@ -2084,7 +2086,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v8';
+const CACHE = 'gym-web-v9';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
