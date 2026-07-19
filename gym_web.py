@@ -378,6 +378,60 @@ def _recovery_pct():
     return None
 
 
+def _whoop_workouts_in_window(cutoff_iso_date):
+    """Read Whoop cached workouts filtered by HKT date >= cutoff.
+
+    Returns list of dicts:
+      [{date, sport_name, strain, kJ, avg_hr, max_hr, start_iso, end_iso}, ...]
+
+    Read from ~/.whoop_data_latest.json cache which is populated by
+    `whoop_nutrition.py --sync` (cron refreshes every ~hour). Falls back to
+    empty list if cache missing/malformed.
+
+    Jim OOB 2026-07-19 (persistent): "Please always refer to whoop activities
+    supplemented by Google sheet" — Cheer routines + History pulls should
+    always include Whoop activity data alongside the Sheet-sourced set rows.
+
+    Per `whoop` skill: workout `start` is ISO UTC; convert via HKT for date.
+    Strain / kJ / avg+max HR live under nested `score` dict.
+    """
+    out = []
+    d = _safe_read_json(WHOOP_CACHE)
+    if not isinstance(d, dict):
+        return out
+    for w in d.get("workouts", []) or []:
+        if w.get("score_state") != "SCORED":
+            continue
+        start_iso = w.get("start", "")
+        if not start_iso:
+            continue
+        try:
+            from zoneinfo import ZoneInfo
+            hkt = ZoneInfo("Asia/Hong_Kong")
+            dt_utc = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+            date_hkt = dt_utc.astimezone(hkt).__format__("%Y-%m-%d")
+        except Exception:
+            continue
+        if date_hkt < cutoff_iso_date:
+            continue
+        sc = w.get("score") or {}
+        out.append({
+            "date": date_hkt,
+            "sport_name": w.get("sport_name", ""),
+            "strain": sc.get("strain"),
+            "kJ": sc.get("kilojoule"),
+            "avg_hr": sc.get("average_heart_rate"),
+            "max_hr": sc.get("max_heart_rate"),
+            "start_iso": start_iso,
+            "end_iso": w.get("end", ""),
+            "duration_ms": w.get("duration"),
+            "id": w.get("id"),
+            "source": "whoop",
+        })
+    out.sort(key=lambda r: (r["date"], r["start_iso"]), reverse=True)
+    return out
+
+
 def _withings_body_latest():
     """Latest Withings body comp reading (any date, not just today).
     Returns dict {date, weight_kg, fat_pct, ...} or {} if none available.
@@ -989,6 +1043,10 @@ def api_workout_recent():
     last_workout = sorted(rows, key=lambda r: (r["date"], r.get("time", "")))[-1] if rows else None
     LAST_POLL_TS["ts"] = datetime.now(HKT).isoformat()
     LAST_POLL_TS["count"] = len(rows)
+    # Jim OOB 2026-07-19 (PERSISTENT): always include Whoop activity summary
+    # alongside the Sheet-pulled set rows. Cheer-routine §2 / History tab /
+    # any downstream consumer should see both data sources.
+    whoop_activities = _whoop_workouts_in_window(cutoff_date)
     return jsonify({
         "source": source,
         "days": days,
@@ -1006,6 +1064,152 @@ def api_workout_recent():
             }
             for d, info in sessions_sorted
         ],
+        "whoop_activities": whoop_activities,
+        "whoop_activity_count": len(whoop_activities),
+        "poll_meta": LAST_POLL_TS,
+    })
+
+
+# Jim OOB 2026-07-19 (PERSISTENT): "Please always refer to whoop activities
+# supplemented by Google sheet." This is the canonical combined endpoint for
+# cheer-routine §2 workouts table and History tab.
+#
+# Pulls from BOTH sources simultaneously:
+#   1. Google Sheet `Workouts` tab (cross-device source of truth — set reps × weight)
+#   2. Whoop /developer/v2/activity/workout (energy / strain / heart rate)
+#   3. Local `WORKOUT_LOG.json` (immediate-write from web app — fallback when Sheet sync pending)
+#
+# Returns a unified response with two parallel arrays:
+#   - `set_rows`: per-set entries from Sheet (+ local-fallback), per-set dedup
+#   - `whoop_activities`: per-session Whoop summary records (sport, strain, kJ, HR)
+# Plus per-date merged `sessions` view combining both (volume from Sheet,
+# strain from Whoop).
+#
+# Cheer / dashboard should display both — never one alone.
+@app.route("/api/workout_combined")
+def api_workout_combined():
+    try:
+        days = int(request.args.get("days", 7))
+    except ValueError:
+        days = 7
+    days = max(1, min(days, 90))
+    cutoff_date = (datetime.now(HKT) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # --- 1. Sheet pull (preferred), local fallback if sheet read fails ---
+    set_rows = []
+    source_set = "sheet"
+    try:
+        sheet_rows = _sheet_read_all()
+        for row in sheet_rows[1:]:
+            if not row or len(row) < 3:
+                continue
+            date = row[0]
+            if date < cutoff_date:
+                continue
+            ex_name = row[2] if len(row) > 2 else ""
+            reps_total = _parse_reps_total(row[4] if len(row) > 4 else "")
+            try:
+                weight = float(row[5]) if len(row) > 5 and row[5] else 0.0
+            except (ValueError, TypeError):
+                weight = 0.0
+            try:
+                sheet_volume = float(row[8]) if len(row) > 8 and row[8] else 0.0
+            except (ValueError, TypeError):
+                sheet_volume = 0.0
+            volume = sheet_volume if sheet_volume > 0 else reps_total * weight
+            try:
+                set_n = int(row[3]) if len(row) > 3 and row[3] else None
+            except (ValueError, TypeError):
+                set_n = None
+            set_rows.append({
+                "date": date,
+                "time": row[1] if len(row) > 1 else "",
+                "exercise": ex_name,
+                "muscle_group": _derive_muscle_group(ex_name),
+                "set_n": set_n,
+                "reps": reps_total,
+                "weight_kg": weight,
+                "volume_kg": volume,
+                "source": "sheet",
+            })
+    except Exception:
+        source_set = "local_fallback"
+        log = load_log()
+        flat = _flatten_sessions(log)
+        set_rows = [r for r in flat if r["date"] >= cutoff_date]
+
+    # --- 2. Whoop activities pull (independent) ---
+    whoop_activities = _whoop_workouts_in_window(cutoff_date)
+
+    # --- 3. Merge per-date ---
+    by_date = {}
+    for r in set_rows:
+        d = r["date"]
+        slot = by_date.setdefault(d, {
+            "date": d,
+            "sets": 0,
+            "volume_kg": 0.0,
+            "exercises": [],
+            "whoop_strain": [],
+            "whoop_kJ": [],
+            "whoop_sports": [],
+            "whoop_max_hr": [],
+        })
+        slot["sets"] += 1
+        slot["volume_kg"] += r.get("volume_kg") or 0
+        ex = r.get("exercise") or ""
+        if ex and ex not in slot["exercises"]:
+            slot["exercises"].append(ex)
+
+    for w in whoop_activities:
+        d = w["date"]
+        slot = by_date.setdefault(d, {
+            "date": d,
+            "sets": 0,
+            "volume_kg": 0.0,
+            "exercises": [],
+            "whoop_strain": [],
+            "whoop_kJ": [],
+            "whoop_sports": [],
+            "whoop_max_hr": [],
+        })
+        if w.get("strain") is not None:
+            slot["whoop_strain"].append(w["strain"])
+        if w.get("kJ") is not None:
+            slot["whoop_kJ"].append(w["kJ"])
+        if w.get("sport_name") and w["sport_name"] not in slot["whoop_sports"]:
+            slot["whoop_sports"].append(w["sport_name"])
+        if w.get("max_hr") is not None:
+            slot["whoop_max_hr"].append(w["max_hr"])
+
+    sessions = []
+    for d, slot in sorted(by_date.items(), reverse=True):
+        sessions.append({
+            "date": slot["date"],
+            "sets": slot["sets"],
+            "volume_kg": round(slot["volume_kg"], 1),
+            "exercises": slot["exercises"][:8],
+            "whoop_strain_total": round(sum(slot["whoop_strain"]), 2) if slot["whoop_strain"] else None,
+            "whoop_kJ_total": round(sum(slot["whoop_kJ"]), 1) if slot["whoop_kJ"] else None,
+            "whoop_sports": slot["whoop_sports"],
+            "whoop_max_hr": max(slot["whoop_max_hr"]) if slot["whoop_max_hr"] else None,
+            "whoop_activity_count": len([w for w in whoop_activities if w["date"] == d]),
+        })
+
+    LAST_POLL_TS["ts"] = datetime.now(HKT).isoformat()
+    LAST_POLL_TS["count"] = len(set_rows)
+    return jsonify({
+        "source": "sheet+whoop" if source_set == "sheet" else "local_fallback+whoop",
+        "days": days,
+        "cutoff_date": cutoff_date,
+        "set_count": len(set_rows),
+        "whoop_activity_count": len(whoop_activities),
+        "total_volume_kg": round(sum((r.get("volume_kg") or 0) for r in set_rows), 1),
+        "muscle_groups": sorted({r["muscle_group"] for r in set_rows if r.get("muscle_group")}),
+        "last_workout": sorted(set_rows, key=lambda r: (r["date"], r.get("time", "")))[-1] if set_rows else None,
+        "set_rows": set_rows,             # per-set entries (Sheet/local)
+        "whoop_activities": whoop_activities,  # per-activity entries (Whoop)
+        "sessions": sessions,             # per-date merged view (THE MAIN consumer table)
         "poll_meta": LAST_POLL_TS,
     })
 
@@ -2086,7 +2290,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v9';
+const CACHE = 'gym-web-v10';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
