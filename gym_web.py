@@ -1387,7 +1387,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('weight', -1)" @pointerup.prevent="endStep('weight', -1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+            <span class="text-base leading-none">−1</span><span class="mt-0.5 text-[8px] text-gray-400">hold −10</span>
           </button>
           <div class="min-w-0 text-center">
             <span class="text-3xl font-black tracking-tighter" x-text="weight"></span><span class="ml-0.5 text-xs text-gray-400">kg</span>
@@ -1395,7 +1395,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('weight', 1)" @pointerup.prevent="endStep('weight', 1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+            <span class="text-base leading-none">+1</span><span class="mt-0.5 text-[8px] text-gray-400">hold +10</span>
           </button>
         </div>
         <div class="glass grid grid-cols-[2.5rem_1fr_2.5rem] items-center rounded-2xl p-1.5">
@@ -1728,7 +1728,9 @@ function gymApp() {
     pickExercise(name) {
       this.currentExercise = name;
       this.exerciseInput = '';
-      // Initial warm-up if first time
+      // Jim OOB 2026-07-19 (re-confirmed in same session): NO auto-step on
+      // reselecting the same exercise. Keep the SAME weight as the last set,
+      // do NOT add +5kg warm-up ramp. User controls progressive loading manually.
       const prev = this.session.exercises.filter(e => e.exercise === name);
       if (!prev.length) {
         this.weight = 20;
@@ -1736,7 +1738,7 @@ function gymApp() {
         this.intensity = 'warm-up';
       } else {
         const last = prev[prev.length - 1];
-        this.weight = (last.weight_kg || 20) + 5;  // warm-up ramp
+        this.weight = last.weight_kg || 20;       // NO +5 ramp
         this.reps = 10;
         this.intensity = prev.length < 2 ? 'warm-up' : (prev.length < 4 ? 'working' : 'burn-out');
       }
@@ -1772,17 +1774,20 @@ function gymApp() {
       this.cancelStep();
       this.pressHandled = false;
       this.pressTimer = setTimeout(() => {
-        if (kind === 'weight') this.bumpWeight(direction * 5);
+        // Jim OOB 2026-07-19: hold = ±10 (was ±5). Reps keep tap-style increments.
+        if (kind === 'weight') this.bumpWeight(direction * 10);
         else this.bumpReps(direction * 5);
         this.pressHandled = true;
         this.pressTimer = null;
-      }, 500);
+      }, 800);
     },
 
     endStep(kind, direction) {
       if (this.pressTimer) clearTimeout(this.pressTimer);
       if (!this.pressHandled) {
-        if (kind === 'weight') this.bumpWeight(direction * 3);
+        // Jim OOB 2026-07-19: tap = ±1 (was ±3 / ±5). Fine-grain control for weight.
+        // Reps keep tap = ±3 (small step, common values 8-10).
+        if (kind === 'weight') this.bumpWeight(direction * 1);
         else this.bumpReps(direction * 3);
       }
       this.pressTimer = null;
@@ -2079,7 +2084,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v6';
+const CACHE = 'gym-web-v7';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
