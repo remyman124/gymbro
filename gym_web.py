@@ -11,7 +11,6 @@ PWA: installable, wake-lock enabled
 import json
 import os
 import secrets
-import base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -115,24 +114,6 @@ def healthz():
     return jsonify({"status": "ok", "time": now_iso(), "today": today_iso()})
 
 
-# ---------- Version stamp — drives PWA forced reload ----------
-# Bump this every time you ship code that affects the in-page JS bundle.
-# The client script polls this endpoint and forces a hard reload if the
-# version differs from localStorage, bypassing stale SW caches that
-# `controllerchange` events might miss on iOS Safari PWA.
-APP_VERSION = "2026-07-19-v6-apple-icon-refresh-btn"
-
-
-@app.route("/api/version")
-def api_version():
-    """Return the current server-side app version stamp.
-
-    Client compares this to localStorage['app_version']; on mismatch,
-    it clears all caches + unregisters SW + hard reloads.
-    """
-    return jsonify({"version": APP_VERSION, "sw_cache": "gym-web-v4"})
-
-
 @app.route("/api/state")
 def api_state():
     """Return full session state for client sync."""
@@ -234,102 +215,12 @@ def api_end_session():
 
 @app.route("/api/today_image")
 def api_today_image():
-    """Return today's daily motivation image with fallback chain.
-
-    Lookup order (NEW 2026-07-19 OOB fix — gym_web should never return None
-    while a cheer_*.png exists from earlier cheer fire):
-      1. /gymbro_{today}.png  (canonical — produced by cron 06:00 HKT)
-      2. /cheer_{today}_*.png  (any cheer fire same day)
-      3. Latest /cheer_*.png   (yesterday's cheer fallback if today missing)
-      4. None                   (truly empty)
-
-    Returns None only if image_cache is genuinely empty for today AND no
-    previous cheer image exists either. Caller (Alpine x-init) should
-    default-hide the <img> tag when image_url is null.
-    """
-    import glob
+    """Return today's daily motivation image (or None if not yet generated)."""
     today = today_iso()
-    cache = Path("/home/work/.hermes/image_cache")
-    # 1. Canonical
-    p = cache / f"gymbro_{today}.png"
-    if p.exists() and p.stat().st_size > 50000:
-        return jsonify({"image_url": f"/img/{p.name}", "date": today, "source": "canonical"})
-    # 2. Same-day cheer (compact form YYYYMMDD)
-    cheer_today = cache / f"cheer_{today.replace('-', '')}_*.png"
-    matches = sorted(cache.glob(f"cheer_{today.replace('-', '')}_*.png"))
-    if matches:
-        latest = matches[-1]
-        if latest.stat().st_size > 50000:
-            return jsonify({"image_url": f"/img/{latest.name}", "date": today, "source": "cheer_today"})
-    # 3. Latest cheer (any day)
-    all_cheer = sorted(cache.glob("cheer_*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
-    if all_cheer:
-        latest = all_cheer[0]
-        if latest.stat().st_size > 50000:
-            # Extract date from cheer filename "cheer_YYYYMMDD_*"
-            fname = latest.stem  # e.g. cheer_20260719_HKT_pre-dawn
-            parts = fname.split('_')
-            cheer_date = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:8]}" if len(parts) > 1 and len(parts[1]) == 8 else today
-            return jsonify({"image_url": f"/img/{latest.name}", "date": cheer_date, "source": "cheer_latest"})
-    return jsonify({"image_url": None, "date": today, "source": "none"})
-
-
-# Manual refresh — 5-min cooldown, runs gymbro_daily_image.py --force in background
-REFRESH_COOLDOWN_SEC = 300
-_last_refresh_ts = {"ts": None, "pid": None}
-
-
-@app.route("/api/refresh_motivation", methods=["POST"])
-def api_refresh_motivation():
-    """Trigger a fresh motivation image generation (async, returns immediately).
-
-    - 5-min cooldown per server (prevents abuse)
-    - Subprocess runs scripts/gymbro_daily_image.py --force
-    - Returns immediately with status; client polls /api/today_image
-    """
-    import subprocess
-    import time
-    now = time.time()
-    last = _last_refresh_ts["ts"]
-    if last is not None and (now - last) < REFRESH_COOLDOWN_SEC:
-        remaining = int(REFRESH_COOLDOWN_SEC - (now - last))
-        return jsonify({
-            "ok": False,
-            "cooldown_remaining": remaining,
-            "error": f"cooldown {remaining}s",
-        }), 429
-    _last_refresh_ts["ts"] = now
-
-    # Launch async subprocess; do not block the request.
-    env = os.environ.copy()
-    # Ensure MiniMax key is available to the subprocess.
-    if "MINIMAX_API_KEY" not in env:
-        env_file = Path("/home/work/.hermes/.env")
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    if k not in os.environ:
-                        env[k] = v
-
-    log_path = Path("/tmp/gym_motivation_refresh.log")
-    log_f = open(log_path, "ab")
-    proc = subprocess.Popen(
-        ["/usr/bin/python3", "/home/work/projects/gymbro/scripts/gymbro_daily_image.py", "--force"],
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        env=env,
-        cwd="/home/work/projects/gymbro",
-    )
-    _last_refresh_ts["pid"] = proc.pid
-    return jsonify({
-        "ok": True,
-        "status": "generating",
-        "pid": proc.pid,
-        "cooldown_remaining": REFRESH_COOLDOWN_SEC,
-        "log": str(log_path),
-    })
+    img_path = Path("/home/work/.hermes/image_cache") / f"gymbro_{today}.png"
+    if img_path.exists() and img_path.stat().st_size > 50000:
+        return jsonify({"image_url": f"/img/gymbro_{today}.png", "date": today})
+    return jsonify({"image_url": None, "date": today})
 
 
 @app.route("/api/streak")
@@ -508,220 +399,6 @@ def api_history():
     return jsonify({"history": history, "streak": streak, "today": today})
 
 
-@app.route("/api/export_text")
-def api_export_text():
-    """Export workout history as plain text/markdown for clipboard sharing.
-
-    Use case (Jim OOB 2026-07-19): paste into Whoop AI coach / personal trainer
-    chat. Format optimised for chat-AI ingestion: date headers, set lists,
-    per-day totals, muscle group summary at the end.
-
-    Query params:
-      days   — int, default 7. 0 = today only. -1 = all-time.
-      fmt    — 'txt' (default) | 'md' (markdown headings) | 'json'
-      source — 'sheet' (default) | 'local' | 'both'
-
-    Reads from Google Sheet (single source of truth) when source='sheet',
-    same parsing as /api/workout_recent. Falls back to WORKOUT_LOG.json on
-    failure so the export never returns empty when data exists somewhere.
-    """
-    try:
-        days = int(request.args.get("days", 7))
-    except ValueError:
-        days = 7
-    fmt = request.args.get("fmt", "txt").lower()
-    source = request.args.get("source", "sheet").lower()
-
-    today = today_iso()
-    if days > 0:
-        from datetime import datetime as _dt, timedelta as _td
-        # Match workout_recent convention: cutoff = today - days (inclusive of today)
-        cutoff = (_dt.strptime(today, "%Y-%m-%d") - _td(days=days)).strftime("%Y-%m-%d")
-    elif days == 0:
-        cutoff = today  # today only — match the date exactly
-    else:
-        cutoff = "0000-00-00"  # -1 = all-time
-
-    # Try sheet first (matches /api/workout_recent data path)
-    sessions = []  # list of dict(date, exercises, sets, volume_kg)
-    sheet_debug = {}  # captured for diagnostics
-    if source in ("sheet", "both"):
-        try:
-            import requests as _req
-            gtok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
-            auth_str = f"{gtok['client_id']}:{gtok['client_secret']}"
-            auth_b64 = base64.b64encode(auth_str.encode()).decode()
-            tok = _req.post(
-                "https://oauth2.googleapis.com/token",
-                data={"grant_type": "refresh_token", "refresh_token": gtok["refresh_token"]},
-                headers={"Authorization": f"Basic {auth_b64}"}, timeout=10,
-            ).json()
-            sheet_id = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
-            tab = "Workouts"
-            sheet_resp = _req.get(
-                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab}",
-                headers={"Authorization": f"Bearer {tok['access_token']}"}, timeout=15,
-            )
-            sheet_debug["status_code"] = sheet_resp.status_code
-            sheet_resp = sheet_resp.json()
-            rows = sheet_resp.get("values", [])
-            sheet_debug["row_count"] = len(rows)
-            if rows:
-                header = rows[0]
-                idx = {h: i for i, h in enumerate(header)}
-                # Sheet columns (canonical): 日期|時間|運動名稱|Sets|Reps|重量 (kg)|每邊 (kg)|Bar (kg)|Volume (kg)|備註|Whoop Strain|Image
-                # Robust field resolution: prefer exact-match then canonical names
-                def _col(name, *fallbacks):
-                    for n in (name, *fallbacks):
-                        if n in idx:
-                            return idx[n]
-                    return -1
-                col_date = _col("日期", "Date", "date")
-                col_time = _col("時間", "Time", "time")
-                col_ex = _col("運動名稱", "Exercise", "exercise")
-                col_sets = _col("Sets", "sets", "Set Count")
-                col_reps = _col("Reps", "reps", "Rep Count")
-                col_weight = _col("重量 (kg)", "重量", "Weight (kg)", "Weight", "weight_kg")
-                col_vol = _col("Volume (kg)", "Volume", "volume_kg")
-                by_date = {}
-                for row in rows[1:]:
-                    try:
-                        def _get(c):
-                            return row[c] if 0 <= c < len(row) else ""
-                        d = _get(col_date) if col_date >= 0 else _get(0)
-                        if not d or d < cutoff:
-                            continue
-                        ex = _get(col_ex) if col_ex >= 0 else _get(2)
-                        weight = _get(col_weight) if col_weight >= 0 else _get(5)
-                        reps = _get(col_reps) if col_reps >= 0 else _get(4)
-                        vol_str = _get(col_vol) if col_vol >= 0 else _get(8)
-                        try:
-                            vol = float((vol_str or "0").replace(",", ""))
-                        except ValueError:
-                            vol = 0.0
-                        try:
-                            w_kg = float((weight or "0").replace(",", ""))
-                        except ValueError:
-                            w_kg = 0.0
-                        try:
-                            # Reps might be "10, 10, 10" (set-by-set list) or "30" (sum)
-                            # or might be empty for bodyweight exercises
-                            if "," in str(reps):
-                                total = sum(int(x.strip()) for x in str(reps).split(",") if x.strip().isdigit())
-                            else:
-                                total = int(float(reps)) if reps else 0
-                        except (ValueError, TypeError):
-                            total = 0
-                        by_date.setdefault(d, {"exercises": [], "sets": 0, "volume_kg": 0.0})
-                        by_date[d]["exercises"].append({
-                            "exercise": ex, "weight_kg": w_kg, "reps": total,
-                            "set_n": len(by_date[d]["exercises"]) + 1,
-                        })
-                        by_date[d]["sets"] += 1
-                        by_date[d]["volume_kg"] += vol
-                    except (IndexError, ValueError, TypeError):
-                        continue
-                for d in sorted(by_date.keys(), reverse=True):
-                    s = by_date[d]
-                    s["date"] = d
-                    sessions.append(s)
-        except Exception as e:
-            sheet_debug["exception"] = repr(e)
-            import traceback
-            sheet_debug["traceback"] = traceback.format_exc()
-
-    # Fallback to local log
-    if not sessions and source in ("local", "both", "sheet"):
-        log = load_log()
-        for d in sorted(log.keys(), reverse=True):
-            if d < cutoff:
-                continue
-            s = log[d]
-            exercises = s.get("exercises", []) or []
-            vol = sum((e.get("weight_kg") or 0) * (e.get("reps") or 0) for e in exercises)
-            sessions.append({
-                "date": d,
-                "exercises": exercises,
-                "sets": len(exercises),
-                "volume_kg": round(vol, 1),
-            })
-
-    # Filter out 0-set sessions unless user explicitly asked for today
-    # (today's empty session might still be in-progress; future days
-    # empty entries are noise when copying for AI ingestion).
-    if days != 0:
-        sessions = [s for s in sessions if s.get("sets", 0) > 0]
-
-    if fmt == "json":
-        return jsonify({"days": days, "cutoff": cutoff, "sessions": sessions,
-                        "total_sets": sum(s["sets"] for s in sessions),
-                        "total_volume_kg": round(sum(s["volume_kg"] for s in sessions), 1),
-                        "sheet_debug": sheet_debug})
-
-    # Build plain text / markdown — concise format tuned for chat AI ingestion
-    # (Jim OOB 2026-07-19: too many underlines, too boring). No separators,
-    # no markdown headers; just date bullets with set lists and a brief tail.
-    lines = []
-    if days == 0:
-        lines.append(f"💪 Workout Log — Today ({today})")
-    elif days < 0:
-        lines.append("💪 Workout Log — All-time")
-    else:
-        lines.append(f"💪 Workout Log — Last {days} days (since {cutoff})")
-    lines.append("")
-
-    if not sessions:
-        lines.append("No workouts in this window.")
-        return jsonify({"text": "\n".join(lines), "sessions": 0,
-                        "total_sets": 0, "total_volume_kg": 0})
-
-    # Muscle group keyword map (same as workout_recent / sheet parser)
-    muscle_kw = {
-        "chest": "CHEST", "bench": "CHEST", "fly": "CHEST", "push": "CHEST",
-        "row": "BACK", "pulldown": "BACK", "pull": "BACK", "lat": "BACK",
-        "squat": "LEG", "leg": "LEG", "rdl": "LEG", "lunge": "LEG", "calf": "LEG",
-        "press": "SHOULDER", "ohp": "SHOULDER", "shoulder": "SHOULDER",
-        "sit": "ABS", "crunch": "ABS", "plank": "ABS", "abs": "ABS", "ab ": "ABS",
-    }
-    muscle_counts = {}
-    total_sets = 0
-    total_vol = 0.0
-
-    for s in sessions:
-        lines.append(f"📅 {s['date']}  ·  {s['sets']} sets · {round(s['volume_kg'], 1)} kg volume")
-        for ex in s["exercises"]:
-            name = ex.get("exercise", "?")
-            w = ex.get("weight_kg", 0)
-            r = ex.get("reps", 0)
-            set_n = ex.get("set_n", "")
-            prefix = f"  Set {set_n} · " if set_n else "  "
-            # Compact one-line per set; show weight+reps
-            lines.append(f"{prefix}{name} — {w}kg × {r}")
-            # Tally muscle group
-            nl = name.lower()
-            for kw, grp in muscle_kw.items():
-                if kw in nl:
-                    muscle_counts[grp] = muscle_counts.get(grp, 0) + 1
-                    break
-        total_sets += s["sets"]
-        total_vol += s["volume_kg"]
-        lines.append("")
-
-    lines.append("─" * 0)  # no separator — empty line only
-    lines.append(f"📊 Totals: {total_sets} sets · {round(total_vol, 1)} kg volume")
-    if muscle_counts:
-        muscle_str = " · ".join(f"{grp} {cnt}" for grp, cnt in muscle_counts.items() if cnt)
-        if muscle_str:
-            lines.append(f"🎯 Muscle split: {muscle_str}")
-    lines.append("")
-    lines.append(f"Copied from gymbro · {today} HKT")
-
-    text = "\n".join(lines)
-    return jsonify({"text": text, "sessions": len(sessions),
-                    "total_sets": total_sets,
-                    "total_volume_kg": round(total_vol, 1)})
-
-
 @app.route("/api/delete_session", methods=["POST"])
 def api_delete_session():
     """Delete a session from BOTH local WORKOUT_LOG and Google Sheet.
@@ -798,7 +475,7 @@ def pwa_manifest():
         "icons": [
             {"src": "/static/gymbro_icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
             {"src": "/static/gymbro_icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
-            {"src": "/static/gymbro_apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any"},
+            {"src": "/static/gymbro_apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
         ],
     })
 
@@ -1281,11 +958,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#000000">
 <title>Gym · Jim</title>
-<link rel="icon" type="image/x-icon" href="/static/gymbro_favicon.ico">
-<link rel="icon" type="image/png" sizes="16x16" href="/static/gymbro_favicon-16.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/gymbro_favicon-32.png">
 <link rel="icon" type="image/png" sizes="192x192" href="/static/gymbro_icon-192.png">
-<link rel="icon" type="image/png" sizes="512x512" href="/static/gymbro_icon-512.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/gymbro_apple-touch-icon.png">
 <link rel="apple-touch-icon" sizes="152x152" href="/static/gymbro_apple-touch-icon.png">
 <link rel="apple-touch-icon" sizes="120x120" href="/static/gymbro_apple-touch-icon.png">
@@ -1501,12 +1175,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div x-show="recovery !== null" class="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold text-emerald-300 backdrop-blur">
           <span>💚</span><span x-text="`${recovery}%`"></span>
         </div>
-        <!-- Refresh motivation image (top-left, below recovery badge) — manual cooldown 5min -->
-        <button @click="refreshMotivation()" :disabled="refreshingMotivation"
-                :title="refreshMotivationCooldown > 0 ? `冷卻中 ${refreshMotivationCooldown}s` : '換新激勵圖'"
-                class="absolute left-2 top-9 z-20 flex h-6 w-6 items-center justify-center rounded-full border border-white/15 bg-black/55 text-[11px] text-white/80 backdrop-blur hover:bg-white/15 active:scale-90 transition disabled:opacity-50 disabled:cursor-not-allowed">
-          <span :class="refreshingMotivation ? 'animate-spin inline-block' : ''" x-text="refreshingMotivation ? '⏳' : '↻'"></span>
-        </button>
         <!-- Top-right: Withings weight (single number, minimal) -->
         <!-- Top-right: Withings weight kg + fat % (Jim's goal: drive fat down) -->
         <div class="absolute right-2 top-2 z-20 flex flex-col items-end gap-1">
@@ -1572,7 +1240,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('weight', -1)" @pointerup.prevent="endStep('weight', -1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">−5</span><span class="mt-0.5 text-[8px] text-gray-400">hold −10</span>
+            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
           </button>
           <div class="min-w-0 text-center">
             <span class="text-3xl font-black tracking-tighter" x-text="weight"></span><span class="ml-0.5 text-xs text-gray-400">kg</span>
@@ -1580,14 +1248,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('weight', 1)" @pointerup.prevent="endStep('weight', 1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">+5</span><span class="mt-0.5 text-[8px] text-gray-400">hold +10</span>
+            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
           </button>
         </div>
         <div class="glass grid grid-cols-[2.5rem_1fr_2.5rem] items-center rounded-2xl p-1.5">
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('reps', -1)" @pointerup.prevent="endStep('reps', -1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">−1</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
+            <span class="text-base leading-none">−3</span><span class="mt-0.5 text-[8px] text-gray-400">hold −5</span>
           </button>
           <div class="min-w-0 text-center">
             <span class="text-3xl font-black tracking-tighter" x-text="reps"></span><span class="ml-0.5 text-xs text-gray-400">×</span>
@@ -1595,7 +1263,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button class="tap flex h-10 w-10 flex-col items-center justify-center rounded-full bg-white/10 font-bold"
                   @pointerdown.prevent="startStep('reps', 1)" @pointerup.prevent="endStep('reps', 1)"
                   @pointerleave="cancelStep()" @pointercancel="cancelStep()">
-            <span class="text-base leading-none">+1</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
+            <span class="text-base leading-none">+3</span><span class="mt-0.5 text-[8px] text-gray-400">hold +5</span>
           </button>
         </div>
       </div>
@@ -1626,27 +1294,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- WORKOUT / PYRAMID TAB -->
     <section x-show="tab === 'workout'">
-      <div class="flex items-baseline justify-between my-3">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">Today's Pyramid</div>
-        <!-- Copy buttons: today / 7d / 30d / all (NEW 2026-07-19 OOB Jim) -->
-        <div class="flex items-center gap-1.5">
-          <button class="text-[10px] px-2 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 tap active:scale-95 transition-all"
-                  :class="copyDays === 0 ? 'border-emerald-400 text-emerald-400' : ''"
-                  @click="copyWorkout(0)" :disabled="copying" x-text="copying && copyDays === 0 ? '...' : 'Today'"></button>
-          <button class="text-[10px] px-2 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 tap active:scale-95 transition-all"
-                  :class="copyDays === 7 ? 'border-emerald-400 text-emerald-400' : ''"
-                  @click="copyWorkout(7)" :disabled="copying" x-text="copying && copyDays === 7 ? '...' : '7d'"></button>
-          <button class="text-[10px] px-2 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 tap active:scale-95 transition-all"
-                  :class="copyDays === 30 ? 'border-emerald-400 text-emerald-400' : ''"
-                  @click="copyWorkout(30)" :disabled="copying" x-text="copying && copyDays === 30 ? '...' : '30d'"></button>
-          <button class="text-xs px-2 py-1 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 tap active:scale-95 transition-all font-semibold"
-                  @click="copyWorkout(copyDays)" :disabled="copying || copyingNow"
-                  :title="'Copy to clipboard'">
-            <span x-show="!copyingNow">📋 Copy</span>
-            <span x-show="copyingNow">...</span>
-          </button>
-        </div>
-      </div>
+      <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 my-3">Today's Pyramid</div>
       <template x-for="(ex, idx) in sessionGrouped" :key="ex.name">
         <div class="mb-6 fade-up" :style="`animation-delay: ${idx * 60}ms`">
           <div class="text-xl font-bold mb-3 tracking-tight" x-text="ex.name"></div>
@@ -1668,7 +1316,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <section x-show="tab === 'history'">
       <div class="flex items-baseline justify-between my-3">
         <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">Recent Sessions</div>
-        <button class="text-xs text-gray-400 underline tap" @click="loadHistory()" x-show="!loadingHistory">↻ Refresh</button>
+        <button class="text-xs text-gray-400 underline tap" @click="refreshHistory(true)" x-show="!loadingHistory">↻ Refresh</button>
         <span class="text-xs text-gray-400" x-show="loadingHistory">Loading…</span>
       </div>
       <div x-show="loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">Loading history…</div>
@@ -1765,10 +1413,6 @@ function gymApp() {
     recovery: null,
     weightKg: null,
     fatPct: null,
-    // Manual motivation image refresh (NEW 2026-07-19 OOB Jim) — 5min server cooldown
-    refreshingMotivation: false,
-    refreshMotivationCooldown: 0,
-    refreshMotivationTimer: null,
     clockStr: '',
     elapsedSec: 0,
     elapsedStr: '0:00',
@@ -1776,10 +1420,6 @@ function gymApp() {
     today: '',
     history: [],
     loadingHistory: false,
-    // Copy-to-clipboard (NEW 2026-07-19 OOB Jim): workout export state
-    copyDays: 0,           // 0=today, 7, 30, -1=all
-    copying: false,         // true while one of the range buttons is fetching
-    copyingNow: false,      // true while the main 📋 Copy button writes to clipboard
     // Audio overlay state — fetched from /api/today_audio
     audioTrack: null,
     audioPlaylist: [],
@@ -1942,11 +1582,9 @@ function gymApp() {
         this.reps = 10;
         this.intensity = 'warm-up';
       } else {
-        // Jim OOB 2026-07-19: keep SAME weight as last set (no auto +5kg ramp).
-        // Use the exact same weight unless user manually edits it.
         const last = prev[prev.length - 1];
-        this.weight = last.weight_kg || 20;
-        this.reps = last.reps || 10;
+        this.weight = (last.weight_kg || 20) + 5;  // warm-up ramp
+        this.reps = 10;
         this.intensity = prev.length < 2 ? 'warm-up' : (prev.length < 4 ? 'working' : 'burn-out');
       }
       this.haptic();
@@ -1980,23 +1618,19 @@ function gymApp() {
     startStep(kind, direction) {
       this.cancelStep();
       this.pressHandled = false;
-      // Jim OOB 2026-07-19: weight hold = ±10 (800ms hold), weight tap = ±5.
-      // Reps hold = ±5, reps tap = ±1 (no auto-ramp for reps).
       this.pressTimer = setTimeout(() => {
-        if (kind === 'weight') this.bumpWeight(direction * 10);
+        if (kind === 'weight') this.bumpWeight(direction * 5);
         else this.bumpReps(direction * 5);
         this.pressHandled = true;
         this.pressTimer = null;
-        this.haptic([30, 50, 30]);  // distinct hold-feedback pattern
-      }, 800);
+      }, 500);
     },
 
     endStep(kind, direction) {
       if (this.pressTimer) clearTimeout(this.pressTimer);
       if (!this.pressHandled) {
-        // Tap = ±5 (weight), ±1 (reps) — Jim OOB 2026-07-19
-        if (kind === 'weight') this.bumpWeight(direction * 5);
-        else this.bumpReps(direction * 1);
+        if (kind === 'weight') this.bumpWeight(direction * 3);
+        else this.bumpReps(direction * 3);
       }
       this.pressTimer = null;
       this.pressHandled = false;
@@ -2090,69 +1724,6 @@ function gymApp() {
       }
       this.saving = false;
     },
-    // ── Copy workout to clipboard (NEW 2026-07-19 OOB Jim) ────────────────
-    // Click 📋 Copy → fetch /api/export_text?days={copyDays} → write to clipboard.
-    // Range buttons (Today/7d/30d) only update copyDays + flash; the main 📋
-    // button does the actual fetch + clipboard write. Format: plain text.
-    async copyWorkout(days) {
-      // Range button click → just update active window
-      if (days !== undefined && days !== this.copyDays) {
-        this.copyDays = days;
-        const labels = { 0: 'Today', 7: '7 days', 30: '30 days', '-1': 'All-time' };
-        this.flash(`Window: ${labels[days] || days + 'd'}`);
-        this.haptic();
-        return;
-      }
-      if (this.copying || this.copyingNow) return;
-      this.copyingNow = true;
-      this.copying = true;
-      this.haptic();
-      try {
-        const d = this.copyDays;  // 0=today, 7, 30, -1=all
-        const res = await fetch(`/api/export_text?days=${d}&fmt=txt`);
-        const data = await res.json();
-        if (!data.text) {
-          this.flash('No data to copy');
-          return;
-        }
-        // Prefer the modern Clipboard API; fall back to execCommand for older iOS
-        let ok = false;
-        try {
-          await navigator.clipboard.writeText(data.text);
-          ok = true;
-        } catch (e) {
-          // Fallback: hidden textarea + execCommand('copy')
-          try {
-            const ta = document.createElement('textarea');
-            ta.value = data.text;
-            ta.style.position = 'fixed';
-            ta.style.opacity = '0';
-            ta.style.pointerEvents = 'none';
-            document.body.appendChild(ta);
-            ta.select();
-            ok = document.execCommand('copy');
-            document.body.removeChild(ta);
-          } catch (e2) {
-            ok = false;
-          }
-        }
-        const windowLabel = d === 0 ? 'today' : (d === -1 ? 'all-time' : `${d}d`);
-        if (ok) {
-          const msg = data.sessions > 0
-            ? `📋 Copied ${data.sessions} session(s) · ${data.total_sets} sets · ${data.total_volume_kg}kg (${windowLabel})`
-            : `📋 Copied (${windowLabel}, no sets)`;
-          this.flash(msg);
-          this.haptic([20, 30, 50]);  // success triple-tap
-        } else {
-          this.flash('Copy failed — try again');
-        }
-      } catch (e) {
-        this.flash('Error: ' + e.message);
-      } finally {
-        this.copying = false;
-        this.copyingNow = false;
-      }
-    },
     // Audio overlay methods — play / pause / next, controlled via hidden <audio> element
     get currentAudioUrl() {
       if (!this.audioPlaylist || this.audioPlaylist.length === 0) return '';
@@ -2193,67 +1764,6 @@ function gymApp() {
         this.audioNext();
       }
     },
-    // Manual motivation image refresh — POST /api/refresh_motivation
-    // 5-min server-side cooldown to prevent API abuse.
-    // Polls /api/today_image every 3s while generating; updates banner on success.
-    async refreshMotivation() {
-      if (this.refreshingMotivation || this.refreshMotivationCooldown > 0) return;
-      this.refreshingMotivation = true;
-      this.flash('生成新激勵圖…');
-      try {
-        const r = await fetch('/api/refresh_motivation', { method: 'POST' });
-        const data = await r.json();
-        if (!data.ok) {
-          this.refreshingMotivation = false;
-          if (data.cooldown_remaining) {
-            this.refreshMotivationCooldown = data.cooldown_remaining;
-            this._startCooldownCountdown();
-            this.flash(`冷卻中 ${data.cooldown_remaining}s`);
-          } else {
-            this.flash(data.error || 'Refresh failed');
-          }
-          return;
-        }
-        // Poll for the new image every 3s (max ~90s).
-        let attempts = 0;
-        const maxAttempts = 30;
-        const poll = async () => {
-          attempts++;
-          try {
-            const imgRes = await fetch('/api/today_image?_t=' + Date.now());
-            const imgData = await imgRes.json();
-            // Server signals "fresh" by setting `fresh: true` on the response after gen.
-            // For simple behaviour: if URL changed OR date is today AND new ts param differs, accept.
-            if (imgData && imgData.image_url && imgData.image_url !== this.motivationImage) {
-              this.motivationImage = imgData.image_url + '?v=' + Date.now();
-              this.flash('新激勵圖 ✓');
-              this.refreshingMotivation = false;
-              return;
-            }
-          } catch(e) { /* keep polling */ }
-          if (attempts < maxAttempts) {
-            setTimeout(poll, 3000);
-          } else {
-            this.refreshingMotivation = false;
-            this.flash('Timeout — 用返今日現有圖');
-          }
-        };
-        setTimeout(poll, 3000);
-      } catch(e) {
-        this.refreshingMotivation = false;
-        this.flash('Refresh failed: ' + (e.message || '網絡錯誤'));
-      }
-    },
-    _startCooldownCountdown() {
-      if (this.refreshMotivationTimer) clearInterval(this.refreshMotivationTimer);
-      this.refreshMotivationTimer = setInterval(() => {
-        this.refreshMotivationCooldown--;
-        if (this.refreshMotivationCooldown <= 0) {
-          clearInterval(this.refreshMotivationTimer);
-          this.refreshMotivationTimer = null;
-        }
-      }, 1000);
-    },
 
     async loadHistory(force = false) {
       // Skip if a load is already in flight (prevents double-fetch on rapid tab switches).
@@ -2267,6 +1777,29 @@ function gymApp() {
         if (data.today) this.today = data.today;
       } catch(e) {
         this.flash('History load failed');
+      }
+      this.loadingHistory = false;
+    },
+    // Jim OOB 2026-07-19: Refresh button should ACTUALLY pull freshest data,
+    // not just re-read the stale local cache. Pre-sync from Sheet first so
+    // any rows that exist on Sheet (from another device, end_session auto-push,
+    // or cheat cron) show up immediately.
+    async refreshHistory(force = true) {
+      if (this.loadingHistory && !force) return;
+      this.loadingHistory = true;
+      this.haptic([20]);
+      try {
+        // 1. Best-effort pull latest from Sheet → local so /api/history gets freshest data.
+        try { await fetch('/api/sync_sheet', { method: 'POST' }); } catch (e) { /* sheet sync is best-effort */ }
+        // 2. Fetch history and update UI.
+        const res = await fetch('/api/history');
+        const data = await res.json();
+        this.history = data.history || [];
+        if (typeof data.streak === 'number') this.streak = data.streak;
+        if (data.today) this.today = data.today;
+        this.flash(`已重新整理 · ${this.history.length} 個 session`);
+      } catch(e) {
+        this.flash('Refresh failed: ' + (e.message || 'network'));
       }
       this.loadingHistory = false;
     },
@@ -2352,53 +1885,7 @@ document.addEventListener('touchend', e => {
 }, {passive:false});
 
 if ('serviceWorker' in navigator) {
-  // Jim OOB 2026-07-19: aggressive SW update — every page load check for
-  // new SW + force-takeover. Standard register() + update() pattern.
-  navigator.serviceWorker.register('/sw.js').then(reg => {
-    // Check for updates immediately
-    reg.update();
-    // Re-check every 60s in case PWA is left open
-    setInterval(() => reg.update().catch(() => {}), 60000);
-    // When new SW takes over, hard-reload so old in-memory JS doesn't linger
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (window.__reloadingForSW) return;
-      window.__reloadingForSW = true;
-      window.location.reload();
-    });
-  }).catch(() => {});
-
-  // Nuclear fallback: version-stamp check. Runs in MAIN THREAD, not under
-  // SW control. If server-side /api/version returns a newer stamp than
-  // localStorage, blow away caches + unregister SW + force reload.
-  // This handles iOS Safari PWA cases where controllerchange never fires.
-  (async () => {
-    try {
-      const r = await fetch('/api/version', {cache: 'no-store'});
-      const data = await r.json();
-      const serverVer = data.version;
-      const localVer = localStorage.getItem('app_version');
-      if (localVer && localVer !== serverVer) {
-        console.log('[gymweb] version mismatch — forcing hard reload', {localVer, serverVer});
-        if (window.__reloadingForVer) return;
-        window.__reloadingForVer = true;
-        try {
-          // Nuke all caches
-          const keys = await caches.keys();
-          await Promise.all(keys.map(k => caches.delete(k)));
-          // Unregister all SWs
-          const regs = await navigator.serviceWorker.getRegistrations();
-          await Promise.all(regs.map(reg => reg.unregister()));
-        } catch (e) {}
-        localStorage.setItem('app_version', serverVer);
-        // Cache-bust the URL itself so even network cache can't return stale
-        window.location.href = '/?_=' + Date.now();
-        return;
-      }
-      localStorage.setItem('app_version', serverVer);
-    } catch (e) {
-      // Network error — silently keep current version
-    }
-  })();
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 </script>
 
@@ -2410,24 +1897,8 @@ if ('serviceWorker' in navigator) {
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
 const CACHE = 'gym-web-v4';
-self.addEventListener('install', e => {
-  self.skipWaiting();
-  // Force-delete old caches (v1/v2/v3) on install
-  e.waitUntil(
-    caches.keys().then(keys => Promise.all(
-      keys.filter(k => k !== CACHE).map(k => caches.delete(k))
-    ))
-  );
-});
-self.addEventListener('activate', e => e.waitUntil(
-  Promise.all([
-    self.clients.claim(),
-    // Also clean up on activate in case any old caches snuck through
-    caches.keys().then(keys => Promise.all(
-      keys.filter(k => k !== CACHE).map(k => caches.delete(k))
-    ))
-  ])
-));
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
   e.respondWith(
     caches.open(CACHE).then(cache =>
