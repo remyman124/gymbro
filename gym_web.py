@@ -215,12 +215,101 @@ def api_end_session():
 
 @app.route("/api/today_image")
 def api_today_image():
-    """Return today's daily motivation image (or None if not yet generated)."""
+    """Return today's daily motivation image (or None if not yet generated).
+
+    Now returns the FIRST entry of the full image list, so the client can
+    cycle through other available motivation images via /api/today_images.
+    Jim OOB 2026-07-19: "The button changing motivation image should also
+    refresh other data on the homepage."
+    """
     today = today_iso()
     img_path = Path("/home/work/.hermes/image_cache") / f"gymbro_{today}.png"
     if img_path.exists() and img_path.stat().st_size > 50000:
-        return jsonify({"image_url": f"/img/gymbro_{today}.png", "date": today})
-    return jsonify({"image_url": None, "date": today})
+        return jsonify({
+            "image_url": f"/img/gymbro_{today}.png",
+            "date": today,
+            "total_available": _count_today_images(),
+        })
+    return jsonify({"image_url": None, "date": today, "total_available": _count_today_images()})
+
+
+def _count_today_images():
+    """Helper: how many motivation images exist for today across both naming conventions."""
+    today = today_iso()
+    cache = Path("/home/work/.hermes/image_cache")
+    if not cache.exists():
+        return 0
+    n = 0
+    # gymbro_{YYYY-MM-DD}.png (with dashes)
+    if (cache / f"gymbro_{today}.png").exists():
+        n += 1
+    # cheer_{YYYYMMDD}_*.png (no dashes, suffix present)
+    yyyymmdd = today.replace("-", "")
+    n += sum(1 for f in cache.glob(f"cheer_{yyyymmdd}_*.png") if f.suffix in ('.png', '.jpg'))
+    return n
+
+
+@app.route("/api/today_images")
+def api_today_images():
+    """Return the ordered list of today's motivation images for cycling.
+
+    Order (newest-cheer-first by mtime, then gymbro daily as anchor):
+      - cheer_{YYYYMMDD}_*.png (no dashes, sorted newest-mtime first)
+      - gymbro_{YYYY-MM-DD}.png (with dashes) — daily anchor, last in list
+
+    Response shape:
+      {"date": "YYYY-MM-DD",
+       "images": [
+         {"url": "/img/cheer_20260719_HKT_afternoon_D2.png",
+          "kind": "cheer",
+          "context": "afternoon_D2",
+          "size_kb": 227,
+          "mtime": "2026-07-19T14:53:14"},
+         ...
+         {"url": "/img/gymbro_2026-07-19.png",
+          "kind": "gymbro",
+          "size_kb": 178,
+          "mtime": "2026-07-19T14:46:36"}
+       ]}
+    """
+    from datetime import datetime as _dt
+    today = today_iso()
+    yyyymmdd = today.replace("-", "")
+    cache = Path("/home/work/.hermes/image_cache")
+    images = []
+    if not cache.exists():
+        return jsonify({"date": today, "images": images})
+
+    # Cheer images for today (no dashes), newest-mtime first
+    cheer_files = sorted(
+        [f for f in cache.glob(f"cheer_{yyyymmdd}_*.png") if f.suffix in ('.png', '.jpg')],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    for f in cheer_files:
+        # Extract context suffix: "cheer_20260719_HKT_afternoon_D2.png" -> "afternoon_D2"
+        suffix = f.stem.replace(f"cheer_{yyyymmdd}_", "", 1)
+        ctx = suffix.split("_", 1)[1] if "_" in suffix else suffix
+        images.append({
+            "url": f"/img/{f.name}",
+            "kind": "cheer",
+            "context": ctx,
+            "size_kb": round(f.stat().st_size / 1024, 1),
+            "mtime": _dt.fromtimestamp(f.stat().st_mtime).isoformat(timespec='seconds'),
+        })
+
+    # Gymbro daily anchor last
+    g = cache / f"gymbro_{today}.png"
+    if g.exists() and g.stat().st_size > 50000:
+        images.append({
+            "url": f"/img/{g.name}",
+            "kind": "gymbro",
+            "context": "daily",
+            "size_kb": round(g.stat().st_size / 1024, 1),
+            "mtime": _dt.fromtimestamp(g.stat().st_mtime).isoformat(timespec='seconds'),
+        })
+
+    return jsonify({"date": today, "images": images, "total": len(images)})
 
 
 @app.route("/api/streak")
@@ -1196,6 +1285,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="text-sm">⏭</span>
           </button>
         </div>
+        <!-- Jim OOB 2026-07-19: Cycle motivation image button — sits at bottom-right
+             bottom-left of the bottom row, so it doesn't collide with the audio
+             play pill (which lives at bottom-right). Tapping also refreshes all
+             home data (overlay + streak + history). -->
+        <button x-show="motivationImageList.length > 1"
+                @click="cycleMotivationImage()"
+                class="absolute bottom-2 left-2 z-20 flex h-8 items-center justify-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-1 text-[10px] font-medium text-gray-200 hover:bg-white/15 active:scale-95 transition backdrop-blur"
+                title="換下一張 + 刷新主頁資料">
+          <span>↻</span><span x-text="`${motivationImageIndex + 1}/${motivationImageList.length}`"></span>
+        </button>
         <!-- Hidden audio element (HTML5 audio, no UI chrome, controlled via Alpine) -->
         <audio x-ref="audioEl" :src="currentAudioUrl" @ended="audioEnded()" @timeupdate="audioProgress = $event.target.currentTime" @loadedmetadata="audioDuration = $event.target.duration" style="display:none"></audio>
       </div>
@@ -1409,6 +1508,8 @@ function gymApp() {
     endRPE: 7,
     endSummary: null,
     motivationImage: '',
+    motivationImageList: [],     // ordered list from /api/today_images
+    motivationImageIndex: 0,      // current index within the list
     streak: 0,
     recovery: null,
     weightKg: null,
@@ -1448,12 +1549,16 @@ function gymApp() {
       const data = await res.json();
       this.session = data.session;
       this.sessionDateStr = data.today;
-      // Pull today's motivation image (non-blocking)
+      // Pull today's motivation image (non-blocking). Loads the full list so
+      // the cycle button can move between cheer / gymbro variants.
       try {
-        const imgRes = await fetch('/api/today_image');
+        const imgRes = await fetch('/api/today_images');
         const imgData = await imgRes.json();
-        if (imgData && imgData.image_url) {
-          this.motivationImage = imgData.image_url;
+        const list = (imgData && imgData.images) || [];
+        this.motivationImageList = list;
+        if (list.length > 0) {
+          this.motivationImageIndex = 0;
+          this.motivationImage = list[0].url;
         }
       } catch(e) { /* keep empty, gradient fallback shows */ }
       // Pull streak (non-blocking)
@@ -1765,6 +1870,36 @@ function gymApp() {
       }
     },
 
+    // Jim OOB 2026-07-19: Tap the ↻ button on the hero image to cycle to the
+    // next motivation image (cheer / gymbro variants) AND refresh all home
+    // page data — overlay (recovery / weight / fat), streak, history.
+    async cycleMotivationImage() {
+      if (!this.motivationImageList || this.motivationImageList.length <= 1) return;
+      this.haptic([20]);
+      // Cycle the image
+      this.motivationImageIndex = (this.motivationImageIndex + 1) % this.motivationImageList.length;
+      const next = this.motivationImageList[this.motivationImageIndex];
+      this.motivationImage = next.url;
+      // While image is loading, refresh home data in parallel.
+      // 1. health overlay
+      try {
+        const r = await fetch('/api/health_overlay');
+        const d = await r.json();
+        this.recovery = d.recovery;
+        this.weightKg = d.weight_kg;
+        this.fatPct = d.fat_pct;
+      } catch(e) { /* keep stale */ }
+      // 2. streak
+      try {
+        const r = await fetch('/api/streak');
+        const d = await r.json();
+        if (typeof d.streak === 'number') this.streak = d.streak;
+      } catch(e) { /* keep stale */ }
+      // 3. history (forces sheet pre-sync so other-device rows surface)
+      await this.refreshHistory(true);
+      this.flash(`已換圖 · 同步 ${this.motivationImageList.length} 張 · ${this.history.length} 個 session`);
+    },
+
     async loadHistory(force = false) {
       // Skip if a load is already in flight (prevents double-fetch on rapid tab switches).
       if (this.loadingHistory && !force) return;
@@ -1896,7 +2031,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v4';
+const CACHE = 'gym-web-v5';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
