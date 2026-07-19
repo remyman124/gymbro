@@ -699,30 +699,61 @@ def _sheet_read_all():
 
 
 def _session_to_sheet_rows(date, session):
-    """Convert a single date's session to sheet-ready row arrays (one per set)."""
+    """Convert a single date's session to sheet-ready row arrays (one per set).
+
+    Handles BOTH session shapes:
+      - Legacy / telegram-text-mode: exercises[i].sets[j] = {n, reps, weight_kg/weight, time}
+      - gym-web-tap (NEW 2026-07-19): exercises[i] = {exercise, set, reps, weight_kg, time} (each entry IS a set)
+
+    Jim OOB 2026-07-19: gym-web 13 sets of BB Bench Press logged but sync_sheet
+    reported rows_added=0 because legacy _session_to_sheet_rows iterated
+    ex["sets"] which is empty for flat-shape gym-web-tap entries.
+    """
     rows = []
     exercises = session.get("exercises", []) if isinstance(session, dict) else []
     for ex in exercises:
-        ex_name = ex.get("name", "")
+        ex_name = ex.get("name") or ex.get("exercise", "")
         muscle = ex.get("muscle_group", "")
         notes = f"{muscle}" if muscle else ""
-        for s in ex.get("sets", []):
-            reps = s.get("reps", 0)
-            weight = s.get("weight_kg") or s.get("weight") or 0
+        sub_sets = ex.get("sets") if isinstance(ex.get("sets"), list) else None
+        if sub_sets:
+            # Legacy / telegram-text-mode shape
+            for s in sub_sets:
+                reps = s.get("reps", 0)
+                weight = s.get("weight_kg") or s.get("weight") or 0
+                volume = reps * weight if (reps and weight) else 0
+                rows.append([
+                    date,
+                    s.get("time", ""),
+                    ex_name,
+                    s.get("n", ""),
+                    reps,
+                    weight,
+                    "",
+                    "",
+                    volume,
+                    notes,
+                    "",
+                    "",
+                ])
+        else:
+            # gym-web-tap flat shape: each exercise entry IS a set
+            reps = ex.get("reps", 0)
+            weight = ex.get("weight_kg") or ex.get("weight") or 0
             volume = reps * weight if (reps and weight) else 0
             rows.append([
-                date,                              # 日期
-                s.get("time", ""),                  # 時間
-                ex_name,                            # 運動名稱
-                s.get("n", ""),                     # Sets
-                reps,                               # Reps
-                weight,                             # 重量
-                "",                                 # 每邊
-                "",                                 # Bar
-                volume,                             # Volume
-                notes,                              # 備註
-                "",                                 # Whoop Strain
-                "",                                 # Image
+                date,
+                ex.get("time", ""),
+                ex_name,
+                ex.get("set", ""),
+                reps,
+                weight,
+                "",
+                "",
+                volume,
+                notes,
+                "",
+                "",
             ])
     return rows
 
@@ -996,8 +1027,25 @@ def api_sync_sheet():
             continue
         rows_to_push = []
         for ex in session.get("exercises", []):
-            for s in ex.get("sets", []):
-                if not _has_sheet_row(date, ex.get("name", ""), s.get("n")):
+            # Handle BOTH session shapes (Jim OOB 2026-07-19):
+            #   - legacy / telegram-text-mode: ex.sets[] = [{n, reps, weight_kg/weight, time}, ...]
+            #   - gym-web-tap flat shape: ex IS a set itself = {exercise, set, reps, weight_kg, time}
+            sub_sets = ex.get("sets") if isinstance(ex.get("sets"), list) else None
+            if sub_sets:
+                for s in sub_sets:
+                    set_n = s.get("n")
+                    if set_n is None:
+                        continue
+                    if not _has_sheet_row(date, ex.get("name", ""), set_n):
+                        rows_to_push.extend(_session_to_sheet_rows(date, {"exercises": [ex]}))
+                    else:
+                        skipped += 1
+            else:
+                # gym-web-tap: each ex entry IS a single set
+                set_n = ex.get("set")
+                if set_n is None:
+                    continue
+                if not _has_sheet_row(date, ex.get("exercise", ""), set_n):
                     rows_to_push.extend(_session_to_sheet_rows(date, {"exercises": [ex]}))
                 else:
                     skipped += 1
@@ -2031,7 +2079,7 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v5';
+const CACHE = 'gym-web-v6';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
