@@ -367,12 +367,29 @@ def _safe_read_json(path, default=None):
 
 
 def _recovery_pct():
-    """Latest Whoop recovery score (single number 0-100, or None)."""
+    """Latest Whoop recovery score (single number 0-100, or None).
+    Reads from Whoop V2 cache shape: {"recovery": {"records": [{score, score_state, ...}, ...]}}.
+    Falls back to flat shape `{"recovery": [r1, ...]}` for backwards compat.
+    """
     d = _safe_read_json(WHOOP_CACHE)
-    recs = d.get("recovery", []) if isinstance(d, dict) else []
+    if not isinstance(d, dict):
+        return None
+    recs_root = d.get("recovery")
+    # Shape A: nested {records: [...]}
+    if isinstance(recs_root, dict):
+        recs = recs_root.get("records", []) or []
+    # Shape B: flat list
+    elif isinstance(recs_root, list):
+        recs = recs_root
+    else:
+        return None
     for r in recs:
-        score = (r.get("score") or {})
-        val = score.get("recovery_score")
+        if not isinstance(r, dict):
+            continue
+        score_raw = r.get("score")
+        if not isinstance(score_raw, dict):
+            continue
+        val = score_raw.get("recovery_score")
         if val is not None and r.get("score_state") == "SCORED":
             return int(round(float(val)))
     return None
@@ -633,40 +650,41 @@ def serve_audio(filename):
 def api_today_audio():
     """Return audio track info for the hero overlay.
 
-    Priority:
-      1. cheer_{today}.mp3   (today's voice summary if generated)
-      2. cheer_{today}.ogg
-      3. Latest cheer_* file in audio_cache (fallback for first-day experience)
-      4. None (UI hides play button)
+    Priority (Jim OOB 2026-07-20 「always in mp3」):
+      1. cheer_{today}.mp3   (today's MP3 voice summary — canonical ONLY format)
+      2. Latest cheer_*.mp3   (any MP3 date — fallback for first-day / no today yet)
+      3. None (UI hides play button)
+
+    Hard rule: ONLY MP3. Never OGG/opus/M4A. /api/audio_cache/ is MP3-only
+    (Rule 22 MEMORY.md). Legacy .ogg audio has been converted to .mp3 + .ogg originals deleted.
     """
     today = today_iso()
     audio_dir = Path("/home/work/.hermes/audio_cache")
     if not audio_dir.exists():
         return jsonify({"available": False})
-    # 1. Today-specific mp3/ogg.
-    for ext in ("mp3", "ogg"):
-        candidate = audio_dir / f"cheer_{today}.{ext}"
-        if candidate.exists():
-            return jsonify({
-                "available": True,
-                "url": f"/audio/{candidate.name}",
-                "kind": "voice_summary",
-                "title": "今日教練總結",
-                "date": today,
-                "size_kb": round(candidate.stat().st_size / 1024, 1),
-            })
-    # 2. Latest cheer_* file (any date) for fallback.
-    cheer_files = sorted(
-        list(audio_dir.glob("cheer_*.mp3")) + list(audio_dir.glob("cheer_*.ogg")),
+    # 1. Today-specific MP3.
+    candidate = audio_dir / f"cheer_{today}.mp3"
+    if candidate.exists():
+        return jsonify({
+            "available": True,
+            "url": f"/audio/{candidate.name}",
+            "kind": "voice_summary",
+            "title": "今日教練總結",
+            "date": today,
+            "size_kb": round(candidate.stat().st_size / 1024, 1),
+        })
+    # 2. Latest MP3 cheer file (any date).
+    mp3_files = sorted(
+        list(audio_dir.glob("cheer_*.mp3")),
         key=lambda p: p.stat().st_mtime, reverse=True,
     )
-    if not cheer_files:
-        cheer_files = sorted(
+    if not mp3_files:
+        mp3_files = sorted(
             audio_dir.glob("*.mp3"),
             key=lambda p: p.stat().st_mtime, reverse=True,
         )
-    if cheer_files:
-        latest = cheer_files[0]
+    if mp3_files:
+        latest = mp3_files[0]
         return jsonify({
             "available": True,
             "url": f"/audio/{latest.name}",
@@ -1223,12 +1241,23 @@ def api_workout_combined():
 #        &fmt=txt|md|json  (txt default — chat-AI friendly)
 @app.route("/api/export_text")
 def api_export_text():
-    try:
-        days = int(request.args.get("days", 7))
-    except (ValueError, TypeError):
-        days = 7
+    """Export workout log. Two modes:
+      - ?date=YYYY-MM-DD → single day (Jim OOB 2026-07-21: per-row Copy)
+      - ?days=N → last N days (legacy compatibility)
+    """
     fmt = request.args.get("fmt", "txt")
-    cutoff_date = (datetime.now(HKT) - timedelta(days=days)).strftime("%Y-%m-%d") if days >= 0 else "0000-00-00"
+    target_date = request.args.get("date")
+    if target_date:
+        cutoff_date = target_date
+        days = 0
+        date_filter_label = target_date
+    else:
+        try:
+            days = int(request.args.get("days", 7))
+        except (ValueError, TypeError):
+            days = 7
+        cutoff_date = (datetime.now(HKT) - timedelta(days=days)).strftime("%Y-%m-%d") if days >= 0 else "0000-00-00"
+        date_filter_label = f"Last {days} day(s) (since {cutoff_date})"
 
     # Sheet pull (preferred, may fail) — falls back to local WORKOUT_LOG.
     sheet_debug = {"status": "ok", "error": None, "rows": 0}
@@ -1241,6 +1270,8 @@ def api_export_text():
                 continue
             date = r[0]
             if date < cutoff_date:
+                continue
+            if target_date and date != target_date:
                 continue
             ex_name = (r[2] if len(r) > 2 else "").strip()
             if not ex_name:
@@ -1330,7 +1361,7 @@ def api_export_text():
         text = "\n".join(parts)
     else:
         # txt default — chat-AI friendly (per `text-coach-summary-voice` Rule 15)
-        parts = [f"💪 Workout Log — Last {days} day(s) (since {cutoff_date})", ""]
+        parts = [f"💪 Workout Log — {date_filter_label}", ""]
         for s in sessions:
             parts.append(f"📅 {s['date']}  ·  {len(s['rows'])} sets · {round(s['volume_kg'],1)}kg volume")
             for r in s["rows"]:
@@ -1662,9 +1693,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span class="text-yellow-300">🔥</span>
           <span x-text="`${streak} day${streak === 1 ? '' : 's'}`"></span>
         </div>
-        <!-- Top-left: Whoop recovery % (single number, minimal) -->
-        <div x-show="recovery !== null" class="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold text-emerald-300 backdrop-blur">
-          <span>💚</span><span x-text="`${recovery}%`"></span>
+        <!-- Top-left: Whoop recovery % — Jim OOB 2026-07-20 make prominent (PROMINENT PILL) -->
+        <div x-show="recovery !== null" class="absolute left-2 top-2 z-20 flex items-center gap-1.5 rounded-full border-2 border-emerald-400/50 bg-black/65 px-3 py-1 text-base font-black text-emerald-300 shadow-lg shadow-emerald-500/20 backdrop-blur">
+          <span class="text-lg">💚</span><span x-text="`${recovery}%`" class="tabular-nums"></span>
         </div>
         <!-- Top-right: Withings weight (single number, minimal) -->
         <!-- Top-right: Withings weight kg + fat % (Jim's goal: drive fat down) -->
@@ -1788,8 +1819,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             ↶ Undo
           </button>
           <button class="tap glow-ready flex-1 rounded-full bg-emerald-400 py-3 text-base font-black tracking-wide text-black ring-2 ring-emerald-300/30"
-                  :class="{'saving': saving}" @click="logSet()"
-                  x-text="saving ? 'Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`">
+                  :class="{'saving': saving, 'opacity-50 cursor-not-allowed': cooldownUntil && Date.now() < cooldownUntil}"
+                  :disabled="saving || (cooldownUntil && Date.now() < cooldownUntil)"
+                  @click="logSet()"
+                  x-text="(cooldownUntil && Date.now() < cooldownUntil) ? `⏳ REST ${cooldownRemaining}s` : (saving ? 'Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`)">
           </button>
         </div>
       </div>
@@ -1823,36 +1856,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="text-xs text-gray-400" x-show="loadingHistory">Loading…</span>
       </div>
 
-      <!-- Jim OOB 2026-07-19: Copy-to-clipboard for past-log AI ingestion.
-           Range chips (Today / 7d / 30d) + 📋 Copy button. Output is chat-AI
-           friendly (emoji headers, no Markdown clutter) — safe to paste into
-           Whoop AI / personal trainer chat / Notes app. -->
-      <div class="my-3 flex items-center gap-2">
-        <div class="flex h-9 shrink-0 items-center gap-1 rounded-full border border-white/15 bg-white/[0.06] p-1 backdrop-blur">
-          <button class="rounded-full px-3 py-1 text-[11px] font-semibold transition tap"
-                  :class="copyRange === 0 ? 'bg-white text-black' : 'text-gray-300 hover:text-white'"
-                  @click="copyRange = 0">Today</button>
-          <button class="rounded-full px-3 py-1 text-[11px] font-semibold transition tap"
-                  :class="copyRange === 7 ? 'bg-white text-black' : 'text-gray-300 hover:text-white'"
-                  @click="copyRange = 7">7d</button>
-          <button class="rounded-full px-3 py-1 text-[11px] font-semibold transition tap"
-                  :class="copyRange === 30 ? 'bg-white text-black' : 'text-gray-300 hover:text-white'"
-                  @click="copyRange = 30">30d</button>
-        </div>
-        <button class="ml-auto flex h-9 items-center gap-1 rounded-full border border-white/15 bg-black/55 px-3 text-[11px] font-semibold text-gray-100 backdrop-blur hover:bg-white/15 active:scale-95 transition tap disabled:opacity-50"
-                :disabled="copyInFlight"
-                @click="copyWorkoutLog()"
-                title="複製 workout log 落 clipboard">
-          <span x-text="copyInFlight ? '⏳' : '📋'"></span>
-          <span x-text="copyInFlight ? 'Copying…' : 'Copy'"></span>
-        </button>
-      </div>
+      <!-- Jim OOB 2026-07-21: Removed date-range chips + global Copy.
+           New pattern: ONE copy button per row in history list.
+           Always copies that single day's data. No date-range. -->
 
       <div x-show="loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">Loading history…</div>
       <div x-show="!loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">No sessions yet — go log some 🔥</div>
       <template x-for="row in history" :key="row.date">
         <div class="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-4 mb-3 relative fade-up"
              :class="row.date === today ? 'ring-2 ring-yellow-400/50' : ''">
+          <button class="absolute top-2 right-11 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
+                  style="background: rgba(99,102,241,0.20); border: 1px solid rgba(99,102,241,0.40); color: #c7d2fe;"
+                  @click="copyDay(row.date)"
+                  :aria-label="`Copy ${row.date}`"
+                  title="複製呢一日 workout log">📋</button>
           <button class="absolute top-2 right-2 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
                   style="background: rgba(239,68,68,0.20); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5;"
                   @click="deleteSession(row.date)"
@@ -1955,6 +1972,10 @@ function gymApp() {
     // from today (0 = today only, 7 = last week, 30 = last month).
     copyRange: 7,
     copyInFlight: false,
+    // Jim OOB 2026-07-21: 30s resting cooldown after LOG SET (prevents accidental double-tap)
+    cooldownUntil: null,
+    cooldownRemaining: 0,
+    cooldownInterval: null,
     // Audio overlay state — fetched from /api/today_audio
     audioTrack: null,
     audioPlaylist: [],
@@ -2196,8 +2217,17 @@ function gymApp() {
       this.flash('Marked partial form');
     },
 
+    // Jim OOB 2026-07-21: 30s resting period after log. Prevents accidental
+    // double-tap from inflating set count. After tapping LOG SET, button
+    // stays disabled for 30 seconds with countdown indicator.
     async logSet() {
       if (!this.currentExercise) return;
+      if (this.saving) return;
+      if (this.cooldownUntil && Date.now() < this.cooldownUntil) {
+        const sec = Math.ceil((this.cooldownUntil - Date.now()) / 1000);
+        this.flash(`等 ${sec}s 後先可以再 log set`);
+        return;
+      }
       this.saving = true;
       this.haptic([60, 30, 60]);
       try {
@@ -2220,16 +2250,32 @@ function gymApp() {
           // Reload state
           const state = await (await fetch('/api/state')).json();
           this.session = state.session;
-          // Auto-advance: warm-up ramp +5 kg, then maintain
+          // Jim OOB 2026-07-21: keep current weight on logSet — NO auto-ramp.
+          // weight stays as-is unless Jim taps the stepper buttons (-/+).
           const sets = this.session.exercises.filter(e => e.exercise === this.currentExercise);
           const last = sets[sets.length - 1];
-          if (sets.length < 3) {
-            this.weight = +(this.weight + 2.5).toFixed(1);
-            this.intensity = sets.length < 2 ? 'warm-up' : 'working';
+          // intensity defaults to 'working' after set 1; first set keeps whatever was set
+          if (sets.length === 1) {
+            this.intensity = this.intensity || 'working';
           } else {
             this.intensity = 'working';
           }
           this.flash(`✓ Set ${last.set} · ${last.weight_kg}kg × ${last.reps} (${this.intensityLabel})`);
+          // Jim OOB 2026-07-21: 30s resting cooldown after log
+          this.cooldownUntil = Date.now() + 30000;
+          this.cooldownRemaining = 30;
+          if (this.cooldownInterval) clearInterval(this.cooldownInterval);
+          this.cooldownInterval = setInterval(() => {
+            const remaining = Math.max(0, Math.ceil((this.cooldownUntil - Date.now()) / 1000));
+            this.cooldownRemaining = remaining;
+            if (remaining <= 0) {
+              clearInterval(this.cooldownInterval);
+              this.cooldownInterval = null;
+              this.cooldownUntil = null;
+              this.cooldownRemaining = 0;
+              this.flash('Rest done · ready 下一組');
+            }
+          }, 1000);
         }
       } catch(e) {
         this.flash('Error: ' + e.message);
@@ -2383,14 +2429,19 @@ function gymApp() {
     // Source: /api/export_text endpoint (sheet-pulled, chat-AI friendly).
     // Uses navigator.clipboard.writeText() with execCommand('copy') fallback
     // for older iOS Safari. Also calls /api/sync_sheet first to ensure freshness.
-    async copyWorkoutLog() {
+    // Jim OOB 2026-07-21: per-row Copy (one day at a time, no date range).
+    // Each history row has its own 📋 button → calls /api/export_text?date=YEAR-MM-DD.
+    // Source: /api/export_text endpoint (sheet-pulled, chat-AI friendly).
+    // Uses navigator.clipboard.writeText() with execCommand('copy') fallback
+    // for older iOS Safari. Also calls /api/sync_sheet first to ensure freshness.
+    async copyDay(date) {
       if (this.copyInFlight) return;
       this.copyInFlight = true;
       this.haptic([20]);
       try {
         // Best-effort sheet sync first (so most recent sets are in the export)
         try { await fetch('/api/sync_sheet', { method: 'POST' }); } catch (e) { /* best-effort */ }
-        const res = await fetch(`/api/export_text?days=${this.copyRange}&fmt=txt`);
+        const res = await fetch(`/api/export_text?date=${encodeURIComponent(date)}&fmt=txt`);
         const data = await res.json();
         const text = (data && data.text) || '';
         if (!text.trim()) {
@@ -2422,11 +2473,11 @@ function gymApp() {
         }
         const sessions = (data && data.sessions) || 0;
         if (ok) {
-          this.flash(`已複製 · ${sessions} 個 session · 落 clipboard ✓`);
+          this.flash(`已複製 ${date} · ${sessions} 個 session · 落 clipboard ✓`);
         } else {
           this.flash('Copy failed — clipboard 唔俾用');
           // Show the text in a toast for manual selection
-          console.log('[gym_web] copy text for manual select:\n' + text);
+          console.log(`[gym_web] copy text for manual select:\\n${text}`);
         }
       } catch(e) {
         this.flash('Copy failed: ' + (e.message || 'network'));
@@ -2526,10 +2577,43 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-const CACHE = 'gym-web-v13';
+// Jim OOB 2026-07-21: bump to v18 + activate-time nuclear flush of OLD
+// caches (v17 and earlier). SW skipWaiting + clients.claim ensure iPhone PWA
+// picks up the new SW on next reload. controllerchange handler below forces
+// auto-reload so the user sees fresh HTML without manual pull-to-refresh.
+// v18 changes (Jim OOB 2026-07-21):
+//   - Per-row Copy button: each history row has its own 📋 button; no more
+//     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
+//     single-day export (legacy ?days=N still works).
+//   - 30s REST cooldown after LOG SET: prevents accidental double-tap from
+//     inflating set count. Button shows ⏳ REST ${cooldownRemaining}s and
+//     is disabled during cooldown. After 30s, button returns to ✓ LOG SET.
+const CACHE = 'gym-web-v18';
 self.addEventListener('install', e => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    Promise.all([
+      caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))),
+      self.clients.claim()
+    ])
+  );
+});
 self.addEventListener('fetch', e => {
+  // Network-first for HTML documents so we never serve stale pages.
+  // Cache-first only for static assets (js/css/images).
+  if (e.request.mode === 'navigate' || (e.request.method === 'GET' && e.request.headers.get('accept')?.includes('text/html'))) {
+    e.respondWith(
+      fetch(e.request).then(res => {
+        if (res.ok && e.request.method === 'GET') {
+          const clone = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, clone));
+        }
+        return res;
+      }).catch(() => caches.match(e.request))
+    );
+    return;
+  }
+  // Cache-first for other static assets.
   e.respondWith(
     caches.open(CACHE).then(cache =>
       cache.match(e.request).then(cached => cached || fetch(e.request).then(res => {
@@ -2538,6 +2622,10 @@ self.addEventListener('fetch', e => {
       }).catch(() => cached))
     )
   );
+});
+// Force reload when a new SW takes over (controllerchange = new SW activated).
+self.addEventListener('controllerchange', () => {
+  if (typeof window !== 'undefined') window.location.reload();
 });
 """.strip()
 
