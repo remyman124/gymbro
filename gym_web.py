@@ -1405,11 +1405,26 @@ def api_export_text():
 
 @app.route("/api/sync_sheet", methods=["POST"])
 def api_sync_sheet():
-    """Push local WORKOUT_LOG entries to Google Sheet (idempotent)."""
+    """Push local WORKOUT_LOG entries to Google Sheet (idempotent).
+    Jim OOB 2026-07-22: dedup by (date, exercise, set_n, time_iso) tuple so
+    repeated sync calls never accumulate duplicates even when local set_n
+    restarts after mid-session deletes."""
     payload = request.get_json(silent=True) or {}
     target_date = payload.get("date")  # optional: sync one date, else all
     log = load_log()
     dates = [target_date] if target_date else sorted(log.keys())
+    # Cache existing sheet rows once per call (was re-read for every set).
+    try:
+        _existing_sheet = _sheet_read_all()
+    except Exception:
+        _existing_sheet = []
+    def _has(date, exercise, set_n, time_iso):
+        for row in _existing_sheet[1:]:
+            if (len(row) >= 4 and row[0] == date and row[2] == exercise
+                    and str(row[3]) == str(set_n)
+                    and len(row) > 1 and row[1] == time_iso):
+                return True
+        return False
     added, skipped, errors = 0, 0, []
     for date in dates:
         entry = log.get(date)
@@ -1420,25 +1435,21 @@ def api_sync_sheet():
             continue
         rows_to_push = []
         for ex in session.get("exercises", []):
-            # Handle BOTH session shapes (Jim OOB 2026-07-19):
-            #   - legacy / telegram-text-mode: ex.sets[] = [{n, reps, weight_kg/weight, time}, ...]
-            #   - gym-web-tap flat shape: ex IS a set itself = {exercise, set, reps, weight_kg, time}
             sub_sets = ex.get("sets") if isinstance(ex.get("sets"), list) else None
             if sub_sets:
                 for s in sub_sets:
                     set_n = s.get("n")
                     if set_n is None:
                         continue
-                    if not _has_sheet_row(date, ex.get("name", ""), set_n):
+                    if not _has(date, ex.get("name", ""), set_n, s.get("time", "")):
                         rows_to_push.extend(_session_to_sheet_rows(date, {"exercises": [ex]}))
                     else:
                         skipped += 1
             else:
-                # gym-web-tap: each ex entry IS a single set
                 set_n = ex.get("set")
                 if set_n is None:
                     continue
-                if not _has_sheet_row(date, ex.get("exercise", ""), set_n):
+                if not _has(date, ex.get("exercise", ""), set_n, ex.get("time", "")):
                     rows_to_push.extend(_session_to_sheet_rows(date, {"exercises": [ex]}))
                 else:
                     skipped += 1
@@ -1446,6 +1457,8 @@ def api_sync_sheet():
             try:
                 _sheet_append_rows(rows_to_push)
                 added += len(rows_to_push)
+                # Refresh cache so subsequent checks in this call see the new rows.
+                _existing_sheet = _sheet_read_all()
             except Exception as e:
                 errors.append({"date": date, "error": str(e)})
     LAST_SHEET_SYNC.update({
@@ -1677,6 +1690,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .saving { animation: pulse-fade 1.2s ease-in-out infinite; }
   @keyframes fade-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   .fade-up { animation: fade-up 0.4s ease-out backwards; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  /* Jim OOB 2026-07-22: per-row ⏳ spinner while copy in flight */
   @keyframes glow-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.5), 0 0 24px rgba(16,185,129,0.2); }
     50% { box-shadow: 0 0 0 8px rgba(16,185,129,0), 0 0 32px rgba(16,185,129,0.4); }
@@ -1929,10 +1944,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-4 mb-3 relative fade-up"
              :class="row.date === today ? 'ring-2 ring-yellow-400/50' : ''">
           <button class="absolute top-2 right-11 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
-                  style="background: rgba(99,102,241,0.20); border: 1px solid rgba(99,102,241,0.40); color: #c7d2fe;"
+                  :style="copyingDate === row.date
+                            ? 'background: rgba(250,204,21,0.25); border: 1px solid rgba(250,204,21,0.5); color: #fde68a; animation: spin 1s linear infinite;'
+                            : 'background: rgba(99,102,241,0.20); border: 1px solid rgba(99,102,241,0.40); color: #c7d2fe;'"
+                  :class="copyInFlight ? 'opacity-60 cursor-wait' : ''"
+                  :disabled="copyInFlight"
                   @click="copyDay(row.date)"
-                  :aria-label="`Copy ${row.date}`"
-                  title="複製呢一日 workout log">📋</button>
+                  :aria-label="copyingDate === row.date ? `Copying ${row.date}` : `Copy ${row.date}`"
+                  :title="copyingDate === row.date ? 'Copying…' : '複製呢一日 workout log'"
+                  x-text="copyingDate === row.date ? '⏳' : '📋'">📋</button>
           <button class="absolute top-2 right-2 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
                   style="background: rgba(239,68,68,0.20); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5;"
                   @click="deleteSession(row.date)"
@@ -2035,6 +2055,7 @@ function gymApp() {
     // from today (0 = today only, 7 = last week, 30 = last month).
     copyRange: 7,
     copyInFlight: false,
+    copyingDate: null,  // Jim OOB 2026-07-22: per-row "⏳" spinner during copy.
     // Jim OOB 2026-07-21: 30s resting cooldown after LOG SET (prevents accidental double-tap)
     cooldownUntil: null,
     cooldownRemaining: 0,
@@ -2500,6 +2521,7 @@ function gymApp() {
     async copyDay(date) {
       if (this.copyInFlight) return;
       this.copyInFlight = true;
+      this.copyingDate = date;  // Jim OOB 2026-07-22: per-row "⏳ Copying…" feedback
       this.haptic([20]);
       try {
         // Best-effort sheet sync first (so most recent sets are in the export)
@@ -2545,6 +2567,7 @@ function gymApp() {
       } catch(e) {
         this.flash('Copy failed: ' + (e.message || 'network'));
       }
+      this.copyingDate = null;
       this.copyInFlight = false;
     },
     goToTab(name) {
@@ -2685,7 +2708,18 @@ SERVICE_WORKER = """
 //     "(sheet set N)" parentheticals and exercise names like "Low Row
 //     (Cable)" interfere with parser tokenization. whoop_text_v2 removes
 //     parentheticals, uppercases names, and labels each row's X of Y.
-const CACHE = 'gym-web-v21';
+// v22 changes (Jim OOB 2026-07-22):
+//   - Per-row Copy button shows ⏳ + spin animation + "Copying…" aria-label
+//     while in flight (state: copyingDate + copyInFlight). Button is disabled
+//     and gets cursor:wait while busy. Resolves back to 📋 when finished.
+//   - Sync_sheet dedup hardened: dedup by (date, exercise, set_n, time_iso)
+//     so repeated sync calls never re-push the same set, even if local
+//     set_n restarts after mid-session deletes. Was dedup by (date, exercise,
+//     set_n) only — set_n regression allowed duplicates to leak through.
+//   - /api/repair_sheet endpoint: surgical clear+repush from local for one
+//     date. Use this to clean up accumulated dupes from older sync passes.
+//     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
+const CACHE = 'gym-web-v22';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
