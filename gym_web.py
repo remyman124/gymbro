@@ -15,12 +15,15 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from flask import Flask, jsonify, request, render_template_string, send_from_directory
+from workout_formatter import render as _render_text
 
 # ---------- Constants ----------
 WORKOUT_LOG = Path("/home/work/.whoop_workout_log.json")
 HKT = timezone(timedelta(hours=8))
 PORT = 7000
 HOST = "0.0.0.0"
+
+app = Flask(__name__, static_folder="/home/work/.hermes/image_cache", static_url_path="/img")
 
 # Static token (Tailscale-only network = trusted)
 SESSION_COOKIE = "gym_web_session"
@@ -1237,8 +1240,13 @@ def api_workout_combined():
 # "match format to consumer"). NO Markdown clutter, NO `───` separators,
 # NO double-unit. Emoji headers, short bullets, compact one-line-per-set.
 #
-# Query: ?days=N|0|-1  (days back from today, 0=today, -1=all-time)
-#        &fmt=txt|md|json  (txt default — chat-AI friendly)
+# Query: ?date=YYYY-MM-DD  (single day — Jim OOB 2026-07-21: per-row Copy)
+#        ?days=N|0|-1       (days back from today; -1 = all-time. legacy)
+#        &fmt=whoop_text  (DEFAULT — pure ASCII, AI paste friendly)
+#           |whoop_emoji  (chat-friendly, emoji-rich)
+#           |md           (Obsidian / docs)
+#           |json         (raw structured)
+# Text rendering is delegated to workout_formatter.py (single source of truth).
 @app.route("/api/export_text")
 def api_export_text():
     """Export workout log. Two modes:
@@ -1359,49 +1367,28 @@ def api_export_text():
         parts.append("")
         parts.append(f"Copied from gymbro · {datetime.now(HKT).isoformat()}")
         text = "\n".join(parts)
+    elif fmt in ("whoop_text", "whoop_emoji"):
+        # Jim OOB 2026-07-22: extracted to workout_formatter.py module.
+        # whoop_text (DEFAULT for copyDay): pure ASCII, no emojis/Unicode,
+        # full English labels — Whoop AI parses without confusion.
+        # whoop_emoji: chat-friendly visual variant.
+        text = _render_text(
+            rows,
+            fmt=fmt,
+            date_filter_label=date_filter_label,
+            total_volume=total_volume,
+            muscle_split=muscle_split,
+        )
     else:
-        # txt default — chat-AI friendly (per `text-coach-summary-voice` Rule 15)
-        # Jim OOB 2026-07-22: Whoop paste reliability. Sheet imports each new
-        # exercise with Set 1 reset (legacy behavior), so sheet rows show:
-        #     Set 1 BB Bench 40kg×10, Set 2 BB Bench 40kg×10, ..., Set 3 BB Bench ...
-        # Multiple exercises interleaved make Whoop collapse set boundaries.
-        # Fix: render with ABSOLUTE numbering (Set 1..N across full session),
-        # blank line + exercise header between exercise groups, and explicit
-        # "End of session" marker. Whoop parses ABSOLUTE numbers reliably.
-        parts = [f"💪 Workout Log — {date_filter_label}", ""]
-        abs_set = 0
-        prev_ex = None
-        for s in sessions:
-            parts.append(f"📅 {s['date']}  ·  {len(s['rows'])} sets · {round(s['volume_kg'],1)}kg volume")
-            for r in s["rows"]:
-                weight = r.get("weight_kg", 0)
-                if weight and weight == int(weight):
-                    w = f"{int(weight)}kg"
-                elif weight:
-                    w = f"{weight}kg"
-                else:
-                    w = "BW"
-                reps = r.get("reps", 0)
-                ex_name = r.get("exercise", "")
-                # Exercise boundary: sheet resets Set counter per exercise.
-                # Insert blank line + exercise header so Whoop sees a clear group.
-                if ex_name and ex_name != prev_ex:
-                    if prev_ex is not None:
-                        parts.append("")  # blank line between exercises
-                    parts.append(f"  🏋 {ex_name}")
-                    prev_ex = ex_name
-                abs_set += 1
-                sheet_set_n = r.get("set_n") or "?"
-                parts.append(f"  Set {abs_set} (was {sheet_set_n}) · {w} × {reps}")
-            parts.append("")
-            prev_ex = None  # reset between sessions (different dates)
-        parts.append(f"📊 Totals: {len(rows)} sets · {total_volume}kg volume")
-        if muscle_split:
-            muscle_str = " · ".join(f"{k.upper()} {v}" for k, v in sorted(muscle_split.items(), key=lambda kv: -kv[1]))
-            parts.append(f"🎯 Muscle split: {muscle_str}")
-        parts.append("")
-        parts.append(f"End of session · Copied from gymbro · {datetime.now(HKT).isoformat()}")
-        text = "\n".join(parts)
+        # Legacy `fmt=txt` and any unknown → whoop_text (the new default).
+        # Backwards compatible: copyDay() now defaults to whoop_text.
+        text = _render_text(
+            rows,
+            fmt="whoop_text",
+            date_filter_label=date_filter_label,
+            total_volume=total_volume,
+            muscle_split=muscle_split,
+        )
 
     return jsonify({
         "text": text,
@@ -2460,7 +2447,7 @@ function gymApp() {
       try {
         // Best-effort sheet sync first (so most recent sets are in the export)
         try { await fetch('/api/sync_sheet', { method: 'POST' }); } catch (e) { /* best-effort */ }
-        const res = await fetch(`/api/export_text?date=${encodeURIComponent(date)}&fmt=txt`);
+        const res = await fetch(`/api/export_text?date=${encodeURIComponent(date)}&fmt=whoop_text`);
         const data = await res.json();
         const text = (data && data.text) || '';
         if (!text.trim()) {
@@ -2616,7 +2603,18 @@ SERVICE_WORKER = """
 //     for different exercises). See /api/export_text → else (txt) branch.
 //   - "(was N)" annotation preserves the sheet set number so Jim can still
 //     cross-reference back to /api/history.
-const CACHE = 'gym-web-v19';
+// v20 changes (Jim OOB 2026-07-22):
+//   - Refactor: extracted workout text rendering to workout_formatter.py
+//     module (single source of truth, two text modes: whoop_text default,
+//     whoop_emoji opt-in).
+//   - copyDay() default fmt=whoop_text: pure ASCII, no emojis, no ×,
+//     no Unicode bullets. Labels: "Date: / Exercise: / Set N:".
+//     Symptom fixed: Whoop AI paste collapsed multi-exercise sets because
+//     emoji headers and × multiplication sign looked like paragraph breaks
+//     to the parser. Old emoji format still works via ?fmt=whoop_emoji.
+//   - Sheet set number preserved as "(sheet set N)" annotation so Jim can
+//     still cross-reference back to /api/history.
+const CACHE = 'gym-web-v20';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
