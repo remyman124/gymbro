@@ -1242,10 +1242,11 @@ def api_workout_combined():
 #
 # Query: ?date=YYYY-MM-DD  (single day — Jim OOB 2026-07-21: per-row Copy)
 #        ?days=N|0|-1       (days back from today; -1 = all-time. legacy)
-#        &fmt=whoop_text  (DEFAULT — pure ASCII, AI paste friendly)
-#           |whoop_emoji  (chat-friendly, emoji-rich)
-#           |md           (Obsidian / docs)
-#           |json         (raw structured)
+#        &fmt=whoop_text_v2 (DEFAULT — all-caps "X OF Y" framing, AI-clean)
+#           |whoop_text    (alias of whoop_text_v2)
+#           |whoop_emoji   (chat-friendly, emoji-rich)
+#           |md            (Obsidian / docs)
+#           |json          (raw structured)
 # Text rendering is delegated to workout_formatter.py (single source of truth).
 @app.route("/api/export_text")
 def api_export_text():
@@ -1367,24 +1368,25 @@ def api_export_text():
         parts.append("")
         parts.append(f"Copied from gymbro · {datetime.now(HKT).isoformat()}")
         text = "\n".join(parts)
-    elif fmt in ("whoop_text", "whoop_emoji"):
+    elif fmt in ("whoop_text", "whoop_text_v2", "whoop_emoji"):
         # Jim OOB 2026-07-22: extracted to workout_formatter.py module.
-        # whoop_text (DEFAULT for copyDay): pure ASCII, no emojis/Unicode,
-        # full English labels — Whoop AI parses without confusion.
+        # whoop_text_v2 (DEFAULT for copyDay): all-caps keywords + "X OF Y"
+        # framing + dedup + empirical exercise-group detection. Designed
+        # for AI parser ingestion with NO ambiguity.
         # whoop_emoji: chat-friendly visual variant.
         text = _render_text(
             rows,
-            fmt=fmt,
+            fmt=fmt if fmt != "whoop_text" else "whoop_text_v2",
             date_filter_label=date_filter_label,
             total_volume=total_volume,
             muscle_split=muscle_split,
         )
     else:
-        # Legacy `fmt=txt` and any unknown → whoop_text (the new default).
-        # Backwards compatible: copyDay() now defaults to whoop_text.
+        # Legacy `fmt=txt` and any unknown → whoop_text_v2 (the new default).
+        # Backwards compatible: copyDay() now defaults to whoop_text_v2.
         text = _render_text(
             rows,
-            fmt="whoop_text",
+            fmt="whoop_text_v2",
             date_filter_label=date_filter_label,
             total_volume=total_volume,
             muscle_split=muscle_split,
@@ -1454,6 +1456,61 @@ def api_sync_sheet():
         "status": "ok" if not errors else "partial",
     })
     return jsonify(LAST_SHEET_SYNC)
+
+
+# Jim OOB 2026-07-22: surgical rebuild of sheet rows for a single date from local.
+# Root cause: previous sync_sheet had no (date, exercise, set_n) dedup across
+# multiple sync passes → accumulated duplicates → Whoop AI parsed 39 rows as
+# 15 collapsed sets. repair_sheet() deletes ALL rows of a date from sheet
+# then re-pushes from local WORKOUT_LOG idempotently.
+@app.route("/api/repair_sheet", methods=["POST"])
+def api_repair_sheet():
+    """Clear all sheet rows for one date, then push from local WORKOUT_LOG.
+    Payload: {"date": "YYYY-MM-DD"}. Returns counts of removed / added."""
+    payload = request.get_json(silent=True) or {}
+    target_date = payload.get("date")
+    if not target_date:
+        return jsonify({"ok": False, "error": "missing date"}), 400
+    removed_summary = []
+    try:
+        removed_summary = _sheet_delete_date(target_date)
+    except Exception as e:
+        return jsonify({"ok": False, "stage": "delete", "error": str(e)}), 500
+    # Re-push from local for that date
+    log = load_log()
+    added = 0
+    errors = []
+    entry = log.get(target_date)
+    if isinstance(entry, dict):
+        session = entry.get("session") if "session" in entry else entry
+        if isinstance(session, dict):
+            rows_to_push = []
+            for ex in session.get("exercises", []):
+                rows_to_push.extend(_session_to_sheet_rows(target_date, {"exercises": [ex]}))
+            # Dedupe within local-source rows by (set_n, exercise) first
+            seen = set()
+            deduped = []
+            for row in rows_to_push:
+                key = (row[0], row[2], row[3])
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(row)
+            rows_to_push = deduped
+            if rows_to_push:
+                try:
+                    _sheet_append_rows(rows_to_push)
+                    added = len(rows_to_push)
+                except Exception as e:
+                    errors.append(str(e))
+    return jsonify({
+        "ok": not errors,
+        "date": target_date,
+        "removed_count": len(removed_summary),
+        "removed_summary": removed_summary[:20],  # first 20 for visibility
+        "added": added,
+        "errors": errors,
+    })
 
 
 @app.route("/api/sync_health")
@@ -2614,7 +2671,21 @@ SERVICE_WORKER = """
 //     to the parser. Old emoji format still works via ?fmt=whoop_emoji.
 //   - Sheet set number preserved as "(sheet set N)" annotation so Jim can
 //     still cross-reference back to /api/history.
-const CACHE = 'gym-web-v20';
+// v21 changes (Jim OOB 2026-07-22):
+//   - Major refactor: copyDay() output now uses ALL-CAPS keywords + "X OF Y"
+//     framing ("EXERCISE 1 OF 4", "SET 1 OF 5 FOR THIS EXERCISE: 40 kg x 10
+//     reps"). Designed to be unambiguous to Whoop's AI parser.
+//   - Dedupe by (date, exercise, set_n) inside formatter; removes sheet
+//     duplicate accumulation from past sync passes.
+//   - Add /api/repair_sheet endpoint: clears ALL sheet rows for a date and
+//     re-pushes from local WORKOUT_LOG idempotently. Use this to clean up
+//     any historical dupes (e.g. POST {"date": "2026-07-20"}). One-time
+//     cleanup, idempotent.
+//   - Old whoop_text format (v20) was still ambiguous because it let sheet
+//     "(sheet set N)" parentheticals and exercise names like "Low Row
+//     (Cable)" interfere with parser tokenization. whoop_text_v2 removes
+//     parentheticals, uppercases names, and labels each row's X of Y.
+const CACHE = 'gym-web-v21';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
