@@ -1361,7 +1361,16 @@ def api_export_text():
         text = "\n".join(parts)
     else:
         # txt default — chat-AI friendly (per `text-coach-summary-voice` Rule 15)
+        # Jim OOB 2026-07-22: Whoop paste reliability. Sheet imports each new
+        # exercise with Set 1 reset (legacy behavior), so sheet rows show:
+        #     Set 1 BB Bench 40kg×10, Set 2 BB Bench 40kg×10, ..., Set 3 BB Bench ...
+        # Multiple exercises interleaved make Whoop collapse set boundaries.
+        # Fix: render with ABSOLUTE numbering (Set 1..N across full session),
+        # blank line + exercise header between exercise groups, and explicit
+        # "End of session" marker. Whoop parses ABSOLUTE numbers reliably.
         parts = [f"💪 Workout Log — {date_filter_label}", ""]
+        abs_set = 0
+        prev_ex = None
         for s in sessions:
             parts.append(f"📅 {s['date']}  ·  {len(s['rows'])} sets · {round(s['volume_kg'],1)}kg volume")
             for r in s["rows"]:
@@ -1373,15 +1382,25 @@ def api_export_text():
                 else:
                     w = "BW"
                 reps = r.get("reps", 0)
-                set_n = r.get("set_n") or "?"
-                parts.append(f"  Set {set_n} · {r.get('exercise','')} — {w} × {reps}")
+                ex_name = r.get("exercise", "")
+                # Exercise boundary: sheet resets Set counter per exercise.
+                # Insert blank line + exercise header so Whoop sees a clear group.
+                if ex_name and ex_name != prev_ex:
+                    if prev_ex is not None:
+                        parts.append("")  # blank line between exercises
+                    parts.append(f"  🏋 {ex_name}")
+                    prev_ex = ex_name
+                abs_set += 1
+                sheet_set_n = r.get("set_n") or "?"
+                parts.append(f"  Set {abs_set} (was {sheet_set_n}) · {w} × {reps}")
             parts.append("")
+            prev_ex = None  # reset between sessions (different dates)
         parts.append(f"📊 Totals: {len(rows)} sets · {total_volume}kg volume")
         if muscle_split:
             muscle_str = " · ".join(f"{k.upper()} {v}" for k, v in sorted(muscle_split.items(), key=lambda kv: -kv[1]))
             parts.append(f"🎯 Muscle split: {muscle_str}")
         parts.append("")
-        parts.append(f"Copied from gymbro · {datetime.now(HKT).isoformat()}")
+        parts.append(f"End of session · Copied from gymbro · {datetime.now(HKT).isoformat()}")
         text = "\n".join(parts)
 
     return jsonify({
@@ -2588,7 +2607,16 @@ SERVICE_WORKER = """
 //   - 30s REST cooldown after LOG SET: prevents accidental double-tap from
 //     inflating set count. Button shows ⏳ REST ${cooldownRemaining}s and
 //     is disabled during cooldown. After 30s, button returns to ✓ LOG SET.
-const CACHE = 'gym-web-v18';
+// v19 changes (Jim OOB 2026-07-22):
+//   - Whoop paste reliability fix: copyDay() output now uses ABSOLUTE set
+//     numbering (Set 1..N across the session, not "Set 1" reset per exercise),
+//     inserts 🏋 exercise header + blank line between exercise groups, and
+//     ends with "End of session" marker. Old format made Whoop collapse set
+//     boundaries when multiple exercises were interleaved (same Set 1 marker
+//     for different exercises). See /api/export_text → else (txt) branch.
+//   - "(was N)" annotation preserves the sheet set number so Jim can still
+//     cross-reference back to /api/history.
+const CACHE = 'gym-web-v19';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
