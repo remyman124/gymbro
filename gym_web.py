@@ -2679,8 +2679,10 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     """Call pplx sonar-pro to synthesize detailed 8-section cheer text per
     cheer-routine Rule 22.
 
-    Jim OOB 2026-07-23 17:35 HKT: voice script needs FULL detail. Now prompts
-    pplx for 600-900 字 with all sections expanded.
+    Jim OOB 2026-07-23 17:35 + 2026-07-24 14:10 HKT: voice ~150s target.
+    150s × 5.69 char/sec WanLung ≈ 855 字 sweet zone. Prompt now targets
+    750-850 字 across 8 sections = ~100 字/section avg, so voice lands
+    in 132s-150s range as Jim requested.
     """
     api_key = _pplx_api_key()
     if not api_key:
@@ -2734,14 +2736,16 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 §5 營養 + 水分建議：今日蛋白質目標、碳水比例、水份目標，根據訓練強度調整。教練具體建議食咩、食幾多
 §6 噉晚恢復計劃：包括瞓前 routine（伸展、鎂、甘胺酸）、房溫、瞓幾多個鐘、手機距離床鋪
 §7 明日預覽：根據今日復原 + 訓練 + 睡眠，建議明日做咩類型訓練、強度、注意事項
-§8 收尾打氣：用純中文 closing（不要 Bon voyage），唔好講英文
+|§8 收尾打氣：用純中文 closing（不要 Bon voyage），唔好講英文
 
 格式要求：
 - 全程用 paragraph prose，唔好用 list / bullet / table / **bold** headers
 - 大量使用粵語助詞：嘅/啦/咗/嗰/咁/吖/囉/嘢 — 目標密度 ≥8 個 per 100 字
 - 每個 section 之間用 `\\n\\n` 分隔（會喺 voice 階段轉成「。 」自然過渡）
-- 長度：600-900 字，**唔好壓縮、唔好遺留數字**
+- **長度目標：750-850 字，voice 預計 130-150 秒**（WanLung 5.69 字/秒）
+- 每個 section 平均 90-110 字：§1 打招呼 60-80、§2 復原 130-160（最重要）、§3 瞓覺 100-130、§4 訓練 80-110、§5 營養 80-110、§6 噉晚恢復 90-120、§7 明日預覽 60-90、§8 收尾 50-80
 - 唔好 fabricate 任何數字，全部用上面提供嘅真實數據
+- **重要**：唔好超 900 字，否則 voice 會超 160 秒；唔好少過 700 字，否則 detail 唔夠
 
 **嚴禁使用以下英文字**（會破壞 TTS 嘅廣東話韻律 — 必須用中文代替）：
 - 常用動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
@@ -2761,7 +2765,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2400,
+        "max_tokens": 1100,  # 750-850 字 ≈ 350-650 tokens output; 1100 上限防 over-run
         "temperature": 0.6,
     }
     try:
@@ -2805,11 +2809,33 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
     )
 
 
+def _cheer_duration_s(text_len: int) -> float:
+    """Empirical WanLung +0% rate ≈ 5.69 char/sec (measured 7/24).
+    For Jim-targeted 150s voice, text_len target ≈ 855 chars.
+    """
+    return round(text_len / 5.69, 1)
+
+
+def _probe_audio_duration(path: str) -> float:
+    """Use ffprobe to get exact MP3 duration in seconds."""
+    try:
+        r = _sp.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+        ], capture_output=True, text=True, timeout=10)
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+
 def _synthesize_cheer_voice(text: str) -> str:
     """Generate Edge-TTS WanLung voice MP3 from cheer text.
 
     Jim OOB 2026-07-23 17:35 HKT: voice was too short and lacked detail.
-    Strategy (v2.5.1):
+    Strategy (v2.5.2 — Jim OOB 7/24 14:10 HKT ~150s target):
+    - Prompt now asks pplx for 750-850 字 sweet zone (~100 字/section avg).
+      750-850 字 × 5.69 char/sec WanLung = 132-150s audio, hitting Jim's ~150s.
+    - max_tokens 2400 → 1100 (avoid over-run; pplx sonar-pro ~1.5-2 tokens/中文字).
     - NO truncation (was capping at 280 chars, killing §3-§5 detail). Now full
       text up to 2000 chars (edge-tts safety).
     - Convert section breaks (\\n) into comma-separated clause continuations so
@@ -2819,7 +2845,9 @@ def _synthesize_cheer_voice(text: str) -> str:
       pause instead of running-on.
     - 100% 中文 enforcement (Rule 26 + Rule 37): zh-replace + audit loop,
       2 retries before fallback to detailed ~280 字 fallback script.
-    - Timeout 45 → 90s for longer scripts.
+    - Timeout 45s → 240s; stderr logged to /tmp/cheer_errors.log.
+    - Post-flight ffprobe duration logged to /tmp/cheer_durations.log so
+      we can verify target window 130-160s on each cheer.
     - NO Telegram 55s cap (Rule 32) — gymbro PWA has no upper bound on voice
       duration; Jim wants full data/insights/recommendation in the bubble.
 
@@ -2908,7 +2936,21 @@ def _synthesize_cheer_voice(text: str) -> str:
             os.unlink(tmp_ogg)
         except Exception:
             pass
-        return str(out_mp3) if out_mp3.exists() else ""
+        if not out_mp3.exists():
+            return ""
+        # Post-flight duration check (Rule 39: 130-160s target window)
+        actual_dur = _probe_audio_duration(str(out_mp3))
+        text_estimated_dur = _cheer_duration_s(len(voice_text))
+        try:
+            with open("/tmp/cheer_durations.log", "a") as f:
+                f.write(
+                    f"{now_iso()} | text_chars={len(voice_text)} | "
+                    f"est_dur={text_estimated_dur}s | actual_dur={actual_dur:.1f}s | "
+                    f"target=130-160s | mp3={out_mp3.name}\n"
+                )
+        except Exception:
+            pass
+        return str(out_mp3)
     except Exception:
         return ""
 
@@ -5224,7 +5266,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v28';
+const CACHE = 'gym-web-v29';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
