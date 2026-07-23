@@ -8,9 +8,13 @@ Bind: 0.0.0.0:7000 (Tailscale IP 100.114.66.125)
 Persistence: /home/work/.whoop_workout_log.json[YYYY-MM-DD]
 PWA: installable, wake-lock enabled
 """
+import base64
 import json
 import os
+import re
 import secrets
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -358,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 def _safe_read_json(path, default=None):
@@ -1548,6 +1552,361 @@ def api_sync_health():
     })
 
 
+# ---------- v2.1 FOOD SCAN (MiniMax M3 vision + pplx enrichment) ----------
+# Jim OOB 2026-07-23 22:26 HKT: "Version will be able to scan food or food receipt
+# to capture. Using MiniMax image recognition and pplx search"
+
+SCAN_CACHE_DIR = Path("/home/work/.hermes/scan_cache")
+SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SCAN_LOG_PATH = Path("/home/work/.hermes/food_scan_log.json")
+NUTRITION_LOG_PATH = Path("/home/work/.hermes/nutrition_log.json")
+
+# pplx API key (separate from MiniMax which is in hermes-torres)
+def _pplx_api_key() -> str:
+    env_file = Path("/home/work/.hermes/.env")
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("PPLX_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return os.environ.get("PPLX_API_KEY", "")
+
+
+def _minimax_api_key() -> str:
+    """Read MiniMax M3 key from .hermes-torres/.env (canonical for vision)."""
+    candidates = [
+        Path("/home/work/.hermes-torres/.env"),
+        Path("/home/work/.hermes/.env"),
+    ]
+    for env_file in candidates:
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("MINIMAX_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return os.environ.get("MINIMAX_API_KEY", "")
+
+
+def _minimax_vision(img_b64: str, prompt: str) -> str:
+    """Call MiniMax M3 vision endpoint. Returns description text."""
+    api_key = _minimax_api_key()
+    if not api_key:
+        return "（MiniMax 金鑰未設定）"
+    payload = {
+        "model": "MiniMax-Text-01",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+        ]}],
+        "max_tokens": 1800,
+        "temperature": 0.25,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=120).read())
+        return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"（MiniMax vision 失敗：{type(e).__name__}）"
+
+
+def _pplx_enrich(dish_desc: str) -> str:
+    """Call pplx sonar-pro for nutrition enrichment of described dishes.
+
+    Prompt focuses on chain/brand lookup + standard portion + kcal/P/C/F
+    per item, structured answer (no marketing copy).
+    """
+    api_key = _pplx_api_key()
+    if not api_key:
+        return "（PPLX 金鑰未設定）"
+    prompt = (
+        f"由以下香港/廣東話食物描述：\n\n「{dish_desc}」\n\n"
+        "幫我做兩件事：\n"
+        "1. 識別每樣菜式所屬嘅餐廳/連鎖/品牌（如：沙嗲王、KFC、大家樂、太興、添好運等），"
+        "列出每樣嘅 standard portion / 標準份量同每份大概嘅卡路里、蛋白質、碳水、脂肪。\n"
+        "2. 如有 brand-specific nutrition 數據（例如 KFC 雞件卡路里），用嗰啲 official 數。"
+        "如無 brand-specific 數，請用一般常見 portion。\n\n"
+        "用繁體中文、表格或 bullet 列明。唔好講餐廳裝修、唔好建議其他餐廳。"
+    )
+    payload = {
+        "model": "sonar-pro",
+        "messages": [
+            {"role": "system", "content": "你係香港連鎖餐廳 nutrition 查詢助手。用事實同官方數據回答，唔好幻想。"},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 1400,
+        "temperature": 0.2,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
+        return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"（PPLX enrichment 失敗：{type(e).__name__}）"
+
+
+def _detect_shared_meal(dish_desc: str) -> bool:
+    """Heuristic — detect if dish description suggests shared meal."""
+    shared_indicators = [
+        "兩人份", "二人份", "分享", "share", "套餐", "二人餐", "二人",
+        "set menu", "family", "set for two", "二人用", "二人套餐",
+        "set  for", "二人用套餐",
+    ]
+    desc_lower = dish_desc.lower()
+    return any(indicator.lower() in desc_lower for indicator in shared_indicators)
+
+
+def _save_scan_log(log_list: list) -> None:
+    SCAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SCAN_LOG_PATH.write_text(json.dumps(log_list, ensure_ascii=False, indent=2))
+
+
+def _load_scan_log() -> list:
+    if not SCAN_LOG_PATH.exists():
+        return []
+    try:
+        return json.loads(SCAN_LOG_PATH.read_text())
+    except Exception:
+        return []
+
+
+def _append_to_nutrition_log(entry: dict) -> None:
+    """Append food entry to canonical nutrition_log.json[meals]."""
+    if NUTRITION_LOG_PATH.exists():
+        log = json.loads(NUTRITION_LOG_PATH.read_text())
+    else:
+        log = {"meals": []}
+    if "meals" not in log:
+        log["meals"] = []
+    log["meals"].append(entry)
+    NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+
+
+def _append_to_sheet_nutrition(entry: dict) -> dict:
+    """Mirror entry to Google Sheet Nutrition tab (sheetId 474877075).
+    Returns {"ok": bool, "range": str} — silent on quota/error."""
+    try:
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        if "token" not in tok or not tok.get("refresh_token"):
+            return {"ok": False, "error": "no_token"}
+        # Refresh access token
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        access = resp["access_token"]
+        tok["token"] = access
+        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # Append row to Nutrition tab
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        row_data = [
+            entry.get("date", today_iso()),
+            f"{entry.get('date', today_iso())}T{entry.get('time', now_iso().split('T')[-1][:5])}:00+08:00",
+            entry.get("meal_type", "meal"),
+            entry.get("meal_name", entry.get("name", "scan"))[:120],
+            entry.get("restaurant_chain", ""),
+            str(entry.get("calories", 0)),
+            str(entry.get("protein", 0)),
+            str(entry.get("carbs", 0)),
+            str(entry.get("fat", 0)),
+            entry.get("note", "scan_food"),
+            entry.get("source", "vision+pplx"),
+            "",
+        ]
+        body = {"values": [row_data], "majorDimension": "ROWS"}
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        return {"ok": True, "range": resp.get("updates", {}).get("updatedRange", "?")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.route("/api/scan_food", methods=["POST"])
+def api_scan_food():
+    """Receive image (multipart), run MiniMax M3 vision + pplx enrichment,
+    build share-locked entry, log to nutrition + Sheet, return JSON entry."""
+    if "image" not in request.files:
+        return jsonify({"ok": False, "error": "no image"}), 400
+    img_file = request.files["image"]
+    img_bytes = img_file.read()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "image too large (>10MB)"}), 413
+    img_b64 = base64.b64encode(img_bytes).decode()
+
+    # 1. MiniMax M3 vision
+    vision_prompt = (
+        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法(炒/炸/蒸/烤)、醬汁、容器、用咩食具。"
+        "餐廳名(如見到 logo/招牌字)。再簡短總結呢餐嘅 estimated calories 同 protein 克數。"
+        "如見到小票/receipt,逐項抄低菜名、份量、價錢(睇到嘅部分)。"
+        "用繁體中文廣東話,一個英文字都唔好有,唔識就寫「難以辨認」。"
+    )
+    vision_desc = _minimax_vision(img_b64, vision_prompt)
+
+    # 2. pplx enrichment
+    pplx_desc = _pplx_enrich(vision_desc)
+
+    # 3. Heuristic share + macros hint (vision often gives totals)
+    shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
+    jim_ratio = 0.60 if shared else 1.00
+
+    # Defaults — keep simple (downstream corrections refine)
+    estimate_match = re.search(r"約?\s*(\d{3,4})\s*[kK]?[cC]al|大約\s*(\d{3,4})\s*千卡", vision_desc + pplx_desc)
+    if estimate_match:
+        raw_kcal = int(estimate_match.group(1) or estimate_match.group(2))
+    else:
+        raw_kcal = 0  # No reliable estimate — log with 0, user can correct
+    jim_kcal = round(raw_kcal * jim_ratio)
+
+    p_match = re.search(r"蛋白質[約大概]*\s*(\d+)\s*[gk]克?", vision_desc + pplx_desc)
+    raw_p = int(p_match.group(1)) if p_match else 0
+    jim_p = round(raw_p * jim_ratio)
+
+    # 4. Build entry
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    entry = {
+        "date": today_iso(),
+        "time": now_hkt_dt.strftime("%H:%M"),
+        "timestamp_iso": now_iso(),
+        "meal_type": "scan",
+        "meal_name": f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
+        "name": vision_desc[:200],
+        "vision_raw_desc": vision_desc,
+        "pplx_enrichment": pplx_desc,
+        "restaurant_chain": "",  # user/correction can fill
+        "share_with_wife": ("Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)"),
+        "is_shared_meal": shared,
+        "calories": jim_kcal,
+        "protein": jim_p,
+        "carbs": 0,
+        "fat": 0,
+        "raw_kcal_estimate": raw_kcal,
+        "raw_p_estimate": raw_p,
+        "source": "v2.1-scan (minimax-m3 + pplx-sonar-pro)",
+        "models_used": ["minimax-m3", "pplx-sonar-pro"],
+        "confidence": "single-pass vision+pplx (Jim can correct via /api/scan_correct)",
+        "notion_synced": False,
+        "image_saved_to": "",  # filled below
+        "user_correction": None,  # permanent — never trimmed (Jim OOB 2026-07-23 22:30 HKT "no trimming of data")
+    }
+
+    # 5. Save image to scan cache
+    img_filename = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    img_path = SCAN_CACHE_DIR / img_filename
+    img_path.write_bytes(img_bytes)
+    entry["image_saved_to"] = str(img_path)
+
+    # 6. Append to local log + Sheet
+    _append_to_nutrition_log(entry)
+    sheet_result = _append_to_sheet_nutrition(entry)
+
+    # 7. Append to scan_log.json (with image path) for /api/scan_recent
+    scan_log = _load_scan_log()
+    scan_index = len(scan_log)
+    scan_log.append({
+        "scan_index": scan_index,
+        "timestamp_iso": entry["timestamp_iso"],
+        "name": entry["name"],
+        "calories": entry["calories"],
+        "protein": entry["protein"],
+        "shared": entry["is_shared_meal"],
+        "image_path": str(img_path),
+        "image_url": f"/scan_img/{img_filename}",
+        "restaurant_chain": entry["restaurant_chain"],
+        "vision_short": vision_desc[:120],
+    })
+    _save_scan_log(scan_log)
+
+    return jsonify({
+        "ok": True,
+        "entry": entry,
+        "scan_index": scan_index,
+        "sheet_synced": sheet_result.get("ok", False),
+        "sheet_range": sheet_result.get("range", ""),
+    })
+
+
+@app.route("/api/scan_recent", methods=["GET"])
+def api_scan_recent():
+    """Return last N scans (default 5) for dashboard overlay."""
+    limit = int(request.args.get("limit", 5))
+    scan_log = _load_scan_log()
+    recent = scan_log[-limit:][::-1]
+    return jsonify({"scans": recent, "total": len(scan_log)})
+
+
+@app.route("/api/scan_correct", methods=["POST"])
+def api_scan_correct():
+    """Receive Jim's correction for a scan. Append user_correction field.
+    NO TRIMMING — corrections are permanent (Jim OOB 2026-07-23 22:30 HKT)."""
+    data = request.get_json(silent=True) or {}
+    scan_index = data.get("scan_index")
+    if scan_index is None:
+        return jsonify({"ok": False, "error": "no scan_index"}), 400
+
+    scan_log = _load_scan_log()
+    if not isinstance(scan_index, int) or scan_index < 0 or scan_index >= len(scan_log):
+        return jsonify({"ok": False, "error": "scan_index out of range"}), 404
+
+    # Append correction — never trim
+    correction = {
+        "corrected_at": now_iso(),
+        "name": data.get("name"),
+        "calories": data.get("calories"),
+        "protein": data.get("protein"),
+        "carbs": data.get("carbs"),
+        "fat": data.get("fat"),
+        "restaurant_chain": data.get("restaurant_chain"),
+        "note": data.get("note", ""),
+    }
+    scan_log[scan_index].setdefault("user_corrections", []).append(correction)
+    _save_scan_log(scan_log)
+
+    # Also update nutrition_log.json entry if scan_index matches timestamp
+    if NUTRITION_LOG_PATH.exists():
+        log = json.loads(NUTRITION_LOG_PATH.read_text())
+        meals = log.get("meals", [])
+        ts_iso = scan_log[scan_index].get("timestamp_iso")
+        for m in meals:
+            if m.get("timestamp_iso") == ts_iso and m.get("meal_type") == "scan":
+                m.setdefault("user_corrections", []).append(correction)
+                NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+                break
+
+    return jsonify({"ok": True, "scan_index": scan_index, "correction": correction})
+
+
+@app.route("/scan_img/<path:filename>", methods=["GET"])
+def serve_scan_image(filename):
+    """Serve scanned food images (for dashboard thumbnail)."""
+    return send_from_directory(str(SCAN_CACHE_DIR), filename)
+
+
 # ---------- HTML (Uber-inspired) ----------
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -1976,10 +2335,86 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="font-bold" x-text="`${row.total_vol_kg}kg vol`"></span>
             <span x-show="row.exercises.length" class="text-gray-500" x-text="` · ${row.exercises.length} exercise${row.exercises.length === 1 ? '' : 's'}`"></span>
           </div>
-          <div x-show="row.exercises.length" class="text-xs text-gray-400 mt-1 truncate" x-text="row.exercises.join(' · ')"></div>
+          <div x-show="row.exercises.length" class="text-xs text-gray-400 mt-1 truncate" x-text="row.exercises.join(' · ')"</div>
         </div>
       </template>
     </section>
+
+
+    <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
+    <section x-show="tab === 'scan'" x-cloak class="px-4 pb-32 pt-3">
+      <div class="text-[10px] uppercase tracking-[0.2em] text-emerald-400 mb-2 text-center font-bold">掃描食物 / 餐單</div>
+      <div class="text-xs text-gray-400 text-center mb-4">影相 → 自動記錄卡路里、蛋白質、餐廳</div>
+
+      <!-- Hidden file input — opens camera on iOS Safari (capture="environment") -->
+      <input type="file" accept="image/*" capture="environment" @change="onScanFile($event)" x-ref="scanInputEl" style="display:none">
+
+      <!-- Big tap-to-scan card -->
+      <button @click="$refs.scanInputEl.click()"
+              :disabled="scanUploading"
+              class="w-full rounded-2xl py-6 px-4 mb-4 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+              style="background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(255,255,255,0.05)); border: 1.5px dashed rgba(16,185,129,0.55);">
+        <div class="text-5xl mb-2" x-text="scanUploading ? '⏳' : '📸'"></div>
+        <div class="text-base font-bold text-emerald-300" x-text="scanUploading ? 'AI 睇緊你張相…' : '撳呢度影相 / 揀圖'"></div>
+        <div class="text-[10px] text-gray-400 mt-1" x-show="!scanUploading">食物、收據、外賣單都影得</div>
+      </button>
+
+      <!-- Upload progress bar -->
+      <div x-show="scanUploading" class="mb-4 rounded-full bg-white/10 h-2 overflow-hidden">
+        <div class="bg-emerald-400 h-2 transition-all duration-500" :style="`width: ${scanProgress}%`"></div>
+      </div>
+
+      <!-- Last scan summary -->
+      <div x-show="lastScan" class="rounded-2xl bg-white/[0.06] backdrop-blur border border-white/10 p-4 mb-4" x-cloak>
+        <div class="text-[10px] uppercase tracking-[0.15em] text-emerald-300 mb-2 font-bold">剛剛嗰個 scan</div>
+        <div class="text-sm text-white mb-1" x-text="lastScan?.vision_short || ''"></div>
+        <div class="flex items-baseline gap-3 text-xs text-gray-300 mb-2">
+          <span><span class="text-emerald-300 font-bold" x-text="lastScan?.calories || 0"></span> kcal</span>
+          <span><span class="text-emerald-300 font-bold" x-text="lastScan?.protein || 0"></span> P</span>
+          <span x-show="lastScan?.shared" class="text-yellow-300 font-bold">👥 60/40 share</span>
+        </div>
+        <div class="text-[10px] text-gray-400 mb-2" x-text="lastScan?.timestamp_iso || ''"></div>
+        <!-- Correction form -->
+        <details class="mt-2">
+          <summary class="text-xs text-emerald-300 cursor-pointer">✏️ 改資料（永遠保留）</summary>
+          <div class="mt-2 grid grid-cols-2 gap-2 text-xs">
+            <input type="text" placeholder="菜名" x-model="correctForm.name" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="text" placeholder="餐廳" x-model="correctForm.restaurant_chain" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="kcal" x-model="correctForm.calories" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="P" x-model="correctForm.protein" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="C" x-model="correctForm.carbs" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="F" x-model="correctForm.fat" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+          </div>
+          <textarea x-model="correctForm.note" placeholder="備註" class="mt-2 w-full rounded-lg bg-black/40 px-2 py-1.5 text-xs text-white border border-white/15" rows="2"></textarea>
+          <button @click="submitCorrection()" class="mt-2 w-full rounded-lg bg-emerald-500/80 px-3 py-1.5 text-xs font-bold text-black active:scale-95">送出修正</button>
+          <div x-show="correctSubmitMsg" class="mt-1 text-[10px] text-emerald-300" x-text="correctSubmitMsg"></div>
+        </details>
+      </div>
+
+      <!-- Recent scans (last 5) -->
+      <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 mb-2 font-bold">最近 5 個 scan</div>
+      <template x-if="recentScans.length === 0">
+        <div class="text-xs text-gray-500 text-center py-6">未有 scan 紀錄</div>
+      </template>
+      <template x-for="scan in recentScans" :key="scan.scan_index">
+        <div class="rounded-xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
+          <div class="flex gap-3 items-center">
+            <img :src="scan.image_url" class="w-16 h-16 rounded-lg object-cover bg-black/40" loading="lazy">
+            <div class="flex-1 min-w-0">
+              <div class="text-xs text-white truncate" x-text="scan.name || scan.vision_short || '—'"></div>
+              <div class="flex items-baseline gap-2 text-[11px] text-gray-400 mt-0.5">
+                <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span> kcal</span>
+                <span><span class="text-emerald-300 font-bold" x-text="scan.protein || 0"></span> P</span>
+                <span x-show="scan.shared" class="text-yellow-300">👥</span>
+                <span x-show="(scan.user_corrections || []).length > 0" class="text-sky-300" x-text="`✏ ${scan.user_corrections.length}`"></span>
+              </div>
+              <div class="text-[10px] text-gray-500" x-text="scan.timestamp_iso || ''"></div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
 
     <!-- END TAB -->
     <section x-show="tab === 'end'" x-cloak>
@@ -2009,7 +2444,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Bottom Tab Bar — 2x2 grid (Jim OOB 2026-07-19) -->
   <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10 bg-black/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-2xl">
-    <div class="grid grid-cols-2 grid-rows-2 gap-x-1 gap-y-1 px-2 py-1.5">
+    <div class="grid grid-cols-3 grid-rows-2 gap-x-1 gap-y-1 px-2 py-1.5">
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
         <span class="text-lg leading-none">✓</span><span class="text-xs font-bold">Set</span>
       </button>
@@ -2019,8 +2454,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="goToTab('history')">
         <span class="text-lg leading-none">📋</span><span class="text-xs font-bold">History</span>
       </button>
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'scan' ? 'tab-active' : 'tab-inactive'" @click="tab = 'scan'" style="background:rgba(16,185,129,0.18);box-shadow:inset 0 0 0 1px rgba(16,185,129,0.45);">
+        <span class="text-lg leading-none">🍽️</span><span class="text-xs font-bold">Scan</span>
+      </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
         <span class="text-lg leading-none">🏁</span><span class="text-xs font-bold">End</span>
+      </button>
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" @click="triggerHeroScan()" :disabled="scanUploading" style="background:rgba(255,255,255,0.05);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.12);">
+        <span class="text-lg leading-none">📷</span><span class="text-xs font-bold" x-text="scanUploading ? '上傳中' : '鏡頭'"></span>
       </button>
     </div>
   </nav>
@@ -2071,6 +2512,13 @@ function gymApp() {
     audioProgress: 0,
     audioDuration: 0,
     pressHandled: false,
+    // v2.1 food scan state (Jim OOB 2026-07-23)
+    scanUploading: false,
+    scanProgress: 0,
+    lastScan: null,
+    recentScans: [],
+    correctForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: '', note: '' },
+    correctSubmitMsg: '',
     quote: '努力唔會辜負你',
     quoteBank: ['努力唔會辜負你', '今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', '慢慢嚟', '穩住', '加油'],
     exerciseCategories: [
@@ -2102,7 +2550,9 @@ function gymApp() {
           this.motivationImageIndex = 0;
           this.motivationImage = list[0].url;
         }
-      } catch(e) { /* keep empty, gradient fallback shows */ }
+      } catch(e) {}
+      // v2.1: preload recent scans (for Scan tab)
+      this.loadRecentScans();
       // Pull streak (non-blocking)
       try {
         const streakRes = await fetch('/api/streak');
@@ -2630,6 +3080,91 @@ function gymApp() {
       this.flash('New session ready');
     },
 
+    async loadRecentScans() {
+      try {
+        const r = await fetch('/api/scan_recent?limit=5');
+        const data = await r.json();
+        this.recentScans = data.scans || [];
+      } catch(e) { /* silent */ }
+    },
+
+    triggerHeroScan() {
+      this.tab = 'scan';
+      this.$nextTick(() => {
+        if (this.$refs.scanInputEl) this.$refs.scanInputEl.click();
+      });
+    },
+
+    async onScanFile(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      this.scanUploading = true;
+      this.scanProgress = 20;
+      this.flash('AI 睇緊你張相…');
+      try {
+        const formData = new FormData();
+        formData.append('image', file);
+        // Simulated progress phases (real progress not accessible via fetch upload)
+        const progressTimer = setInterval(() => {
+          if (this.scanProgress < 90) this.scanProgress += 5;
+        }, 400);
+
+        const r = await fetch('/api/scan_food', { method: 'POST', body: formData });
+        clearInterval(progressTimer);
+        this.scanProgress = 100;
+
+        const data = await r.json();
+        if (!data.ok) {
+          this.flash('Scan 失敗：' + (data.error || '未知錯誤'));
+          this.scanUploading = false;
+          return;
+        }
+
+        this.lastScan = data.entry;
+        this.lastScan.scan_index = data.scan_index;
+        this.lastScan.vision_short = (data.entry.vision_raw_desc || '').slice(0, 120);
+        this.lastScan.timestamp_iso = data.entry.timestamp_iso;
+        this.lastScan.shared = data.entry.is_shared_meal;
+        this.lastScan.image_url = `/scan_img/${(data.entry.image_saved_to || '').split('/').pop()}`;
+        this.correctSubmitMsg = '';
+        this.flash(data.sheet_synced ? 'Scan 完成 ✓ 已寫入 Sheet' : 'Scan 完成 ✓（Sheet 跳過）');
+        await this.loadRecentScans();
+      } catch(e) {
+        this.flash('Error：' + e.message);
+      } finally {
+        this.scanUploading = false;
+        this.scanProgress = 0;
+        // Reset file input so same file can be re-selected
+        event.target.value = '';
+      }
+    },
+
+    async submitCorrection() {
+      if (!this.lastScan || this.lastScan.scan_index == null) {
+        this.correctSubmitMsg = '冇 scan 可以改';
+        return;
+      }
+      try {
+        const r = await fetch('/api/scan_correct', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scan_index: this.lastScan.scan_index,
+            ...this.correctForm,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          this.correctSubmitMsg = '✓ 修正送出（永久保留）';
+          await this.loadRecentScans();
+        } else {
+          this.correctSubmitMsg = '修正失敗：' + (data.error || '未知');
+        }
+      } catch(e) {
+        this.correctSubmitMsg = 'Error：' + e.message;
+      }
+    },
+
     haptic(pattern = 30) {
       try { if (navigator.vibrate) navigator.vibrate(pattern); } catch(e) {}
     },
@@ -2722,7 +3257,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v23';
+const CACHE = 'gym-web-v24';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(

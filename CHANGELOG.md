@@ -4,6 +4,60 @@ All notable changes to gymbro are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-07-23
+
+### 🍽️ Food Scan Feature — PWA-side camera + MiniMax M3 vision + pplx enrichment (Jim OOB 2026-07-23 22:26 HKT)
+
+First mini-minor feature release. Jim OOB：「Version will be able to scan food or food receipt to capture. Using MiniMax image recognition and pplx search」.
+
+#### Added
+
+- **3 new API endpoints**:
+  - `POST /api/scan_food` — Receive iPhone camera / file-picker image, runs MiniMax M3 vision for dish/portion/chain detection, pplx sonar-pro for brand-specific nutrition enrichment, applies 60/40 share silently if shared dish detected, appends to `nutrition_log.json[meals]` and mirrors to Google Sheet `Nutrition` tab.
+  - `GET /api/scan_recent?limit=N` — Last N scans with thumbnail (for dashboard overlay).
+  - `POST /api/scan_correct` — Jim corrections re-feed back; appended as `user_corrections[]` to scan entry. **NO TRIMMING** — corrections permanent (Jim OOB 2026-07-23 22:30 HKT).
+  - `GET /scan_img/&lt;filename&gt;` — serve scanned images from `/home/work/.hermes/scan_cache/`.
+
+- **Scan cache directory**: `/home/work/.hermes/scan_cache/` (auto-created)
+- **Scan log**: `/home/work/.hermes/food_scan_log.json` (per-scan index + thumbnail)
+- **Hidden file input with `capture="environment"`** — iOS Safari opens camera directly, file picker fallback if camera denied.
+
+#### Frontend UI (3x2 bottom-nav)
+
+- Added `🍽️ Scan` tab (emerald-tinged) + `📷 鏡頭` quick-trigger button
+- Big tap-to-scan card with progress bar + upload state
+- Last scan summary card with 60/40 share indicator + correction form (✏️ collapsed details)
+- Recent 5 scans strip with thumbnail + macros + edit-count badge
+- Auto-loads scan history on page init
+
+#### NO TRIMMING Guarantee (Jim OOB 2026-07-23 22:30 HKT)
+
+All `user_corrections[]` entries are **permanent** — no cron trims, no age expiry, no retention policy. Corrections accumulate indefinitely to support model retraining + Jim's audit needs.
+
+#### Defaults chosen (Jim OOB 「You decide for me」 2026-07-23 22:35 HKT)
+
+| Open question | Decision |
+|---|---|
+| UI placement | **Both** — Scan tab + Hero quick-trigger `📷 鏡頭` |
+| iOS camera permission fallback | **Auto** — `<input capture="environment">` natively handles: grants → camera, denies → file picker |
+| Pplx enrichment prompt | **Single-pass** — focus on chain/brand lookup + per-dish standard portion |
+| Correction retention | **Permanent** (NO TRIMMING) — Jim OOB explicit |
+
+#### Files Touched
+
+- `gym_web.py` (4 new endpoints, scan section HTML, scan Alpine state, scan methods in gymApp)
+- `workout_formatter.py` (version bump comment)
+- `CHANGELOG.md` (this entry)
+- Service Worker cache: `gym-web-v23 → v24`
+
+#### Verification
+
+- `node --check` on rendered HTML gymApp() JS — clean
+- Playwright headless iPhone viewport 393×852 — all 6 nav tabs render, scan tab opens, file input renders with `capture="environment"`
+- Real scan test with 沙嗲王 online-order screenshot → vision parsed 9 dishes, pplx enrichment returned brand-detection honesty, shared=True heuristic fired, `Nutrition!A8:L8` row appended to Sheet, scan_index=4 incremented, image saved to `scan_cache/scan_20260723_*.jpg`
+
+---
+
 ## [2.0.0] — 2026-07-23
 
 ### 🎉 Major Release — Stable Single-User Workout Tracking PWA
