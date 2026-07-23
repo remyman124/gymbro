@@ -2680,9 +2680,10 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     cheer-routine Rule 22.
 
     Jim OOB 2026-07-23 17:35 + 2026-07-24 14:10 HKT: voice ~150s target.
-    150s × 5.69 char/sec WanLung ≈ 855 字 sweet zone. Prompt now targets
-    750-850 字 across 8 sections = ~100 字/section avg, so voice lands
-    in 132s-150s range as Jim requested.
+    Empirical measurement 7/24 01:53 HKT: 1091 chars text → 218s audio
+    → real WanLung rate ≈ 5.0 char/sec (not 5.69 — heat/queue slow-down).
+    For 150s target, text_chars target = 150 × 5.0 = 750 (sweet zone
+    700-800 chars → 140-160s).
     """
     api_key = _pplx_api_key()
     if not api_key:
@@ -2742,10 +2743,10 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 - 全程用 paragraph prose，唔好用 list / bullet / table / **bold** headers
 - 大量使用粵語助詞：嘅/啦/咗/嗰/咁/吖/囉/嘢 — 目標密度 ≥8 個 per 100 字
 - 每個 section 之間用 `\\n\\n` 分隔（會喺 voice 階段轉成「。 」自然過渡）
-- **長度目標：750-850 字，voice 預計 130-150 秒**（WanLung 5.69 字/秒）
-- 每個 section 平均 90-110 字：§1 打招呼 60-80、§2 復原 130-160（最重要）、§3 瞓覺 100-130、§4 訓練 80-110、§5 營養 80-110、§6 噉晚恢復 90-120、§7 明日預覽 60-90、§8 收尾 50-80
+- **長度目標：600-720 字（唔好超 750），voice 預計 120-150 秒**（WanLung 實測 5.0 字/秒）
+- 每個 section 平均 75-90 字：§1 打招呼 50-70、§2 復原 110-140（最重要）、§3 瞓覺 90-110、§4 訓練 60-80、§5 營養 60-80、§6 噉晚恢復 70-90、§7 明日預覽 50-70、§8 收尾 40-60
 - 唔好 fabricate 任何數字，全部用上面提供嘅真實數據
-- **重要**：唔好超 900 字，否則 voice 會超 160 秒；唔好少過 700 字，否則 detail 唔夠
+- **重要**：唔好超 750 字，否則 voice 會超 150 秒；唔好少過 580 字，否則 detail 唔夠
 
 **嚴禁使用以下英文字**（會破壞 TTS 嘅廣東話韻律 — 必須用中文代替）：
 - 常用動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
@@ -2765,7 +2766,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1100,  # 750-850 字 ≈ 350-650 tokens output; 1100 上限防 over-run
+        "max_tokens": 850,  # 600-720 字 ≈ 320-500 tokens output; 850 上限防 over-run
         "temperature": 0.6,
     }
     try:
@@ -2832,10 +2833,12 @@ def _synthesize_cheer_voice(text: str) -> str:
     """Generate Edge-TTS WanLung voice MP3 from cheer text.
 
     Jim OOB 2026-07-23 17:35 HKT: voice was too short and lacked detail.
-    Strategy (v2.5.2 — Jim OOB 7/24 14:10 HKT ~150s target):
-    - Prompt now asks pplx for 750-850 字 sweet zone (~100 字/section avg).
-      750-850 字 × 5.69 char/sec WanLung = 132-150s audio, hitting Jim's ~150s.
-    - max_tokens 2400 → 1100 (avoid over-run; pplx sonar-pro ~1.5-2 tokens/中文字).
+    Strategy (v2.5.3 — Jim OOB 7/24 14:18 HKT ~150s target):
+    - Prompt now asks pplx for **600-720 字 sweet zone** (~80 字/section avg).
+      600-720 字 × 5.0 char/sec WanLung = 120-144s audio, hitting Jim's ~150s.
+      (v2.5.2 used 5.69 char/sec estimate → text 1100 chars → audio 220s.
+      That ratio was wrong. Re-measured 7/24 01:53: 1091 chars → 218s.)
+    - max_tokens 2400 → 800 (avoid over-run; pplx sonar-pro ~1.5-2 tokens/中文字).
     - NO truncation (was capping at 280 chars, killing §3-§5 detail). Now full
       text up to 2000 chars (edge-tts safety).
     - Convert section breaks (\\n) into comma-separated clause continuations so
@@ -5266,7 +5269,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v29';
+const CACHE = 'gym-web-v30';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
