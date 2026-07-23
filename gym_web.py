@@ -2520,6 +2520,7 @@ def _save_cheer_log(log: list) -> None:
 # Whoop cache (read live if <2h, else use cache)
 WHOOP_CACHE_PATH = Path("/home/work/.whoop_data_latest.json")
 WHOOP_PULL_SCRIPT = Path("/home/work/.hermes/skills/fitness/whoop-pull-activities/scripts/whoop_pull.py")
+WITHINGS_PULL_SCRIPT = Path("/home/work/.hermes/skills/withings/withings.py")  # Jim OOB 2026-07-24: cheer pulls Withings on every fire
 
 EN_TO_ZH_VOICE = {
     # Brand / proper nouns
@@ -2637,7 +2638,10 @@ def _run_whoop_pull_cached() -> dict:
 
 
 def _extract_whoop_metrics(whoop: dict) -> dict:
-    """Pull the headline metrics from Whoop V2 cache (Defensive parsing per Rule 34 pitfall)."""
+    """Pull the headline metrics from Whoop V2 cache (Defensive parsing per Rule 34 pitfall).
+
+    Jim OOB 2026-07-24: HRV/RHR/SpO2 — keep to 1 decimal place (no 28.625788 noise).
+    """
     def _records(d, key):
         v = d.get(key)
         if isinstance(v, list): return v
@@ -2656,13 +2660,17 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
     score = (latest_rec or {}).get('score') or {}
     sleep_ss = ((latest_sleep or {}).get('score') or {}).get('stage_summary') or {}
 
+    # Round noisy floats to 1 decimal (Jim OOB 2026-07-24).
+    def _r1(v):
+        return round(float(v), 1) if v is not None else None
+
     return {
         "recovery_pct": score.get('recovery_score'),
         "recovery_state": score.get('score_state'),
-        "hrv_ms": score.get('hrv_rmssd_milli'),
-        "rhr_bpm": score.get('resting_heart_rate'),
-        "spo2_pct": score.get('spo2_percentage'),
-        "skin_temp_c": score.get('skin_temp_celsius'),
+        "hrv_ms": _r1(score.get('hrv_rmssd_milli')),
+        "rhr_bpm": _r1(score.get('resting_heart_rate')),
+        "spo2_pct": _r1(score.get('spo2_percentage')),
+        "skin_temp_c": _r1(score.get('skin_temp_celsius')),
         "sleep_id": (latest_sleep or {}).get('id'),
         "sleep_bed_hr": round(sleep_ss.get('total_in_bed_time_milli', 0) / 3600000, 2),
         "sleep_rem_min": round(sleep_ss.get('total_rem_sleep_time_milli', 0) / 60000, 1),
@@ -2670,9 +2678,132 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
         "sleep_perf_pct": ((latest_sleep or {}).get('score') or {}).get('sleep_performance_percentage'),
         "sleep_eff_pct": ((latest_sleep or {}).get('score') or {}).get('sleep_efficiency_percentage'),
         "today_workout_count": len(today_workouts),
+        "today_workouts": today_workouts,  # Jim OOB 2026-07-24: keep raw list for §4 detail loop
         "cycle_id": (latest_cycle or {}).get('id'),
         "strain": (latest_cycle or {}).get('score', {}).get('strain'),
     }
+
+
+def _format_workout_detail_for_cheer(workouts: list) -> str:
+    """Jim OOB 2026-07-24: loop every workout with set-by-set detail.
+
+    Build a Chinese-friendly bullet string the cheer prompt can quote. Uses Whoop
+    V2 activity payload (`zone_durations` / `score.strain` are coarse; we rely on
+    the local gymbro log inside WHOOP_CACHE_PATH's workouts if available, else
+    just sport + strain + duration).
+
+    Returns: e.g. "🌅 09:12 — 舉重訓練，總時長 42 分鐘，平均強度 8.3，總組數 28，
+    內容包括：啞鈴卧推 60 公斤 × 4 組、啞鈴划船 30 公斤 × 4 組⋯⋯"
+    Or "(尚未做運動)" if workouts == [].
+    """
+    if not workouts:
+        return "(尚未做運動)"
+    lines = []
+    from zoneinfo import ZoneInfo
+    hkt = ZoneInfo("Asia/Hong_Kong")
+    for w in workouts:
+        try:
+            start_iso = w.get("start", "")
+            if not start_iso:
+                continue
+            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+            time_str = dt.astimezone(hkt).strftime("%H:%M")
+        except Exception:
+            time_str = "??:??"
+        sport = (w.get("sport_name") or w.get("sport_id_name") or "未知類型")
+        score = w.get("score") or {}
+        strain = score.get("strain")
+        avg_hr = score.get("average_heart_rate")
+        max_hr = score.get("max_heart_rate")
+        # duration = end - start in minutes
+        try:
+            t0 = datetime.fromisoformat(w["start"].replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(w["end"].replace("Z", "+00:00"))
+            dur_min = round((t1 - t0).total_seconds() / 60, 1)
+        except Exception:
+            dur_min = None
+
+        # Try local gymbro workout log for richer detail (exercises + sets).
+        # gymbro log schema: /home/work/.whoop_workout_log.json is a dict
+        # keyed by date → {date, exercises: [{exercise, weight_kg, reps, set,
+        # time, source}, ...], start_time, end_time}.
+        local_detail_lines = []
+        try:
+            from pathlib import Path
+            log_path = Path("/home/work/.whoop_workout_log.json")
+            if log_path.exists():
+                local_log = json.loads(log_path.read_text())
+                today = datetime.now(hkt).strftime("%Y-%m-%d")
+                # If the gym start_time on `today` falls inside this workout's
+                # time window, treat all of its exercises as belonging here.
+                today_log = local_log.get(today, {})
+                todays_exercises = today_log.get("exercises") or []
+                if todays_exercises:
+                    # Aggregate by exercise: total sets, last weight, max weight,
+                    # total reps.
+                    by_ex = {}
+                    for e in todays_exercises:
+                        ex_name = e.get("exercise", "?")
+                        by_ex.setdefault(ex_name, []).append(e)
+                    for ex_name, sets in by_ex.items():
+                        # Filter sets whose 'time' falls within this Whoop workout's
+                        # start/end window (if both ends are present).
+                        in_window = sets
+                        try:
+                            if w.get("start") and w.get("end"):
+                                w_start = datetime.fromisoformat(
+                                    w["start"].replace("Z", "+00:00")
+                                ).astimezone(hkt)
+                                w_end = datetime.fromisoformat(
+                                    w["end"].replace("Z", "+00:00")
+                                ).astimezone(hkt)
+                                def _in(ee):
+                                    try:
+                                        et = datetime.fromisoformat(
+                                            (ee.get("time") or "").replace("Z", "+00:00")
+                                        ).astimezone(hkt)
+                                        return w_start <= et <= w_end
+                                    except Exception:
+                                        return True
+                                in_window = [s for s in sets if _in(s)]
+                        except Exception:
+                            pass
+                        if not in_window:
+                            continue
+                        # Sort by set number, dedupe by (set, time)
+                        in_window.sort(key=lambda s: (s.get("set", 0), s.get("time", "")))
+                        seen = set()
+                        uniq = []
+                        for s in in_window:
+                            key = (s.get("set"), s.get("time"))
+                            if key not in seen:
+                                seen.add(key)
+                                uniq.append(s)
+                        # Aggregate
+                        max_w = max((s.get("weight_kg") or 0) for s in uniq) or 0
+                        total_reps = sum((s.get("reps") or 0) for s in uniq)
+                        total_vol = sum(
+                            (s.get("weight_kg") or 0) * (s.get("reps") or 0) for s in uniq
+                        )
+                        sample_reps = uniq[0].get("reps") or 0
+                        local_detail_lines.append(
+                            f"{ex_name}：{round(max_w,1):g} 公斤 × {len(uniq)} 組（每次 {sample_reps} 下，總容量 {round(total_vol,1)} 公斤）"
+                        )
+        except Exception:
+            pass
+
+        parts = [f"⏰ {time_str} — {sport}"]
+        if dur_min is not None:
+            parts.append(f"時長 {dur_min:g} 分鐘")
+        if strain is not None:
+            parts.append(f"強度 {strain:g}")
+        if avg_hr:
+            parts.append(f"均心跳 {avg_hr:g}")
+        line = "、".join(parts)
+        if local_detail_lines:
+            line += "\n   內容：" + "、".join(local_detail_lines)
+        lines.append(line)
+    return "\n".join(lines) if lines else "(尚未做運動)"
 
 
 def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
@@ -2701,6 +2832,10 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     workout_n = metrics.get("today_workout_count", 0)
     strain = metrics.get("strain")
     cycle_id = metrics.get("cycle_id")
+    # Jim OOB 2026-07-24: enrichment from Withings + workout detail loop
+    withings_weight = metrics.get("withings_weight_kg")
+    withings_fat = metrics.get("withings_fat_pct")
+    workout_detail_zh = metrics.get("workout_detail_zh", "(尚未做運動)")
 
     hkt = datetime.now(timezone(timedelta(hours=8)))
     hkt_str = hkt.strftime("%H:%M")
@@ -2728,12 +2863,17 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 - 昨日疲勞度：{strain}
 - Cycle ID：{cycle_id}
 - HKT 時間：{hkt_str}
+- Withings 今日體重：{withings_weight} 公斤
+- Withings 今日體脂：{withings_fat} %
+
+**今日健身詳細記錄**（Jim 想要逐個動作 loop 出嚟，唔好概括）：
+{workout_detail_zh}
 
 必須包含以下 8 個 section，每個 section 都要有 detail + 教練建議：
 §1 打招呼 + HKT 時間 + 朝早/夜晚/即場 時段呼應
 §2 Whoop 復原詳細解讀：四個核心數字（復原%、HRV、RHR、SPO2）每個講一個 insight，復原區間代表咩意思，今日適合咩強度 ({rec_advice_zh})
 §3 睡眠評估：噉晚瞓咗幾多個鐘、深層瞓 REM 分鐘、表現指數、效率，每個講教練點睇。如果深層瞓少過 90 分鐘，要明確建議噉晚早瞓 + 鎂補充
-§4 今日健身檢討：已經做咗 N 個 session，每個 session 嘅訓練容量、組數、重量分佈。教練建議點樣調整強度
+§4 今日健身檢討：**將今日每個 session 嘅每個動作都逐個講**（動作名、重量、組數、總容量），唔好概括。如果有 Withings 體重／體脂都提一提，教練建議點樣調整強度
 §5 營養 + 水分建議：今日蛋白質目標、碳水比例、水份目標，根據訓練強度調整。教練具體建議食咩、食幾多
 §6 噉晚恢復計劃：包括瞓前 routine（伸展、鎂、甘胺酸）、房溫、瞓幾多個鐘、手機距離床鋪
 §7 明日預覽：根據今日復原 + 訓練 + 睡眠，建議明日做咩類型訓練、強度、注意事項
@@ -3028,16 +3168,46 @@ def _generate_cheer_image(context: str = "manual") -> str:
 
 
 def _background_cheer_job(job_id: str, fire_type: str):
-    """Run cheer pipeline in background thread."""
+    """Run cheer pipeline in background thread.
+
+    Jim OOB 2026-07-24: pull Whoop AND Withings data on every fire
+    (so weight / fat / steps / distance are always fresh in the prompt).
+    """
     try:
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id] = {"status": "running", "step": "whoop_pull", "started_at": now_iso()}
 
-        # 1. Whoop pull
+        # 1. Whoop pull (cached; refreshes if cache > 2h old or empty)
         whoop = _run_whoop_pull_cached()
         metrics = _extract_whoop_metrics(whoop)
         with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id].update({"step": "withings_pull", "metrics": metrics})
+
+        # 1b. Withings pull — refresh weight/fat/steps/distance/calories today.
+        try:
+            _sp.run([
+                sys.executable, str(WITHINGS_PULL_SCRIPT),
+                "today",
+            ], capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+        # Read fresh body weight + fat + steps from the Withings helpers.
+        try:
+            metrics["withings_weight_kg"] = _withings_weight()
+            metrics["withings_fat_pct"] = _withings_fat_pct()
+        except Exception:
+            metrics.setdefault("withings_weight_kg", None)
+            metrics.setdefault("withings_fat_pct", None)
+        with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({"step": "text_gen", "metrics": metrics})
+
+        # 1c. Workout detail loop (Jim OOB 2026-07-24: list every exercise).
+        try:
+            metrics["workout_detail_zh"] = _format_workout_detail_for_cheer(
+                metrics.get("today_workouts") or []
+            )
+        except Exception:
+            metrics["workout_detail_zh"] = "(運動 detail 讀取失敗)"
 
         # 2. Text
         text = _synthesize_cheer_text(metrics, fire_type)
@@ -4129,9 +4299,11 @@ function gymApp() {
     copyRange: 7,
     copyInFlight: false,
     copyingDate: null,  // Jim OOB 2026-07-22: per-row "⏳" spinner during copy.
-    // Jim OOB 2026-07-21: 30s resting cooldown after LOG SET (prevents accidental double-tap)
+    // Jim OOB 2026-07-21: 30s resting cooldown after LOG SET (prevents accidental double-tap).
+    // Jim OOB 2026-07-24: bumped 30s → 60s (1 minute).
     cooldownUntil: null,
     cooldownRemaining: 0,
+    cooldownTotalSec: 60,  // 1-minute cooldown (Jim OOB 2026-07-24)
     cooldownInterval: null,
     // Audio overlay state — fetched from /api/today_audio
     audioTrack: null,
@@ -4449,9 +4621,9 @@ function gymApp() {
             this.intensity = 'working';
           }
           this.flash(`✓ Set ${last.set} · ${last.weight_kg}kg × ${last.reps} (${this.intensityLabel})`);
-          // Jim OOB 2026-07-21: 30s resting cooldown after log
-          this.cooldownUntil = Date.now() + 30000;
-          this.cooldownRemaining = 30;
+          // Jim OOB 2026-07-24: 60s resting cooldown after log (was 30s).
+          this.cooldownUntil = Date.now() + 60000;
+          this.cooldownRemaining = 60;
           if (this.cooldownInterval) clearInterval(this.cooldownInterval);
           this.cooldownInterval = setInterval(() => {
             const remaining = Math.max(0, Math.ceil((this.cooldownUntil - Date.now()) / 1000));
@@ -5269,7 +5441,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v30';
+const CACHE = 'gym-web-v31';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
