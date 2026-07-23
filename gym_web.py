@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 
 def _safe_read_json(path, default=None):
@@ -2910,17 +2910,151 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="text-[10px] uppercase tracking-[0.2em] text-emerald-400 mb-2 text-center font-bold">掃描食物 / 餐單</div>
       <div class="text-xs text-gray-400 text-center mb-4">影相 → 自動記錄卡路里、蛋白質、餐廳</div>
 
-      <!-- Hidden file input — opens camera on iOS Safari (capture="environment") -->
+      <!-- v2.3: two file inputs — (1) live camera + (2) iPhone photo stream picker (multiple) -->
       <input type="file" accept="image/*" capture="environment" @change="onScanFile($event)" x-ref="scanInputEl" style="display:none">
+      <input type="file" accept="image/*" multiple @change="onScanPhotosPicked($event)" x-ref="scanPhotosInputEl" style="display:none">
 
-      <!-- Big tap-to-scan card -->
+      <!-- Big tap-to-scan card — opens live camera -->
       <button @click="$refs.scanInputEl.click()"
               :disabled="scanUploading"
-              class="w-full rounded-2xl py-6 px-4 mb-4 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+              class="w-full rounded-2xl py-6 px-4 mb-3 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
               style="background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(255,255,255,0.05)); border: 1.5px dashed rgba(16,185,129,0.55);">
         <div class="text-5xl mb-2" x-text="scanUploading ? '⏳' : '📸'"></div>
         <div class="text-base font-bold text-emerald-300" x-text="scanUploading ? 'AI 睇緊你張相…' : '撳呢度影相 / 揀圖'"></div>
         <div class="text-[10px] text-gray-400 mt-1" x-show="!scanUploading">食物、收據、外賣單都影得</div>
+      </button>
+
+      <!-- v2.3: iPhone photo stream picker — opens Photos app for multi-select (server cache independent) -->
+      <button @click="$refs.scanPhotosInputEl.click()"
+              :disabled="scanUploading || scanPhotosQueue.length > 0"
+              class="w-full rounded-2xl py-4 px-4 mb-4 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+              style="background: rgba(255,255,255,0.04); border: 1.5px solid rgba(16,185,129,0.35);">
+        <div class="flex items-center justify-center gap-2">
+          <div class="text-3xl">📷</div>
+          <div class="text-left">
+            <div class="text-sm font-bold text-emerald-300">iPhone 相簿（多選）</div>
+            <div class="text-[10px] text-gray-400 mt-0.5">直接開 Photos app 揀幾張食物相，每張 AI 逐張 preview 確認</div>
+          </div>
+        </div>
+      </button>
+
+      <!-- v2.3: Progress indicator when multi-photo queue is processing -->
+      <div x-show="scanPhotosQueue.length > 0" class="mb-4 rounded-xl bg-blue-500/10 border border-blue-400/30 px-3 py-2 text-xs text-blue-200" x-cloak>
+        <div class="flex items-center gap-2">
+          <span>📷 處理中相簿：</span>
+          <span class="font-bold text-blue-100" x-text="`${scanPhotosQueueDone}/${scanPhotosQueue.length} 完成`"></span>
+          <span class="text-blue-300/80" x-text="scanPhotosQueueDone === scanPhotosQueue.length ? '（全部 AI 分析完，可以逐張確認）' : '（AI 睇緊下一張…）'"></span>
+        </div>
+      </div>
+
+      <!-- v2.3: Multi-photo from iPhone photo stream — N preview cards stacked -->
+      <template x-for="(item, idx) in scanPhotosQueue" :key="item.client_index">
+        <div class="mb-3 rounded-2xl border-2"
+             :class="{
+               'border-yellow-400/40 bg-yellow-500/10': item.status === 'ready',
+               'border-emerald-400/40 bg-emerald-500/10': item.status === 'committed',
+               'border-white/10 bg-white/5 opacity-50': item.status === 'skipped',
+               'border-red-400/40 bg-red-500/10': item.status === 'failed',
+               'border-blue-400/40 bg-blue-500/10': item.status === 'processing',
+             }">
+          <!-- Header: file name + status pill -->
+          <div class="flex items-center justify-between px-3 pt-2">
+            <div class="text-[10px] font-mono text-white/70 truncate flex-1">
+              <span x-text="`#${idx+1} · ${item.filename.slice(0, 18)} · ${item.file_size_kb}KB`"></span>
+            </div>
+            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full"
+                  :class="{
+                    'bg-yellow-400 text-black': item.status === 'ready',
+                    'bg-emerald-400 text-black': item.status === 'committed',
+                    'bg-white/20 text-white/60': item.status === 'skipped',
+                    'bg-red-400 text-white': item.status === 'failed',
+                    'bg-blue-400 text-black': item.status === 'processing',
+                    'bg-white/10 text-white/60': item.status === 'pending',
+                  }"
+                  x-text="{
+                    pending: '排隊',
+                    processing: 'AI 睇緊',
+                    ready: '待確認',
+                    committed: '已 log',
+                    skipped: '跳過',
+                    failed: '失敗'
+                  }[item.status] || item.status">
+            </span>
+          </div>
+
+          <!-- Body: image + suggested entry — only visible when ready/committed/failed -->
+          <template x-if="item.preview">
+            <div class="p-3">
+              <div class="flex gap-3">
+                <img :src="item.preview.image_url" class="w-24 h-24 object-cover rounded-xl bg-black/40 border border-white/10">
+                <div class="flex-1 min-w-0">
+                  <div class="text-[11px] text-white mb-1 line-clamp-3" x-text="item.preview.vision_short || ''"></div>
+                  <div class="flex items-baseline gap-2 text-xs text-gray-300">
+                    <span><span class="text-emerald-300 font-bold" x-text="item.previewCorrectForm.calories ?? item.preview.suggested_entry.calories"></span> kcal</span>
+                    <span><span class="text-emerald-300 font-bold" x-text="item.previewCorrectForm.protein ?? item.preview.suggested_entry.protein"></span> P</span>
+                    <template x-if="item.preview.suggested_entry.is_shared_meal">
+                      <span class="text-yellow-300 font-bold">👥 60/40</span>
+                    </template>
+                  </div>
+                  <div class="text-[10px] text-gray-500 mt-1 truncate" x-text="`菜名: ${item.previewCorrectForm.name || item.preview.suggested_entry.name || '—'}`"></div>
+                </div>
+              </div>
+
+              <!-- Edit section (collapsible) — Jim can override before commit -->
+              <details class="mt-2" :open="item.edit_mode">
+                <summary class="text-[10px] text-emerald-300 cursor-pointer" @click="item.edit_mode = !item.edit_mode">✏️ 改呢張嘅資料</summary>
+                <div class="grid grid-cols-2 gap-2 text-xs mt-2">
+                  <input type="text" placeholder="菜名" x-model="item.previewCorrectForm.name" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+                  <input type="text" placeholder="餐廳" x-model="item.previewCorrectForm.restaurant_chain" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+                  <input type="number" placeholder="kcal" x-model.number="item.previewCorrectForm.calories" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+                  <input type="number" placeholder="P" x-model.number="item.previewCorrectForm.protein" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+                  <input type="number" placeholder="C" x-model.number="item.previewCorrectForm.carbs" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+                  <input type="number" placeholder="F" x-model.number="item.previewCorrectForm.fat" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+                </div>
+                <textarea x-model="item.previewCorrectForm.note" placeholder="備註（永久保留）" class="mt-2 w-full rounded-lg bg-black/40 px-2 py-1.5 text-[11px] text-white border border-white/15" rows="2"></textarea>
+              </details>
+
+              <!-- Action buttons: ✓ confirm / skip / re-pick -->
+              <div class="mt-3 grid grid-cols-2 gap-2">
+                <button @click="skipQueueItem(idx)"
+                        :disabled="item.status === 'committed' || item.status === 'skipped'"
+                        class="rounded-lg bg-white/10 px-3 py-2 text-[11px] font-bold text-white/80 active:scale-95 disabled:opacity-30">
+                  跳過
+                </button>
+                <button @click="commitQueueItem(idx)"
+                        :disabled="item.status === 'committed' || item.status === 'skipped' || item.status === 'failed' || item.status === 'pending' || item.status === 'processing'"
+                        class="rounded-lg bg-emerald-500 px-3 py-2 text-[11px] font-bold text-black active:scale-95 disabled:opacity-30">
+                  <span x-text="item.status === 'committed' ? '✓ 已 log' : '✓ 確認 log 呢張'"></span>
+                </button>
+              </div>
+              <div class="mt-2 text-[10px] text-yellow-300" x-show="item.preview.suggested_entry.is_shared_meal">
+                已自動 60/40 share ← 你食 60% · 小寶 40%
+              </div>
+            </div>
+          </template>
+
+          <!-- Pending/Processing state — show spinner -->
+          <template x-if="!item.preview && (item.status === 'pending' || item.status === 'processing')">
+            <div class="p-4 text-center text-xs text-white/60">
+              <div class="text-3xl mb-2 animate-spin inline-block">⏳</div>
+              <div>AI 睇緊呢張相…</div>
+            </div>
+          </template>
+
+          <!-- Failed state — show error -->
+          <template x-if="item.status === 'failed'">
+            <div class="p-3 text-[11px] text-red-300">
+              <span class="font-bold">失敗：</span><span x-text="item.error"></span>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <!-- v2.3: Clear queue button -->
+      <button x-show="scanPhotosQueue.length > 0 && scanPhotosQueue.every(i => i.status === 'committed' || i.status === 'skipped' || i.status === 'failed')"
+              @click="clearPhotosQueue()"
+              class="w-full rounded-xl bg-white/10 px-3 py-2 text-xs font-bold text-white/70 active:scale-95 mb-4">
+        清空相簿 queue
       </button>
 
       <!-- Upload progress bar -->
@@ -3178,6 +3312,8 @@ function gymApp() {
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
     photostream: [],           // today's images with optional classification
     photostreamClassifying: false,
+    scanPhotosQueue: [],       // v2.3: queue of preview entries from multi-photo iPhone picker
+    scanPhotosQueueDone: 0,    // v2.3: how many previews fetched (out of scanPhotosQueue.length)
     previewEntry: null,        // current scan preview pending Jim confirmation
     previewEditing: false,     // toggle edit-mode for preview fields
     previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
@@ -3841,6 +3977,126 @@ function gymApp() {
       }
     },
 
+    // v2.3: iPhone photo stream multi-select picker (independent of server cache).
+    // Picks N photos from iOS Photos app → sequentially fetches preview for each → renders queue
+    // in UI below scan tab. Each queue item shows preview card with ✓ / skip / open-edit actions.
+    async onScanPhotosPicked(event) {
+      const files = Array.from(event.target.files || []);
+      if (files.length === 0) return;
+      this.flash(`你揀咗 ${files.length} 張相，AI 逐張睇緊…`);
+      this.scanPhotosQueue = files.map((f, i) => ({
+        client_index: i,
+        filename: f.name || `image_${i+1}.jpg`,
+        file_size_kb: Math.round(f.size / 1024),
+        status: 'pending',  // pending | processing | ready | committed | skipped | failed
+        preview: null,
+        edit_mode: false,
+        previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
+        error: null,
+      }));
+      this.scanPhotosQueueDone = 0;
+
+      // Sequential processing — MiniMax + pplx is rate-limited; parallel = MiniMax quota burning
+      for (let i = 0; i < this.scanPhotosQueue.length; i++) {
+        const queueItem = this.scanPhotosQueue[i];
+        queueItem.status = 'processing';
+        // Force reactivity (Alpine.js tracks direct index write but be safe)
+        this.scanPhotosQueue = [...this.scanPhotosQueue];
+        try {
+          const formData = new FormData();
+          formData.append('image', files[i]);
+          const r = await fetch('/api/scan_preview', { method: 'POST', body: formData });
+          const data = await r.json();
+          if (!data.ok) {
+            queueItem.status = 'failed';
+            queueItem.error = data.error || 'preview failed';
+          } else {
+            queueItem.preview = data.preview;
+            queueItem.previewCorrectForm = {
+              name: data.preview.suggested_entry.name || '',
+              restaurant_chain: data.preview.suggested_entry.restaurant_chain || '',
+              calories: data.preview.suggested_entry.calories || null,
+              protein: data.preview.suggested_entry.protein || null,
+              carbs: data.preview.suggested_entry.carbs || null,
+              fat: data.preview.suggested_entry.fat || null,
+              note: '',
+            };
+            queueItem.status = 'ready';
+          }
+        } catch (e) {
+          queueItem.status = 'failed';
+          queueItem.error = e.message;
+        }
+        this.scanPhotosQueueDone = i + 1;
+        this.scanPhotosQueue = [...this.scanPhotosQueue];  // trigger reactivity
+      }
+      this.flash(this.scanPhotosQueue.length === this.scanPhotosQueueDone
+        ? `✓ 全部 ${this.scanPhotosQueueDone} 張 AI 睇完，可以逐張確認`
+        : `⚠️ ${this.scanPhotosQueueDone}/${this.scanPhotosQueue.length} 完成，睇下有冇失敗`);
+      event.target.value = '';  // reset picker so same files can be re-picked later
+    },
+
+    // v2.3: commit one queue item (called per queue card's ✓ confirm button)
+    async commitQueueItem(idx) {
+      const item = this.scanPhotosQueue[idx];
+      if (!item || item.status !== 'ready' || !item.preview) {
+        this.flash('呢張未 ready 唔可以 log');
+        return;
+      }
+      try {
+        const baseEntry = item.preview.suggested_entry;
+        const form = item.previewCorrectForm;
+        const finalEntry = {
+          ...baseEntry,
+          name: form.name || baseEntry.name,
+          restaurant_chain: form.restaurant_chain || baseEntry.restaurant_chain,
+          calories: form.calories ?? baseEntry.calories,
+          protein: form.protein ?? baseEntry.protein,
+          carbs: form.carbs ?? baseEntry.carbs,
+          fat: form.fat ?? baseEntry.fat,
+        };
+        const r = await fetch('/api/scan_commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            entry: finalEntry,
+            image_path: item.preview.image_path,
+            user_correction: form.note ? form : null,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          item.status = 'committed';
+          this.flash(`✓ 張 ${idx+1} (${item.filename.slice(0,12)}) 寫入 log + Sheet`);
+        } else {
+          item.status = 'failed';
+          item.error = data.error || 'commit failed';
+          this.flash('Log 失敗：' + item.error);
+        }
+      } catch (e) {
+        item.status = 'failed';
+        item.error = e.message;
+        this.flash('Error：' + e.message);
+      }
+      this.scanPhotosQueue = [...this.scanPhotosQueue];
+    },
+
+    // v2.3: skip one queue item (mark skipped, don't commit)
+    skipQueueItem(idx) {
+      const item = this.scanPhotosQueue[idx];
+      if (!item) return;
+      item.status = 'skipped';
+      this.scanPhotosQueue = [...this.scanPhotosQueue];
+      this.flash(`跳過第 ${idx+1} 張 (${item.filename.slice(0,12)})`);
+    },
+
+    // v2.3: clear all queue items that aren't pending/processing
+    clearPhotosQueue() {
+      this.scanPhotosQueue = [];
+      this.scanPhotosQueueDone = 0;
+      this.flash('已清空相簿 queue');
+    },
+
     async loadPhotostream(classify = true) {
       this.photostreamClassifying = classify;
       try {
@@ -4045,7 +4301,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v25';
+const CACHE = 'gym-web-v26';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
