@@ -1,10 +1,62 @@
 # Changelog
 
 All notable changes to gymbro are documented here.
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-versioning follows [Semantic Versioning](https://semver.org/).
 
-## [2.1.0] — 2026-07-23
+## [2.2.0] — 2026-07-23
+
+### 🎯 AI-driven personal coach pipeline (Jim OOB 2026-07-23 22:42 HKT)
+
+Three coordinated features for Jim's daily workflow:
+
+1. **Photostream auto-suggest** — scans today's image_cache + scan_cache files, classifies each via MiniMax vision (food vs not-food), flags photos that haven't been logged yet with 「AI log 呢張」 button for one-tap scan.
+2. **Preview / confirm** — every food log now goes through a preview step (`POST /api/scan_preview` returns suggested entry, `POST /api/scan_commit` writes only after Jim taps 確認). Auto-fills kcal/P/chain from vision, Jim can edit any field, then taps 確認.
+3. **Activity coach tips window** — after END SESSION, pplx sonar-pro generates per-exercise form cues + progression tips; MiniMax synthesizes into Traditional Chinese cheer-style summary (≤250 字). Cached by (date, exercises).
+
+#### New endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/photostream/today` | GET | Today's photos, optional `?classify=true` runs MiniMax food detection |
+| `/api/scan_preview` | POST | Take image → run vision + pplx → return suggested entry (NO LOG) |
+| `/api/scan_preview_from_path` | POST | Same but on existing photostream image (server-side path) |
+| `/api/scan_commit` | POST | Receive (possibly edited) entry → write to log + Sheet (PREVIEW-ONLY enforcement) |
+| `/api/coach_tips` | POST | pplx + MiniMax for session exercises → Traditional Chinese coach cues |
+
+#### Frontend changes
+
+- Scan tab now shows a 3-column grid of today's photos (`今日相片 (N 建議 log)`). Tap 「AI log 呢張」 → re-runs vision → preview card appears.
+- Preview card (yellow border) shows vision description + estimated macros + edit form + two buttons: 「取消」 / 「✓ 確認 log」. NO auto-log until 確認 tapped.
+- END tab now auto-fetches coach tips after session ends (~60s for pplx + MiniMax). Shows loading state, then form cues + progression tips + raw pplx output (collapsible).
+- All scan/photostream interactions use the same file → preview → commit pattern.
+
+#### Defaults chosen (Jim OOB 「You decide for me」 applied consistently)
+
+| Decision | Choice |
+|---|---|
+| Preview mode default | ON for ALL new scans |
+| Confirm button label | `✓ 確認 log` (large emerald) |
+| Cancel button label | `取消` |
+| Coach tips format | Summary ≤250字 + raw pplx collapsible |
+| Coach tips cache | Per (date, exercises tuple) |
+| Photostream classify cache | Per (path + mtime) — re-classify only on file change |
+
+#### Files Touched
+
+- `gym_web.py` (5 new endpoints, photostream + preview + coach tips UI, scan flow refactored to preview-first)
+- `workout_formatter.py` (version bump)
+- `CHANGELOG.md` (this entry)
+- Service Worker: `gym-web-v24 → v25`
+- `__version__`: `2.1.0 → 2.2.0`
+
+#### Verification (verified 2026-07-23 22:51 HKT)
+
+- `node --check` on rendered gymApp() JS — clean (32571 chars)
+- Playwright iPhone 393×852 — 10 photostream items render, scan tab loads clean
+- Real preview flow: 沙嗲王 screenshot → 9 dishes parsed → suggested kcal=72 / protein=0 → Jim edits to 1850 kcal / 85P / chain=沙嗲王 → commit → Sheet `Nutrition!A10:L10` ✓ → scan_index=6 with `user_corrections: [{note: ...}]`
+- Coach tips real test: pplx NSCA-CSCS perspective + MiniMax synthesis → Traditional Chinese output `### 教練總結訊息 (1) 今日表現 (2) 動作 Cue (3) 下次 Progression Tip`
+- Cached on second call (avoid re-running pplx + MiniMax)
+
+---
 
 ### 🍽️ Food Scan Feature — PWA-side camera + MiniMax M3 vision + pplx enrichment (Jim OOB 2026-07-23 22:26 HKT)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Workout Formatter — Text rendering for workout logs.  Version 2.1.0
+Workout Formatter — Text rendering for workout logs.  Version 2.2.0
 
 Jim OOB 2026-07-22: Refactored after Whoop AI paste mis-interpreted set counts.
 Root cause investigation:

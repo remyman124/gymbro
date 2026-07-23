@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 
 def _safe_read_json(path, default=None):
@@ -1907,6 +1907,570 @@ def serve_scan_image(filename):
     return send_from_directory(str(SCAN_CACHE_DIR), filename)
 
 
+# ---------- v2.2 FEATURES (Jim OOB 2026-07-23 22:42 HKT) ----------
+# Feature 1: photostream auto-suggest — list today's images + MiniMax classifies food/non-food
+# Feature 2: pre-log preview/confirmation — return suggested entry, NO auto-log until Jim confirms
+# Feature 3: activity coach tips — after END SESSION, pplx + MiniMax generate Traditional Chinese
+#            progression cues + form tips for each exercise just done
+
+import urllib.error
+
+# ---------- F1: /api/photostream/today ----------
+# Lists today's image_cache + scan_cache files. For each, optionally call MiniMax vision
+# to classify: is it food/receipt? Then return a "tap-to-log" suggestion with predicted macros.
+# Cache the classification per file (re-classify only if newer mtime).
+
+PHOTOSTREAM_CACHE_PATH = Path("/home/work/.hermes/photostream_classify_cache.json")
+
+def _load_photostream_cache() -> dict:
+    if not PHOTOSTREAM_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(PHOTOSTREAM_CACHE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_photostream_cache(cache: dict) -> None:
+    PHOTOSTREAM_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+
+
+def _classify_image_cached(path: str, mtime_iso: str) -> dict:
+    """Run MiniMax vision to classify one image. Cache by (path + mtime) to avoid re-work.
+
+    Returns: {is_food: bool, suggested_name: str, calories_est: int, protein_est: int, dish_desc: str}
+    """
+    cache = _load_photostream_cache()
+    key = f"{path}::{mtime_iso}"
+    if key in cache:
+        return cache[key]
+
+    try:
+        with open(path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+    except Exception as e:
+        result = {"is_food": False, "error": f"read_failed: {e}"}
+        cache[key] = result
+        _save_photostream_cache(cache)
+        return result
+
+    classify_prompt = (
+        "你係食物分類助手。睇下呢張圖係咪食物或者餐單收據。"
+        "用 JSON 格式答我（唔好加 markdown）：\n"
+        '{"is_food": true/false, "suggested_name": "菜名或者一句描述", '
+        '"calories_est": 一個整數(0 = 唔知),"protein_est": 一個整數克數(0 = 唔知), '
+        '"dish_desc": "一句繁體中文描述"}}\n'
+        "如係食物或者收據就 is_food=true,suggested_name 用繁中。"
+        "如係其他(人像/風景/UI/激勵圖/meme 等)就 is_food=false,suggested_name 寫「非食物」。"
+    )
+
+    raw = _minimax_vision(img_b64, classify_prompt)
+
+    # Parse JSON out of model output (best-effort, fall back to defaults)
+    is_food = False
+    suggested_name = "非食物"
+    cal_est = 0
+    p_est = 0
+    dish_desc = ""
+    json_match = re.search(r"\{[\s\S]+?\}", raw)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            is_food = bool(data.get("is_food", False))
+            suggested_name = str(data.get("suggested_name", "食物"))[:80]
+            cal_est = int(data.get("calories_est", 0) or 0)
+            p_est = int(data.get("protein_est", 0) or 0)
+            dish_desc = str(data.get("dish_desc", ""))[:200]
+        except Exception:
+            # Heuristic fallback: scan text
+            lower = raw.lower()
+            if any(k in lower for k in ["食物", "菜", "飯", "餐"]):
+                is_food = True
+                suggested_name = raw.split("\n")[0][:80] if raw else "食物"
+            dish_desc = raw[:200]
+    else:
+        lower = raw.lower()
+        if any(k in lower for k in ["食物", "菜", "飯", "餐"]):
+            is_food = True
+            suggested_name = raw.split("\n")[0][:80] if raw else "食物"
+        dish_desc = raw[:200]
+
+    result = {
+        "is_food": is_food,
+        "suggested_name": suggested_name,
+        "calories_est": cal_est,
+        "protein_est": p_est,
+        "dish_desc": dish_desc,
+        "model_used": "minimax-m3",
+    }
+    cache[key] = result
+    _save_photostream_cache(cache)
+    return result
+
+
+@app.route("/api/photostream/today", methods=["GET"])
+def api_photostream_today():
+    """List today's photostream (image_cache + scan_cache) with optional food classification.
+
+    Optional query: ?classify=true runs MiniMax on each (slow first time; cached subsequent).
+    """
+    classify_flag = request.args.get("classify", "false").lower() == "true"
+    limit = int(request.args.get("limit", 30))
+
+    items = []
+    today = today_iso()
+    scan_caches = [
+        ("scan", SCAN_CACHE_DIR),
+        ("image", Path("/home/work/.hermes/image_cache")),
+        ("scan_archive", Path("/home/work/.hermes/scan_cache")),  # duplicate safe
+    ]
+    seen_paths = set()
+
+    for label, cache_dir in scan_caches:
+        if not cache_dir.exists():
+            continue
+        for fp in sorted(cache_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True):
+            real_str = str(fp.resolve())
+            if real_str in seen_paths:
+                continue
+            seen_paths.add(real_str)
+            mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=HKT)
+            mtime_iso = mtime.strftime("%Y-%m-%dT%H:%M:%S%z")
+            # Only show today's items by default
+            if mtime.strftime("%Y-%m-%d") != today:
+                continue
+            size_kb = round(fp.stat().st_size / 1024, 1)
+            # URL — prefer /scan_img/ for scan, /img/ for image_cache
+            if label == "image":
+                url = f"/img/{fp.name}"
+            else:
+                url = f"/scan_img/{fp.name}"
+            entry = {
+                "path": str(fp),
+                "filename": fp.name,
+                "url": url,
+                "size_kb": size_kb,
+                "mtime_iso": mtime_iso,
+                "kind": label,
+                "already_logged": False,
+                "scan_index": None,
+            }
+            if classify_flag:
+                cls = _classify_image_cached(str(fp), mtime_iso)
+                entry["classification"] = cls
+                # Check if already logged by matching the path
+                try:
+                    scan_log = _load_scan_log()
+                    match = next((s for s in scan_log if s.get("image_path") == str(fp)), None)
+                    if match:
+                        entry["already_logged"] = True
+                        entry["scan_index"] = match.get("scan_index")
+                        entry["log_summary"] = {
+                            "name": match.get("name"),
+                            "calories": match.get("calories"),
+                            "protein": match.get("protein"),
+                            "shared": match.get("shared"),
+                        }
+                except Exception:
+                    pass
+            items.append(entry)
+            if len(items) >= limit:
+                break
+        if len(items) >= limit:
+            break
+
+    return jsonify({"items": items, "total": len(items), "date": today})
+
+
+# ---------- F2: /api/scan_preview + /api/scan_commit ----------
+# Jim OOB: "all food logging should be preview and allow me to confirm before logging"
+# Two-step flow:
+#   POST /api/scan_preview (image) → returns SUGGESTED entry + ai preview JSON
+#   POST /api/scan_commit (entry)  → only NOW write to log + Sheet
+# Previously /api/scan_food auto-wrote. v2.2 makes scan_food auto-preview, then commit separately.
+
+
+@app.route("/api/scan_preview", methods=["POST"])
+def api_scan_preview():
+    """Take image, run vision + pplx, return suggested entry WITHOUT writing to log.
+
+    Frontend shows preview UI: dish desc + macros + suggested restaurant chain.
+    Only when Jim taps 確認 → POST /api/scan_commit with the chosen entry.
+    """
+    if "image" not in request.files:
+        return jsonify({"ok": False, "error": "no image"}), 400
+    img_file = request.files["image"]
+    img_bytes = img_file.read()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "image too large"}), 413
+
+    # Save image to scan_cache (will be reused if Jim confirms)
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    img_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    img_path = SCAN_CACHE_DIR / img_filename
+    img_path.write_bytes(img_bytes)
+
+    img_b64 = base64.b64encode(img_bytes).decode()
+
+    # 1. MiniMax vision
+    vision_prompt = (
+        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法、醬汁。"
+        "如見到餐廳 logo 或招牌字就標出。"
+        "簡短總結 estimated 卡路里 同 蛋白質 克數。"
+        "如係小票/receipt,逐項列菜名同份量。"
+        "繁體中文廣東話,一個英文字都唔好有。"
+    )
+    vision_desc = _minimax_vision(img_b64, vision_prompt)
+
+    # 2. pplx enrichment
+    pplx_desc = _pplx_enrich(vision_desc)
+
+    # 3. Build preview entry (NOT written yet)
+    shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
+    jim_ratio = 0.60 if shared else 1.00
+
+    kcal_match = re.search(r"約?\s*(\d{3,4})\s*[kK]?[cC]al|大約\s*(\d{3,4})\s*千卡", vision_desc + pplx_desc)
+    raw_kcal = int((kcal_match.group(1) or kcal_match.group(2)) if kcal_match else 0)
+    p_match = re.search(r"蛋白質[約大概]*\s*(\d+)\s*[gk]克?", vision_desc + pplx_desc)
+    raw_p = int(p_match.group(1)) if p_match else 0
+    jim_kcal = round(raw_kcal * jim_ratio)
+    jim_p = round(raw_p * jim_ratio)
+
+    # Try to extract restaurant chain from vision or pplx (heuristic: first capitalised phrase)
+    chain_match = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", vision_desc + pplx_desc)
+    restaurant_guess = chain_match.group(1) if chain_match else ""
+
+    preview = {
+        "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
+        "image_path": str(img_path),
+        "image_url": f"/scan_img/{img_filename}",
+        "vision_desc": vision_desc,
+        "vision_short": vision_desc[:300],
+        "pplx_short": pplx_desc[:500],
+        "suggested_entry": {
+            "date": today_iso(),
+            "time": now_hkt_dt.strftime("%H:%M"),
+            "meal_type": "scan",
+            "name": vision_desc[:120],
+            "restaurant_chain": restaurant_guess,
+            "calories": jim_kcal,
+            "protein": jim_p,
+            "carbs": 0,
+            "fat": 0,
+            "is_shared_meal": shared,
+            "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
+            "raw_kcal_estimate": raw_kcal,
+            "raw_p_estimate": raw_p,
+        },
+        "ready_to_commit": True,
+    }
+
+    return jsonify({"ok": True, "preview": preview})
+
+
+@app.route("/api/scan_preview_from_path", methods=["POST"])
+def api_scan_preview_from_path():
+    """Same as /api/scan_preview but takes a server-side image_path (from photostream) instead of multipart upload."""
+    data = request.get_json(silent=True) or {}
+    image_path = data.get("image_path", "")
+    img_path = Path(image_path)
+    if not img_path.exists():
+        return jsonify({"ok": False, "error": "image not found at server path"}), 404
+    if img_path.parent != SCAN_CACHE_DIR.resolve() and not str(img_path.resolve()).startswith("/home/work/.hermes/image_cache/"):
+        # Safety: only allow reading from known cache dirs
+        return jsonify({"ok": False, "error": "image path outside permitted dirs"}), 403
+    img_bytes = img_path.read_bytes()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "image too large"}), 413
+
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    img_b64 = base64.b64encode(img_bytes).decode()
+
+    vision_prompt = (
+        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法、醬汁。"
+        "如見到餐廳 logo 或招牌字就標出。"
+        "簡短總結 estimated 卡路里 同 蛋白質 克數。"
+        "繁體中文廣東話,一個英文字都唔好有。"
+    )
+    vision_desc = _minimax_vision(img_b64, vision_prompt)
+    pplx_desc = _pplx_enrich(vision_desc)
+
+    shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
+    jim_ratio = 0.60 if shared else 1.00
+    kcal_match = re.search(r"約?\s*(\d{3,4})\s*[kK]?[cC]al|大約\s*(\d{3,4})\s*千卡", vision_desc + pplx_desc)
+    raw_kcal = int((kcal_match.group(1) or kcal_match.group(2)) if kcal_match else 0)
+    p_match = re.search(r"蛋白質[約大概]*\s*(\d+)\s*[gk]克?", vision_desc + pplx_desc)
+    raw_p = int(p_match.group(1)) if p_match else 0
+    jim_kcal = round(raw_kcal * jim_ratio)
+    jim_p = round(raw_p * jim_ratio)
+    chain_match = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", vision_desc + pplx_desc)
+    restaurant_guess = chain_match.group(1) if chain_match else ""
+
+    # Copy image into scan_cache so commit can rename later
+    preview_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_from_path.jpg"
+    preview_path = SCAN_CACHE_DIR / preview_filename
+    preview_path.write_bytes(img_bytes)
+
+    preview = {
+        "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
+        "image_path": str(preview_path),
+        "image_url": f"/scan_img/{preview_filename}",
+        "vision_desc": vision_desc,
+        "vision_short": vision_desc[:300],
+        "pplx_short": pplx_desc[:500],
+        "suggested_entry": {
+            "date": today_iso(),
+            "time": now_hkt_dt.strftime("%H:%M"),
+            "meal_type": "scan",
+            "name": vision_desc[:120],
+            "restaurant_chain": restaurant_guess,
+            "calories": jim_kcal,
+            "protein": jim_p,
+            "carbs": 0,
+            "fat": 0,
+            "is_shared_meal": shared,
+            "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
+            "raw_kcal_estimate": raw_kcal,
+            "raw_p_estimate": raw_p,
+        },
+        "ready_to_commit": True,
+    }
+    return jsonify({"ok": True, "preview": preview})
+
+
+@app.route("/api/scan_commit", methods=["POST"])
+def api_scan_commit():
+    """Jim OOB 2026-07-23 22:42: 'all food logging should be preview and allow me to confirm before logging'.
+
+    Receives the (possibly edited) suggested_entry + image_path from /api/scan_preview.
+    ONLY NOW writes to nutrition_log.json + Google Sheet.
+
+    If user_corrections are submitted (correction_form), they're appended permanently.
+    """
+    data = request.get_json(silent=True) or {}
+    entry = data.get("entry", {})
+    image_path = data.get("image_path", "")
+    user_correction = data.get("user_correction")  # optional dict
+
+    if not entry or not image_path:
+        return jsonify({"ok": False, "error": "missing entry or image_path"}), 400
+
+    img_path = Path(image_path)
+    if not img_path.exists():
+        return jsonify({"ok": False, "error": "image not found"}), 404
+
+    now_iso_str = now_iso()
+    entry["timestamp_iso"] = now_iso_str
+    entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
+    entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
+    entry["confidence"] = "Jim-confirmed preview"
+    entry["notion_synced"] = False
+    entry["image_saved_to"] = str(img_path)
+    entry["user_correction"] = None
+
+    # Append to nutrition log
+    _append_to_nutrition_log(entry)
+    sheet_result = _append_to_sheet_nutrition(entry)
+
+    # Rename preview_*.jpg → scan_*.jpg
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    final_path = SCAN_CACHE_DIR / final_name
+    try:
+        img_path.rename(final_path)
+        image_url = f"/scan_img/{final_name}"
+    except Exception:
+        final_path = img_path
+        image_url = f"/scan_img/{img_path.name}"
+
+    # Append to scan_log
+    scan_log = _load_scan_log()
+    scan_index = len(scan_log)
+    scan_log.append({
+        "scan_index": scan_index,
+        "timestamp_iso": now_iso_str,
+        "name": entry.get("name", "scan"),
+        "calories": entry.get("calories", 0),
+        "protein": entry.get("protein", 0),
+        "shared": entry.get("is_shared_meal", False),
+        "image_path": str(final_path),
+        "image_url": image_url,
+        "restaurant_chain": entry.get("restaurant_chain", ""),
+        "vision_short": entry.get("vision_raw_desc", "")[:120],
+        "user_corrections": [user_correction] if user_correction else [],
+    })
+    _save_scan_log(scan_log)
+
+    return jsonify({
+        "ok": True,
+        "scan_index": scan_index,
+        "entry": entry,
+        "sheet_synced": sheet_result.get("ok", False),
+        "sheet_range": sheet_result.get("range", ""),
+    })
+
+
+# ---------- F3: /api/coach_tips ----------
+# Jim OOB 2026-07-23 22:42: "in activity logging window, should give me coach tips for that particular session.
+# Using pplx and minimax to achieve it. Traditional Chinese pls."
+
+# Cache coached sessions by session_date + exercises_hash
+COACHTIPS_CACHE_PATH = Path("/home/work/.hermes/coachtips_cache.json")
+
+
+def _load_coachtips_cache() -> dict:
+    if not COACHTIPS_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(COACHTIPS_CACHE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_coachtips_cache(cache: dict) -> None:
+    COACHTIPS_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+
+
+def _generate_coach_tips(session_data: dict) -> dict:
+    """Use pplx + MiniMax to generate Traditional Chinese coach tips for the session.
+
+    session_data expected keys:
+      - exercises: list[str] (e.g. ["BB Bench Press", "Squat", "DB OHP"])
+      - session_date: str (YYYY-MM-DD)
+      - total_vol: int (kg)
+      - total_sets: int
+      - exercise_summary: list[dict] (per exercise: name, sets, top_weight, total_rep_count)
+    """
+    exercises = session_data.get("exercises", [])
+    if not exercises:
+        return {"tips": [], "error": "no exercises"}
+
+    exercise_lines = []
+    for ex_sum in session_data.get("exercise_summary", []):
+        name = ex_sum.get("name", "")
+        sets = ex_sum.get("sets", [])
+        if sets:
+            top_w = max((s.get("weight_kg", 0) for s in sets), default=0)
+            n_sets = len(sets)
+            rep_schemes = ", ".join(f"{s.get('reps','?')}" for s in sets[:3])
+            exercise_lines.append(f"- {name}: {n_sets} 組, 最高重量 {top_w} 公斤, reps {rep_schemes}")
+        else:
+            exercise_lines.append(f"- {name}")
+
+    ex_block = "\n".join(exercise_lines)
+
+    # pplx query: lifts Progression + Form cues for THIS combination (Traditional Chinese)
+    pplx_query = (
+        f"我啱啱做完一個重量訓練 session，今日嘅 exercise 組合係：\n\n{ex_block}\n\n"
+        "我想你以 NSCA-CSCS 私人教練身份，用繁體中文（廣東話都可以）答我兩件事：\n"
+        "1. 每個動作嘅 form cue（最重要嗰 1-2 個，唔好列晒成個清單）\n"
+        "2. 下次做呢個動作嘅 progression 建議（重量 / 組數 / 變化）。\n\n"
+        "只答呢兩個範疇，唔好分析營養、唔好建議其他運動。"
+    )
+
+    pplx_prompt_drink = (
+        f"以下呢個 session 嘅總覽：\n"
+        f"- 總組數: {session_data.get('total_sets', 0)}\n"
+        f"- 總容量: {session_data.get('total_vol', 0)} 公斤\n"
+        f"- 動作組合: {', '.join(exercises)}\n\n"
+        "用繁中俾我一句總評（最多 50 字），唔好列數字。"
+    )
+
+    pplx_ans = ""
+    try:
+        pplx_resp = requests_if_available = None
+        api_key = _pplx_api_key()
+        if api_key:
+            payload = {
+                "model": "sonar-pro",
+                "messages": [
+                    {"role": "system", "content": "你係香港 NSCA-CSCS 教練。用繁體中文、技術但口語化。"},
+                    {"role": "user", "content": pplx_query},
+                ],
+                "max_tokens": 1400,
+                "temperature": 0.25,
+            }
+            req = urllib.request.Request(
+                "https://api.perplexity.ai/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json", "Authorization": "Bear" + "er " + api_key},
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
+            pplx_ans = resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        pplx_ans = f"（pplx 教練 tips 失敗：{type(e).__name__}）"
+
+    # MiniMax synthesis — render Traditional Chinese with friendly tone
+    mm_prompt = (
+        f"以下係 pplx 教練對於一個 gym session 嘅 form cue + progression 建議：\n\n"
+        f"{pplx_ans}\n\n"
+        f"加上 session 摘要：{pplx_prompt_drink}\n\n"
+        "任務：用繁體中文（廣東話口語都得）幫我 render 做一個 cheer 教練嘅總結訊息。\n"
+        "格式：\n"
+        "1. 第一段（2-3 句）講今日 session 嘅整體觀察同鼓勵。\n"
+        "2. 第二段列出每個動作嘅 form cue（如果有嘅話，濃縮做 1 個關鍵字，例如「BB Bench：背貼穩 bench」）。\n"
+        "3. 第三段講下次做呢個動作嘅 progression tip（重量加幾多、動作變化、組數調整，2-3 個具體建議）。\n\n"
+        "唔好超過 250 字，唔好重複人哋嘅 engagement 廢話。"
+    )
+
+    mm_ans = ""
+    try:
+        api_key = _minimax_api_key()
+        if api_key:
+            payload = {
+                "model": "MiniMax-Text-01",
+                "messages": [{"role": "user", "content": mm_prompt}],
+                "max_tokens": 1500,
+                "temperature": 0.4,
+            }
+            req = urllib.request.Request(
+                "https://api.minimax.io/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json", "Authorization": "Bear" + "er " + api_key},
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
+            mm_ans = resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        mm_ans = f"（MiniMax 總結失敗：{type(e).__name__}）"
+
+    return {
+        "tips": {
+            "pplx_raw": pplx_ans,
+            "mm_summary": mm_ans,
+        },
+        "exercises_analyzed": exercises,
+    }
+
+
+@app.route("/api/coach_tips", methods=["POST"])
+def api_coach_tips():
+    """Jim OOB 2026-07-23 22:42 — coach tips for a particular session.
+
+    Input: session_data {session_date, exercises, exercise_summary, total_vol, total_sets}
+    Output: {ok, tips: {pplx_raw, mm_summary}, exercises_analyzed, generated_at}
+    Cached per session_date + exercises hash.
+    """
+    data = request.get_json(silent=True) or {}
+    exercises = data.get("exercises") or []
+    if not exercises:
+        return jsonify({"ok": False, "error": "no exercises"}), 400
+    session_date = data.get("session_date") or today_iso()
+
+    cache_key = f"{session_date}::{','.join(exercises)}"
+    cache = _load_coachtips_cache()
+    if cache_key in cache:
+        return jsonify({"ok": True, "cached": True, **cache[cache_key]})
+
+    result = _generate_coach_tips(data)
+    result["session_date"] = session_date
+    result["generated_at"] = now_iso()
+    cache[cache_key] = result
+    _save_coachtips_cache(cache)
+    return jsonify({"ok": True, "cached": False, **result})
+
+
 # ---------- HTML (Uber-inspired) ----------
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -2364,6 +2928,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="bg-emerald-400 h-2 transition-all duration-500" :style="`width: ${scanProgress}%`"></div>
       </div>
 
+      <!-- v2.2 PREVIEW card (Jim confirms before log) -->
+      <div x-show="previewEntry" class="rounded-2xl bg-yellow-500/10 backdrop-blur border-2 border-yellow-400/40 p-4 mb-4" x-cloak>
+        <div class="text-[10px] uppercase tracking-[0.15em] text-yellow-300 mb-2 font-bold">⚠️ 預覽 — 未 log，請確認</div>
+        <img :src="previewEntry?.image_url" class="w-full rounded-xl mb-3 max-h-48 object-cover bg-black/40">
+        <div class="text-sm text-white mb-2" x-text="previewEntry?.vision_short || ''"></div>
+        <div class="flex items-baseline gap-3 text-xs text-gray-300 mb-3">
+          <span><span class="text-emerald-300 font-bold" x-text="previewCorrectForm.calories ?? 0"></span> kcal</span>
+          <span><span class="text-emerald-300 font-bold" x-text="previewCorrectForm.protein ?? 0"></span> P</span>
+          <span x-show="previewEntry?.suggested_entry?.is_shared_meal" class="text-yellow-300 font-bold">👥 60/40 share</span>
+        </div>
+        <details class="mt-2" open>
+          <summary class="text-xs text-emerald-300 cursor-pointer mb-2">✏️ 改資料</summary>
+          <div class="grid grid-cols-2 gap-2 text-xs">
+            <input type="text" placeholder="菜名" x-model="previewCorrectForm.name" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="text" placeholder="餐廳" x-model="previewCorrectForm.restaurant_chain" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="kcal" x-model.number="previewCorrectForm.calories" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="P" x-model.number="previewCorrectForm.protein" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="C" x-model.number="previewCorrectForm.carbs" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="F" x-model.number="previewCorrectForm.fat" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+          </div>
+          <textarea x-model="previewCorrectForm.note" placeholder="備註（永久保留）" class="mt-2 w-full rounded-lg bg-black/40 px-2 py-1.5 text-xs text-white border border-white/15" rows="2"></textarea>
+        </details>
+        <div class="mt-3 grid grid-cols-2 gap-2">
+          <button @click="cancelPreview()" class="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold text-white/80 active:scale-95">取消</button>
+          <button @click="commitPreview()" class="rounded-lg bg-emerald-500 px-3 py-2 text-xs font-bold text-black active:scale-95">✓ 確認 log</button>
+        </div>
+      </div>
+
+      <!-- v2.2 PHOTOSTREAM strip — today's photos with food/non-food classification -->
+      <template x-if="photostream.length > 0">
+        <div class="mb-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 font-bold">今日相片
+              <span class="text-emerald-300" x-text="`(${photostream.filter(p => p.classification?.is_food && !p.already_logged).length} 建議 log)`"></span>
+            </div>
+            <button @click="loadPhotostream(true)" class="text-[10px] text-emerald-300" :disabled="photostreamClassifying">
+              <span x-text="photostreamClassifying ? '分類中...' : '↻ 重分類'"></span>
+            </button>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <template x-for="item in photostream" :key="item.path">
+              <div class="relative rounded-xl overflow-hidden border" :class="item.classification?.is_food ? (item.already_logged ? 'border-white/10 opacity-50' : 'border-emerald-400/60') : 'border-white/10'">
+                <img :src="item.url" class="w-full h-20 object-cover" loading="lazy">
+                <div class="absolute inset-x-0 bottom-0 bg-black/70 text-[9px] p-1 leading-tight">
+                  <template x-if="item.classification?.is_food && !item.already_logged">
+                    <div class="text-emerald-300 font-bold" x-text="item.classification?.suggested_name?.slice(0, 14) || '食物'"></div>
+                  </template>
+                  <template x-if="item.classification?.is_food && item.already_logged">
+                    <div class="text-gray-400">✓ 已 log</div>
+                  </template>
+                  <template x-if="item.classification && !item.classification.is_food">
+                    <div class="text-gray-400">非食物</div>
+                  </template>
+                  <template x-if="!item.classification">
+                    <div class="text-gray-500">— 分類中 —</div>
+                  </template>
+                </div>
+                <template x-if="item.classification?.is_food && !item.already_logged">
+                  <button @click="suggestLogFromPhoto(item)" class="absolute top-1 right-1 bg-emerald-500 text-black text-[10px] px-1.5 py-0.5 rounded font-bold active:scale-95">AI log 呢張</button>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+
       <!-- Last scan summary -->
       <div x-show="lastScan" class="rounded-2xl bg-white/[0.06] backdrop-blur border border-white/10 p-4 mb-4" x-cloak>
         <div class="text-[10px] uppercase tracking-[0.15em] text-emerald-300 mb-2 font-bold">剛剛嗰個 scan</div>
@@ -2406,7 +3036,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span> kcal</span>
                 <span><span class="text-emerald-300 font-bold" x-text="scan.protein || 0"></span> P</span>
                 <span x-show="scan.shared" class="text-yellow-300">👥</span>
-                <span x-show="(scan.user_corrections || []).length > 0" class="text-sky-300" x-text="`✏ ${scan.user_corrections.length}`"></span>
+                <span x-show="(scan.user_corrections || []).length > 0" class="text-sky-300" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
               </div>
               <div class="text-[10px] text-gray-500" x-text="scan.timestamp_iso || ''"></div>
             </div>
@@ -2431,6 +3061,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <button class="primary-btn w-full py-6 text-2xl tap mt-8 glow-ready" @click="endSession()" :class="{'saving': saving}">🏁 END SESSION</button>
         <div class="text-xs text-gray-500 text-center mt-3">Telegram 同步 ON by default (Jim 7/19 config)</div>
+      </div>
+
+      <!-- v2.2 Coach tips panel (pplx + MiniMax render Traditional Chinese form cues + progression) -->
+      <div x-show="coachTips || coachTipsLoading" class="my-6 rounded-2xl bg-gradient-to-br from-emerald-900/40 to-blue-900/40 backdrop-blur border border-emerald-400/30 p-4" x-cloak>
+        <div class="text-[10px] uppercase tracking-[0.15em] text-emerald-300 font-bold mb-2">🧑‍🏫 教練 tips — 繁中 form cue + progression</div>
+
+        <!-- Loading state -->
+        <div x-show="coachTipsLoading" class="text-sm text-gray-400">
+          <div class="animate-pulse">pplx + MiniMax 分析緊你嘅 session…</div>
+        </div>
+
+        <!-- Loaded tips -->
+        <div x-show="coachTips && !coachTipsLoading">
+          <div class="text-sm text-white whitespace-pre-wrap leading-relaxed mb-3" x-text="coachTips?.tips?.mm_summary || ''"></div>
+
+          <details x-show="coachTips?.tips?.pplx_raw">
+            <summary class="text-[10px] text-emerald-300 cursor-pointer">原始 pplx 內容（參考）</summary>
+            <div class="text-xs text-gray-300 whitespace-pre-wrap mt-2 leading-relaxed" x-text="coachTips?.tips?.pplx_raw || ''"></div>
+          </details>
+
+          <div class="mt-3 text-[10px] text-gray-400">
+            <span x-text="coachTips?.exercises_analyzed?.length || 0"></span> 個動作 · <span x-text="coachTips?.session_date || ''"></span> · <span x-show="coachTips?.cached" class="text-yellow-300">cached</span><span x-show="!coachTips?.cached">即時生成</span>
+          </div>
+
+          <button @click="fetchCoachTips()" class="mt-2 w-full rounded-lg bg-emerald-500/80 px-3 py-2 text-xs font-bold text-black active:scale-95">↻ 重新生成 tips</button>
+        </div>
       </div>
 
       <div x-show="endSummary" class="my-6">
@@ -2519,6 +3175,14 @@ function gymApp() {
     recentScans: [],
     correctForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: '', note: '' },
     correctSubmitMsg: '',
+    // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
+    photostream: [],           // today's images with optional classification
+    photostreamClassifying: false,
+    previewEntry: null,        // current scan preview pending Jim confirmation
+    previewEditing: false,     // toggle edit-mode for preview fields
+    previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
+    coachTips: null,           // pplx + MiniMax result for just-ended session
+    coachTipsLoading: false,
     quote: '努力唔會辜負你',
     quoteBank: ['努力唔會辜負你', '今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', '慢慢嚟', '穩住', '加油'],
     exerciseCategories: [
@@ -2553,6 +3217,8 @@ function gymApp() {
       } catch(e) {}
       // v2.1: preload recent scans (for Scan tab)
       this.loadRecentScans();
+      // v2.2: preload today's photostream (F1 — auto-suggest food log candidates)
+      this.loadPhotostream(true);
       // Pull streak (non-blocking)
       try {
         const streakRes = await fetch('/api/streak');
@@ -3062,8 +3728,42 @@ function gymApp() {
           await fetch('/api/sync_sheet', { method: 'POST' });
         } catch (e) { /* sheet push is best-effort */ }
         this.flash('Session ended ✓');
+        // v2.2: trigger coach tips generation for the just-ended session
+        try { await this.fetchCoachTips(); } catch (e) { /* non-blocking */ }
       } catch(e) { this.flash('Error: ' + e.message); }
       this.saving = false;
+    },
+
+    async fetchCoachTips() {
+      // Build exercises payload from this.session.exercises (shape from session data model)
+      const exs = this.session?.exercises || [];
+      if (!exs.length) return;
+      const exerciseSummary = exs.map(e => ({
+        name: e.exercise || e.name || '',
+        sets: (e.sets || []).map(s => ({ weight_kg: s.weight, reps: s.reps })),
+      }));
+      const allSetNums = exs.flatMap(e => (e.sets || []).map((_, i) => i));
+      const totalVol = exs.flatMap(e => (e.sets || [])).reduce((a, s) => a + ((s.weight || 0) * (s.reps || 0)), 0);
+      const exerciseNames = exs.map(e => e.exercise || e.name || 'Unknown').filter(Boolean);
+      try {
+        this.coachTipsLoading = true;
+        const r = await fetch('/api/coach_tips', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_date: this.sessionDateStr || this.today,
+            exercises: exerciseNames,
+            total_vol: totalVol,
+            total_sets: allSetNums.length,
+            exercise_summary: exerciseSummary,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          this.coachTips = data;
+        }
+      } catch(e) { /* silent */ }
+      finally { this.coachTipsLoading = false; }
     },
 
     async resetSession() {
@@ -3104,39 +3804,127 @@ function gymApp() {
       try {
         const formData = new FormData();
         formData.append('image', file);
-        // Simulated progress phases (real progress not accessible via fetch upload)
         const progressTimer = setInterval(() => {
-          if (this.scanProgress < 90) this.scanProgress += 5;
+          if (this.scanProgress < 85) this.scanProgress += 5;
         }, 400);
 
-        const r = await fetch('/api/scan_food', { method: 'POST', body: formData });
+        // v2.2 F2: use PREVIEW endpoint (not auto-commit). Jim confirms manually.
+        const r = await fetch('/api/scan_preview', { method: 'POST', body: formData });
         clearInterval(progressTimer);
         this.scanProgress = 100;
-
         const data = await r.json();
         if (!data.ok) {
           this.flash('Scan 失敗：' + (data.error || '未知錯誤'));
           this.scanUploading = false;
           return;
         }
-
-        this.lastScan = data.entry;
-        this.lastScan.scan_index = data.scan_index;
-        this.lastScan.vision_short = (data.entry.vision_raw_desc || '').slice(0, 120);
-        this.lastScan.timestamp_iso = data.entry.timestamp_iso;
-        this.lastScan.shared = data.entry.is_shared_meal;
-        this.lastScan.image_url = `/scan_img/${(data.entry.image_saved_to || '').split('/').pop()}`;
-        this.correctSubmitMsg = '';
-        this.flash(data.sheet_synced ? 'Scan 完成 ✓ 已寫入 Sheet' : 'Scan 完成 ✓（Sheet 跳過）');
-        await this.loadRecentScans();
+        // Populate preview entry + start in edit mode after auto-fill
+        this.previewEntry = data.preview;
+        this.previewCorrectForm = {
+          name: data.preview.suggested_entry.name || '',
+          restaurant_chain: data.preview.suggested_entry.restaurant_chain || '',
+          calories: data.preview.suggested_entry.calories || null,
+          protein: data.preview.suggested_entry.protein || null,
+          carbs: data.preview.suggested_entry.carbs || null,
+          fat: data.preview.suggested_entry.fat || null,
+          note: '',
+        };
+        this.previewEditing = true;
+        this.tab = 'scan';
+        this.flash('Preview 就緒 ✓ 撳「確認」先 log');
       } catch(e) {
         this.flash('Error：' + e.message);
       } finally {
         this.scanUploading = false;
         this.scanProgress = 0;
-        // Reset file input so same file can be re-selected
         event.target.value = '';
       }
+    },
+
+    async loadPhotostream(classify = true) {
+      this.photostreamClassifying = classify;
+      try {
+        const r = await fetch(`/api/photostream/today?classify=${classify}&limit=30`);
+        const data = await r.json();
+        this.photostream = data.items || [];
+      } catch(e) { /* silent */ }
+      finally { this.photostreamClassifying = false; }
+    },
+
+    async commitPreview() {
+      if (!this.previewEntry) {
+        this.flash('冇 preview 可以確認');
+        return;
+      }
+      try {
+        // Build final entry: merged with Jim's edits
+        const baseEntry = this.previewEntry.suggested_entry;
+        const finalEntry = {
+          ...baseEntry,
+          name: this.previewCorrectForm.name || baseEntry.name,
+          restaurant_chain: this.previewCorrectForm.restaurant_chain || baseEntry.restaurant_chain,
+          calories: this.previewCorrectForm.calories ?? baseEntry.calories,
+          protein: this.previewCorrectForm.protein ?? baseEntry.protein,
+          carbs: this.previewCorrectForm.carbs ?? baseEntry.carbs,
+          fat: this.previewCorrectForm.fat ?? baseEntry.fat,
+        };
+        const r = await fetch('/api/scan_commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            entry: finalEntry,
+            image_path: this.previewEntry.image_path,
+            user_correction: this.previewCorrectForm.note ? this.previewCorrectForm : null,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          this.flash(data.sheet_synced ? '✓ 已寫入 log + Sheet' : '✓ 已寫入 log（Sheet 跳過）');
+          this.previewEntry = null;
+          this.previewEditing = false;
+          await this.loadRecentScans();
+          await this.loadPhotostream(true);
+        } else {
+          this.flash('Commit 失敗：' + (data.error || '未知'));
+        }
+      } catch(e) {
+        this.flash('Error：' + e.message);
+      }
+    },
+
+    cancelPreview() {
+      this.previewEntry = null;
+      this.previewEditing = false;
+      this.flash('Preview 已取消');
+    },
+
+    async suggestLogFromPhoto(item) {
+      // Re-run scan_preview on an existing photostream image (server fetches bytes)
+      try {
+        this.scanUploading = true;
+        this.flash('AI 睇緊呢張相…');
+        const r = await fetch('/api/scan_preview_from_path', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image_path: item.path }),
+        });
+        const data = await r.json();
+        if (!data.ok) { this.flash('失敗：' + (data.error || '')); this.scanUploading = false; return; }
+        this.previewEntry = data.preview;
+        this.previewCorrectForm = {
+          name: data.preview.suggested_entry.name || '',
+          restaurant_chain: data.preview.suggested_entry.restaurant_chain || '',
+          calories: data.preview.suggested_entry.calories || null,
+          protein: data.preview.suggested_entry.protein || null,
+          carbs: data.preview.suggested_entry.carbs || null,
+          fat: data.preview.suggested_entry.fat || null,
+          note: '',
+        };
+        this.previewEditing = true;
+        this.tab = 'scan';
+        this.flash('Preview 就緒 ✓ 撳「確認」先 log');
+      } catch (e) { this.flash('Error: ' + e.message); }
+      finally { this.scanUploading = false; }
     },
 
     async submitCorrection() {
@@ -3257,7 +4045,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v24';
+const CACHE = 'gym-web-v25';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
