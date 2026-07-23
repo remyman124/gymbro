@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 
 def _safe_read_json(path, default=None):
@@ -1853,11 +1853,22 @@ def api_scan_food():
 
 @app.route("/api/scan_recent", methods=["GET"])
 def api_scan_recent():
-    """Return last N scans (default 5) for dashboard overlay."""
+    """Return last N successful scans (default 5) for dashboard overlay.
+
+    Jim OOB 2026-07-23: 'In scan last 5 photo. Do not show failed upload'.
+    Filter logic: drop scans whose name/vision_short indicates MiniMax vision
+    failure (calories==0 + NameError marker), so the dashboard only shows
+    scans that produced a real food entry.
+    """
     limit = int(request.args.get("limit", 5))
     scan_log = _load_scan_log()
-    recent = scan_log[-limit:][::-1]
-    return jsonify({"scans": recent, "total": len(scan_log)})
+    # v2.4: drop failed scans (name/vision_short contain Vision failed marker)
+    def _is_failed_scan(s):
+        n = str(s.get("name", "")) + " " + str(s.get("vision_short", ""))
+        return ("失敗" in n or "NameError" in n or "failed" in n.lower())
+    successful = [s for s in scan_log if not _is_failed_scan(s)]
+    recent = successful[-limit:][::-1]
+    return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
 
 
 @app.route("/api/scan_correct", methods=["POST"])
@@ -3155,8 +3166,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </details>
       </div>
 
-      <!-- Recent scans (last 5) -->
-      <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 mb-2 font-bold">最近 5 個 scan</div>
+      <!-- Recent scans (last 5) — v2.4 filters out failed uploads -->
+      <div class="flex items-baseline justify-between mb-2">
+        <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 font-bold">最近 5 個 scan</div>
+        <div x-show="recentScansFiltered > 0" class="text-[10px] text-gray-500">
+          過濾咗 <span class="text-yellow-300 font-bold" x-text="recentScansFiltered"></span> 條 failed upload
+        </div>
+      </div>
       <template x-if="recentScans.length === 0">
         <div class="text-xs text-gray-500 text-center py-6">未有 scan 紀錄</div>
       </template>
@@ -3307,6 +3323,7 @@ function gymApp() {
     scanProgress: 0,
     lastScan: null,
     recentScans: [],
+    recentScansFiltered: 0,  // v2.4: count of failed scans skipped by filter
     correctForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: '', note: '' },
     correctSubmitMsg: '',
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
@@ -3921,6 +3938,7 @@ function gymApp() {
         const r = await fetch('/api/scan_recent?limit=5');
         const data = await r.json();
         this.recentScans = data.scans || [];
+        this.recentScansFiltered = data.filtered || 0;
       } catch(e) { /* silent */ }
     },
 
@@ -4301,7 +4319,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v26';
+const CACHE = 'gym-web-v27';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
