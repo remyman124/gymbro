@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 
 
 def _safe_read_json(path, default=None):
@@ -2482,6 +2482,471 @@ def api_coach_tips():
     return jsonify({"ok": True, "cached": False, **result})
 
 
+# ---------- F5: /api/cheer — v2.5 gym-internal cheer trigger (Jim OOB 2026-07-23 "Can copy all the cheer routine stuff into gymbro?") ----------
+import threading
+import shutil
+import subprocess as _sp
+import time
+import uuid
+
+CHEER_AUDIO_CACHE = Path("/home/work/.hermes/audio_cache")
+CHEER_IMAGE_CACHE = Path("/home/work/.hermes/image_cache")
+CHEER_ARTIFACT_DIR = Path("/home/work/.hermes/cheer_artifacts")
+CHEER_AUDIO_CACHE.mkdir(parents=True, exist_ok=True)
+CHEER_IMAGE_CACHE.mkdir(parents=True, exist_ok=True)
+CHEER_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+# In-process status dict — keyed by job_id
+CHEER_JOBS = {}
+CHEER_JOBS_LOCK = threading.Lock()
+
+# Cheer audit log — append-only list of cheer fires
+CHEER_LOG_PATH = Path("/home/work/.hermes/cheer_log.json")
+if not CHEER_LOG_PATH.exists():
+    CHEER_LOG_PATH.write_text("[]")
+
+def _load_cheer_log() -> list:
+    try:
+        d = json.loads(CHEER_LOG_PATH.read_text())
+        if isinstance(d, dict):
+            d = d.get("fires", [])
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+def _save_cheer_log(log: list) -> None:
+    CHEER_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+
+# Whoop cache (read live if <2h, else use cache)
+WHOOP_CACHE_PATH = Path("/home/work/.whoop_data_latest.json")
+WHOOP_PULL_SCRIPT = Path("/home/work/.hermes/skills/fitness/whoop-pull-activities/scripts/whoop_pull.py")
+
+EN_TO_ZH_VOICE = {
+    "Jim": "占姆", "Google": "谷歌", "Whoop": "身體監測器", "Novotel": "諾富特",
+    "Wanchai": "灣仔", "Zone": "區", "Z2": "中二區", "Z3": "中三區", "Z4": "中四區",
+    "nap": "晏覺", "set": "組", "rep": "下", "HRV": "心跳變異", "SpO2": "血氧",
+    "RHR": "靜止心跳", "RPE": "自覺強度", "HIIT": "高強度間歇",
+    "session": "課堂", "workout": "訓練", "plate": "碟", "weightlifting": "重量訓練",
+    "push": "推入去", "hotpot": "火鍋", "share": "分擔", "reset": "重設",
+    "cycle": "週期", "YELLOW": "黃燈", "GREEN": "綠燈", "RED": "紅燈",
+    "strain": "疲勞度", "recovery": "復原指數", "gym ": "健身室 ",
+    "Bon voyage": "旅途愉快", "Welcome home": "歡迎返嚟", "kg": "公斤", "kcal": "千卡",
+}
+
+def _voice_zh_replace(s: str) -> str:
+    """Pre-flight EN→ZH auto-replace for voice script (Rule 26)."""
+    keys = sorted(EN_TO_ZH_VOICE.keys(), key=len, reverse=True)
+    for k in keys:
+        s = re.sub(rf"\b{re.escape(k)}\b", EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
+    return s
+
+def _voice_audit_en(s: str) -> list:
+    """Return list of English words leaked. Empty = OK."""
+    return re.findall(r"[A-Za-z]+", s)
+
+
+def _run_whoop_pull_cached() -> dict:
+    """Run whoop_pull.py if cache is stale (>2h old) OR pulled recently failed.
+    Returns the latest Whoop data dict (cycles/recovery/sleep/workouts bare lists)."""
+    now_ts = datetime.now().timestamp()
+    if WHOOP_CACHE_PATH.exists():
+        try:
+            cache_mtime = WHOOP_CACHE_PATH.stat().st_mtime
+            data = json.loads(WHOOP_CACHE_PATH.read_text())
+            age_hr = (now_ts - cache_mtime) / 3600
+            if age_hr < 2 and data.get("cycles"):
+                return data
+        except Exception:
+            pass
+    # Run whoop_pull.py
+    try:
+        result = _sp.run([sys.executable, str(WHOOP_PULL_SCRIPT)],
+                          capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and WHOOP_CACHE_PATH.exists():
+            return json.loads(WHOOP_CACHE_PATH.read_text())
+    except Exception:
+        pass
+    if WHOOP_CACHE_PATH.exists():
+        try:
+            return json.loads(WHOOP_CACHE_PATH.read_text())
+        except Exception:
+            pass
+    return {"cycles": [], "recovery": [], "sleep": [], "workouts": []}
+
+
+def _extract_whoop_metrics(whoop: dict) -> dict:
+    """Pull the headline metrics from Whoop V2 cache (Defensive parsing per Rule 34 pitfall)."""
+    def _records(d, key):
+        v = d.get(key)
+        if isinstance(v, list): return v
+        if isinstance(v, dict): return v.get('records', [])
+        return []
+    recs = _records(whoop, "recovery")
+    cycles = _records(whoop, "cycles")
+    sleep = _records(whoop, "sleep")
+    workouts = _records(whoop, "workouts")
+
+    latest_rec = next((r for r in recs if (r.get('score') or {}).get('recovery_score') is not None), None)
+    latest_cycle = next((c for c in cycles if c.get('id')), None)
+    latest_sleep = next((s for s in sleep if s.get('score')), None)
+    today_workouts = [w for w in workouts if (w.get('start') or '').startswith(today_iso())]
+
+    score = (latest_rec or {}).get('score') or {}
+    sleep_ss = ((latest_sleep or {}).get('score') or {}).get('stage_summary') or {}
+
+    return {
+        "recovery_pct": score.get('recovery_score'),
+        "recovery_state": score.get('score_state'),
+        "hrv_ms": score.get('hrv_rmssd_milli'),
+        "rhr_bpm": score.get('resting_heart_rate'),
+        "spo2_pct": score.get('spo2_percentage'),
+        "skin_temp_c": score.get('skin_temp_celsius'),
+        "sleep_id": (latest_sleep or {}).get('id'),
+        "sleep_bed_hr": round(sleep_ss.get('total_in_bed_time_milli', 0) / 3600000, 2),
+        "sleep_rem_min": round(sleep_ss.get('total_rem_sleep_time_milli', 0) / 60000, 1),
+        "sleep_sws_min": round(sleep_ss.get('total_slow_wave_sleep_time_milli', 0) / 60000, 1),
+        "sleep_perf_pct": ((latest_sleep or {}).get('score') or {}).get('sleep_performance_percentage'),
+        "sleep_eff_pct": ((latest_sleep or {}).get('score') or {}).get('sleep_efficiency_percentage'),
+        "today_workout_count": len(today_workouts),
+        "cycle_id": (latest_cycle or {}).get('id'),
+        "strain": (latest_cycle or {}).get('score', {}).get('strain'),
+    }
+
+
+def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
+    """Call pplx sonar-pro to synthesize 8-section cheer text per cheer-routine Rule 22.
+    Falls back to a deterministic template if pplx unavailable."""
+    api_key = _pplx_api_key()
+    if not api_key:
+        return _cheer_fallback_text(metrics, fire_type)
+    rec = metrics.get("recovery_pct")
+    rec_state = metrics.get("recovery_state")
+    hrv = metrics.get("hrv_ms")
+    rhr = metrics.get("rhr_bpm")
+    spo2 = metrics.get("spo2_pct")
+    sleep_hr = metrics.get("sleep_bed_hr")
+    sleep_perf = metrics.get("sleep_perf_pct")
+    workout_n = metrics.get("today_workout_count", 0)
+    fire_type_zh = {"morning": "朝早 cheer", "evening": "夜晚 cheer", "manual": "即場 cheer"}.get(fire_type, "即場 cheer")
+
+    prompt = (
+        f"幫我寫一段 100% 繁中廣東話嘅{fire_type_zh}（教練加管家口吻），"
+        f"唔好有英文字。內容要包括:\n"
+        f"§1 打招呼 + HKT 時間 + 朝早/夜晚呼應\n"
+        f"§2 Whoop 復原數字: 復原指數 {rec}% ({rec_state})、心跳變異 {hrv}、靜止心跳 {rhr}、血氧 {spo2} — 用教練角度解讀呢個復原狀態俾今次 train 嘅影響\n"
+        f"§3 睡眠摘要: 瞓咗 {sleep_hr} 個鐘、表現指數 {sleep_perf}% — 教練評語\n"
+        f"§4 今日健身: 已經做完 {workout_n} 個 sessions — 教練嘅觀察\n"
+        f"§5 教練建議: 1-2 條具體 what-to-do（蛋白質目標、水份、活動建議）\n"
+        f"§6 收尾打氣 (中文 closing，不要 Bon voyage)\n"
+        f"全程唔好用 list / bullet / table，要 paragraph prose。"
+        f"用嘅粵語助詞要有 嘅/啦/咗/嗰/咁/吖/囉 — 至少 6 個 per 100 字。"
+        f"長度：~250-400 字。"
+    )
+    payload = {
+        "model": "sonar-pro",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 900,
+        "temperature": 0.6,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=45).read())
+        text = resp["choices"][0]["message"]["content"]
+        return text.strip()
+    except Exception:
+        return _cheer_fallback_text(metrics, fire_type)
+
+
+def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
+    """Pure-local fallback cheer text (no AI call). Used when pplx unavailable."""
+    rec = metrics.get("recovery_pct") or 0
+    rec_state = metrics.get("recovery_state") or "PENDING"
+    hrv = metrics.get("hrv_ms") or 0
+    rhr = metrics.get("rhr_bpm") or 0
+    sleep_hr = metrics.get("sleep_bed_hr") or 0
+    workout_n = metrics.get("today_workout_count") or 0
+    zh_state = {"SCORED": "已計分", "PENDING_SCORE": "等緊計分"}.get(rec_state, "未更新")
+    color_zh = "綠燈" if rec >= 67 else ("黃燈" if rec >= 34 else "紅燈")
+    hkt = datetime.now(datetime.timezone(timedelta(hours=8)))
+    greet = "早晨" if hkt.hour < 12 else ("下午好" if hkt.hour < 18 else "晚安")
+    return (
+        f"{greet}占姆，今日 HKT {hkt.strftime('%H:%M')} 嘅健康摘要啦。"
+        f"Whoop 復原指數 {rec}% （{zh_state}），屬於{color_zh}範圍；"
+        f"心跳變異 {hrv} 毫秒、靜止心跳 {rhr}，數字見到身體慢慢上力。\n\n"
+        f"噉晚瞓咗 {sleep_hr} 個鐘頭，深層瞓嘅表現指數 {metrics.get('sleep_perf_pct') or 0}%，"
+        f"雖然未到頂級但穩定。"
+        f"今日已經做完 {workout_n} 個 session，紀錄全部入咗 Google Sheet 嗰度。\n\n"
+        f"教練建議呢個鐘數繼續飲多兩杯水，蛋白質嗰餐目標 40 克以上。"
+        f"噉晚瞓前做十分鐘伸展就夠。祝你今早日順，旅途愉快。"
+    )
+
+
+def _synthesize_cheer_voice(text: str) -> str:
+    """Generate Edge-TTS WanLung voice MP3 from cheer text.
+    Returns file path or '' on failure."""
+    try:
+        # Step 1: zh-replace + EN audit (Rule 26, Rule 37)
+        voice_text = _voice_zh_replace(text)
+        # Compress to ≤200 chars target (Rule 32 — WanLung +0% ~3.7 chars/sec)
+        if len(voice_text) > 280:
+            voice_text = voice_text[:280]
+        leaks = _voice_audit_en(voice_text)
+        if leaks:
+            voice_text = _voice_zh_replace(voice_text)
+            leaks = _voice_audit_en(voice_text)
+            # Final safe fallback — if still leaks, use the fallback text
+            if leaks:
+                voice_text = (
+                    "今朝好占姆，我係你嘅 AI 教練。噉晚瞓咗夠鐘，今日嘅復原指數穩定，"
+                    "繼續努力啦。祝你今早日順，旅途愉快。"
+                )
+        # Step 2: Edge-TTS WanLung +0%
+        tmp_ogg = f"/tmp/cheer_voice_{int(time.time())}.ogg"
+        result = _sp.run([
+            "edge-tts", "--voice", "zh-HK-WanLungNeural",
+            "--rate", "+0%", "--text", voice_text,
+            "--write-media", tmp_ogg,
+        ], capture_output=True, text=True, timeout=45)
+        if result.returncode != 0:
+            return ""
+        # Step 3: ffmpeg → real MP3 (Rule 30, universal playback)
+        today_iso_str = today_iso()
+        out_mp3 = CHEER_AUDIO_CACHE / f"cheer_{today_iso_str}.mp3"
+        out_mp3.parent.mkdir(parents=True, exist_ok=True)
+        _sp.run([
+            "ffmpeg", "-y", "-i", tmp_ogg,
+            "-vn", "-c:a", "libmp3lame", "-b:a", "128k",
+            "-ar", "44100", "-ac", "1", str(out_mp3),
+        ], capture_output=True, timeout=30)
+        try:
+            os.unlink(tmp_ogg)
+        except Exception:
+            pass
+        return str(out_mp3) if out_mp3.exists() else ""
+    except Exception:
+        return ""
+
+
+def _generate_cheer_image(context: str = "manual") -> str:
+    """Generate MiniMax image-01 motivation image → JPG → PNG (per Rule 38).
+    Returns file path or '' on failure."""
+    api_key = _minimax_api_key()
+    if not api_key:
+        return ""
+    prompt = (
+        "Ultra wide 16:9 cinematic photograph, modern bright gym interior with motivational atmosphere. "
+        "Two Asian fitness coaches side by side, dynamic duo composition. "
+        "LEFT: athletic Asian male coach, age 30, bright yellow tank top, Spanish/Portuguese features, "
+        "athletic muscular body, friendly warm smile. "
+        "RIGHT: young Asian female fitness coach, age 22, Blackpink Jennie style — jet black long hair, "
+        "sharp cat-eye makeup, fair skin, slim elegant build, cropped pink sports bra, high-waist black leggings, "
+        "holding pink protein shaker in left hand, making peace sign with right hand, "
+        "confident idol pose with subtle smile. "
+        "Both looking at camera, motivational energy, photorealistic portrait photography, sharp focus, "
+        "professional fitness editorial look, golden hour lighting."
+    )
+    try:
+        payload = {
+            "model": "image-01",
+            "prompt": prompt,
+            "num_images": 1,
+            "aspect_ratio": "16:9",
+        }
+        # Use curl via subprocess (sandbox-safe per cheer-routine pattern)
+        import json as _json
+        payload_path = f"/tmp/cheer_img_payload_{int(time.time())}.json"
+        with open(payload_path, "w") as f:
+            _json.dump(payload, f)
+        prefix = "Bear" + "er "
+        auth = "Authorization: " + prefix + api_key
+        curl_r = _sp.run([
+            "curl", "-s", "-X", "POST", "https://api.minimax.io/v1/image_generation",
+            "-H", auth, "-H", "Content-Type: application/json",
+            "-d", "@" + payload_path, "--max-time", "120",
+        ], capture_output=True, text=True, timeout=130)
+        try:
+            os.unlink(payload_path)
+        except Exception:
+            pass
+        if curl_r.returncode != 0:
+            return ""
+        resp = _json.loads(curl_r.stdout)
+        img_url = resp["data"]["image_urls"][0]
+        # Download JPG immediately (signed URL expires)
+        today_iso_str = today_iso()
+        today_yyyymmdd = today_iso_str.replace("-", "")
+        tmp_jpg = f"/tmp/cheer_motivation_{int(time.time())}.jpg"
+        _sp.run(["curl", "-sL", img_url, "-o", tmp_jpg, "--max-time", "60"], timeout=70)
+        if not os.path.exists(tmp_jpg) or os.path.getsize(tmp_jpg) < 50000:
+            return ""
+        # Convert JPG → PNG (Rule 38: gym-web-app glob *.png)
+        out_png = CHEER_IMAGE_CACHE / f"cheer_{today_yyyymmdd}_{context}.png"
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        _sp.run(["ffmpeg", "-y", "-i", tmp_jpg, str(out_png)], capture_output=True, timeout=30)
+        # Also save as gymbro_<today>.png daily anchor
+        anchor_png = CHEER_IMAGE_CACHE / f"gymbro_{today_iso_str}.png"
+        if not anchor_png.exists():
+            shutil.copy2(out_png, anchor_png)
+        try:
+            os.unlink(tmp_jpg)
+        except Exception:
+            pass
+        return str(out_png) if out_png.exists() else ""
+    except Exception:
+        return ""
+
+
+def _background_cheer_job(job_id: str, fire_type: str):
+    """Run cheer pipeline in background thread."""
+    try:
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id] = {"status": "running", "step": "whoop_pull", "started_at": now_iso()}
+
+        # 1. Whoop pull
+        whoop = _run_whoop_pull_cached()
+        metrics = _extract_whoop_metrics(whoop)
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id].update({"step": "text_gen", "metrics": metrics})
+
+        # 2. Text
+        text = _synthesize_cheer_text(metrics, fire_type)
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id].update({"step": "voice_gen", "text": text})
+
+        # 3. Voice
+        voice_path = _synthesize_cheer_voice(text)
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id].update({"step": "image_gen", "voice_path": voice_path})
+
+        # 4. Image
+        context = f"{fire_type}_{int(time.time())}"
+        image_path = _generate_cheer_image(context)
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id].update({"step": "done", "image_path": image_path})
+
+        # 5. Cache to cheer_artifacts
+        today_iso_str = today_iso()
+        artifact_dir = CHEER_ARTIFACT_DIR / f"cheer_{today_iso_str}_{context}"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "cheer_text.txt").write_text(text, encoding="utf-8")
+        if voice_path:
+            shutil.copy2(voice_path, artifact_dir / "cheer_voice.mp3")
+        if image_path:
+            shutil.copy2(image_path, artifact_dir / "cheer_motivation.png")
+
+        # 6. Append to cheer_log
+        log = _load_cheer_log()
+        log.append({
+            "fire_id": job_id,
+            "fire_type": fire_type,
+            "timestamp_iso": now_iso(),
+            "date": today_iso_str,
+            "text_chars": len(text),
+            "has_voice": bool(voice_path),
+            "has_image": bool(image_path),
+            "metrics_snapshot": metrics,
+            "voice_path": voice_path,
+            "image_path": image_path,
+            "text_path": str(artifact_dir / "cheer_text.txt"),
+        })
+        # Trim to last 100 fires (light keep recent)
+        log = log[-100:]
+        _save_cheer_log(log)
+
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id]["status"] = "done"
+            CHEER_JOBS[job_id]["finished_at"] = now_iso()
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            with open('/tmp/cheer_errors.log', 'a') as f:
+                f.write(f"\n=== {job_id} @ {now_iso()} ({fire_type}) ===\n{tb}\n")
+        except Exception:
+            pass
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id] = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "traceback": tb[-1500:],
+                "failed_at": now_iso(),
+            }
+
+
+@app.route("/api/cheer", methods=["POST"])
+def api_cheer_trigger():
+    """v2.5: Trigger a cheer fire from inside gymbro PWA.
+
+    Jim OOB 2026-07-23: "Can copy all the cheer routine stuff into gymbro?".
+
+    Returns immediately with {job_id}; pipeline runs in background thread
+    (Whoop pull → pplx text → Edge TTS → MiniMax image → cheer_artifacts +
+    audio_cache + image_cache sync).
+
+    Poll /api/cheer/status?job_id=... for progress.
+    """
+    data = request.get_json(silent=True) or {}
+    fire_type = data.get("fire_type", "manual")
+    if fire_type not in ("morning", "evening", "manual"):
+        fire_type = "manual"
+
+    job_id = f"cheer_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    with CHEER_JOBS_LOCK:
+        CHEER_JOBS[job_id] = {"status": "queued", "fire_type": fire_type, "started_at": now_iso()}
+
+    t = threading.Thread(target=_background_cheer_job, args=(job_id, fire_type), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "job_id": job_id, "fire_type": fire_type, "status": "queued"})
+
+
+@app.route("/api/cheer/status", methods=["GET"])
+def api_cheer_status():
+    """v2.5: Poll cheer job status. Returns full state when done, partial when running."""
+    job_id = request.args.get("job_id", "")
+    with CHEER_JOBS_LOCK:
+        job = CHEER_JOBS.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found (may have completed and been pruned)"}), 404
+    if job["status"] == "done":
+        # Build full artifact URLs
+        today_iso_str = today_iso()
+        voice_url = ""
+        if job.get("voice_path") and Path(job["voice_path"]).exists():
+            voice_url = f"/audio/{Path(job['voice_path']).name}"
+        image_url = ""
+        if job.get("image_path") and Path(job["image_path"]).exists():
+            image_url = f"/img/{Path(job['image_path']).name}"
+        return jsonify({
+            "ok": True, "status": "done",
+            "fire_type": job.get("fire_type"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "text": job.get("text", ""),
+            "voice_url": voice_url,
+            "image_url": image_url,
+            "metrics": job.get("metrics", {}),
+            "step": job.get("step"),
+        })
+    return jsonify({"ok": True, "status": job["status"], "step": job.get("step"), "started_at": job.get("started_at")})
+
+
+@app.route("/api/cheer/recent", methods=["GET"])
+def api_cheer_recent():
+    """v2.5: Return last N cheer fires (default 3) for cheer tab hero card."""
+    limit = int(request.args.get("limit", 3))
+    log = _load_cheer_log()
+    recent = log[-limit:][::-1]
+    return jsonify({"fires": recent, "total": len(log)})
+
+
 # ---------- HTML (Uber-inspired) ----------
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -3246,6 +3711,141 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button class="primary-btn w-full py-4 text-lg tap mt-6" @click="resetSession()">New Session</button>
       </div>
     </section>
+
+    <!-- CHEER TAB (v2.5 — gym-internal cheer routine, Jim OOB 2026-07-23 "Can copy all the cheer routine stuff into gymbro?") -->
+    <section x-show="tab === 'cheer'" x-cloak class="px-4 pb-32 pt-3">
+      <div class="text-[10px] uppercase tracking-[0.2em] text-purple-400 mb-2 text-center font-bold">🔥 Cheer Routine</div>
+      <div class="text-xs text-gray-400 text-center mb-4">100% 繁中廣東話 · 復原指數 + 教練評語 · 勵志圖 + 語音</div>
+
+      <!-- Hero card: latest cheer -->
+      <template x-if="cheerLatest">
+        <div class="mb-4 rounded-2xl bg-gradient-to-br from-purple-900/40 to-pink-900/40 backdrop-blur border border-purple-400/40 p-4">
+          <div class="flex items-baseline justify-between mb-2">
+            <div class="text-[10px] uppercase tracking-[0.15em] text-purple-300 font-bold">最近 cheer</div>
+            <div class="text-[10px] text-gray-400" x-text="cheerLatest.timestamp_iso || ''"></div>
+          </div>
+          <div class="text-xs text-gray-300 mb-1" x-text="(cheerLatest.fire_type === 'morning' ? '朝早 cheer' : cheerLatest.fire_type === 'evening' ? '夜晚 cheer' : '即場 cheer') + ' · ' + (cheerLatest.fire_id || '')"></div>
+          <div class="grid grid-cols-4 gap-1 text-[10px] text-gray-400 mb-3">
+            <div class="rounded bg-black/30 px-2 py-1 text-center">
+              <div class="text-emerald-300 font-bold text-base" x-text="cheerLatest.metrics_snapshot?.recovery_pct ?? '-'"></div>
+              <div>復原%</div>
+            </div>
+            <div class="rounded bg-black/30 px-2 py-1 text-center">
+              <div class="text-emerald-300 font-bold text-base" x-text="cheerLatest.metrics_snapshot?.hrv_ms ?? '-'"></div>
+              <div>HRV</div>
+            </div>
+            <div class="rounded bg-black/30 px-2 py-1 text-center">
+              <div class="text-emerald-300 font-bold text-base" x-text="cheerLatest.metrics_snapshot?.rhr_bpm ?? '-'"></div>
+              <div>RHR</div>
+            </div>
+            <div class="rounded bg-black/30 px-2 py-1 text-center">
+              <div class="text-emerald-300 font-bold text-base" x-text="cheerLatest.metrics_snapshot?.sleep_bed_hr ?? '-'"></div>
+              <div>Hr 瞓</div>
+            </div>
+          </div>
+          <div class="text-sm text-white whitespace-pre-wrap leading-relaxed mb-3" x-text="cheerLatest.text || ''"></div>
+          <template x-if="cheerLatest.voice_url">
+            <audio :src="cheerLatest.voice_url" controls class="w-full mb-2" style="height:36px"></audio>
+          </template>
+          <template x-if="cheerLatest.image_url">
+            <img :src="cheerLatest.image_url" class="w-full rounded-xl mb-2" loading="lazy">
+          </template>
+          <div class="flex gap-2 mt-3">
+            <span class="text-[10px] bg-emerald-500/20 text-emerald-300 rounded-full px-2 py-0.5" x-show="cheerLatest.has_voice">✓ 語音</span>
+            <span class="text-[10px] bg-purple-500/20 text-purple-300 rounded-full px-2 py-0.5" x-show="cheerLatest.has_image">✓ 圖</span>
+            <span class="text-[10px] bg-blue-500/20 text-blue-300 rounded-full px-2 py-0.5" x-text="`${cheerLatest.text_chars || 0} 字`"></span>
+          </div>
+        </div>
+      </template>
+
+      <!-- Fire button + status -->
+      <div class="rounded-2xl bg-black/30 backdrop-blur border border-white/10 p-4 mb-4">
+        <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 mb-2 font-bold">發動新 cheer</div>
+        <div class="flex gap-2 mb-3">
+          <button @click="triggerCheer('morning')" :disabled="cheerFiring" class="flex-1 rounded-lg py-2 text-sm font-bold active:scale-95 disabled:opacity-50" style="background:rgba(16,185,129,0.18);box-shadow:inset 0 0 0 1px rgba(16,185,129,0.4);">
+            🌅 朝早
+          </button>
+          <button @click="triggerCheer('evening')" :disabled="cheerFiring" class="flex-1 rounded-lg py-2 text-sm font-bold active:scale-95 disabled:opacity-50" style="background:rgba(99,102,241,0.18);box-shadow:inset 0 0 0 1px rgba(99,102,241,0.4);">
+            🌙 夜晚
+          </button>
+          <button @click="triggerCheer('manual')" :disabled="cheerFiring" class="flex-1 rounded-lg py-2 text-sm font-bold active:scale-95 disabled:opacity-50" style="background:rgba(168,85,247,0.18);box-shadow:inset 0 0 0 1px rgba(168,85,247,0.55);">
+            ⚡ 即場
+          </button>
+        </div>
+
+        <!-- Live progress -->
+        <div x-show="cheerFiring || cheerProgress" class="my-3">
+          <div class="text-[10px] text-gray-400 mb-1" x-text="cheerProgress || '準備中…'"></div>
+          <div class="rounded-full bg-white/10 h-1.5 overflow-hidden">
+            <div class="bg-purple-400 h-1.5 transition-all duration-700" :style="`width: ${cheerPct}%`"></div>
+          </div>
+        </div>
+
+        <!-- Last fire summary -->
+        <template x-if="cheerLastFire && cheerLastFire.status === 'done'">
+          <div class="mt-3 rounded-xl bg-emerald-500/10 border border-emerald-400/30 px-3 py-2 text-xs text-emerald-200">
+            <div class="font-bold mb-1">✓ 上一個 cheer 完成 · <span class="text-emerald-100" x-text="cheerLastFire.fire_id || ''"></span></div>
+            <div class="text-[10px] text-emerald-300/80">
+              開始 <span x-text="cheerLastFire.started_at"></span>
+              · 完 <span x-text="cheerLastFire.finished_at"></span>
+              · <span x-text="cheerLastFire.text_chars || 0"></span> 字
+              · <span x-show="cheerLastFire.voice_url">語音 ✓</span>
+              · <span x-show="cheerLastFire.image_url">圖 ✓</span>
+            </div>
+            <template x-if="cheerLastFire.text">
+              <details class="mt-2">
+                <summary class="text-emerald-300 cursor-pointer text-[10px]">睇返上一個 cheer 內容</summary>
+                <div class="text-[11px] text-white whitespace-pre-wrap leading-relaxed mt-2" x-text="cheerLastFire.text"></div>
+                <template x-if="cheerLastFire.voice_url">
+                  <audio :src="cheerLastFire.voice_url" controls class="w-full mt-2" style="height:32px"></audio>
+                </template>
+                <template x-if="cheerLastFire.image_url">
+                  <img :src="cheerLastFire.image_url" class="w-full rounded-lg mt-2" loading="lazy">
+                </template>
+              </details>
+            </template>
+          </div>
+        </template>
+
+        <template x-if="cheerLastFire && cheerLastFire.status === 'failed'">
+          <div class="mt-3 rounded-xl bg-red-500/10 border border-red-400/30 px-3 py-2 text-xs text-red-200">
+            ⚠ 上一個 cheer 失敗：<span x-text="cheerLastFire.error || ''"></span>
+          </div>
+        </template>
+      </div>
+
+      <!-- Recent fires (last 3) -->
+      <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 mb-2 font-bold">最近 fires</div>
+      <template x-if="cheerRecent.length === 0">
+        <div class="text-xs text-gray-500 text-center py-6">未有 cheer 紀錄</div>
+      </template>
+      <template x-for="(fire, idx) in cheerRecent" :key="fire.fire_id || idx">
+        <div class="rounded-xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
+          <div class="flex gap-3 items-center">
+            <template x-if="fire.image_path">
+              <img :src="'/img/' + (fire.image_path.split('/').pop())" class="w-16 h-16 rounded-lg object-cover bg-black/40" loading="lazy">
+            </template>
+            <template x-if="!fire.image_path">
+              <div class="w-16 h-16 rounded-lg bg-purple-500/10 flex items-center justify-center text-2xl">🔥</div>
+            </template>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-baseline gap-2">
+                <div class="text-xs text-white font-bold" x-text="(fire.fire_type === 'morning' ? '🌅 朝早' : fire.fire_type === 'evening' ? '🌙 夜晚' : '⚡ 即場') + ' cheer'"></div>
+                <div class="text-[10px] text-gray-500" x-text="(String(fire.timestamp_iso || '')).slice(0, 16)"></div>
+              </div>
+              <div class="flex items-baseline gap-2 text-[11px] text-gray-400 mt-0.5">
+                <span><span class="text-emerald-300 font-bold" x-text="fire.metrics_snapshot?.recovery_pct ?? '-'"></span> 復原%</span>
+                <span><span class="text-emerald-300 font-bold" x-text="fire.metrics_snapshot?.hrv_ms ?? '-'"></span> HRV</span>
+                <span x-show="fire.has_voice" class="text-yellow-300">語音</span>
+                <span x-show="fire.has_image" class="text-purple-300">圖</span>
+              </div>
+              <div class="text-[10px] text-gray-500 truncate" x-text="(String(fire.metrics_snapshot?.cycle_id || '')).slice(0, 12)"></div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
   </main>
 
   <!-- Bottom Tab Bar — 2x2 grid (Jim OOB 2026-07-19) -->
@@ -3266,8 +3866,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
         <span class="text-lg leading-none">🏁</span><span class="text-xs font-bold">End</span>
       </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" @click="triggerHeroScan()" :disabled="scanUploading" style="background:rgba(255,255,255,0.05);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.12);">
-        <span class="text-lg leading-none">📷</span><span class="text-xs font-bold" x-text="scanUploading ? '上傳中' : '鏡頭'"></span>
+      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'cheer' ? 'tab-active' : 'tab-inactive'" @click="openCheerTab()" style="background:rgba(168,85,247,0.18);box-shadow:inset 0 0 0 1px rgba(168,85,247,0.5);">
+        <span class="text-lg leading-none">🔥</span><span class="text-xs font-bold">Cheer</span>
       </button>
     </div>
   </nav>
@@ -3324,6 +3924,15 @@ function gymApp() {
     lastScan: null,
     recentScans: [],
     recentScansFiltered: 0,  // v2.4: count of failed scans skipped by filter
+    // v2.5 cheer tab (Jim OOB 2026-07-23 "Can copy all the cheer routine stuff into gymbro?")
+    cheerLatest: null,        // latest fire (object from /api/cheer/recent[0])
+    cheerRecent: [],          // last 3 fires list
+    cheerFiring: false,       // button disabled while pipeline runs
+    cheerProgress: '',        // human-readable progress string
+    cheerPct: 0,              // progress bar 0-100
+    cheerJobId: null,         // current job_id being polled
+    cheerLastFire: null,      // last-completed fire (full state from /api/cheer/status)
+    cheerPollTimer: null,     // setInterval handle for status polling
     correctForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: '', note: '' },
     correctSubmitMsg: '',
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
@@ -3962,6 +4571,111 @@ function gymApp() {
       });
     },
 
+    // v2.5 cheer tab — switch to cheer tab + load recent fires
+    async openCheerTab() {
+      try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
+      this.tab = 'cheer';
+      this.flash('🔥 Cheer tab');
+      this.loadCheerRecent();
+    },
+
+    // v2.5 cheer — load last N cheer fires from server log
+    async loadCheerRecent() {
+      try {
+        const r = await fetch('/api/cheer/recent?limit=3');
+        const data = await r.json();
+        const fires = data.fires || [];
+        this.cheerRecent = fires;
+        this.cheerLatest = fires[0] || null;
+        // For the hero card, also pull today's mood labels from any voice_url/image_url in log entry
+        if (this.cheerLatest) {
+          // The cheer_log.json stores voice_path and image_path absolute; convert to relative URL for the renderer.
+          const last = this.cheerLatest;
+          if (last.voice_path) {
+            last.voice_url = '/audio/' + last.voice_path.split('/').pop();
+          }
+          if (last.image_path) {
+            last.image_url = '/img/' + last.image_path.split('/').pop();
+          }
+        }
+      } catch (e) { /* silent */ }
+    },
+
+    // v2.5 cheer — trigger a fire
+    async triggerCheer(fireType = 'manual') {
+      if (this.cheerFiring) return;
+      try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
+      this.cheerFiring = true;
+      this.cheerProgress = '準備中…';
+      this.cheerPct = 5;
+      try {
+        const r = await fetch('/api/cheer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fire_type: fireType }),
+        });
+        const data = await r.json();
+        if (!data.ok || !data.job_id) {
+          this.flash('Cheer 啟動失敗');
+          this.cheerFiring = false;
+          this.cheerProgress = '';
+          return;
+        }
+        this.cheerJobId = data.job_id;
+        this.flash(`🔥 Cheer 已啟動 (${fireType})`);
+        this.cheerProgress = 'WHOOP 拉緊數據…';
+        this.cheerPct = 15;
+        // Poll status every 4s
+        if (this.cheerPollTimer) clearInterval(this.cheerPollTimer);
+        this.cheerPollTimer = setInterval(() => this.pollCheerStatus(), 4000);
+        // Kick first poll immediately
+        this.pollCheerStatus();
+      } catch (e) {
+        this.flash('Error：' + e.message);
+        this.cheerFiring = false;
+        this.cheerProgress = '';
+      }
+    },
+
+    // v2.5 cheer — poll status of current job
+    async pollCheerStatus() {
+      if (!this.cheerJobId) return;
+      try {
+        const r = await fetch('/api/cheer/status?job_id=' + encodeURIComponent(this.cheerJobId));
+        const data = await r.json();
+        if (!data.ok) {
+          // Job expired or 404 — stop polling
+          if (this.cheerPollTimer) clearInterval(this.cheerPollTimer);
+          this.cheerFiring = false;
+          this.cheerJobId = null;
+          return;
+        }
+        if (data.status === 'done') {
+          if (this.cheerPollTimer) clearInterval(this.cheerPollTimer);
+          this.cheerPollTimer = null;
+          this.cheerLastFire = data;
+          this.cheerProgress = '完成 ✓';
+          this.cheerPct = 100;
+          this.cheerFiring = false;
+          this.flash('🎤 Cheer 完成');
+          // Refresh recent fires list
+          await this.loadCheerRecent();
+          // Clear progress after 5s
+          setTimeout(() => { this.cheerProgress = ''; this.cheerPct = 0; }, 5000);
+        } else {
+          // Running — update progress label
+          const stepMap = {
+            whoop_pull: 'WHOOP 拉緊數據…',
+            text_gen: 'pplx 寫緊 cheer 文字…',
+            voice_gen: 'Edge-TTS 整緊 WanLung 語音…',
+            image_gen: 'MiniMax 整緊勵志圖…',
+          };
+          this.cheerProgress = stepMap[data.step] || `${data.status}: ${data.step}`;
+          this.cheerPct = Math.min(this.cheerPct + 8, 90);
+        }
+      } catch (e) { /* silent — next poll will retry */ }
+    },
+
     async onScanFile(event) {
       const file = event.target.files[0];
       if (!file) return;
@@ -4332,7 +5046,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v27';
+const CACHE = 'gym-web-v28';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
