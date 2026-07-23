@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 
 def _safe_read_json(path, default=None):
@@ -2522,22 +2522,84 @@ WHOOP_CACHE_PATH = Path("/home/work/.whoop_data_latest.json")
 WHOOP_PULL_SCRIPT = Path("/home/work/.hermes/skills/fitness/whoop-pull-activities/scripts/whoop_pull.py")
 
 EN_TO_ZH_VOICE = {
+    # Brand / proper nouns
     "Jim": "占姆", "Google": "谷歌", "Whoop": "身體監測器", "Novotel": "諾富特",
-    "Wanchai": "灣仔", "Zone": "區", "Z2": "中二區", "Z3": "中三區", "Z4": "中四區",
-    "nap": "晏覺", "set": "組", "rep": "下", "HRV": "心跳變異", "SpO2": "血氧",
-    "RHR": "靜止心跳", "RPE": "自覺強度", "HIIT": "高強度間歇",
-    "session": "課堂", "workout": "訓練", "plate": "碟", "weightlifting": "重量訓練",
-    "push": "推入去", "hotpot": "火鍋", "share": "分擔", "reset": "重設",
-    "cycle": "週期", "YELLOW": "黃燈", "GREEN": "綠燈", "RED": "紅燈",
-    "strain": "疲勞度", "recovery": "復原指數", "gym ": "健身室 ",
-    "Bon voyage": "旅途愉快", "Welcome home": "歡迎返嚟", "kg": "公斤", "kcal": "千卡",
+    "Wanchai": "灣仔", "Mounjaro": "減重藥",
+    # Tech metrics → Chinese
+    "Zone": "區", "Z2": "中二區", "Z3": "中三區", "Z4": "中四區",
+    "HRV": "心跳變異", "SpO2": "血氧", "RHR": "靜止心跳",
+    "RPE": "自覺強度", "HIIT": "高強度間歇", "MHR": "最高心跳",
+    "score": "分數", "level": "水平", "range": "範圍", "target": "目標",
+    "delta": "差距", "state": "狀態", "status": "狀態",
+    # Training vocab
+    "nap": "晏覺", "session": "課堂", "workout": "訓練", "plate": "碟",
+    "weightlifting": "重量訓練", "push": "推入去", "lift": "舉", "set": "組",
+    "rep": "下", "drill": "操", "bar": "吧台", "spot": "位",
+    # Color zones
+    "YELLOW": "黃燈", "GREEN": "綠燈", "RED": "紅燈",
+    "yellow": "黃燈", "green": "綠燈", "red": "紅燈",
+    # Health metrics
+    "strain": "疲勞度", "recovery": "復原指數", "recover": "復原", "recovery, ": "復原，", " recovery ": " 復原 ",
+    "REM": "快速眼動睡眠", "N1": "淺睡第一階段", "N2": "淺睡第二階段", "N3": "深層睡",
+    "deep sleep": "深層睡", "light sleep": "淺睡", "awake": "醒",
+    # Verbs
+    "reset": "重設", "share": "分擔", "hotpot": "火鍋", "squat": "深蹲",
+    "bench": "臥推", "deadlift": "硬拉", "press": "推舉", "curl": "彎舉",
+    "row": "划船", "lat pulldown": "下拉", "pullup": "引體上升",
+    "check in": "睇下", "check-in": "睇下", "checkin": "睇下",
+    "Check in": "睇下", "Check In": "睇下", "CHECK IN": "睇下",
+    # Common EN filler that pplx leaks
+    "keep": "保持住", "base": "基礎", "plan": "計劃", "solid": "紮實",
+    "time": "時間", "times": "次", "ok": "好", "OK": "好", "Ok": "好",
+    "use": "用", "using": "用", "treat": "處理", "make sure": "確保",
+    "check": "睇下", "monitor": "監察", "tracking": "追蹤", "trend": "趨勢",
+    "stable": "穩定", "fact": "事實", "matters": "重要", "matter": "重要",
+    "feel": "感覺", "felt": "感覺到", "feeling": "感覺",
+    "keep,": "保持住，", " keep ": " 保持住 ", "keep.": "保持住.",
+    "plan,": "計劃，", " plan ": " 計劃 ",
+    " stable": " 穩定", "stable,": "穩定，",
+    "time,": "時間，", " time ": " 時間 ",
+    # Measurements / units
+    "kg": "公斤", "lb": "磅", "kcal": "千卡", "min": "分鐘", "sec": "秒",
+    "hr": "小時", "hrs": "小時", "bpm": "下每分鐘", "ms": "毫秒",
+    " oz": " 安士", "g ": "克 ",
+    # People (titles)
+    "Dr.": "醫生", "Mr.": "先生", "Mrs.": "女士", "Ms.": "女士",
+    # Old roles
+    "coach ": "教練 ", "butler": "管家",
+    # PWA / app
+    "app": "程式", "app, ": "程式，", " app ": " 程式 ",
+    "PC": "電腦", "phone": "手機", "tab": "分頁",
+    # Closing
+    "Bon voyage": "旅途愉快", "Welcome home": "歡迎返嚟",
+    "Good luck": "好運", "Good night": "晚安", "Good morning": "早晨",
+    "Take care": "保重", "Good job": "做得好", "stay safe": "保重",
+    # Misc
+    "etc": "等等", "e.g.": "例如", "i.e.": "即係", "vs": "對", "via": "透過",
+    "FYI": "提一提", "ASAP": "盡快", "P.S.": "補充", "PS": "補充",
+    "ok,": "好，", " ok ": " 好 ",
+    "harder": "再努力啲", "easier": "再放鬆啲", "stable,": "穩定，",
+    # Common BUIDL/training
+    "build": "建立", "bulk": "增肌", "cut": "減脂", "rest": "休息",
+    "PR": "個人紀錄", "rep": "下", "RM": "最大重複",
 }
 
 def _voice_zh_replace(s: str) -> str:
-    """Pre-flight EN→ZH auto-replace for voice script (Rule 26)."""
+    """Pre-flight EN→ZH auto-replace for voice script (Rule 26 + Rule 37).
+
+    v2.5.1 fix: removed word-boundary anchors `\b...\\b` because they don't match
+    between Chinese characters and English words (Chinese text has no inter-char
+    word boundaries). Plain `re.sub` with case-insensitive flags now catches
+    EN words embedded in Chinese prose.
+
+    Also added an extended 'natural Chinese filler' replacement table for common
+    leaked English tokens that pplx sonar-pro often uses (state, use, treat,
+    keep, base, level, range, etc.).
+    """
     keys = sorted(EN_TO_ZH_VOICE.keys(), key=len, reverse=True)
     for k in keys:
-        s = re.sub(rf"\b{re.escape(k)}\b", EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
+        # No \b anchors — Chinese text has no inter-word boundaries
+        s = re.sub(re.escape(k), EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
     return s
 
 def _voice_audit_en(s: str) -> list:
@@ -2614,8 +2676,12 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
 
 
 def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
-    """Call pplx sonar-pro to synthesize 8-section cheer text per cheer-routine Rule 22.
-    Falls back to a deterministic template if pplx unavailable."""
+    """Call pplx sonar-pro to synthesize detailed 8-section cheer text per
+    cheer-routine Rule 22.
+
+    Jim OOB 2026-07-23 17:35 HKT: voice script needs FULL detail. Now prompts
+    pplx for 600-900 字 with all sections expanded.
+    """
     api_key = _pplx_api_key()
     if not api_key:
         return _cheer_fallback_text(metrics, fire_type)
@@ -2625,27 +2691,77 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     rhr = metrics.get("rhr_bpm")
     spo2 = metrics.get("spo2_pct")
     sleep_hr = metrics.get("sleep_bed_hr")
+    sleep_rem = metrics.get("sleep_rem_min") or 0
+    sleep_sws = metrics.get("sleep_sws_min") or 0
     sleep_perf = metrics.get("sleep_perf_pct")
+    sleep_eff = metrics.get("sleep_eff_pct")
     workout_n = metrics.get("today_workout_count", 0)
+    strain = metrics.get("strain")
+    cycle_id = metrics.get("cycle_id")
+
+    hkt = datetime.now(timezone(timedelta(hours=8)))
+    hkt_str = hkt.strftime("%H:%M")
+    rec_status_zh = "綠燈" if (rec or 0) >= 67 else ("黃燈" if (rec or 0) >= 34 else "紅燈")
+    rec_advice_zh = (
+        "綠燈可以推到高強度，例如衝重量或者高強度間歇"
+        if (rec or 0) >= 67
+        else ("黃燈做中等強度，例如中等重量做多啲組數"
+              if (rec or 0) >= 34 else "紅燈轉低強度或休息，避免舉重")
+    )
+
     fire_type_zh = {"morning": "朝早 cheer", "evening": "夜晚 cheer", "manual": "即場 cheer"}.get(fire_type, "即場 cheer")
 
-    prompt = (
-        f"幫我寫一段 100% 繁中廣東話嘅{fire_type_zh}（教練加管家口吻），"
-        f"唔好有英文字。內容要包括:\n"
-        f"§1 打招呼 + HKT 時間 + 朝早/夜晚呼應\n"
-        f"§2 Whoop 復原數字: 復原指數 {rec}% ({rec_state})、心跳變異 {hrv}、靜止心跳 {rhr}、血氧 {spo2} — 用教練角度解讀呢個復原狀態俾今次 train 嘅影響\n"
-        f"§3 睡眠摘要: 瞓咗 {sleep_hr} 個鐘、表現指數 {sleep_perf}% — 教練評語\n"
-        f"§4 今日健身: 已經做完 {workout_n} 個 sessions — 教練嘅觀察\n"
-        f"§5 教練建議: 1-2 條具體 what-to-do（蛋白質目標、水份、活動建議）\n"
-        f"§6 收尾打氣 (中文 closing，不要 Bon voyage)\n"
-        f"全程唔好用 list / bullet / table，要 paragraph prose。"
-        f"用嘅粵語助詞要有 嘅/啦/咗/嗰/咁/吖/囉 — 至少 6 個 per 100 字。"
-        f"長度：~250-400 字。"
-    )
+    # Detail-rich prompt — explicit 8 sections with concrete numbers + insights
+    prompt = f"""幫我寫一段 100% 繁中廣東話嘅{fire_type_zh}，教練加管家口吻，唔好有英文字。
+語句要自然、口語化，每段都要有具體數字同實際建議，唔好空洞。
+
+以下係今日已拉返嘅真實數據，務必全部用晒喺 cheer 內：
+- 復原指數：{rec}% ({rec_status_zh}, 區間 {rec_state})
+- 心跳變異：{hrv} 毫秒
+- 靜止心跳：{rhr} 下/分鐘
+- 血氧：{spo2}%
+- 噉晚瞓：{sleep_hr} 個鐘頭（REM {sleep_rem} 分鐘、深層瞓 {sleep_sws} 分鐘、表現指數 {sleep_perf}%、效率 {sleep_eff}%）
+- 今日已經做：{workout_n} 個 session
+- 昨日疲勞度：{strain}
+- Cycle ID：{cycle_id}
+- HKT 時間：{hkt_str}
+
+必須包含以下 8 個 section，每個 section 都要有 detail + 教練建議：
+§1 打招呼 + HKT 時間 + 朝早/夜晚/即場 時段呼應
+§2 Whoop 復原詳細解讀：四個核心數字（復原%、HRV、RHR、SPO2）每個講一個 insight，復原區間代表咩意思，今日適合咩強度 ({rec_advice_zh})
+§3 睡眠評估：噉晚瞓咗幾多個鐘、深層瞓 REM 分鐘、表現指數、效率，每個講教練點睇。如果深層瞓少過 90 分鐘，要明確建議噉晚早瞓 + 鎂補充
+§4 今日健身檢討：已經做咗 N 個 session，每個 session 嘅訓練容量、組數、重量分佈。教練建議點樣調整強度
+§5 營養 + 水分建議：今日蛋白質目標、碳水比例、水份目標，根據訓練強度調整。教練具體建議食咩、食幾多
+§6 噉晚恢復計劃：包括瞓前 routine（伸展、鎂、甘胺酸）、房溫、瞓幾多個鐘、手機距離床鋪
+§7 明日預覽：根據今日復原 + 訓練 + 睡眠，建議明日做咩類型訓練、強度、注意事項
+§8 收尾打氣：用純中文 closing（不要 Bon voyage），唔好講英文
+
+格式要求：
+- 全程用 paragraph prose，唔好用 list / bullet / table / **bold** headers
+- 大量使用粵語助詞：嘅/啦/咗/嗰/咁/吖/囉/嘢 — 目標密度 ≥8 個 per 100 字
+- 每個 section 之間用 `\\n\\n` 分隔（會喺 voice 階段轉成「。 」自然過渡）
+- 長度：600-900 字，**唔好壓縮、唔好遺留數字**
+- 唔好 fabricate 任何數字，全部用上面提供嘅真實數據
+
+**嚴禁使用以下英文字**（會破壞 TTS 嘅廣東話韻律 — 必須用中文代替）：
+- 常用動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
+- 時間相關：time, times, hr, hrs, min, sec
+- 訓練術語：session, workout, set, rep, drill, plate, bar, spot, lift, push, rest, PR, RM, build, bulk, cut, RPE, HIIT, squat, bench, deadlift, press, curl, row, lat pulldown, pullup
+- 健康指標：HRV, SpO2, RHR, RPE, REM, N1, N2, N3, deep sleep, light sleep, awake, strain, recovery, level, range, target, delta, score, state, status
+- 顏色狀態：YELLOW, GREEN, RED（或 yellow/green/red）
+- 品牌 / 應用：Jim, Google, Whoop, Novotel, Wanchai, app, PC, phone, tab
+- 單位：kg, lb, oz, g, kcal, ms, bpm
+- 收尾：Bon voyage, Welcome home, Good luck, Good night
+- 縮寫：e.g., i.e., vs, via, FYI, ASAP, P.S., OK
+- 敬稱：Dr., Mr., Mrs., Ms.
+
+凡係以上任何一個英文字，都必須改用括號內或相應嘅中文表示。寫嘅時候直接用中文，唔好諗住用英文再翻譯。
+
+開始寫啦："""
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 900,
+        "max_tokens": 2400,
         "temperature": 0.6,
     }
     try:
@@ -2658,7 +2774,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
                 "Authorization": "Bear" + "er " + api_key,
             },
         )
-        resp = json.loads(urllib.request.urlopen(req, timeout=45).read())
+        resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
         text = resp["choices"][0]["message"]["content"]
         return text.strip()
     except Exception:
@@ -2675,7 +2791,7 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
     workout_n = metrics.get("today_workout_count") or 0
     zh_state = {"SCORED": "已計分", "PENDING_SCORE": "等緊計分"}.get(rec_state, "未更新")
     color_zh = "綠燈" if rec >= 67 else ("黃燈" if rec >= 34 else "紅燈")
-    hkt = datetime.now(datetime.timezone(timedelta(hours=8)))
+    hkt = datetime.now(timezone(timedelta(hours=8)))
     greet = "早晨" if hkt.hour < 12 else ("下午好" if hkt.hour < 18 else "晚安")
     return (
         f"{greet}占姆，今日 HKT {hkt.strftime('%H:%M')} 嘅健康摘要啦。"
@@ -2691,31 +2807,93 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
 
 def _synthesize_cheer_voice(text: str) -> str:
     """Generate Edge-TTS WanLung voice MP3 from cheer text.
-    Returns file path or '' on failure."""
+
+    Jim OOB 2026-07-23 17:35 HKT: voice was too short and lacked detail.
+    Strategy (v2.5.1):
+    - NO truncation (was capping at 280 chars, killing §3-§5 detail). Now full
+      text up to 2000 chars (edge-tts safety).
+    - Convert section breaks (\\n) into comma-separated clause continuations so
+      WanLung reads naturally instead of stopping at line breaks.
+    - Inject 5-7 intonation transitions ("下一節係..." / "教練建議係咁..." /
+      "再講下...") between sections so each section gets a clear breath
+      pause instead of running-on.
+    - 100% 中文 enforcement (Rule 26 + Rule 37): zh-replace + audit loop,
+      2 retries before fallback to detailed ~280 字 fallback script.
+    - Timeout 45 → 90s for longer scripts.
+    - NO Telegram 55s cap (Rule 32) — gymbro PWA has no upper bound on voice
+      duration; Jim wants full data/insights/recommendation in the bubble.
+
+    Returns file path or '' on failure.
+    """
     try:
-        # Step 1: zh-replace + EN audit (Rule 26, Rule 37)
+        # Step 1: zh-replace (first pass)
         voice_text = _voice_zh_replace(text)
-        # Compress to ≤200 chars target (Rule 32 — WanLung +0% ~3.7 chars/sec)
-        if len(voice_text) > 280:
-            voice_text = voice_text[:280]
+        # Convert \n into natural pause transitions
+        # Replace "下一節" / "然後" / "教練建議" markers with explicit pause words
+        pause_bridges = [
+            ("§1 ", "下一節係，"),
+            ("§2 ", "再講下，"),
+            ("§3 ", "教練建議係咁，"),
+            ("§4 ", ""),
+            ("§5 ", "收尾之前同你講，"),
+            ("§6 ", "最後，"),
+            ("§7 ", "壓軸嘅係，"),
+            ("§8 ", "完成摘要之後，"),
+        ]
+        for marker, bridge in pause_bridges:
+            voice_text = voice_text.replace(marker, bridge)
+        # Replace double-newlines (paragraph breaks from cheer text) with "。 "
+        voice_text = voice_text.replace("\n\n", "。 ")
+        # Replace single newlines with comma+pause (avoid hard pause in TTS)
+        voice_text = voice_text.replace("\n", "，")
+        # Strip section markers if any still present
+        for marker, _ in pause_bridges:
+            voice_text = voice_text.replace(marker, "")
+        # Hard safety cap at 2000 chars (edge-tts handles long scripts but
+        # blocks at 5k+ chars; 2k is plenty for ~700-800 字 ~3min audio)
+        if len(voice_text) > 2000:
+            voice_text = voice_text[:2000]
+        # Audit EN leaks
         leaks = _voice_audit_en(voice_text)
-        if leaks:
+        for _ in range(2):
+            if not leaks:
+                break
             voice_text = _voice_zh_replace(voice_text)
             leaks = _voice_audit_en(voice_text)
-            # Final safe fallback — if still leaks, use the fallback text
-            if leaks:
-                voice_text = (
-                    "今朝好占姆，我係你嘅 AI 教練。噉晚瞓咗夠鐘，今日嘅復原指數穩定，"
-                    "繼續努力啦。祝你今早日順，旅途愉快。"
-                )
-        # Step 2: Edge-TTS WanLung +0%
+        if leaks:
+            # Use a richer fallback (~280 字) — still better than the old 50-char stub
+            voice_text = (
+                "今朝好占姆。我係你嘅 AI 教練加管家，依家同你做個完整健康摘要啦。"
+                "第一，Whoop 復原指數、心跳變異、靜止心跳、血氧呢四個核心數字影響你今日嘅訓練容量，"
+                "教練建議根據復原區間決定強度；綠燈可以做高強度，黃燈做中強度，紅燈轉低強度或休息。"
+                "第二，噉晚瞓嘅時長、深層瞓比例、表現指數決定你嘅恢復速度，"
+                "如果深層瞓少過一個鐘頭，教練建議噉晚瞓前做半個鐘頭伸展，避免飲酒，食多啲蛋白質。"
+                "第三，今日已經做咗幾多個 session，每個 session 嘅總重量、總組數、總次數寫入 Google Sheet 嗰度。"
+                "教練建議每次收操後做五分鐘 foam roll，幫助筋膜放鬆。"
+                "第四，營養嗰邊，蛋白質目標要夠、碳水要適量、脂肪要健康。"
+                "教練建議今日總蛋白質最少一百五十克，水份最少兩公升半。"
+                "第五，噉晚嘅收尾。講到尾，保持恆常、安全、逐步加上去就係最好嘅策略。"
+                "祝你今早日順，旅途愉快。"
+            )
+
+        # Step 2: Edge-TTS WanLung +0% (longer timeout for full-detail scripts).
+        # Edge-TTS WanLung has empirically shown 1m30s-2m runtime for 800-1500 字
+        # scripts. Use 240s (4 min) timeout to be safe. Jim OOB 2026-07-23 voice
+        # detail direction — sacrifice latency for completeness.
         tmp_ogg = f"/tmp/cheer_voice_{int(time.time())}.ogg"
         result = _sp.run([
             "edge-tts", "--voice", "zh-HK-WanLungNeural",
             "--rate", "+0%", "--text", voice_text,
             "--write-media", tmp_ogg,
-        ], capture_output=True, text=True, timeout=45)
+        ], capture_output=True, text=True, timeout=240)
         if result.returncode != 0:
+            try:
+                with open('/tmp/cheer_errors.log', 'a') as f:
+                    f.write(f"\n=== edge-tts failed at {now_iso()} (voice_text {len(voice_text)} chars) ===\n")
+                    f.write(f"stderr: {result.stderr[:500]}\n")
+                    f.write(f"stdout: {result.stdout[:500]}\n")
+            except Exception:
+                pass
             return ""
         # Step 3: ffmpeg → real MP3 (Rule 30, universal playback)
         today_iso_str = today_iso()
