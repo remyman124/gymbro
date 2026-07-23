@@ -357,6 +357,9 @@ def api_cancel_last_set():
 WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
+# gymbro PWA version — bump on every release
+__version__ = "2.0.0"
+
 
 def _safe_read_json(path, default=None):
     """Read a JSON cache file. Returns default on missing/corrupt — never raises to UI."""
@@ -2719,7 +2722,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v22';
+const CACHE = 'gym-web-v23';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
