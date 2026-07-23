@@ -2873,7 +2873,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 §1 打招呼 + HKT 時間 + 朝早/夜晚/即場 時段呼應
 §2 Whoop 復原詳細解讀：四個核心數字（復原%、HRV、RHR、SPO2）每個講一個 insight，復原區間代表咩意思，今日適合咩強度 ({rec_advice_zh})
 §3 睡眠評估：噉晚瞓咗幾多個鐘、深層瞓 REM 分鐘、表現指數、效率，每個講教練點睇。如果深層瞓少過 90 分鐘，要明確建議噉晚早瞓 + 鎂補充
-§4 今日健身檢討：**將今日每個 session 嘅每個動作都逐個講**（動作名、重量、組數、總容量），唔好概括。如果有 Withings 體重／體脂都提一提，教練建議點樣調整強度
+§4 今日健身檢討：**將今日每個 session 嘅每個動作都逐個講**（動作名、重量、組數、總容量），唔好概括。如果今日 0 個 session，唔好跳過，要話用 Withings 今日體重 {withings_weight} 公斤、體脂 {withings_fat}% 去補位，教練根據呢啲數據畀訓練建議
 §5 營養 + 水分建議：今日蛋白質目標、碳水比例、水份目標，根據訓練強度調整。教練具體建議食咩、食幾多
 §6 噉晚恢復計劃：包括瞓前 routine（伸展、鎂、甘胺酸）、房溫、瞓幾多個鐘、手機距離床鋪
 §7 明日預覽：根據今日復原 + 訓練 + 睡眠，建議明日做咩類型訓練、強度、注意事項
@@ -2906,7 +2906,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 850,  # 600-720 字 ≈ 320-500 tokens output; 850 上限防 over-run
+        "max_tokens": 1300,  # 600-720 字 = ~350-500 pplx output tokens; 1300 headroom prevents mid-section truncation (Jim OOB 7/24).
         "temperature": 0.6,
     }
     try:
