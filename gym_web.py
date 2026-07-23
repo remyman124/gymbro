@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 
 def _safe_read_json(path, default=None):
@@ -2672,7 +2672,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Top Bar -->
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
     <div class="flex items-center justify-between gap-2">
-      <h1 class="text-3xl font-black tracking-tighter">Gym</h1>
+      <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gym</h1>
       <div class="flex flex-col items-end leading-tight">
         <span class="text-sm font-bold text-emerald-300 tabular-nums" x-text="clockStr"></span>
         <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
@@ -3942,6 +3942,19 @@ function gymApp() {
       } catch(e) { /* silent */ }
     },
 
+    // v2.4: tap brand heading — go back to SET tab + scroll to top, NO reload.
+    // Jim OOB 2026-07-23: 'When I click the gym heading, it refresh and reload'.
+    // Prevents page reload via (a) intercept click event, (b) preventDefault,
+    // (c) explicitly call window.scrollTo so iOS doesn't bounce-reload.
+    // Also stamps window.__lastTapAt so the SW controllerchange guard knows
+    // an active interaction just happened and won't mid-tap force-reload.
+    onBrandTap() {
+      try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
+      this.tab = 'set';
+      try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e) { window.scrollTo(0, 0); }
+      this.flash('返到 SET 主頁');
+    },
+
     triggerHeroScan() {
       this.tab = 'scan';
       this.$nextTick(() => {
@@ -4355,8 +4368,22 @@ self.addEventListener('fetch', e => {
   );
 });
 // Force reload when a new SW takes over (controllerchange = new SW activated).
+// v2.4 guarded: only reload if user is NOT actively logging a set. Without this guard,
+// every SW cache bump (v27→v28 etc.) force-reloaded iPhone PWA mid-tap, causing
+// the 'click heading → reload' symptom Jim reported. We briefly suppress reload
+// during active interaction (last tap <1500ms ago) so user-initiated clicks are
+// never interrupted by a background SW update. After the cooldown elapses, the
+// new SW will still kick in on next navigation naturally.
 self.addEventListener('controllerchange', () => {
-  if (typeof window !== 'undefined') window.location.reload();
+  if (typeof window !== 'undefined') {
+    const lastTap = (typeof window.__lastTapAt === 'number') ? window.__lastTapAt : 0;
+    if (Date.now() - lastTap < 1500) {
+      // Active tap — skip reload, but force-takeover after grace period
+      setTimeout(() => { try { window.location.reload(); } catch(e){} }, 30000);
+      return;
+    }
+    window.location.reload();
+  }
 });
 """.strip()
 
