@@ -481,31 +481,34 @@ def _withings_body_latest():
                 capture_output=True, text=True, timeout=20,
             )
             if r.returncode == 0 and r.stdout.strip():
+                found = None
                 for line in r.stdout.strip().splitlines():
                     parts = line.split()
                     if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
                         try:
-                            latest = {
+                            found = {
                                 "date": parts[0],
                                 "weight_kg": float(parts[1]),
                                 "fat_pct": float(parts[2]),
                             }
+                            break  # got the most recent reading in this window
                         except (ValueError, IndexError):
                             continue
-                        # Persist into the cache file so subsequent reads are fast.
-                        try:
-                            cur = _safe_read_json(WITHINGS_CACHE)
-                            if not isinstance(cur, dict):
-                                cur = {}
-                            cur["body"] = latest
-                            cur["synced_at"] = now_iso()
-                            tmp = str(WITHINGS_CACHE) + ".tmp"
-                            Path(tmp).write_text(_json.dumps(cur, indent=2, ensure_ascii=False))
-                            os.replace(tmp, str(WITHINGS_CACHE))
-                        except Exception:
-                            pass
-                        return latest
-                break
+                if found is not None:
+                    # Persist into the cache file so subsequent reads are fast.
+                    try:
+                        cur = _safe_read_json(WITHINGS_CACHE)
+                        if not isinstance(cur, dict):
+                            cur = {}
+                        cur["body"] = found
+                        cur["synced_at"] = now_iso()
+                        tmp = str(WITHINGS_CACHE) + ".tmp"
+                        Path(tmp).write_text(_json.dumps(cur, indent=2, ensure_ascii=False))
+                        os.replace(tmp, str(WITHINGS_CACHE))
+                    except Exception:
+                        pass
+                    return found
+                # window returned no rows — try wider window
     except Exception:
         pass
     return {}
@@ -2605,6 +2608,27 @@ EN_TO_ZH_VOICE = {
     "plan,": "計劃，", " plan ": " 計劃 ",
     " stable": " 穩定", "stable,": "穩定，",
     "time,": "時間，", " time ": " 時間 ",
+    # Jim OOB 2026-07-24: extended EN filler coverage (pplx casual news text leaks)
+    "fit": "健", "fitness": "健康", "share": "分擔", "shared": "分咗", "fast": "快",
+    "simple": "簡單", "basically": "基本上", "literally": "真係", "actually": "其實",
+    "okay": "好", "yeah": "係", "yep": "係", "nope": "唔係", "kinda": "有少少",
+    "sort of": "有少少", "kind of": "有少少", "gonna": "會", "wanna": "想",
+    "gotta": "要", "should": "應該", "would": "會", "could": "可以",
+    "maybe": "可能", "probably": "可能", "definitely": "一定",
+    "anyway": "總之", "anyways": "總之", "though": "不過", "although": "雖然",
+    "because": "因為", "since": "因為", "while": "當", "during": "喺",
+    "right": "啱", "wrong": "錯", "true": "啱", "false": "錯",
+    "best": "最好", "worst": "最差", "better": "更好", "worse": "更差",
+    "more": "多啲", "less": "少啲", "most": "最多", "least": "最少",
+    "today": "今日", "tomorrow": "聽日", "yesterday": "尋日",
+    "morning": "朝早", "evening": "夜晚", "afternoon": "下晝", "night": "夜晚",
+    "week": "星期", "month": "月份", "year": "年",
+    "world cup": "世界盃", "World Cup": "世界盃",
+    "premier league": "英超", "Premier League": "英超",
+    "liverpool": "利物浦", "Liverpool": "利物浦",
+    "man utd": "曼聯", "Man Utd": "曼聯", "Manchester United": "曼聯",
+    "fitness,": "健康，", " fit": " 健",
+    "FIT": "健", "FITS": "健",
     # Measurements / units
     "kg": "公斤", "lb": "磅", "kcal": "千卡", "min": "分鐘", "sec": "秒",
     "hr": "小時", "hrs": "小時", "bpm": "下每分鐘", "ms": "毫秒",
@@ -2651,6 +2675,66 @@ def _voice_zh_replace(s: str) -> str:
 def _voice_audit_en(s: str) -> list:
     """Return list of English words leaked. Empty = OK."""
     return re.findall(r"[A-Za-z]+", s)
+
+
+def _zh_inline(en_word: str) -> str:
+    """Last-resort EN→ZH map for any word that survived the main _voice_zh_replace
+    passes. v2.7.3 (Jim OOB 2026-07-24): the old behaviour replaced the whole text
+    with a 383-char stub; now we keep the full body and just inline-translate
+    any remaining EN words.
+    """
+    table = {
+        "fit": "健", "fitness": "健康", "share": "分擔", "shared": "分咗",
+        "fast": "快", "slow": "慢", "high": "高", "low": "低",
+        "good": "好", "bad": "差", "ok": "好", "OK": "好",
+        "so": "咁", "very": "好", "too": "太", "just": "只",
+        "and": "同", "or": "或者", "but": "但", "if": "如果",
+        "the": "", "a": "", "an": "", "is": "係", "are": "係", "was": "係",
+        "be": "係", "been": "係", "have": "有", "has": "有", "had": "有",
+        "do": "做", "does": "做", "did": "做", "doing": "做",
+        "go": "去", "going": "去", "went": "去", "gone": "去",
+        "get": "拎", "got": "拎咗", "take": "拎", "took": "拎咗",
+        "make": "整", "made": "整咗", "let": "等", "lets": "等",
+        "see": "睇", "saw": "見過", "say": "講", "said": "講過",
+        "tell": "講", "told": "講過", "ask": "問", "asked": "問過",
+        "give": "畀", "gave": "畀咗", "bring": "攞", "brought": "攞咗",
+        "find": "搵", "found": "搵到", "know": "知", "knew": "知",
+        "think": "諗", "thought": "諗過", "feel": "感覺", "felt": "感覺",
+        "want": "想", "wanted": "想", "need": "需要", "needed": "需要",
+        "like": "鍾意", "liked": "鍾意", "love": "愛", "loved": "愛",
+        "hate": "憎", "hated": "憎", "try": "試", "tried": "試過",
+        "use": "用", "used": "用", "using": "用", "work": "做嘢",
+        "worked": "做咗", "working": "做緊", "walk": "行", "walked": "行咗",
+        "run": "跑", "ran": "跑咗", "running": "跑緊", "eat": "食",
+        "ate": "食咗", "eating": "食緊", "drink": "飲", "drank": "飲咗",
+        "drinking": "飲緊", "sleep": "瞓", "slept": "瞓咗", "sleeping": "瞓緊",
+        "wake": "醒", "woke": "醒咗", "woken": "醒咗", "wakeup": "瞓醒",
+        "wake up": "瞓醒", "woke up": "瞓醒咗", "woken up": "瞓醒咗",
+        "sit": "坐", "sat": "坐咗", "stand": "企", "stood": "企咗",
+        "lie": "瞓低", "lay": "瞓低", "rest": "休息", "rested": "休息咗",
+        "push": "推", "pull": "拉", "lift": "舉", "squat": "深蹲",
+        "press": "推", "curl": "彎", "row": "划", "bench": "臥推",
+        "deadlift": "硬拉", "stretch": "拉筋", "drill": "操", "sets": "組",
+        "reps": "下", "weight": "重量", "muscle": "肌肉", "fat": "脂肪",
+        "protein": "蛋白質", "carb": "碳水", "carbs": "碳水", "water": "水",
+        "rice": "飯", "noodle": "麵", "noodles": "麵", "meat": "肉",
+        "chicken": "雞", "pork": "豬肉", "beef": "牛肉", "fish": "魚",
+        "egg": "蛋", "eggs": "蛋", "milk": "奶", "bread": "包",
+        "fruit": "生果", "apple": "蘋果", "banana": "蕉",
+        "morning": "朝早", "evening": "夜晚", "afternoon": "下晝", "night": "夜晚",
+        "today": "今日", "tomorrow": "聽日", "yesterday": "尋日",
+        "monday": "星期一", "tuesday": "星期二", "wednesday": "星期三",
+        "thursday": "星期四", "friday": "星期五", "saturday": "星期六", "sunday": "星期日",
+        "world": "世界", "world cup": "世界盃", "World Cup": "世界盃",
+        "premier": "英超", "league": "聯賽", "Premier League": "英超",
+        "liverpool": "利物浦", "Liverpool": "利物浦", "manchester": "曼徹斯特",
+        "Man Utd": "曼聯", "Manchester United": "曼聯",
+        "chelsea": "車路士", "Chelsea": "車路士", "arsenal": "阿仙奴", "Arsenal": "阿仙奴",
+        "tottenham": "熱刺", "Tottenham": "熱刺",
+        "city": "曼城", "man city": "曼城", "Man City": "曼城",
+        "sunday": "星期日", "saturday": "星期六", "weekend": "週末",
+    }
+    return table.get(en_word, f"「{en_word}」")
 
 
 def _run_whoop_pull_cached(force: bool = False) -> dict:
@@ -3104,20 +3188,10 @@ def _synthesize_cheer_voice(text: str) -> str:
             voice_text = _voice_zh_replace(voice_text)
             leaks = _voice_audit_en(voice_text)
         if leaks:
-            # Use a richer fallback (~280 字) — still better than the old 50-char stub
-            voice_text = (
-                "今朝好占姆。我係你嘅 AI 教練加管家，依家同你做個完整健康摘要啦。"
-                "第一，Whoop 復原指數、心跳變異、靜止心跳、血氧呢四個核心數字影響你今日嘅訓練容量，"
-                "教練建議根據復原區間決定強度；綠燈可以做高強度，黃燈做中強度，紅燈轉低強度或休息。"
-                "第二，噉晚瞓嘅時長、深層瞓比例、表現指數決定你嘅恢復速度，"
-                "如果深層瞓少過一個鐘頭，教練建議噉晚瞓前做半個鐘頭伸展，避免飲酒，食多啲蛋白質。"
-                "第三，今日已經做咗幾多個 session，每個 session 嘅總重量、總組數、總次數寫入 Google Sheet 嗰度。"
-                "教練建議每次收操後做五分鐘 foam roll，幫助筋膜放鬆。"
-                "第四，營養嗰邊，蛋白質目標要夠、碳水要適量、脂肪要健康。"
-                "教練建議今日總蛋白質最少一百五十克，水份最少兩公升半。"
-                "第五，噉晚嘅收尾。講到尾，保持恆常、安全、逐步加上去就係最好嘅策略。"
-                "祝你今早日順，旅途愉快。"
-            )
+            # Inline-replace any remaining EN leaks so we keep the full body (v2.7.3
+            # fix — previously nuked 1200 chars and replaced with 383-char stub).
+            import re as _re
+            voice_text = _re.sub(r"([A-Za-z]+)", lambda m: _zh_inline(m.group(0)), voice_text)
 
         # Step 2: Edge-TTS WanLung +0% (longer timeout for full-detail scripts).
         # Edge-TTS WanLung has empirically shown 1m30s-2m runtime for 800-1500 字
@@ -5513,7 +5587,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v33';
+const CACHE = 'gym-web-v34';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
