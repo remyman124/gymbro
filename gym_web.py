@@ -534,6 +534,46 @@ def _withings_fat_pct():
         return None
 
 
+def _withings_steps_today() -> dict:
+    """Latest Withings activity (steps / distance / calories) for today.
+
+    Jim OOB 2026-07-24: whoop V2 cycle has no `steps` field, so steps must
+    come from Withings. Runs `withings.py steps 1` every call and parses the
+    last line for today's date. Returns dict {steps, distance_km, calories}
+    or {} on failure.
+    """
+    import subprocess as _sp, re as _re
+    try:
+        r = _sp.run(
+            ["python3", str(WITHINGS_PULL_SCRIPT), "steps", "1"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return {}
+        lines = r.stdout.strip().splitlines()
+        # Find the last data row (skip header + dashes).
+        for line in reversed(lines):
+            parts = line.split()
+            if not parts or not _re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
+                continue
+            try:
+                date = parts[0]
+                steps = int(parts[1].replace(",", ""))
+                # distance format: "4.30km" → 4.30 (km)
+                dist_m = _re.match(r"([\d.]+)km", parts[2]) if len(parts) > 2 else None
+                dist_km = float(dist_m.group(1)) if dist_m else None
+                # calories format: "144kcal"
+                cal_m = _re.match(r"([\d.]+)kcal", parts[3]) if len(parts) > 3 else None
+                calories = float(cal_m.group(1)) if cal_m else None
+                return {"date": date, "steps": steps,
+                        "distance_km": dist_km, "calories": calories}
+            except (ValueError, IndexError, AttributeError):
+                continue
+    except Exception:
+        pass
+    return {}
+
+
 @app.route("/api/health_overlay")
 def api_health_overlay():
     """Single endpoint for the hero overlay.
@@ -545,6 +585,8 @@ def api_health_overlay():
         "weight_kg": _withings_weight(),
         "fat_pct": _withings_fat_pct(),
         "weight_date": (_withings_body_latest() or {}).get("date"),
+        "steps_today": (_withings_steps_today() or {}).get("steps"),
+        "distance_km_today": (_withings_steps_today() or {}).get("distance_km"),
     })
 
 
@@ -2966,6 +3008,8 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     # Jim OOB 2026-07-24: enrichment from Withings + workout detail loop
     withings_weight = metrics.get("withings_weight_kg")
     withings_fat = metrics.get("withings_fat_pct")
+    withings_steps = metrics.get("withings_steps_today")
+    withings_dist_km = metrics.get("withings_distance_km")
     workout_detail_zh = metrics.get("workout_detail_zh", "(尚未做運動)")
 
     hkt = datetime.now(timezone(timedelta(hours=8)))
@@ -3012,6 +3056,8 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 - 疲勞度：{strain}
 - Withings 體重：{withings_weight} 公斤
 - Withings 體脂：{withings_fat} %
+- Withings 今日步數：{withings_steps} 步
+- Withings 今日步行距離：{withings_dist_km} 公里
 - 今日 workout：{workout_n} 個 session
 
 **今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
@@ -3344,6 +3390,17 @@ def _background_cheer_job(job_id: str, fire_type: str):
         except Exception:
             metrics.setdefault("withings_weight_kg", None)
             metrics.setdefault("withings_fat_pct", None)
+        # Jim OOB 2026-07-24 09:15: Withings steps must be fresh on every fire
+        # (Whoop V2 cycle has no `steps` field, so steps come from Withings).
+        try:
+            steps_data = _withings_steps_today() or {}
+            metrics["withings_steps_today"] = steps_data.get("steps")
+            metrics["withings_distance_km"] = steps_data.get("distance_km")
+            metrics["withings_calories_today"] = steps_data.get("calories")
+        except Exception:
+            metrics.setdefault("withings_steps_today", None)
+            metrics.setdefault("withings_distance_km", None)
+            metrics.setdefault("withings_calories_today", None)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({"step": "text_gen", "metrics": metrics})
 
@@ -3838,10 +3895,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             ↶ Undo
           </button>
           <button class="tap glow-ready flex-1 rounded-full bg-emerald-400 py-3 text-base font-black tracking-wide text-black ring-2 ring-emerald-300/30"
-                  :class="{'saving': saving, 'opacity-50 cursor-not-allowed': cooldownUntil && Date.now() < cooldownUntil}"
-                  :disabled="saving || (cooldownUntil && Date.now() < cooldownUntil)"
+                  :class="{'saving': saving}"
+                  :disabled="saving"
                   @click="logSet()"
-                  x-text="(cooldownUntil && Date.now() < cooldownUntil) ? `⏳ REST ${cooldownRemaining}s` : (saving ? 'Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`)">
+                  x-text="saving ? 'Saving…' : `✓ LOG SET ${currentSet ? currentSet.set : 1}`">
           </button>
         </div>
       </div>
@@ -4442,15 +4499,9 @@ function gymApp() {
     loadingHistory: false,
     // Jim OOB 2026-07-19: copy-to-clipboard export state. Range is days back
     // from today (0 = today only, 7 = last week, 30 = last month).
-    copyRange: 7,
     copyInFlight: false,
-    copyingDate: null,  // Jim OOB 2026-07-22: per-row "⏳" spinner during copy.
-    // Jim OOB 2026-07-21: 30s resting cooldown after LOG SET (prevents accidental double-tap).
-    // Jim OOB 2026-07-24: bumped 30s → 60s (1 minute).
-    cooldownUntil: null,
-    cooldownRemaining: 0,
-    cooldownTotalSec: 60,  // 1-minute cooldown (Jim OOB 2026-07-24)
-    cooldownInterval: null,
+    copyingDate: null,  // Jim OOB 2026
+    // Jim OOB 2026-07-24 09:15: cooldown REMOVED — Jim wants to log sets as fast as possible.
     // Audio overlay state — fetched from /api/today_audio
     audioTrack: null,
     audioPlaylist: [],
@@ -4729,11 +4780,6 @@ function gymApp() {
     async logSet() {
       if (!this.currentExercise) return;
       if (this.saving) return;
-      if (this.cooldownUntil && Date.now() < this.cooldownUntil) {
-        const sec = Math.ceil((this.cooldownUntil - Date.now()) / 1000);
-        this.flash(`等 ${sec}s 後先可以再 log set`);
-        return;
-      }
       this.saving = true;
       this.haptic([60, 30, 60]);
       try {
@@ -4767,21 +4813,6 @@ function gymApp() {
             this.intensity = 'working';
           }
           this.flash(`✓ Set ${last.set} · ${last.weight_kg}kg × ${last.reps} (${this.intensityLabel})`);
-          // Jim OOB 2026-07-24: 60s resting cooldown after log (was 30s).
-          this.cooldownUntil = Date.now() + 60000;
-          this.cooldownRemaining = 60;
-          if (this.cooldownInterval) clearInterval(this.cooldownInterval);
-          this.cooldownInterval = setInterval(() => {
-            const remaining = Math.max(0, Math.ceil((this.cooldownUntil - Date.now()) / 1000));
-            this.cooldownRemaining = remaining;
-            if (remaining <= 0) {
-              clearInterval(this.cooldownInterval);
-              this.cooldownInterval = null;
-              this.cooldownUntil = null;
-              this.cooldownRemaining = 0;
-              this.flash('Rest done · ready 下一組');
-            }
-          }, 1000);
         }
       } catch(e) {
         this.flash('Error: ' + e.message);
@@ -5542,6 +5573,18 @@ SERVICE_WORKER = """
 //   - 30s REST cooldown after LOG SET: prevents accidental double-tap from
 //     inflating set count. Button shows ⏳ REST ${cooldownRemaining}s and
 //     is disabled during cooldown. After 30s, button returns to ✓ LOG SET.
+// v2.7.4 changes (Jim OOB 2026-07-24 09:15 HKT):
+//   - LOG SET cooldown REMOVED entirely (was 30s → 60s, now no cooldown).
+//     Jim wants to log sets as fast as possible. Disabled the
+//     cooldownUntil / cooldownRemaining / cooldownInterval state and the
+//     "⏳ REST Ns" button label. Button is now always clickable when
+//     !saving.
+//   - Withings steps: new _withings_steps_today() helper runs on every
+//     cheer fire (Whoop V2 cycle has no `steps` field, so steps must come
+//     from Withings). Parses "withings.py steps 1" stdout, injects
+//     {steps, distance_km, calories} into metrics. pplx prompt now has
+//     "Withings 今日步數" + "Withings 今日步行距離" lines.
+//   - /api/health_overlay now also returns steps_today + distance_km_today.
 // v19 changes (Jim OOB 2026-07-22):
 //   - Whoop paste reliability fix: copyDay() output now uses ABSOLUTE set
 //     numbering (Set 1..N across the session, not "Set 1" reset per exercise),
@@ -5587,7 +5630,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v34';
+const CACHE = 'gym-web-v35';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
