@@ -3061,6 +3061,11 @@ def _synthesize_cheer_voice(text: str) -> str:
         except Exception:
             pass
         voice_text = _voice_zh_replace(text)
+        try:
+            with open("/tmp/cheer_voice_debug.log", "a") as _f:
+                _f.write(f"{now_iso()} | after_zh_replace={len(voice_text)}\n")
+        except Exception:
+            pass
         # Convert \n into natural pause transitions
         # Replace "下一節" / "然後" / "教練建議" markers with explicit pause words
         pause_bridges = [
@@ -3082,6 +3087,11 @@ def _synthesize_cheer_voice(text: str) -> str:
         # Strip section markers if any still present
         for marker, _ in pause_bridges:
             voice_text = voice_text.replace(marker, "")
+        try:
+            with open("/tmp/cheer_voice_debug.log", "a") as _f:
+                _f.write(f"{now_iso()} | after_bridges={len(voice_text)}\n")
+        except Exception:
+            pass
         # Hard safety cap at 2000 chars (edge-tts handles long scripts but
         # blocks at 5k+ chars; 2k is plenty for ~700-800 字 ~3min audio)
         if len(voice_text) > 2000:
