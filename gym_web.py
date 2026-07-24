@@ -3055,6 +3055,11 @@ def _synthesize_cheer_voice(text: str) -> str:
     """
     try:
         # Step 1: zh-replace (first pass)
+        try:
+            with open("/tmp/cheer_voice_debug.log", "a") as _f:
+                _f.write(f"{now_iso()} | text_in={len(text)} chars\n")
+        except Exception:
+            pass
         voice_text = _voice_zh_replace(text)
         # Convert \n into natural pause transitions
         # Replace "下一節" / "然後" / "教練建議" markers with explicit pause words
