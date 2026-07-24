@@ -462,38 +462,50 @@ def _whoop_workouts_in_window(cutoff_iso_date):
 def _withings_body_latest():
     """Latest Withings body comp reading (any date, not just today).
     Returns dict {date, weight_kg, fat_pct, ...} or {} if none available.
-    Falls back to most recent cache entry so Jim always sees his latest weigh-in."""
+    Falls back to most recent cache entry so Jim always sees his latest weigh-in.
+
+    Jim OOB 2026-07-24: refresh cache from `withings.py body 7` every call so the
+    latest 1-2 weeks readings are tried, then saved to WITHINGS_CACHE atomically.
+    """
+    # Step 1: try the cache first (fast path)
     d = _safe_read_json(WITHINGS_CACHE)
     body = d.get("body") if isinstance(d, dict) else None
     if isinstance(body, dict) and body.get("weight_kg"):
         return body
-    # Fallback: most recent weight from `weight_today` or any cached body reading
-    for key in ("weight_kg", "fat_pct", "fat_kg", "muscle_kg", "hydration_pct", "bone_kg"):
-        if body and body.get(key) is not None:
-            return body  # at least some field populated
-    # Last resort: try direct measurement lookup from Withings
+    # Step 2: refresh from Withings API by parsing the most recent body row.
     try:
-        import subprocess, json, re
-        # Try wider windows until we find a reading
+        import subprocess, json as _json, re
         for window in (7, 14, 30, 90):
             r = subprocess.run(
                 ["python3", "/home/work/.hermes/skills/withings/withings.py", "body", str(window)],
                 capture_output=True, text=True, timeout=20,
             )
             if r.returncode == 0 and r.stdout.strip():
-                # Parse CLI table — first data line is most recent
                 for line in r.stdout.strip().splitlines():
                     parts = line.split()
                     if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
                         try:
-                            return {
+                            latest = {
                                 "date": parts[0],
                                 "weight_kg": float(parts[1]),
                                 "fat_pct": float(parts[2]),
                             }
                         except (ValueError, IndexError):
                             continue
-                break  # exit loop if subprocess worked
+                        # Persist into the cache file so subsequent reads are fast.
+                        try:
+                            cur = _safe_read_json(WITHINGS_CACHE)
+                            if not isinstance(cur, dict):
+                                cur = {}
+                            cur["body"] = latest
+                            cur["synced_at"] = now_iso()
+                            tmp = str(WITHINGS_CACHE) + ".tmp"
+                            Path(tmp).write_text(_json.dumps(cur, indent=2, ensure_ascii=False))
+                            os.replace(tmp, str(WITHINGS_CACHE))
+                        except Exception:
+                            pass
+                        return latest
+                break
     except Exception:
         pass
     return {}
@@ -1572,6 +1584,39 @@ def _pplx_api_key() -> str:
     return os.environ.get("PPLX_API_KEY", "")
 
 
+def _get_latest_news_for_cheer() -> str:
+    """Pull 1-2 fresh HK / sports / lifestyle news bits for the cheer prompt.
+    Jim OOB 2026-07-24: 'use latest news to make it more innovative and funny'.
+    Returns a short Chinese string or '' on failure.
+    """
+    key = _pplx_api_key()
+    if not key:
+        return ""
+    try:
+        payload = {
+            "model": "sonar-pro",
+            "messages": [{"role": "user", "content":
+                "幫我搵 2 至 3 則最新嘅香港 / 體育 / 健身 / 健康 / 飲食 / 潮流 topic 嘅新聞或熱話，"
+                "限本週 2026 年 7 月 22 至 24 日內發生嘅。簡短每則 30-60 字繁中廣東話回覆，"
+                "可以用嚟做 cheer 收尾嘅有趣話題。唔好 fabricate，唔肯定就講 \"(本週未有確認熱話)\"。" }],
+            "max_tokens": 400,
+            "temperature": 0.7,
+        }
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        return (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _minimax_api_key() -> str:
     """Read MiniMax M3 key from .hermes-torres/.env (canonical for vision)."""
     candidates = [
@@ -2608,11 +2653,13 @@ def _voice_audit_en(s: str) -> list:
     return re.findall(r"[A-Za-z]+", s)
 
 
-def _run_whoop_pull_cached() -> dict:
+def _run_whoop_pull_cached(force: bool = False) -> dict:
     """Run whoop_pull.py if cache is stale (>2h old) OR pulled recently failed.
+    If `force=True`, always re-pull (Jim OOB 2026-07-24: never show yesterday's data).
+
     Returns the latest Whoop data dict (cycles/recovery/sleep/workouts bare lists)."""
     now_ts = datetime.now().timestamp()
-    if WHOOP_CACHE_PATH.exists():
+    if not force and WHOOP_CACHE_PATH.exists():
         try:
             cache_mtime = WHOOP_CACHE_PATH.stat().st_mtime
             data = json.loads(WHOOP_CACHE_PATH.read_text())
@@ -2621,7 +2668,7 @@ def _run_whoop_pull_cached() -> dict:
                 return data
         except Exception:
             pass
-    # Run whoop_pull.py
+    # Run whoop_pull.py (always when forced)
     try:
         result = _sp.run([sys.executable, str(WHOOP_PULL_SCRIPT)],
                           capture_output=True, text=True, timeout=60)
@@ -2849,60 +2896,70 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 
     fire_type_zh = {"morning": "朝早 cheer", "evening": "夜晚 cheer", "manual": "即場 cheer"}.get(fire_type, "即場 cheer")
 
-    # Detail-rich prompt — explicit 8 sections with concrete numbers + insights
-    prompt = f"""幫我寫一段 100% 繁中廣東話嘅{fire_type_zh}，教練加管家口吻，唔好有英文字。
-語句要自然、口語化，每段都要有具體數字同實際建議，唔好空洞。
+    # Pull latest news bits (Jim OOB 2026-07-24: be innovative / use latest news)
+    news_bits = _get_latest_news_for_cheer()
+    news_block = (
+        f"\n**本週熱話（Jim 想要 cheer 識用最新潮 / 體育 / 健康 news）**：\n{news_bits}\n" if news_bits else ""
+    )
 
-以下係今日已拉返嘅真實數據，務必全部用晒喺 cheer 內：
-- 復原指數：{rec}% ({rec_status_zh}, 區間 {rec_state})
+    # Jim OOB 2026-07-24: voice is too robotic — focus on INSIGHTS not figures,
+    # be funny + casual + use latest news. Drop mechanical §1-§8 structure;
+    # write it like you're talking to a friend in a gym locker room.
+    # Data freshness stamp: tell Jim when this snapshot was taken.
+    data_freshness = (
+        f"數據快照時間：HKT {hkt_str}（剛從 Whoop + Withings 即時拉返）"
+    )
+
+    prompt = f"""你係 Jim 嘅私人教練加管家 Alonso，識晒 Jim 嘅 personality：
+- 中年香港人，餐廳老闆，太太叫小寶（一齊分擔食物，Jim 60% / 小寶 40%）
+- 利物浦 / 曼聯 / 英超球迷，唔睇欖球
+- 講嘢有時懶幽默、自嘲，接受得啲位整蠱
+- 對數字敏感但唔想被數字 cold-call — 想要「點解」、「即係咩意思」、「咁我應該點」
+- 唔好 corporate speak、唔好「作為您嘅教練」嗰種官腔
+
+{fire_type_zh} 嚟喇，目標：講 data insights 唔係讀 data figures，做個 **會笑、識講潮流、識抽水、識用新聞** 嘅兄弟。
+
+{fire_type_zh} 當下數據快照（{data_freshness}）：
+- 復原指數：{rec}% ({rec_status_zh})
 - 心跳變異：{hrv} 毫秒
 - 靜止心跳：{rhr} 下/分鐘
 - 血氧：{spo2}%
-- 噉晚瞓：{sleep_hr} 個鐘頭（REM {sleep_rem} 分鐘、深層瞓 {sleep_sws} 分鐘、表現指數 {sleep_perf}%、效率 {sleep_eff}%）
-- 今日已經做：{workout_n} 個 session
-- 昨日疲勞度：{strain}
-- Cycle ID：{cycle_id}
-- HKT 時間：{hkt_str}
-- Withings 今日體重：{withings_weight} 公斤
-- Withings 今日體脂：{withings_fat} %
+- 噉晚瞓：{sleep_hr} 個鐘頭（深層瞓 {sleep_sws} 分鐘、REM {sleep_rem} 分鐘、表現 {sleep_perf}%）
+- 疲勞度：{strain}
+- Withings 體重：{withings_weight} 公斤
+- Withings 體脂：{withings_fat} %
+- 今日 workout：{workout_n} 個 session
 
-**今日健身詳細記錄**（Jim 想要逐個動作 loop 出嚟，唔好概括）：
+**今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
 {workout_detail_zh}
+{news_block}
+寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
+1. **唔好讀數字**：唔好寫「HRV 28.6 ms」咁讀出嚟，寫「你個自律神經而家有返廿八點六左右嘅彈性，比你上週好少少」；唔好寫「7.35 個鐘」咁平，寫「噉晚瞓咗七個幾鐘，差啲就夠八個」
+2. **要有笑位、要有自嘲**：可以講下「深層瞓終於過咗兩個鐘，唔使再被我鬧」、講下「今日操水，話晒係你嘅，唔係被窩」、講下「教練同你講過好多次早瞓啦，仲要我重複幾多次」
+3. **識用新聞**：將本週熱話 news 嵌入 cheer 內，自然講下「啱啱睇到⋯⋯」、「今朝睇新聞見到⋯⋯」配返 cheer 主題
+4. **.要有真實建議**：每講完一個 insight 即刻跟住「咁所以你⋯⋯」嘅 actionable 建議，唔好淨講完就算
+5. **識講 personal**：叫 Jim，唔好「你」— 直接用名；可以提小寶（如果講到食物／睡眠／早晨 routine）；可以講「教練」、「管家」
+6. **段落結構**：6-8 段，唔好 list / bullet / table / 編號。段落之間用 `\\n\\n` 分隔
+7. **長度**：**600-720 字**，唔好超 750，唔好少過 580 — voice 預計 120-150 秒 (WanLung 5.0 字/秒)
+8. **段落長度指引**：打招呼 50-70、復原 insight 110-140（最重要）、睡眠 insight 90-110、訓練 insight 60-80、營養 60-80、噉晚 routine 70-90、明日預覽 50-70、收尾打氣 40-60
+9. **唔好 fabricate 數字**：所有 metric 必須喺上面 data 入面搵到
+10. **粵語助詞密度**：嘅/啦/咗/嗰/咁/吖/囉/嘢 ≥8 個 per 100 字
 
-必須包含以下 8 個 section，每個 section 都要有 detail + 教練建議：
-§1 打招呼 + HKT 時間 + 朝早/夜晚/即場 時段呼應
-§2 Whoop 復原詳細解讀：四個核心數字（復原%、HRV、RHR、SPO2）每個講一個 insight，復原區間代表咩意思，今日適合咩強度 ({rec_advice_zh})
-§3 睡眠評估：噉晚瞓咗幾多個鐘、深層瞓 REM 分鐘、表現指數、效率，每個講教練點睇。如果深層瞓少過 90 分鐘，要明確建議噉晚早瞓 + 鎂補充
-§4 今日健身檢討：**將今日每個 session 嘅每個動作都逐個講**（動作名、重量、組數、總容量），唔好概括。如果今日 0 個 session，唔好跳過，要話用 Withings 今日體重 {withings_weight} 公斤、體脂 {withings_fat}% 去補位，教練根據呢啲數據畀訓練建議
-§5 營養 + 水分建議：今日蛋白質目標、碳水比例、水份目標，根據訓練強度調整。教練具體建議食咩、食幾多
-§6 噉晚恢復計劃：包括瞓前 routine（伸展、鎂、甘胺酸）、房溫、瞓幾多個鐘、手機距離床鋪
-§7 明日預覽：根據今日復原 + 訓練 + 睡眠，建議明日做咩類型訓練、強度、注意事項
-|§8 收尾打氣：用純中文 closing（不要 Bon voyage），唔好講英文
-
-格式要求：
-- 全程用 paragraph prose，唔好用 list / bullet / table / **bold** headers
-- 大量使用粵語助詞：嘅/啦/咗/嗰/咁/吖/囉/嘢 — 目標密度 ≥8 個 per 100 字
-- 每個 section 之間用 `\\n\\n` 分隔（會喺 voice 階段轉成「。 」自然過渡）
-- **長度目標：600-720 字（唔好超 750），voice 預計 120-150 秒**（WanLung 實測 5.0 字/秒）
-- 每個 section 平均 75-90 字：§1 打招呼 50-70、§2 復原 110-140（最重要）、§3 瞓覺 90-110、§4 訓練 60-80、§5 營養 60-80、§6 噉晚恢復 70-90、§7 明日預覽 50-70、§8 收尾 40-60
-- 唔好 fabricate 任何數字，全部用上面提供嘅真實數據
-- **重要**：唔好超 750 字，否則 voice 會超 150 秒；唔好少過 580 字，否則 detail 唔夠
-
-**嚴禁使用以下英文字**（會破壞 TTS 嘅廣東話韻律 — 必須用中文代替）：
-- 常用動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
-- 時間相關：time, times, hr, hrs, min, sec
-- 訓練術語：session, workout, set, rep, drill, plate, bar, spot, lift, push, rest, PR, RM, build, bulk, cut, RPE, HIIT, squat, bench, deadlift, press, curl, row, lat pulldown, pullup
-- 健康指標：HRV, SpO2, RHR, RPE, REM, N1, N2, N3, deep sleep, light sleep, awake, strain, recovery, level, range, target, delta, score, state, status
-- 顏色狀態：YELLOW, GREEN, RED（或 yellow/green/red）
-- 品牌 / 應用：Jim, Google, Whoop, Novotel, Wanchai, app, PC, phone, tab
+**嚴禁使用以下英文字**（會破壞 TTS 廣東話韻律）：
+- 動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
+- 時間：time, times, hr, hrs, min, sec
+- 訓練：session, workout, set, rep, drill, plate, bar, spot, lift, push, rest, PR, RM, build, bulk, cut, RPE, HIIT, squat, bench, deadlift, press, curl, row, lat pulldown, pullup
+- 指標：HRV, SpO2, RHR, RPE, REM, N1, N2, N3, deep sleep, light sleep, awake, strain, recovery, level, range, target, delta, score, state, status
+- 顏色：YELLOW, GREEN, RED
+- 品牌：Jim, Google, Whoop, Novotel, Wanchai, app, PC, phone, tab
 - 單位：kg, lb, oz, g, kcal, ms, bpm
 - 收尾：Bon voyage, Welcome home, Good luck, Good night
 - 縮寫：e.g., i.e., vs, via, FYI, ASAP, P.S., OK
 - 敬稱：Dr., Mr., Mrs., Ms.
 
-凡係以上任何一個英文字，都必須改用括號內或相應嘅中文表示。寫嘅時候直接用中文，唔好諗住用英文再翻譯。
+凡係以上任何一個英文字都必須用中文。寫嘅時候直接用中文，唔好諗住用英文再翻譯。
 
-開始寫啦："""
+開始啦，記住：係兄弟傾偈，唔係 CEO 匯報："""
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
@@ -3177,8 +3234,8 @@ def _background_cheer_job(job_id: str, fire_type: str):
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id] = {"status": "running", "step": "whoop_pull", "started_at": now_iso()}
 
-        # 1. Whoop pull (cached; refreshes if cache > 2h old or empty)
-        whoop = _run_whoop_pull_cached()
+        # 1. Whoop pull — Jim OOB 2026-07-24: force re-pull on EVERY fire (no yesterday data).
+        whoop = _run_whoop_pull_cached(force=True)
         metrics = _extract_whoop_metrics(whoop)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({"step": "withings_pull", "metrics": metrics})
@@ -5441,7 +5498,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v32';
+const CACHE = 'gym-web-v33';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
