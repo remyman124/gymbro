@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.5.1"
+__version__ = "2.7.5"
 
 
 def _safe_read_json(path, default=None):
@@ -537,41 +537,122 @@ def _withings_fat_pct():
 def _withings_steps_today() -> dict:
     """Latest Withings activity (steps / distance / calories) for today.
 
-    Jim OOB 2026-07-24: whoop V2 cycle has no `steps` field, so steps must
-    come from Withings. Runs `withings.py steps 1` every call and parses the
-    last line for today's date. Returns dict {steps, distance_km, calories}
-    or {} on failure.
+    Jim OOB 2026-07-24 22:25 HKT: 09:19 cheer fire showed 59 steps (WRONG,
+    real value was 6046). Root cause: subprocess-based pull (each fire
+    spawns a fresh Python interpreter) + Withings server-side 5-minute
+    cache that returns the LAST-COMMITTED device sync value, not the
+    latest. First call after a sync event can return the 04:00 commit
+    baseline (59 steps = yesterday-end of day) instead of today's
+    full-day running total.
+
+    Systemic fix (v2.7.5):
+      1. In-process import — reuse the same module instance as the rest
+         of the gym_web Flask process, so token state is shared and
+         Python startup cost is zero per call.
+      2. Double-pull with 3s gap — first call may hit the stale server
+         cache; second call usually returns the fresh value. Use max()
+         to guard against the rare reverse case.
+      3. In-process 30s cache — multiple cheer fires within 30s share
+         one Withings roundtrip (cheer UI fires 3 buttons in <2s).
+      4. Atomic file write to WITHINGS_CACHE so /api/health_overlay and
+         other endpoints see the same fresh value.
+
+    Returns dict {date, steps, distance_km, calories} or {} on failure.
     """
-    import subprocess as _sp, re as _re
+    import importlib
+    from datetime import datetime, timezone, timedelta
+    import time as _time
+
+    # In-process 30s cache
+    cache = _safe_read_json(WITHINGS_CACHE)
+    cached_steps = (cache or {}).get("steps") or {}
+    now_ts = _time.time()
+    if isinstance(cached_steps, dict) and cached_steps.get("fetched_at_ts"):
+        age = now_ts - (cached_steps.get("fetched_at_ts") or 0)
+        if age < 30 and cached_steps.get("steps") is not None:
+            return {
+                "date": cached_steps.get("date", ""),
+                "steps": cached_steps.get("steps"),
+                "distance_km": cached_steps.get("distance_km"),
+                "calories": cached_steps.get("calories"),
+            }
+
+    # In-process import (re-use if already imported in this worker)
     try:
-        r = _sp.run(
-            ["python3", str(WITHINGS_PULL_SCRIPT), "steps", "1"],
-            capture_output=True, text=True, timeout=20,
-        )
-        if r.returncode != 0 or not r.stdout.strip():
-            return {}
-        lines = r.stdout.strip().splitlines()
-        # Find the last data row (skip header + dashes).
-        for line in reversed(lines):
-            parts = line.split()
-            if not parts or not _re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
-                continue
-            try:
-                date = parts[0]
-                steps = int(parts[1].replace(",", ""))
-                # distance format: "4.30km" → 4.30 (km)
-                dist_m = _re.match(r"([\d.]+)km", parts[2]) if len(parts) > 2 else None
-                dist_km = float(dist_m.group(1)) if dist_m else None
-                # calories format: "144kcal"
-                cal_m = _re.match(r"([\d.]+)kcal", parts[3]) if len(parts) > 3 else None
-                calories = float(cal_m.group(1)) if cal_m else None
-                return {"date": date, "steps": steps,
-                        "distance_km": dist_km, "calories": calories}
-            except (ValueError, IndexError, AttributeError):
-                continue
+        import sys as _sys
+        if "/home/work/.hermes/skills/withings" not in _sys.path:
+            _sys.path.insert(0, "/home/work/.hermes/skills/withings")
+        withings_mod = importlib.import_module("withings")
+        get_activity = withings_mod.get_daily_activity
+    except Exception:
+        return {}
+
+    today_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=1)
+
+    def _extract(data):
+        if not data:
+            return None
+        for d in reversed(data):
+            if d.get("date") == today_str:
+                return d
+        return None
+
+    # Pull #1
+    a1 = _extract(get_activity(start, end))
+    # Pull #2 after 3s — guards against server-side 5-min cache
+    _time.sleep(3)
+    a2 = _extract(get_activity(start, end))
+
+    # Pick the higher steps value (most-fresh). If only one returned,
+    # use it. If both empty, fall through.
+    chosen = None
+    if a1 and a2:
+        s1, s2 = a1.get("steps", 0) or 0, a2.get("steps", 0) or 0
+        chosen = a1 if s1 >= s2 else a2
+    elif a1:
+        chosen = a1
+    elif a2:
+        chosen = a2
+
+    if not chosen:
+        # If we already have a cached value (older than 30s) and pull failed,
+        # keep serving the last good value rather than returning empty.
+        if isinstance(cached_steps, dict) and cached_steps.get("steps") is not None:
+            return {
+                "date": cached_steps.get("date", ""),
+                "steps": cached_steps.get("steps"),
+                "distance_km": cached_steps.get("distance_km"),
+                "calories": cached_steps.get("calories"),
+            }
+        return {}
+
+    steps = int(chosen.get("steps") or 0)
+    distance_m = float(chosen.get("distance_m") or 0)
+    calories = float(chosen.get("calories") or 0)
+    out = {
+        "date": today_str,
+        "steps": steps,
+        "distance_km": round(distance_m / 1000, 2),
+        "calories": round(calories, 1),
+    }
+    # Atomic write to WITHINGS_CACHE
+    try:
+        cur = _safe_read_json(WITHINGS_CACHE) or {}
+        if not isinstance(cur, dict):
+            cur = {}
+        cur["steps"] = {
+            **out,
+            "fetched_at_ts": now_ts,
+            "fetched_at_iso": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = str(WITHINGS_CACHE) + ".tmp"
+        Path(tmp).write_text(json.dumps(cur, indent=2, ensure_ascii=False))
+        os.replace(tmp, str(WITHINGS_CACHE))
     except Exception:
         pass
-    return {}
+    return out
 
 
 @app.route("/api/health_overlay")
@@ -5573,6 +5654,18 @@ SERVICE_WORKER = """
 //   - 30s REST cooldown after LOG SET: prevents accidental double-tap from
 //     inflating set count. Button shows ⏳ REST ${cooldownRemaining}s and
 //     is disabled during cooldown. After 30s, button returns to ✓ LOG SET.
+// v2.7.5 changes (Jim OOB 2026-07-24 22:25 HKT):
+//   - Withings steps systemic fix: 09:19 cheer fire showed 59 steps but
+//     real value was 6046. Root cause = subprocess + Withings server-side
+//     5-min cache returning last-committed (04:00 baseline) instead of
+//     fresh day-total.
+//   - Fix: in-process import (shared module state, zero per-call Python
+//     startup), double-pull with 3s gap (second call usually clears the
+//     stale server cache), in-process 30s cache (cheer UI fires 3 buttons
+//     in <2s, no point hitting Withings 3x), max(steps_1, steps_2) to
+//     pick the freshest value, atomic WITHINGS_CACHE write so all
+//     endpoints see the same number, fallback to last-good cached value
+//     if pull fails.
 // v2.7.4 changes (Jim OOB 2026-07-24 09:15 HKT):
 //   - LOG SET cooldown REMOVED entirely (was 30s → 60s, now no cooldown).
 //     Jim wants to log sets as fast as possible. Disabled the
@@ -5630,7 +5723,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v35';
+const CACHE = 'gym-web-v36';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
