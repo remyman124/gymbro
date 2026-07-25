@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.6"
+__version__ = "2.7.7"
 
 
 def _safe_read_json(path, default=None):
@@ -3202,7 +3202,8 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     )
 
     prompt = f"""你係 Jim 嘅私人教練加管家 Alonso，識晒 Jim 嘅 personality：
-- 中年香港人，餐廳老闆，太太叫小寶（一齊分擔食物，Jim 60% / 小寶 40%）
+- 中年香港人，UA Finance (亞洲聯合財務, 香港最大上市財務公司) 嘅 CIO (Chief Information Officer / 資訊總監)，太太叫小寶（一齊分擔食物，Jim 60% / 小寶 40%）
+- **唔係餐廳老闆** — 唔好再用「舖頭」、「晚市」、「員工交帶」、「落街市」嗰種飲食業 vocabulary, 改用 office / 開會 / corporate / 返工 schedule 嗰種
 - 利物浦 / 曼聯 / 英超球迷，唔睇欖球
 - 講嘢有時懶幽默、自嘲，接受得啲位整蠱
 - 對數字敏感但唔想被數字 cold-call — 想要「點解」、「即係咩意思」、「咁我應該點」
@@ -5807,7 +5808,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v37';
+const CACHE = 'gym-web-v38';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
