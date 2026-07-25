@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.5"
+__version__ = "2.7.6"
 
 
 def _safe_read_json(path, default=None):
@@ -661,13 +661,91 @@ def api_health_overlay():
     - Top-left: Whoop recovery %
     - Top-right: Withings weight kg + fat % (latest reading, drives Jim's goal)
     """
+    steps = _withings_steps_today() or {}
     return jsonify({
         "recovery": _recovery_pct(),
         "weight_kg": _withings_weight(),
         "fat_pct": _withings_fat_pct(),
         "weight_date": (_withings_body_latest() or {}).get("date"),
-        "steps_today": (_withings_steps_today() or {}).get("steps"),
-        "distance_km_today": (_withings_steps_today() or {}).get("distance_km"),
+        "steps_today": steps.get("steps"),
+        "distance_km_today": steps.get("distance_km"),
+    })
+
+
+# ---------- Jim context store (cheer pipeline reads this to make text more personal) ----------
+JIM_CONTEXT = Path("/home/work/.jim_context.json")
+
+
+def _load_jim_context() -> dict:
+    """Read /home/work/.jim_context.json. Returns {entries: {...}, updated_at: ...}."""
+    d = _safe_read_json(JIM_CONTEXT, {"entries": {}})
+    if not isinstance(d, dict):
+        return {"entries": {}}
+    if not isinstance(d.get("entries"), dict):
+        d["entries"] = {}
+    return d
+
+
+def _save_jim_context(ctx: dict) -> bool:
+    """Atomic write to JIM_CONTEXT."""
+    try:
+        tmp = str(JIM_CONTEXT) + ".tmp"
+        Path(tmp).write_text(json.dumps(ctx, indent=2, ensure_ascii=False))
+        os.replace(tmp, str(JIM_CONTEXT))
+        return True
+    except Exception:
+        return False
+
+
+def _get_jim_context_for_cheer() -> str:
+    """Format jim_context as a string block for the cheer pplx prompt.
+
+    Reads JIM_CONTEXT, formats each entry as "- <key>: <value> (tags: <tags>)".
+    Returns empty string if no entries.
+    """
+    ctx = _load_jim_context()
+    entries = ctx.get("entries") or {}
+    if not entries:
+        return ""
+    lines = ["\n**Jim 個人 context（pushed by MCP / cheer 要記住）**："]
+    for k, v in entries.items():
+        if not isinstance(v, dict):
+            continue
+        val = v.get("value", "")
+        tags = ", ".join(v.get("tags") or [])
+        lines.append(f"- {k}: {val}" + (f" (tags: {tags})" if tags else ""))
+    return "\n".join(lines)
+
+
+@app.route("/api/context", methods=["GET", "POST"])
+def api_context():
+    """GET: return all Jim context entries.
+    POST: push {key, value, tags?} → stored in /home/work/.jim_context.json.
+
+    This is the gym_web HTTP-side twin of the MCP `push_jim_context` tool, so
+    the iPhone PWA can push context (e.g. "today I want low-carb diet") and
+    the cheer pipeline picks it up on the next fire.
+    """
+    if request.method == "GET":
+        return jsonify(_load_jim_context())
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    value = (data.get("value") or "").strip()
+    tags = data.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    if not key or not value:
+        return jsonify({"error": "key and value required"}), 400
+    ctx = _load_jim_context()
+    hkt_iso = datetime.now(timezone(timedelta(hours=8))).isoformat()
+    ctx["entries"][key] = {"value": value, "tags": tags, "pushed_at": hkt_iso}
+    ctx["updated_at"] = hkt_iso
+    ok = _save_jim_context(ctx)
+    return jsonify({
+        "ok": ok,
+        "key": key,
+        "stored": ctx["entries"][key],
+        "total_entries": len(ctx["entries"]),
     })
 
 
@@ -3111,6 +3189,10 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
         f"\n**本週熱話（Jim 想要 cheer 識用最新潮 / 體育 / 健康 news）**：\n{news_bits}\n" if news_bits else ""
     )
 
+    # Jim OOB 2026-07-25 10:55 HKT: pull pushed context (favourite team, rivalry,
+    # dietary notes) so cheer can reference Jim's preferences naturally.
+    jim_context_block = _get_jim_context_for_cheer()
+
     # Jim OOB 2026-07-24: voice is too robotic — focus on INSIGHTS not figures,
     # be funny + casual + use latest news. Drop mechanical §1-§8 structure;
     # write it like you're talking to a friend in a gym locker room.
@@ -3125,6 +3207,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 - 講嘢有時懶幽默、自嘲，接受得啲位整蠱
 - 對數字敏感但唔想被數字 cold-call — 想要「點解」、「即係咩意思」、「咁我應該點」
 - 唔好 corporate speak、唔好「作為您嘅教練」嗰種官腔
+- **Jim 自己 push 落 context 嘅內容**（jim_context_block 下面嗰段）係最權威 — 寫文時要引用同活用，唔好當 background noise 略過。例如「死敵, 唔好當面讚」即係 rivalry 要識得抽水唔好讚；「Jim 60% / 太太 40%」要記住唔好再問
 
 {fire_type_zh} 嚟喇，目標：講 data insights 唔係讀 data figures，做個 **會笑、識講潮流、識抽水、識用新聞** 嘅兄弟。
 
@@ -3144,6 +3227,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 **今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
 {workout_detail_zh}
 {news_block}
+{jim_context_block}
 寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
 1. **唔好讀數字**：唔好寫「HRV 28.6 ms」咁讀出嚟，寫「你個自律神經而家有返廿八點六左右嘅彈性，比你上週好少少」；唔好寫「7.35 個鐘」咁平，寫「噉晚瞓咗七個幾鐘，差啲就夠八個」
 2. **要有笑位、要有自嘲**：可以講下「深層瞓終於過咗兩個鐘，唔使再被我鬧」、講下「今日操水，話晒係你嘅，唔係被窩」、講下「教練同你講過好多次早瞓啦，仲要我重複幾多次」
@@ -5723,7 +5807,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v36';
+const CACHE = 'gym-web-v37';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
