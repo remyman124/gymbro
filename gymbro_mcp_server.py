@@ -38,6 +38,7 @@ WORKOUT_LOG = HOME / ".whoop_workout_log.json"
 WHOOP_CACHE = HOME / ".whoop_data_latest.json"
 WITHINGS_CACHE = HOME / ".withings_latest_cache.json"
 JIM_CONTEXT = HOME / ".jim_context.json"
+NUTRITION_LOG = Path("/home/work/.hermes/nutrition_log.json")
 CHEER_ARTIFACTS = Path("/home/work/.hermes/cheer_artifacts")
 
 
@@ -70,6 +71,49 @@ def _hkt_now_iso() -> str:
 
 def _hkt_today() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _load_today_nutrition() -> dict:
+    """Read /home/work/.hermes/nutrition_log.json and return today's meals
+    + summary stats. Mirrors gym_web._load_today_nutrition.
+    """
+    out = {"meals": [], "totals": {"kcal": 0.0, "P": 0.0, "C": 0.0, "F": 0.0}, "meal_count": 0, "last_meal_ts": None}
+    if not NUTRITION_LOG.exists():
+        return out
+    try:
+        log = json.loads(NUTRITION_LOG.read_text())
+    except Exception:
+        return out
+    meals = (log or {}).get("meals") or []
+    today = _hkt_today()
+    today_meals = []
+    for m in meals:
+        if not isinstance(m, dict):
+            continue
+        m_date = m.get("date") or ""
+        if not m_date:
+            ts = m.get("timestamp") or m.get("logged_at")
+            if ts and isinstance(ts, str) and today in ts:
+                m_date = today
+        if m_date != today:
+            continue
+        today_meals.append(m)
+    today_meals.sort(key=lambda m: m.get("time") or m.get("timestamp") or "")
+    out["meals"] = today_meals
+    out["meal_count"] = len(today_meals)
+    for m in today_meals:
+        try:
+            out["totals"]["kcal"] += float(m.get("calories") or 0)
+            out["totals"]["P"] += float(m.get("protein") or 0)
+            out["totals"]["C"] += float(m.get("carbs") or 0)
+            out["totals"]["F"] += float(m.get("fat") or 0)
+        except (TypeError, ValueError):
+            pass
+    out["totals"] = {k: round(v, 1) for k, v in out["totals"].items()}
+    if today_meals:
+        last = today_meals[-1]
+        out["last_meal_ts"] = f"{last.get('date', today)}T{last.get('time', '00:00')}:00+08:00"
+    return out
 
 
 # ── FastMCP server ────────────────────────────────────────────────────────────
@@ -203,6 +247,25 @@ def push_jim_context(key: str, value: str, tags: str = "") -> str:
         "key": key,
         "stored": ctx["entries"][key],
         "total_entries": len(ctx["entries"]),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_today_nutrition() -> str:
+    """Return today's meals + totals (kcal, P, C, F) from nutrition_log.json.
+
+    Jim OOB 2026-07-25 13:30 HKT: 'monitor my food' — Alonso should be able
+    to inspect today's intake directly via MCP, not just rely on cheer
+    pipeline. Returns the same shape as gym_web /api/nutrition/today.
+    """
+    data = _load_today_nutrition()
+    return json.dumps({
+        "date": _hkt_today(),
+        "fetched_at": _hkt_now_iso(),
+        "meal_count": data["meal_count"],
+        "totals": data["totals"],
+        "last_meal_ts": data["last_meal_ts"],
+        "meals": data["meals"],
     }, ensure_ascii=False)
 
 

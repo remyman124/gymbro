@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.7"
+__version__ = "2.7.8"
 
 
 def _safe_read_json(path, default=None):
@@ -746,6 +746,25 @@ def api_context():
         "key": key,
         "stored": ctx["entries"][key],
         "total_entries": len(ctx["entries"]),
+    })
+
+
+@app.route("/api/nutrition/today")
+def api_nutrition_today():
+    """Return today's nutrition: per-meal list + totals + last_meal_ts.
+
+    Used by gym_web PWA nutrition tab + cheer pipeline. iPhone PWA can
+    also POST to /api/food_scan (existing) which writes to the same log
+    this endpoint reads.
+    """
+    data = _load_today_nutrition()
+    return jsonify({
+        "date": today_iso(),
+        "fetched_at": now_iso(),
+        "meal_count": data["meal_count"],
+        "totals": data["totals"],
+        "last_meal_ts": data["last_meal_ts"],
+        "meals": data["meals"],
     })
 
 
@@ -1944,6 +1963,98 @@ def _append_to_nutrition_log(entry: dict) -> None:
         log["meals"] = []
     log["meals"].append(entry)
     NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+
+
+def _load_today_nutrition() -> dict:
+    """Read /home/work/.hermes/nutrition_log.json and return today's meals
+    + summary stats. Returns {'meals': [...], 'totals': {kcal, P, C, F}, 'meal_count': N, 'last_meal_ts': ISO}.
+
+    Used by cheer pipeline (Jim OOB 2026-07-25 13:30 HKT: "monitor my food").
+    """
+    out = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0}, "meal_count": 0, "last_meal_ts": None}
+    if not NUTRITION_LOG_PATH.exists():
+        return out
+    try:
+        log = json.loads(NUTRITION_LOG_PATH.read_text())
+    except Exception:
+        return out
+    meals = (log or {}).get("meals") or []
+    today = today_iso()
+    today_meals = []
+    for m in meals:
+        # entry schema: {date, time, meal_type, meal_name, calories, protein, carbs, fat, ...}
+        if not isinstance(m, dict):
+            continue
+        m_date = m.get("date") or ""
+        if not m_date:
+            # try parse timestamp
+            ts = m.get("timestamp") or m.get("logged_at")
+            if ts and isinstance(ts, str) and today in ts:
+                m_date = today
+        if m_date != today:
+            continue
+        today_meals.append(m)
+    # Sort by time
+    today_meals.sort(key=lambda m: m.get("time") or m.get("timestamp") or "")
+    out["meals"] = today_meals
+    out["meal_count"] = len(today_meals)
+    for m in today_meals:
+        try:
+            out["totals"]["kcal"] += float(m.get("calories") or 0)
+            out["totals"]["P"] += float(m.get("protein") or 0)
+            out["totals"]["C"] += float(m.get("carbs") or 0)
+            out["totals"]["F"] += float(m.get("fat") or 0)
+        except (TypeError, ValueError):
+            pass
+    out["totals"] = {k: round(v, 1) for k, v in out["totals"].items()}
+    if today_meals:
+        last = today_meals[-1]
+        out["last_meal_ts"] = f"{last.get('date', today)}T{last.get('time', '00:00')}:00+08:00"
+    return out
+
+
+def _get_today_nutrition_for_cheer() -> str:
+    """Format today's nutrition as a Chinese block for the cheer pplx prompt.
+
+    Jim OOB 2026-07-25 13:30: "monitor my food, also enhance for food comment,
+    not just log nutrient". Returns empty string if no meals logged today.
+    """
+    data = _load_today_nutrition()
+    if not data["meals"]:
+        return ""
+    lines = ["\n**今日飲食記錄（Alonso 主動 monitor，唔係等 Jim 講）**："]
+    lines.append(f"- 已 log 餐數: {data['meal_count']} 餐")
+    for m in data["meals"]:
+        t = m.get("time", "??:??")
+        mt = m.get("meal_type", "餐")
+        mn = m.get("meal_name") or m.get("dish_name") or m.get("name") or "(未命名)"
+        chain = m.get("restaurant_chain") or ""
+        kcal = m.get("calories")
+        chain_part = f" @ {chain}" if chain else ""
+        kcal_part = f" (~{int(float(kcal))} kcal)" if kcal is not None and str(kcal) != "" else ""
+        lines.append(f"  - {t} {mt}：{mn}{chain_part}{kcal_part}")
+    t = data["totals"]
+    lines.append(f"- 今日累計: ~{int(t['kcal'])} kcal / P {int(t['P'])}g / C {int(t['C'])}g / F {int(t['F'])}g")
+    if data["last_meal_ts"]:
+        try:
+            from datetime import datetime as _dt
+            last_dt = _dt.fromisoformat(data["last_meal_ts"].replace("Z", "+00:00"))
+            from datetime import timezone, timedelta as _td
+            last_hkt = last_dt.astimezone(timezone(_td(hours=8)))
+            lines.append(f"- 最後進食: {last_hkt.strftime('%H:%M')} HKT")
+        except Exception:
+            pass
+    lines.append("")
+    lines.append("**commentary 風格指引** (Jim OOB 2026-07-25)：")
+    lines.append("1. 唔好 read out numbers，講 insight 點解呢餐對 recovery / workout / 體脂 / 濕疹嘅影響")
+    lines.append("2. comment 唔好只係 macro log，要講 timing / quality / 搭配 / 影響")
+    lines.append("3. link 落 recovery + workout (e.g. 訓前食咁多糖影響深層瞓)")
+    lines.append("4. link 落濕疹 context (高糖 / 高 processed food 會 trigger flare-up)")
+    lines.append("5. 幽默自嘲 style (e.g. CIO 晏茶又擺低兩舊曲奇, 投資回報率好低)")
+    lines.append("6. share ratio enforcement (Jim 60% / 小寶 40% 鎖死)")
+    lines.append("7. 唔好算死, 留 5-10% buffer 唔好逐克計")
+    lines.append("8. 觀察全日 pattern, comment 飲食 timing (e.g. 晏茶太夜食, dinner 唔該收一收)")
+    return "\n".join(lines)
 
 
 def _append_to_sheet_nutrition(entry: dict) -> dict:
@@ -3193,6 +3304,11 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     # dietary notes) so cheer can reference Jim's preferences naturally.
     jim_context_block = _get_jim_context_for_cheer()
 
+    # Jim OOB 2026-07-25 13:30 HKT: monitor my food, enhance for food comment
+    # not just log nutrient. Pulls today's meals from NUTRITION_LOG_PATH
+    # and injects as a structured block for pplx to comment on.
+    nutrition_block = _get_today_nutrition_for_cheer()
+
     # Jim OOB 2026-07-24: voice is too robotic — focus on INSIGHTS not figures,
     # be funny + casual + use latest news. Drop mechanical §1-§8 structure;
     # write it like you're talking to a friend in a gym locker room.
@@ -3229,6 +3345,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 {workout_detail_zh}
 {news_block}
 {jim_context_block}
+{nutrition_block}
 寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
 1. **唔好讀數字**：唔好寫「HRV 28.6 ms」咁讀出嚟，寫「你個自律神經而家有返廿八點六左右嘅彈性，比你上週好少少」；唔好寫「7.35 個鐘」咁平，寫「噉晚瞓咗七個幾鐘，差啲就夠八個」
 2. **要有笑位、要有自嘲**：可以講下「深層瞓終於過咗兩個鐘，唔使再被我鬧」、講下「今日操水，話晒係你嘅，唔係被窩」、講下「教練同你講過好多次早瞓啦，仲要我重複幾多次」
@@ -5808,7 +5925,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v38';
+const CACHE = 'gym-web-v39';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
