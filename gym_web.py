@@ -1977,7 +1977,7 @@ def _pplx_enrich(dish_desc: str) -> str:
             {"role": "system", "content": "你係香港連鎖餐廳 nutrition 查詢助手。用事實同官方數據回答, 唔好幻想, 唔識就寫 0。"},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 1800,
+        "max_tokens": 2400,
         "temperature": 0.2,
     }
     try:
