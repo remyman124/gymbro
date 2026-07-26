@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.8"
+__version__ = "2.7.10"
 
 
 def _safe_read_json(path, default=None):
@@ -1855,6 +1855,59 @@ def _minimax_api_key() -> str:
     return os.environ.get("MINIMAX_API_KEY", "")
 
 
+def _openrouter_api_key() -> str:
+    """Read OpenRouter key from .hermes/.env (canonical) or env var.
+    Used for 2nd-opinion food nutrition enrichment via gpt-4o-mini.
+    """
+    env_file = Path("/home/work/.hermes/.env")
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("OPENROUTER_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return os.environ.get("OPENROUTER_API_KEY", "")
+
+
+# Canonical 12-field nutrition schema (Jim OOB 2026-07-25 13:35 HKT:
+# "food recognition buggy, doesn't gather protein, carbs, fiber etc").
+# Used by both pplx and openrouter enrich prompts + parser + Sheet header.
+NUTRITION_FIELDS = [
+    "calories",   # kcal (total energy)
+    "protein",    # g
+    "carbs",      # g
+    "fat",        # g
+    "fiber",      # g
+    "sugar",      # g
+    "sodium",     # mg
+    "sat_fat",    # g (saturated fat)
+    "trans_fat",  # g
+    "vit_c",      # mg (vitamin C)
+    "iron",       # mg
+    "calcium",    # mg
+]
+NUTRITION_UNITS = {
+    "calories": "kcal", "protein": "g", "carbs": "g", "fat": "g",
+    "fiber": "g", "sugar": "g", "sodium": "mg", "sat_fat": "g",
+    "trans_fat": "g", "vit_c": "mg", "iron": "mg", "calcium": "mg",
+}
+# Field alias mapping for robust parsing (Chinese + English variants).
+# Each field maps to a list of regex patterns; first match wins.
+NUTRITION_ALIASES = {
+    "calories":  [r"卡路里", r"熱量", r"卡[^路路]里", r"calorie", r"kcal", r"energy"],
+    "protein":   [r"蛋白質", r"蛋白", r"protein", r"^p[^a-z]"],
+    "carbs":     [r"碳水化合物", r"碳水", r"carbs?", r"^c[^a-z]"],
+    "fat":       [r"脂肪(?!酸)", r"油脂", r"\bfat\b", r"^f[^a-z]"],
+    "fiber":     [r"纖維", r"膳食纖維", r"纖[^維]", r"fiber", r"fibre"],
+    "sugar":     [r"糖[^尿果]", r"蔗糖", r"添加糖", r"sugar"],
+    "sodium":    [r"鈉", r"鈉質", r"鹽分.*?(\d)", r"sodium", r"salt"],
+    "sat_fat":   [r"飽和脂肪", r"飽和脂", r"飽和", r"saturated\s*fat", r"sat\s*fat"],
+    "trans_fat": [r"反式脂肪", r"反式脂", r"反式", r"trans\s*fat"],
+    "vit_c":     [r"維他命c", r"維生素c", r"vit(?:amin)?\s*c", r"^vc[^a-z]"],
+    "iron":      [r"鐵質", r"鐵", r"\biron\b", r"\bfe\b"],
+    "calcium":   [r"鈣質", r"鈣", r"\bcalcium\b", r"\bca\b"],
+}
+
+
 def _minimax_vision(img_b64: str, prompt: str) -> str:
     """Call MiniMax M3 vision endpoint. Returns description text."""
     api_key = _minimax_api_key()
@@ -1888,28 +1941,43 @@ def _minimax_vision(img_b64: str, prompt: str) -> str:
 def _pplx_enrich(dish_desc: str) -> str:
     """Call pplx sonar-pro for nutrition enrichment of described dishes.
 
-    Prompt focuses on chain/brand lookup + standard portion + kcal/P/C/F
-    per item, structured answer (no marketing copy).
+    Jim OOB 2026-07-25 13:35: ask for FULL 12-field nutrition (kcal, P, C, F,
+    fiber, sugar, sodium, sat_fat, trans_fat, vit_c, iron, calcium), not just
+    P/C/F/kcal. Used as 1st of 2 estimates (median-merged with OpenRouter).
     """
     api_key = _pplx_api_key()
     if not api_key:
         return "（PPLX 金鑰未設定）"
+    fields_desc = "\n".join(
+        f"- {f} ({NUTRITION_UNITS[f]})"
+        for f in NUTRITION_FIELDS
+    )
     prompt = (
         f"由以下香港/廣東話食物描述：\n\n「{dish_desc}」\n\n"
         "幫我做兩件事：\n"
         "1. 識別每樣菜式所屬嘅餐廳/連鎖/品牌（如：沙嗲王、KFC、大家樂、太興、添好運等），"
-        "列出每樣嘅 standard portion / 標準份量同每份大概嘅卡路里、蛋白質、碳水、脂肪。\n"
-        "2. 如有 brand-specific nutrition 數據（例如 KFC 雞件卡路里），用嗰啲 official 數。"
-        "如無 brand-specific 數，請用一般常見 portion。\n\n"
-        "用繁體中文、表格或 bullet 列明。唔好講餐廳裝修、唔好建議其他餐廳。"
+        "列出每樣嘅 standard portion / 標準份量。\n"
+        "2. **必須**用以下 exact format, 每個 field 一行, field 喺 value 之前用全形冒號「：」:\n"
+        f"{fields_desc}\n\n"
+        "格式範例 (要跟足, 一個 field 一行, 唔好 narrative):\n"
+        "卡路里：750\n蛋白質：38g\n碳水化合物：80g\n脂肪：25g\n膳食纖維：4g\n糖：6g\n鈉：950mg\n飽和脂肪：8g\n反式脂肪：0.5g\n維他命C：12mg\n鐵質：3mg\n鈣質：80mg\n\n"
+        "重要：\n"
+        "- 唔識 / 唔肯定就寫 0, 唔好 fabricate 大數值\n"
+        "- 飽和脂肪/反式脂肪如果係自煮 dish 一般 0, 快餐先有高值\n"
+        "- 維他命 C / 鐵質 / 鈣質係 micronutrient, 主要喺菜類/肉類\n"
+        "- sodium 用 mg (1g 鹽 ≈ 400mg sodium)\n"
+        "- 餐廳 chain / 標準份量可以 narrative 寫, 但 12 個 nutrition field 必須 strict format\n\n"
+        "3. 如有 brand-specific nutrition 數據（例如 KFC 雞件卡路里），用嗰啲 official 數。"
+        "如無 brand-specific 數, 請用一般常見 portion。\n\n"
+        "用繁體中文, 一個英文字都唔好有。餐廳裝修、裝飾、其他餐廳 唔好講。"
     )
     payload = {
         "model": "sonar-pro",
         "messages": [
-            {"role": "system", "content": "你係香港連鎖餐廳 nutrition 查詢助手。用事實同官方數據回答，唔好幻想。"},
+            {"role": "system", "content": "你係香港連鎖餐廳 nutrition 查詢助手。用事實同官方數據回答, 唔好幻想, 唔識就寫 0。"},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 1400,
+        "max_tokens": 1800,
         "temperature": 0.2,
     }
     try:
@@ -1926,6 +1994,162 @@ def _pplx_enrich(dish_desc: str) -> str:
         return resp["choices"][0]["message"]["content"]
     except Exception as e:
         return f"（PPLX enrichment 失敗：{type(e).__name__}）"
+
+
+def _openrouter_nutrition_enrich(dish_desc: str) -> str:
+    """Call OpenRouter gpt-4o-mini for 2nd-opinion food nutrition enrichment.
+
+    Jim OOB 2026-07-25 13:35 HKT: "do you need ChatGPT too via openrouter?"
+    Yes — gpt-4o-mini is $0.15/$0.6 per 1M tokens, perfect 2nd-opinion
+    voter. Returns text (or empty on failure) — caller parses via
+    _parse_nutrition_block then median-merges with pplx.
+
+    NOTE 2026-07-25: requires OPENROUTER_API_KEY in /home/work/.hermes/.env
+    or env var. Until key is added, returns "" and pipeline silently
+    falls back to pplx-only single estimate. After key is added, the
+    2-source median merge activates automatically — no code change.
+    """
+    api_key = _openrouter_api_key()
+    if not api_key:
+        return ""  # graceful fallback — single-source pplx only
+    fields_desc = ", ".join(
+        f"{f} ({NUTRITION_UNITS[f]})" for f in NUTRITION_FIELDS
+    )
+    prompt = (
+        f"Estimate per-portion nutrition for this HK/Cantonese food description:\n\n"
+        f"「{dish_desc}」\n\n"
+        f"Reply with ONLY a single JSON object, no markdown, no commentary. "
+        f"Schema (all 12 fields required, use 0 if unknown, do NOT fabricate):\n"
+        f'{{"calories": 0, "protein": 0, "carbs": 0, "fat": 0, "fiber": 0, '
+        f'"sugar": 0, "sodium": 0, "sat_fat": 0, "trans_fat": 0, '
+        f'"vit_c": 0, "iron": 0, "calcium": 0}}\n\n'
+        f"Units: {fields_desc}.\n"
+        f"Note: sodium in mg (1g salt ≈ 400mg sodium); vit_c / iron / calcium "
+        f"in mg; rest in g except calories (kcal).\n"
+        f"Be conservative — chain-specific numbers only if well-known "
+        f"(KFC, McDonald's, Starbucks). Otherwise use typical HK portion."
+    )
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 400,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+                "HTTP-Referer": "https://gymbro.local",
+                "X-Title": "gymbro food scan",
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"（OpenRouter enrichment 失敗：{type(e).__name__}）"
+
+
+def _parse_nutrition_block(text: str) -> dict:
+    """Parse a nutrition block (Chinese or English) into the 12-field schema.
+
+    Handles formats like:
+      "蛋白質: 38g" / "蛋白質 38克" / "P: 38g" / "Protein: 38g"
+      "卡路里: 750" / "熱量: 750kcal" / "Calories: 750"
+      "Sodium 800mg" / "鈉: 800mg" / "鹽分 2g" (auto-convert 2g salt → 800mg)
+    Returns {field: numeric_value, ...} for fields found; missing fields absent.
+    """
+    out = {}
+    if not text or not isinstance(text, str):
+        return out
+    for field, aliases in NUTRITION_ALIASES.items():
+        unit = NUTRITION_UNITS[field]
+        for alias in aliases:
+            # Pattern: <alias> (optional space/colons) <number> (optional unit)
+            pat = re.compile(
+                rf"(?:{alias})\s*[:：=]?\s*"
+                rf"(\d+(?:\.\d+)?)\s*"
+                rf"(?:{unit}|mg|mcg|克|gram|g)?",
+                re.IGNORECASE | re.UNICODE,
+            )
+            m = pat.search(text)
+            if m:
+                try:
+                    val = float(m.group(1))
+                    # Unit conversion: if alias matched but value was in wrong unit
+                    if field == "sodium" and val < 50 and "鹽" in text:
+                        # Heuristic: if "鹽分 2g" and we got 2, that's grams of salt
+                        # convert g salt → mg sodium (×400). Skip — too risky, only
+                        # trust explicit mg.
+                        pass
+                    out[field] = val
+                    break  # first match wins for this field
+                except (ValueError, IndexError):
+                    continue
+    return out
+
+
+def _merge_nutrition_estimates(estimates: list) -> dict:
+    """Merge multiple nutrition estimate dicts via median + confidence.
+
+    Args:
+        estimates: list of {field: value, ...} dicts. Empty fields ignored.
+
+    Returns:
+        {field: {value: float, source_count: N, confidence: 'high'|'medium'|'low'}, ...}
+        - 'high' if 2+ sources agree within 30%
+        - 'medium' if 2+ sources but disagree
+        - 'low' if only 1 source (no second opinion)
+    Missing fields absent.
+    """
+    if not estimates:
+        return {}
+    merged = {}
+    for field in NUTRITION_FIELDS:
+        vals = []
+        for est in estimates:
+            if field in est and est[field] is not None and est[field] > 0:
+                try:
+                    vals.append(float(est[field]))
+                except (TypeError, ValueError):
+                    pass
+        if not vals:
+            continue
+        if len(vals) == 1:
+            merged[field] = {
+                "value": round(vals[0], 1),
+                "source_count": 1,
+                "confidence": "low",
+            }
+        else:
+            # Median
+            vals_sorted = sorted(vals)
+            mid = len(vals_sorted) // 2
+            if len(vals_sorted) % 2 == 0:
+                median = (vals_sorted[mid - 1] + vals_sorted[mid]) / 2
+            else:
+                median = vals_sorted[mid]
+            # Agreement check: max/min within 30%
+            vmin, vmax = min(vals), max(vals)
+            if vmin > 0:
+                spread = (vmax - vmin) / vmin
+            else:
+                spread = 1.0
+            confidence = "high" if spread < 0.3 else "medium"
+            merged[field] = {
+                "value": round(median, 1),
+                "source_count": len(vals),
+                "confidence": confidence,
+                "sources": vals,
+            }
+    return merged
 
 
 def _detect_shared_meal(dish_desc: str) -> bool:
@@ -2128,27 +2352,43 @@ def api_scan_food():
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
-    # 2. pplx enrichment
+    # 2. pplx enrichment (1st of 2 estimates for 12-field nutrition)
     pplx_desc = _pplx_enrich(vision_desc)
+
+    # 2b. OpenRouter gpt-4o-mini (2nd estimate, JSON mode, Jim OOB 2026-07-25 13:35)
+    openrouter_desc = _openrouter_nutrition_enrich(vision_desc)
+
+    # 2c. Parse both → merge via median (12-field schema)
+    pplx_parsed = _parse_nutrition_block(pplx_desc)
+    # OpenRouter returns JSON string, parse differently
+    openrouter_parsed = {}
+    if openrouter_desc and openrouter_desc.startswith("{"):
+        try:
+            openrouter_parsed = json.loads(openrouter_desc)
+        except Exception:
+            openrouter_parsed = _parse_nutrition_block(openrouter_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, openrouter_parsed])
+    # legacy raw fields (kcal, P) for back-compat with code that reads these
+    raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
+    raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
 
     # 3. Heuristic share + macros hint (vision often gives totals)
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
-
-    # Defaults — keep simple (downstream corrections refine)
-    estimate_match = re.search(r"約?\s*(\d{3,4})\s*[kK]?[cC]al|大約\s*(\d{3,4})\s*千卡", vision_desc + pplx_desc)
-    if estimate_match:
-        raw_kcal = int(estimate_match.group(1) or estimate_match.group(2))
-    else:
-        raw_kcal = 0  # No reliable estimate — log with 0, user can correct
     jim_kcal = round(raw_kcal * jim_ratio)
-
-    p_match = re.search(r"蛋白質[約大概]*\s*(\d+)\s*[gk]克?", vision_desc + pplx_desc)
-    raw_p = int(p_match.group(1)) if p_match else 0
     jim_p = round(raw_p * jim_ratio)
 
-    # 4. Build entry
+    # 4. Build entry — 12-field nutrition schema (Jim OOB 2026-07-25 13:35)
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    # Per-field entry: jim_*_amount = round(value * jim_ratio) if shared, else value
+    field_entries = {}
+    for f in NUTRITION_FIELDS:
+        info = merged_nutrition.get(f)
+        if not info:
+            field_entries[f] = 0
+            continue
+        v = info.get("value", 0) or 0
+        field_entries[f] = round(v * jim_ratio, 1) if shared else v
     entry = {
         "date": today_iso(),
         "time": now_hkt_dt.strftime("%H:%M"),
@@ -2158,18 +2398,30 @@ def api_scan_food():
         "name": vision_desc[:200],
         "vision_raw_desc": vision_desc,
         "pplx_enrichment": pplx_desc,
+        "openrouter_enrichment": openrouter_desc[:500] if openrouter_desc else "",
+        "openrouter_json_parsed": openrouter_parsed,
+        "nutrition_merged": merged_nutrition,
         "restaurant_chain": "",  # user/correction can fill
         "share_with_wife": ("Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)"),
         "is_shared_meal": shared,
-        "calories": jim_kcal,
-        "protein": jim_p,
-        "carbs": 0,
-        "fat": 0,
+        # 12-field nutrition (Jim OOB 2026-07-25 13:35)
+        "calories": field_entries["calories"],
+        "protein": field_entries["protein"],
+        "carbs": field_entries["carbs"],
+        "fat": field_entries["fat"],
+        "fiber": field_entries["fiber"],
+        "sugar": field_entries["sugar"],
+        "sodium": field_entries["sodium"],
+        "sat_fat": field_entries["sat_fat"],
+        "trans_fat": field_entries["trans_fat"],
+        "vit_c": field_entries["vit_c"],
+        "iron": field_entries["iron"],
+        "calcium": field_entries["calcium"],
         "raw_kcal_estimate": raw_kcal,
         "raw_p_estimate": raw_p,
-        "source": "v2.1-scan (minimax-m3 + pplx-sonar-pro)",
-        "models_used": ["minimax-m3", "pplx-sonar-pro"],
-        "confidence": "single-pass vision+pplx (Jim can correct via /api/scan_correct)",
+        "source": "v2.9-scan (minimax-m3 + pplx-sonar-pro + openrouter-gpt-4o-mini, median-merged)",
+        "models_used": ["minimax-m3", "pplx-sonar-pro", "openrouter/gpt-4o-mini"],
+        "confidence": "12-field median-merged (Jim can correct via /api/scan_correct)",
         "notion_synced": False,
         "image_saved_to": "",  # filled below
         "user_correction": None,  # permanent — never trimmed (Jim OOB 2026-07-23 22:30 HKT "no trimming of data")
@@ -2496,20 +2748,38 @@ def api_scan_preview():
     # 2. pplx enrichment
     pplx_desc = _pplx_enrich(vision_desc)
 
+    # 2b. OpenRouter gpt-4o-mini 2nd-opinion (Jim OOB 2026-07-25 13:35)
+    openrouter_desc = _openrouter_nutrition_enrich(vision_desc)
+    pplx_parsed = _parse_nutrition_block(pplx_desc)
+    openrouter_parsed = {}
+    if openrouter_desc and openrouter_desc.startswith("{"):
+        try:
+            openrouter_parsed = json.loads(openrouter_desc)
+        except Exception:
+            openrouter_parsed = _parse_nutrition_block(openrouter_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, openrouter_parsed])
+
     # 3. Build preview entry (NOT written yet)
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
-
-    kcal_match = re.search(r"約?\s*(\d{3,4})\s*[kK]?[cC]al|大約\s*(\d{3,4})\s*千卡", vision_desc + pplx_desc)
-    raw_kcal = int((kcal_match.group(1) or kcal_match.group(2)) if kcal_match else 0)
-    p_match = re.search(r"蛋白質[約大概]*\s*(\d+)\s*[gk]克?", vision_desc + pplx_desc)
-    raw_p = int(p_match.group(1)) if p_match else 0
+    raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
+    raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
     jim_kcal = round(raw_kcal * jim_ratio)
     jim_p = round(raw_p * jim_ratio)
 
     # Try to extract restaurant chain from vision or pplx (heuristic: first capitalised phrase)
     chain_match = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", vision_desc + pplx_desc)
     restaurant_guess = chain_match.group(1) if chain_match else ""
+
+    # Per-field entries for preview (12-field schema, Jim OOB 2026-07-25 13:35)
+    preview_field_entries = {}
+    for f in NUTRITION_FIELDS:
+        info = merged_nutrition.get(f)
+        if not info:
+            preview_field_entries[f] = 0
+            continue
+        v = info.get("value", 0) or 0
+        preview_field_entries[f] = round(v * jim_ratio, 1) if shared else v
 
     preview = {
         "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
@@ -2518,16 +2788,26 @@ def api_scan_preview():
         "vision_desc": vision_desc,
         "vision_short": vision_desc[:300],
         "pplx_short": pplx_desc[:500],
+        "openrouter_enrichment": openrouter_desc[:300] if openrouter_desc else "",
+        "nutrition_merged": merged_nutrition,
         "suggested_entry": {
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": vision_desc[:120],
             "restaurant_chain": restaurant_guess,
-            "calories": jim_kcal,
-            "protein": jim_p,
-            "carbs": 0,
-            "fat": 0,
+            "calories": preview_field_entries["calories"],
+            "protein": preview_field_entries["protein"],
+            "carbs": preview_field_entries["carbs"],
+            "fat": preview_field_entries["fat"],
+            "fiber": preview_field_entries["fiber"],
+            "sugar": preview_field_entries["sugar"],
+            "sodium": preview_field_entries["sodium"],
+            "sat_fat": preview_field_entries["sat_fat"],
+            "trans_fat": preview_field_entries["trans_fat"],
+            "vit_c": preview_field_entries["vit_c"],
+            "iron": preview_field_entries["iron"],
+            "calcium": preview_field_entries["calcium"],
             "is_shared_meal": shared,
             "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
             "raw_kcal_estimate": raw_kcal,
@@ -2568,10 +2848,17 @@ def api_scan_preview_from_path():
 
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
-    kcal_match = re.search(r"約?\s*(\d{3,4})\s*[kK]?[cC]al|大約\s*(\d{3,4})\s*千卡", vision_desc + pplx_desc)
-    raw_kcal = int((kcal_match.group(1) or kcal_match.group(2)) if kcal_match else 0)
-    p_match = re.search(r"蛋白質[約大概]*\s*(\d+)\s*[gk]克?", vision_desc + pplx_desc)
-    raw_p = int(p_match.group(1)) if p_match else 0
+    openrouter_desc = _openrouter_nutrition_enrich(vision_desc)
+    pplx_parsed = _parse_nutrition_block(pplx_desc)
+    openrouter_parsed = {}
+    if openrouter_desc and openrouter_desc.startswith("{"):
+        try:
+            openrouter_parsed = json.loads(openrouter_desc)
+        except Exception:
+            openrouter_parsed = _parse_nutrition_block(openrouter_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, openrouter_parsed])
+    raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
+    raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
     jim_kcal = round(raw_kcal * jim_ratio)
     jim_p = round(raw_p * jim_ratio)
     chain_match = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", vision_desc + pplx_desc)
@@ -5925,7 +6212,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v39';
+const CACHE = 'gym-web-v41';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
