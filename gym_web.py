@@ -1821,10 +1821,10 @@ def _get_latest_news_for_cheer() -> str:
             "messages": [{"role": "user", "content":
                 "幫我搵 2 至 3 則最新嘅香港 / 體育 / 健身 / 健康 / 飲食 / 潮流 topic 嘅新聞或熱話，"
                 "限本週 2026 年 7 月 22 至 24 日內發生嘅。簡短每則 30-60 字繁中廣東話回覆，"
-                "可以用嚟做 cheer 收尾嘅有趣話題。唔好 fabricate，唔肯定就講 \"(本週未有確認熱話)\"。" }],
-            "max_tokens": 400,
-            "temperature": 0.7,
-        }
+                ]},
+                "max_tokens": 2400,
+                "temperature": 0.2,
+                }
         req = urllib.request.Request(
             "https://api.perplexity.ai/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -1918,9 +1918,9 @@ def _minimax_vision(img_b64: str, prompt: str) -> str:
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-        ]}],
-        "max_tokens": 1800,
-        "temperature": 0.25,
+        ]},
+        "max_tokens": 2400,
+        "temperature": 0.2,
     }
     try:
         req = urllib.request.Request(
@@ -1976,8 +1976,8 @@ def _pplx_enrich(dish_desc: str) -> str:
         "messages": [
             {"role": "system", "content": "你係香港連鎖餐廳 nutrition 查詢助手。用事實同官方數據回答, 唔好幻想, 唔識就寫 0。"},
             {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 1800,
+        ]},
+        "max_tokens": 2400,
         "temperature": 0.2,
     }
     try:
@@ -2034,10 +2034,10 @@ def _openrouter_nutrition_enrich(dish_desc: str) -> str:
         "messages": [
             {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
             {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 400,
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
+        ]},
+        "max_tokens": 2400,
+        "temperature": 0.2,
+    }
     }
     try:
         req = urllib.request.Request(
@@ -3044,10 +3044,10 @@ def _generate_coach_tips(session_data: dict) -> dict:
                 "messages": [
                     {"role": "system", "content": "你係香港 NSCA-CSCS 教練。用繁體中文、技術但口語化。"},
                     {"role": "user", "content": pplx_query},
-                ],
-                "max_tokens": 1400,
-                "temperature": 0.25,
-            }
+                ]},
+                "max_tokens": 2400,
+                "temperature": 0.2,
+                }
             req = urllib.request.Request(
                 "https://api.perplexity.ai/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
@@ -3078,10 +3078,10 @@ def _generate_coach_tips(session_data: dict) -> dict:
         if api_key:
             payload = {
                 "model": "MiniMax-Text-01",
-                "messages": [{"role": "user", "content": mm_prompt}],
-                "max_tokens": 1500,
-                "temperature": 0.4,
-            }
+                ]},
+                "max_tokens": 2400,
+                "temperature": 0.2,
+                }
             req = urllib.request.Request(
                 "https://api.minimax.io/v1/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
@@ -3662,9 +3662,9 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 開始啦，記住：係兄弟傾偈，唔係 CEO 匯報："""
     payload = {
         "model": "sonar-pro",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1300,  # 600-720 字 = ~350-500 pplx output tokens; 1300 headroom prevents mid-section truncation (Jim OOB 7/24).
-        "temperature": 0.6,
+        ]},
+        "max_tokens": 2400,
+        "temperature": 0.2,
     }
     try:
         req = urllib.request.Request(
