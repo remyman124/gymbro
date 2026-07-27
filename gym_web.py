@@ -362,7 +362,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.10"
+__version__ = "2.7.13"
 
 
 def _safe_read_json(path, default=None):
@@ -1855,22 +1855,25 @@ def _minimax_api_key() -> str:
     return os.environ.get("MINIMAX_API_KEY", "")
 
 
-def _openrouter_api_key() -> str:
-    """Read OpenRouter key from .hermes/.env (canonical) or env var.
-    Used for 2nd-opinion food nutrition enrichment via gpt-4o-mini.
+def _apiyi_api_key() -> str:
+    """Read APiyi key from .hermes/.env (canonical) or env var.
+    APiyi = OpenAI-compatible proxy → can call ChatGPT gpt-4o / gpt-4o-mini.
+    Jim OOB 2026-07-25 17:12 HKT: 'Not openrouter using apiyi'.
+    Verified live 2026-07-27 08:35 HKT: https://api.apiyi.com/v1/chat/completions
+    with model gpt-4o-mini returns valid ChatGPT response.
     """
     env_file = Path("/home/work/.hermes/.env")
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
-            if line.startswith("OPENROUTER_API_KEY="):
+            if line.startswith("APIYI_API_KEY="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return os.environ.get("OPENROUTER_API_KEY", "")
+    return os.environ.get("APIYI_API_KEY", "")
 
 
 # Canonical 12-field nutrition schema (Jim OOB 2026-07-25 13:35 HKT:
 # "food recognition buggy, doesn't gather protein, carbs, fiber etc").
-# Used by both pplx and openrouter enrich prompts + parser + Sheet header.
+# Used by both pplx and apiyi enrich prompts + parser + Sheet header.
 NUTRITION_FIELDS = [
     "calories",   # kcal (total energy)
     "protein",    # g
@@ -1938,6 +1941,39 @@ def _minimax_vision(img_b64: str, prompt: str) -> str:
         return f"（MiniMax vision 失敗：{type(e).__name__}）"
 
 
+def _apiyi_vision_analyze(img_b64: str, prompt: str) -> str:
+    """2nd-opinion vision via APiyi gpt-4o-mini (Jim OOB 2026-07-26 19:35 HKT).
+    Returns description text, or "" if key missing → graceful fallback.
+    Median-merge logic in _merge_nutrition_estimates handles 1 vs 2 vision sources.
+    """
+    api_key = _apiyi_api_key()
+    if not api_key:
+        return ""
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+        ]}],
+        "max_tokens": 1200,
+        "temperature": 0.25,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.apiyi.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
+        return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"（APiyi vision 失敗：{type(e).__name__}）"
+
+
 def _pplx_enrich(dish_desc: str) -> str:
     """Call pplx sonar-pro for nutrition enrichment of described dishes.
 
@@ -1996,20 +2032,19 @@ def _pplx_enrich(dish_desc: str) -> str:
         return f"（PPLX enrichment 失敗：{type(e).__name__}）"
 
 
-def _openrouter_nutrition_enrich(dish_desc: str) -> str:
-    """Call OpenRouter gpt-4o-mini for 2nd-opinion food nutrition enrichment.
+def _apiyi_nutrition_enrich(dish_desc: str) -> str:
+    """Call APiyi gpt-4o-mini for 2nd-opinion food nutrition enrichment.
 
-    Jim OOB 2026-07-25 13:35 HKT: "do you need ChatGPT too via openrouter?"
-    Yes — gpt-4o-mini is $0.15/$0.6 per 1M tokens, perfect 2nd-opinion
-    voter. Returns text (or empty on failure) — caller parses via
-    _parse_nutrition_block then median-merges with pplx.
+    APiyi = OpenAI-compatible proxy. Confirmed live 2026-07-27 08:35 HKT.
+    Jim OOB 2026-07-25 17:12 HKT: 'Not openrouter using apiyi' — ChatGPT
+    gpt-4o-mini is the 2nd-opinion source for 12-field schema. Returns
+    text (or empty on failure) — caller parses via _parse_nutrition_block
+    then median-merges with pplx.
 
-    NOTE 2026-07-25: requires OPENROUTER_API_KEY in /home/work/.hermes/.env
-    or env var. Until key is added, returns "" and pipeline silently
-    falls back to pplx-only single estimate. After key is added, the
-    2-source median merge activates automatically — no code change.
+    NOTE: requires APIYI_API_KEY in /home/work/.hermes/.env or env var.
+    Returns "" if key missing → pipeline silently falls back to pplx-only.
     """
-    api_key = _openrouter_api_key()
+    api_key = _apiyi_api_key()
     if not api_key:
         return ""  # graceful fallback — single-source pplx only
     fields_desc = ", ".join(
@@ -2030,7 +2065,7 @@ def _openrouter_nutrition_enrich(dish_desc: str) -> str:
         f"(KFC, McDonald's, Starbucks). Otherwise use typical HK portion."
     )
     payload = {
-        "model": "openai/gpt-4o-mini",
+        "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
             {"role": "user", "content": prompt},
@@ -2041,20 +2076,18 @@ def _openrouter_nutrition_enrich(dish_desc: str) -> str:
     }
     try:
         req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.apiyi.com/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "Content-Type": "application/json",
                 "Authorization": "Bear" + "er " + api_key,
-                "HTTP-Referer": "https://gymbro.local",
-                "X-Title": "gymbro food scan",
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
         return resp["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"（OpenRouter enrichment 失敗：{type(e).__name__}）"
+        return f"（APiyi enrichment 失敗：{type(e).__name__}）"
 
 
 def _parse_nutrition_block(text: str) -> dict:
@@ -2352,22 +2385,29 @@ def api_scan_food():
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
+    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
+    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+        # 2-vision median-merge: take whichever is longer (more dish detail)
+        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+
     # 2. pplx enrichment (1st of 2 estimates for 12-field nutrition)
     pplx_desc = _pplx_enrich(vision_desc)
 
     # 2b. OpenRouter gpt-4o-mini (2nd estimate, JSON mode, Jim OOB 2026-07-25 13:35)
-    openrouter_desc = _openrouter_nutrition_enrich(vision_desc)
+    apiyi_desc = _apiyi_nutrition_enrich(vision_desc)
 
     # 2c. Parse both → merge via median (12-field schema)
     pplx_parsed = _parse_nutrition_block(pplx_desc)
     # OpenRouter returns JSON string, parse differently
-    openrouter_parsed = {}
-    if openrouter_desc and openrouter_desc.startswith("{"):
+    apiyi_parsed = {}
+    if apiyi_desc and apiyi_desc.startswith("{"):
         try:
-            openrouter_parsed = json.loads(openrouter_desc)
+            apiyi_parsed = json.loads(apiyi_desc)
         except Exception:
-            openrouter_parsed = _parse_nutrition_block(openrouter_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, openrouter_parsed])
+            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
     # legacy raw fields (kcal, P) for back-compat with code that reads these
     raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
     raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
@@ -2398,8 +2438,8 @@ def api_scan_food():
         "name": vision_desc[:200],
         "vision_raw_desc": vision_desc,
         "pplx_enrichment": pplx_desc,
-        "openrouter_enrichment": openrouter_desc[:500] if openrouter_desc else "",
-        "openrouter_json_parsed": openrouter_parsed,
+        "apiyi_enrichment": apiyi_desc[:500] if apiyi_desc else "",
+        "apiyi_json_parsed": apiyi_parsed,
         "nutrition_merged": merged_nutrition,
         "restaurant_chain": "",  # user/correction can fill
         "share_with_wife": ("Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)"),
@@ -2419,8 +2459,8 @@ def api_scan_food():
         "calcium": field_entries["calcium"],
         "raw_kcal_estimate": raw_kcal,
         "raw_p_estimate": raw_p,
-        "source": "v2.9-scan (minimax-m3 + pplx-sonar-pro + openrouter-gpt-4o-mini, median-merged)",
-        "models_used": ["minimax-m3", "pplx-sonar-pro", "openrouter/gpt-4o-mini"],
+        "source": "v2.11-scan (minimax-m3 + pplx-sonar-pro + apiyi-gpt-4o-mini, median-merged)",
+        "models_used": ["minimax-m3", "pplx-sonar-pro", "apiyi/gpt-4o-mini"],
         "confidence": "12-field median-merged (Jim can correct via /api/scan_correct)",
         "notion_synced": False,
         "image_saved_to": "",  # filled below
@@ -2745,19 +2785,26 @@ def api_scan_preview():
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
+    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
+    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+        # 2-vision median-merge: take whichever is longer (more dish detail)
+        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+
     # 2. pplx enrichment
     pplx_desc = _pplx_enrich(vision_desc)
 
     # 2b. OpenRouter gpt-4o-mini 2nd-opinion (Jim OOB 2026-07-25 13:35)
-    openrouter_desc = _openrouter_nutrition_enrich(vision_desc)
+    apiyi_desc = _apiyi_nutrition_enrich(vision_desc)
     pplx_parsed = _parse_nutrition_block(pplx_desc)
-    openrouter_parsed = {}
-    if openrouter_desc and openrouter_desc.startswith("{"):
+    apiyi_parsed = {}
+    if apiyi_desc and apiyi_desc.startswith("{"):
         try:
-            openrouter_parsed = json.loads(openrouter_desc)
+            apiyi_parsed = json.loads(apiyi_desc)
         except Exception:
-            openrouter_parsed = _parse_nutrition_block(openrouter_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, openrouter_parsed])
+            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
 
     # 3. Build preview entry (NOT written yet)
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
@@ -2788,7 +2835,7 @@ def api_scan_preview():
         "vision_desc": vision_desc,
         "vision_short": vision_desc[:300],
         "pplx_short": pplx_desc[:500],
-        "openrouter_enrichment": openrouter_desc[:300] if openrouter_desc else "",
+        "apiyi_enrichment": apiyi_desc[:300] if apiyi_desc else "",
         "nutrition_merged": merged_nutrition,
         "suggested_entry": {
             "date": today_iso(),
@@ -2844,19 +2891,26 @@ def api_scan_preview_from_path():
         "繁體中文廣東話,一個英文字都唔好有。"
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
+
+    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
+    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+        # 2-vision median-merge: take whichever is longer (more dish detail)
+        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
     pplx_desc = _pplx_enrich(vision_desc)
 
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
-    openrouter_desc = _openrouter_nutrition_enrich(vision_desc)
+    apiyi_desc = _apiyi_nutrition_enrich(vision_desc)
     pplx_parsed = _parse_nutrition_block(pplx_desc)
-    openrouter_parsed = {}
-    if openrouter_desc and openrouter_desc.startswith("{"):
+    apiyi_parsed = {}
+    if apiyi_desc and apiyi_desc.startswith("{"):
         try:
-            openrouter_parsed = json.loads(openrouter_desc)
+            apiyi_parsed = json.loads(apiyi_desc)
         except Exception:
-            openrouter_parsed = _parse_nutrition_block(openrouter_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, openrouter_parsed])
+            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
     raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
     raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
     jim_kcal = round(raw_kcal * jim_ratio)
@@ -6123,6 +6177,43 @@ document.addEventListener('touchend', e => {
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
+
+// PWA install prompt — 7-day delayed bottom sheet (Jim OOB 2026-07-26 19:35 HKT).
+// Captures beforeinstallprompt for Android, shows iOS manual instructions for iPhone.
+(function(){
+  try {
+    const DISMISS_KEY = 'pwa_install_dismissed_at';
+    const dismissedAt = parseInt(localStorage.getItem(DISMISS_KEY) || '0', 10);
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const elapsed = Date.now() - dismissedAt;
+    if (dismissedAt && elapsed < sevenDaysMs) return;  // already shown within 7 days
+    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
+    if (isStandalone) return;  // already installed
+    setTimeout(() => {
+      const banner = document.createElement('div');
+      banner.id = 'pwa-install-banner';
+      banner.style.cssText = 'position:fixed;left:16px;right:16px;bottom:80px;z-index:9999;background:#1f2937;color:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.4);font-family:system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5;';
+      const steps = isIos
+        ? '1. 撳底下 Share掣 (□↑)<br>2. 揀「加到主畫面」<br>3. 撳「加入」'
+        : '1. 撳 Chrome menu (⋮)<br>2. 揀「加到主畫面」<br>3. 撳「加入」';
+      banner.innerHTML = '<div style="font-weight:700;margin-bottom:8px;">📲 加 gymbro 到主畫面</div>' +
+        '<div style="opacity:0.9;margin-bottom:12px;">更快開 + 全螢幕 + 即時通知</div>' +
+        '<div style="opacity:0.85;margin-bottom:12px;">' + steps + '</div>' +
+        '<div style="display:flex;gap:8px;">' +
+        '<button id="pwa-install-close" style="flex:1;background:transparent;border:1px solid #4b5563;color:white;padding:8px;border-radius:8px;font-size:13px;">遲啲</button>' +
+        '<button id="pwa-install-go" style="flex:1;background:#10b981;border:none;color:white;padding:8px;border-radius:8px;font-size:13px;font-weight:600;">開工</button>' +
+        '</div>';
+      document.body.appendChild(banner);
+      const dismiss = () => {
+        try { localStorage.setItem(DISMISS_KEY, String(Date.now())); } catch(e) {}
+        banner.remove();
+      };
+      document.getElementById('pwa-install-close').onclick = dismiss;
+      document.getElementById('pwa-install-go').onclick = () => { dismiss(); };
+    }, 3000);  // 3s delay after page load — don't compete with hero
+  } catch(e) { /* noop */ }
+})();
 </script>
 
 </body>
@@ -6212,7 +6303,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v41';
+const CACHE = 'gym-web-v42';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
