@@ -3408,11 +3408,21 @@ def _run_whoop_pull_cached(force: bool = False) -> dict:
     # Run whoop_pull.py (always when forced)
     try:
         result = _sp.run([sys.executable, str(WHOOP_PULL_SCRIPT)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=180)
         if result.returncode == 0 and WHOOP_CACHE_PATH.exists():
             return json.loads(WHOOP_CACHE_PATH.read_text())
-    except Exception:
-        pass
+        # 7/27 Jim OOB repeated: log stderr on failure so cheer artifact shows it
+        print(f"[whoop_pull] exit={result.returncode} stderr={result.stderr[:300] if result.stderr else 'none'}")
+    except _sp.TimeoutExpired:
+        # 7/27 Jim OOB repeated: surface failure in stderr for visibility
+        try:
+            cur_mtime = WHOOP_CACHE_PATH.stat().st_mtime if WHOOP_CACHE_PATH.exists() else 0
+            cur_age_hr = (now_ts - cur_mtime) / 3600 if cur_mtime else -1
+        except Exception:
+            cur_age_hr = -1
+        print(f"[whoop_pull] TIMEOUT after 180s — using stale cache (was {cur_age_hr:.1f}h old)" if cur_age_hr >= 0 else "[whoop_pull] TIMEOUT after 180s — no cache available")
+    except Exception as e:
+        print(f"[whoop_pull] EXCEPTION {type(e).__name__}: {e}")
     if WHOOP_CACHE_PATH.exists():
         try:
             return json.loads(WHOOP_CACHE_PATH.read_text())
