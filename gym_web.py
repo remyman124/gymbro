@@ -16,6 +16,7 @@ import secrets
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from datetime import datetime as _dt
 from pathlib import Path
 
 from flask import Flask, jsonify, request, render_template_string, send_from_directory
@@ -362,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.13"
+__version__ = "2.7.15"
 
 
 def _safe_read_json(path, default=None):
@@ -561,6 +562,7 @@ def _withings_steps_today() -> dict:
     """
     import importlib
     from datetime import datetime, timezone, timedelta
+    from datetime import datetime as _dt
     import time as _time
 
     # In-process 30s cache
@@ -4001,13 +4003,31 @@ def _background_cheer_job(job_id: str, fire_type: str):
     """
     try:
         with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id] = {"status": "running", "step": "whoop_pull", "started_at": now_iso()}
+            CHEER_JOBS[job_id] = {
+                "status": "running",
+                "step": "whoop_pull",
+                "step_at": now_iso(),
+                "started_at": now_iso(),
+            }
 
         # 1. Whoop pull — Jim OOB 2026-07-24: force re-pull on EVERY fire (no yesterday data).
         whoop = _run_whoop_pull_cached(force=True)
+        # 7/29 Jim OOB: show 'as of time' for Whoop data
+        whoop_pulled_at = now_iso()
+        try:
+            if WHOOP_CACHE_PATH.exists():
+                whoop_pulled_at = _dt.fromtimestamp(WHOOP_CACHE_PATH.stat().st_mtime, tz=HKT).isoformat(timespec='seconds')
+        except Exception:
+            pass
         metrics = _extract_whoop_metrics(whoop)
+        metrics["whoop_pulled_at"] = whoop_pulled_at
         with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id].update({"step": "withings_pull", "metrics": metrics})
+            CHEER_JOBS[job_id].update({
+                "step": "withings_pull",
+                "step_at": now_iso(),
+                "metrics": metrics,
+                "whoop_pulled_at": whoop_pulled_at,
+            })
 
         # 1b. Withings pull — refresh weight/fat/steps/distance/calories today.
         try:
@@ -4017,6 +4037,14 @@ def _background_cheer_job(job_id: str, fire_type: str):
             ], capture_output=True, text=True, timeout=60)
         except Exception:
             pass
+        # 7/29 Jim OOB: show 'as of time' for Withings data
+        withings_pulled_at = now_iso()
+        try:
+            if WITHINGS_CACHE.exists():
+                withings_pulled_at = _dt.fromtimestamp(WITHINGS_CACHE.stat().st_mtime, tz=HKT).isoformat(timespec='seconds')
+        except Exception:
+            pass
+        metrics["withings_pulled_at"] = withings_pulled_at
         # Read fresh body weight + fat + steps from the Withings helpers.
         try:
             metrics["withings_weight_kg"] = _withings_weight()
@@ -4036,7 +4064,12 @@ def _background_cheer_job(job_id: str, fire_type: str):
             metrics.setdefault("withings_distance_km", None)
             metrics.setdefault("withings_calories_today", None)
         with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id].update({"step": "text_gen", "metrics": metrics})
+            CHEER_JOBS[job_id].update({
+                "step": "text_gen",
+                "step_at": now_iso(),
+                "metrics": metrics,
+                "withings_pulled_at": withings_pulled_at,
+            })
 
         # 1c. Workout detail loop (Jim OOB 2026-07-24: list every exercise).
         try:
@@ -4049,18 +4082,18 @@ def _background_cheer_job(job_id: str, fire_type: str):
         # 2. Text
         text = _synthesize_cheer_text(metrics, fire_type)
         with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id].update({"step": "voice_gen", "text": text})
+            CHEER_JOBS[job_id].update({"step": "voice_gen", "step_at": now_iso(), "text": text})
 
         # 3. Voice
         voice_path = _synthesize_cheer_voice(text)
         with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id].update({"step": "image_gen", "voice_path": voice_path})
+            CHEER_JOBS[job_id].update({"step": "image_gen", "step_at": now_iso(), "voice_path": voice_path})
 
         # 4. Image
         context = f"{fire_type}_{int(time.time())}"
         image_path = _generate_cheer_image(context)
         with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id].update({"step": "done", "image_path": image_path})
+            CHEER_JOBS[job_id].update({"step": "done", "step_at": now_iso(), "image_path": image_path})
 
         # 5. Cache to cheer_artifacts
         today_iso_str = today_iso()
@@ -4164,8 +4197,19 @@ def api_cheer_status():
             "image_url": image_url,
             "metrics": job.get("metrics", {}),
             "step": job.get("step"),
+            "step_at": job.get("step_at"),
+            "whoop_pulled_at": job.get("whoop_pulled_at"),
+            "withings_pulled_at": job.get("withings_pulled_at"),
         })
-    return jsonify({"ok": True, "status": job["status"], "step": job.get("step"), "started_at": job.get("started_at")})
+    return jsonify({
+        "ok": True,
+        "status": job["status"],
+        "step": job.get("step"),
+        "step_at": job.get("step_at"),
+        "started_at": job.get("started_at"),
+        "whoop_pulled_at": job.get("whoop_pulled_at"),
+        "withings_pulled_at": job.get("withings_pulled_at"),
+    })
 
 
 @app.route("/api/cheer/recent", methods=["GET"])
@@ -5869,14 +5913,20 @@ function gymApp() {
           // Clear progress after 5s
           setTimeout(() => { this.cheerProgress = ''; this.cheerPct = 0; }, 5000);
         } else {
-          // Running — update progress label
+          // Running — update progress label with as-of timestamps (7/29 Jim OOB)
           const stepMap = {
-            whoop_pull: 'WHOOP 拉緊數據…',
-            text_gen: 'pplx 寫緊 cheer 文字…',
-            voice_gen: 'Edge-TTS 整緊 WanLung 語音…',
-            image_gen: 'MiniMax 整緊勵志圖…',
+            whoop_pull: '🟢 WHOOP 拉緊數據…',
+            withings_pull: '🟢 Withings 拉緊數據…',
+            text_gen: '✍️ pplx 寫緊 cheer 文字…',
+            voice_gen: '🎙 Edge-TTS 整緊 WanLung 語音…',
+            image_gen: '🖼 MiniMax 整緊勵志圖…',
           };
-          this.cheerProgress = stepMap[data.step] || `${data.status}: ${data.step}`;
+          // 7/29 Jim OOB: surface 'as of time' so he sees when the data is actually from
+          let suffix = '';
+          if (data.whoop_pulled_at) suffix += ` · WHOOP ${data.whoop_pulled_at}`;
+          if (data.withings_pulled_at) suffix += ` · Withings ${data.withings_pulled_at}`;
+          if (data.step_at) suffix += ` · step ${data.step_at}`;
+          this.cheerProgress = (stepMap[data.step] || `${data.status}: ${data.step}`) + suffix;
           this.cheerPct = Math.min(this.cheerPct + 8, 90);
         }
       } catch (e) { /* silent — next poll will retry */ }
