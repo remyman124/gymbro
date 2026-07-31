@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.15"
+__version__ = "2.7.19"
 
 
 def _safe_read_json(path, default=None):
@@ -599,6 +599,10 @@ def _withings_steps_today() -> dict:
         for d in reversed(data):
             if d.get("date") == today_str:
                 return d
+        # Jim OOB 2026-07-29: Withings server may not have synced today's data yet
+        # (especially morning). Fallback to last available record (yesterday).
+        if data:
+            return data[-1]
         return None
 
     # Pull #1
@@ -1812,19 +1816,26 @@ def _pplx_api_key() -> str:
 def _get_latest_news_for_cheer() -> str:
     """Pull 1-2 fresh HK / sports / lifestyle news bits for the cheer prompt.
     Jim OOB 2026-07-24: 'use latest news to make it more innovative and funny'.
+    Jim OOB 2026-07-29: random-pick 1 of 4 categories (gossip / sports / AI / hacker news).
     Returns a short Chinese string or '' on failure.
     """
+    import random
     key = _pplx_api_key()
     if not key:
         return ""
+    # Jim OOB 2026-07-29: random-pick 1 of 4 categories
+    categories = [
+        ("gossip", "娛樂圈 / 明星 / 藝人 gossip — 香港或國際明星新聞, 限本週 2026 年 7 月 22 至 29 日內發生。簡短 30-50 字繁中廣東話回覆, 可以用嚟做 cheer 收尾嘅有趣話題。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
+        ("sports", "體育 / 足球 / NBA / 網球 / 賽車 — 國際體育新聞, 限本週內發生。簡短 30-50 字繁中廣東話回覆。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
+        ("ai", "AI / 人工智能 / 大模型 / 生成式 AI — 業界新聞, 例如新模型發佈、產品更新、AI 政策。限本週內發生。簡短 30-50 字繁中廣東話回覆。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
+        ("hacker", "黑客 / 資訊安全 / 漏洞 / 數據外洩 / 開源工具新聞。限本週內發生。簡短 30-50 字繁中廣東話回覆。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
+    ]
+    cat_name, cat_prompt = random.choice(categories)
     try:
         payload = {
             "model": "sonar-pro",
-            "messages": [{"role": "user", "content":
-                "幫我搵 2 至 3 則最新嘅香港 / 體育 / 健身 / 健康 / 飲食 / 潮流 topic 嘅新聞或熱話，"
-                "限本週 2026 年 7 月 22 至 24 日內發生嘅。簡短每則 30-60 字繁中廣東話回覆，"
-                "可以用嚟做 cheer 收尾嘅有趣話題。唔好 fabricate，唔肯定就講 \"(本週未有確認熱話)\"。" }],
-            "max_tokens": 400,
+            "messages": [{"role": "user", "content": f"幫我搵 1 則最新嘅 {cat_prompt}"}],
+            "max_tokens": 250,
             "temperature": 0.7,
         }
         req = urllib.request.Request(
@@ -1837,7 +1848,69 @@ def _get_latest_news_for_cheer() -> str:
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        return (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        content = (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        # Prepend category tag for cheer to reference
+        cat_label = {"gossip": "🎭 明星娛樂", "sports": "⚽ 體育", "ai": "🤖 AI", "hacker": "💻 黑客"}.get(cat_name, "📰")
+        return f"【{cat_label}】{content}" if content else ""
+    except Exception:
+        return ""
+
+
+def _get_liverpool_fixture_for_cheer() -> str:
+    """Pull next Liverpool FC fixture for cheer prompt context (Jim OOB 2026-07-29).
+    If next match is Big 6 (Man Utd / Man City / Chelsea / Arsenal / Tottenham)
+    within 7 days, return a Cantonese string with opponent + days_until.
+    Returns '' on failure / no upcoming Big 6.
+    Cache: 6-hour TTL via /home/work/.liverpool_fixture_cache.json.
+    """
+    cache_path = "/home/work/.liverpool_fixture_cache.json"
+    # Check cache TTL (6h)
+    try:
+        cache_mtime = os.path.getmtime(cache_path)
+        if (time.time() - cache_mtime) < 6 * 3600:
+            with open(cache_path) as f:
+                cached = json.load(f)
+                if cached.get("block"):
+                    return cached["block"]
+                else:
+                    return ""
+    except Exception:
+        pass
+    key = _pplx_api_key()
+    if not key:
+        return ""
+    try:
+        payload = {
+            "model": "sonar-pro",
+            "messages": [{"role": "user", "content":
+                "利物浦 (Liverpool FC) 下一場英超賽事係幾時? 對手係邊隊? 喺主場定作客?"
+                "用繁中廣東話一句 30-50 字回覆, 例如「下週六 (7月25日) 主場對曼聯」, "
+                "如果 7 日內冇賽事就答「7 日內冇利物浦比賽」。唔好 fabricate, 唔肯定就講「未確認」。"}],
+            "max_tokens": 200,
+            "temperature": 0.3,
+        }
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        content = (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        # Determine if Big 6 — if yes, return block; else empty
+        big6_kw = ["曼聯", "曼城", "車路士", "阿仙奴", "熱刺", "曼聯", "曼联", "曼联", "Manchester United", "Man City", "Chelsea", "Arsenal", "Tottenham"]
+        is_big6 = any(kw in content for kw in big6_kw)
+        is_no_match = "冇" in content or "未確認" in content or "未確認" in content
+        block = content if (is_big6 and not is_no_match) else ""
+        # Atomic cache write
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"block": block, "raw": content, "is_big6": is_big6, "fetched_at": datetime.now(timezone.utc).isoformat()}, f, ensure_ascii=False)
+        os.rename(tmp, cache_path)
+        return block
     except Exception:
         return ""
 
@@ -2318,7 +2391,12 @@ def _get_today_nutrition_for_cheer() -> str:
 
 def _append_to_sheet_nutrition(entry: dict) -> dict:
     """Mirror entry to Google Sheet Nutrition tab (sheetId 474877075).
-    Returns {"ok": bool, "range": str} — silent on quota/error."""
+    Returns {"ok": bool, "range": str} — silent on quota/error.
+
+    Jim OOB 2026-07-29: dedup by (date, time_short, calories) BEFORE push.
+    Prevents cron double-push from creating duplicates.
+    Also marks entry.sheet_synced=True on success.
+    """
     try:
         tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
         if "token" not in tok or not tok.get("refresh_token"):
@@ -2338,21 +2416,50 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
         access = resp["access_token"]
         tok["token"] = access
         Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
-        # Append row to Nutrition tab
+
+        # Dedup check: pull existing sheet rows + check if entry already exists
+        # Jim OOB 2026-07-29: signature (date, time_short, calories) catches duplicates
+        # regardless of meal_type naming inconsistency.
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        try:
+            url_check = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:Z1000?valueRenderOption=FORMATTED_VALUE"
+            req_check = urllib.request.Request(url_check, headers={"Authorization": f"Bearer {access}"})
+            existing = json.loads(urllib.request.urlopen(req_check, timeout=10).read()).get("values", [])
+            entry_date = entry.get("date", today_iso())
+            entry_time = (entry.get("time", "00:00") or "00:00")[:5]
+            entry_cal = str(int(entry.get("calories", 0) or 0))
+            for row in existing[1:]:
+                if not row:
+                    continue
+                row_date = row[0]
+                row_time_full = row[1] if len(row) > 1 else ''
+                row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
+                row_cal = row[5] if len(row) > 5 else ''
+                if row_date == entry_date and row_time == entry_time and row_cal == entry_cal:
+                    # Already in sheet — mark synced locally + skip push
+                    entry["sheet_synced"] = True
+                    return {"ok": True, "range": "deduped", "skipped": True}
+        except Exception:
+            # If dedup check fails, continue with append (better to dup than miss)
+            pass
+
+        # Append row to Nutrition tab
+        # v2.7.19: column M (13th) = user_hints joined by " | " (Jim OOB 7/31)
+        user_hints_joined = " | ".join(entry.get("user_hints", []) or [])[:200]
         row_data = [
             entry.get("date", today_iso()),
             f"{entry.get('date', today_iso())}T{entry.get('time', now_iso().split('T')[-1][:5])}:00+08:00",
             entry.get("meal_type", "meal"),
             entry.get("meal_name", entry.get("name", "scan"))[:120],
             entry.get("restaurant_chain", ""),
-            str(entry.get("calories", 0)),
+            str(int(entry.get("calories", 0) or 0)),
             str(entry.get("protein", 0)),
             str(entry.get("carbs", 0)),
             str(entry.get("fat", 0)),
             entry.get("note", "scan_food"),
             entry.get("source", "vision+pplx"),
             "",
+            user_hints_joined,  # col M — User Hints
         ]
         body = {"values": [row_data], "majorDimension": "ROWS"}
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
@@ -2361,7 +2468,25 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
             headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-        return {"ok": True, "range": resp.get("updates", {}).get("updatedRange", "?")}
+        # Mark synced locally (Jim OOB 2026-07-29: prevent re-push)
+        entry["sheet_synced"] = True
+        updated_range = resp.get("updates", {}).get("updatedRange", "?")
+        # v2.7.19: ensure header row has column M = "User Hints" (one-time bootstrap)
+        # If header M is empty, set it. Idempotent — safe to call every push.
+        try:
+            header_check_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!M1"
+            req_h = urllib.request.Request(header_check_url, headers={"Authorization": f"Bearer {access}"})
+            hdr_resp = json.loads(urllib.request.urlopen(req_h, timeout=10).read())
+            existing_m = (hdr_resp.get("values") or [[""]])[0][0] if hdr_resp.get("values") else ""
+            if not existing_m:
+                url_m = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!M1?valueInputOption=USER_ENTERED"
+                hdr_body = {"values": [["User Hints"]]}
+                req_m = urllib.request.Request(url_m, data=json.dumps(hdr_body).encode(), method="PUT",
+                                               headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+                urllib.request.urlopen(req_m, timeout=10).read()
+        except Exception:
+            pass  # header bootstrap is best-effort, don't break the main push
+        return {"ok": True, "range": updated_range}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -2464,7 +2589,7 @@ def api_scan_food():
         "source": "v2.11-scan (minimax-m3 + pplx-sonar-pro + apiyi-gpt-4o-mini, median-merged)",
         "models_used": ["minimax-m3", "pplx-sonar-pro", "apiyi/gpt-4o-mini"],
         "confidence": "12-field median-merged (Jim can correct via /api/scan_correct)",
-        "notion_synced": False,
+        "sheet_synced": False,
         "image_saved_to": "",  # filled below
         "user_correction": None,  # permanent — never trimmed (Jim OOB 2026-07-23 22:30 HKT "no trimming of data")
     }
@@ -2523,6 +2648,55 @@ def api_scan_recent():
     successful = [s for s in scan_log if not _is_failed_scan(s)]
     recent = successful[-limit:][::-1]
     return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
+
+
+# v2.7.18: Withings steps endpoints (Jim OOB 2026-07-29)
+@app.route("/api/withings_steps_today", methods=["GET"])
+def api_withings_steps_today():
+    """Return today's Withings step count + distance + calories."""
+    try:
+        steps_data = _withings_steps_today() or {}
+        return jsonify({
+            "date": steps_data.get("date", ""),
+            "steps": int(steps_data.get("steps") or 0),
+            "distance_km": float(steps_data.get("distance_km") or 0),
+            "calories": float(steps_data.get("calories") or 0),
+        })
+    except Exception as e:
+        return jsonify({"steps": 0, "distance_km": 0, "calories": 0, "error": str(e)[:120]})
+
+
+@app.route("/api/withings_steps_7d_avg", methods=["GET"])
+def api_withings_steps_7d_avg():
+    """Return 7-day average steps (Jim OOB 2026-07-29)."""
+    try:
+        cache = _safe_read_json(WITHINGS_CACHE) or {}
+        # If cache has full 7d activities, use those; else fall back to whoop walk estimate
+        acts = cache.get("activities_30d") or cache.get("activities") or []
+        if not acts:
+            # Try to compute from cache directly
+            steps_list = []
+            for k, v in cache.items():
+                if isinstance(v, dict) and 'steps' in v and isinstance(v['steps'], (int, float)):
+                    steps_list.append(v['steps'])
+            if steps_list:
+                return jsonify({"avg": int(sum(steps_list) / len(steps_list)), "samples": len(steps_list)})
+            return jsonify({"avg": 0, "samples": 0})
+        # Get last 7 daily records
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        # Filter last 7 days
+        recent = acts[-7:] if isinstance(acts, list) else []
+        steps_vals = []
+        for a in recent:
+            if isinstance(a, dict):
+                s = a.get("steps", 0)
+                if isinstance(s, (int, float)):
+                    steps_vals.append(s)
+        avg = int(sum(steps_vals) / max(1, len(steps_vals))) if steps_vals else 0
+        return jsonify({"avg": avg, "samples": len(steps_vals)})
+    except Exception as e:
+        return jsonify({"avg": 0, "samples": 0, "error": str(e)[:120]})
 
 
 @app.route("/api/scan_correct", methods=["POST"])
@@ -2965,6 +3139,8 @@ def api_scan_commit():
     entry = data.get("entry", {})
     image_path = data.get("image_path", "")
     user_correction = data.get("user_correction")  # optional dict
+    # v2.7.19: list of hint strings Jim typed during scan → re-estimate cycle
+    user_hints_in = data.get("user_hints", []) or []
 
     if not entry or not image_path:
         return jsonify({"ok": False, "error": "missing entry or image_path"}), 400
@@ -2978,9 +3154,24 @@ def api_scan_commit():
     entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
     entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
     entry["confidence"] = "Jim-confirmed preview"
-    entry["notion_synced"] = False
+    entry["sheet_synced"] = False
     entry["image_saved_to"] = str(img_path)
     entry["user_correction"] = None
+    # v2.7.19: persist user hints (each round-trip = one hint in the list)
+    # Dedupe + cap to 20 entries to avoid bloat
+    cleaned_hints = []
+    seen = set()
+    for h in user_hints_in:
+        if not isinstance(h, str):
+            continue
+        h = h.strip()
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        cleaned_hints.append(h[:500])
+        if len(cleaned_hints) >= 20:
+            break
+    entry["user_hints"] = cleaned_hints
 
     # Append to nutrition log
     _append_to_nutrition_log(entry)
@@ -3022,6 +3213,144 @@ def api_scan_commit():
         "sheet_synced": sheet_result.get("ok", False),
         "sheet_range": sheet_result.get("range", ""),
     })
+
+
+# v2.7.19: scan re-enrich with user hint (Jim OOB 2026-07-31 13:25 HKT)
+# After preview returned, Jim can type supplementary info (餐廳名/份量/醬汁/材料)
+# and tap "🔄 用補充資料再 estimate" → this endpoint re-runs pplx + APiyi
+# nutrition enrichment with hint prepend, returns new suggested_entry.
+# NO write to log/Sheet — Jim still needs to confirm via /api/scan_commit.
+@app.route("/api/scan_re_enrich", methods=["POST"])
+def api_scan_re_enrich():
+    """Re-enrich a scan preview using user-supplied supplementary hint.
+
+    Receives: {image_path: str, user_hint: str, original_vision_desc: str (optional)}
+    Returns: same shape as /api/scan_preview's `preview` object.
+
+    Flow:
+      1. Read image bytes from image_path (server-side cache).
+      2. Re-run MiniMax vision (cheap, 2-3s) — get fresh dish desc.
+      3. Prepend `「用家補充資料: {hint}」` to vision_desc.
+      4. Re-run _pplx_enrich() + _apiyi_nutrition_enrich() with augmented desc.
+      5. Merge 12-field nutrition via median.
+      6. Return preview-style object for frontend to swap in.
+    """
+    data = request.get_json(silent=True) or {}
+    image_path = data.get("image_path", "")
+    user_hint = (data.get("user_hint") or "").strip()
+    original_vision_desc = data.get("original_vision_desc", "")
+
+    if not image_path:
+        return jsonify({"ok": False, "error": "missing image_path"}), 400
+    if not user_hint:
+        return jsonify({"ok": False, "error": "missing user_hint"}), 400
+
+    # Sanitize hint (cap 500 chars to avoid pplx truncation + injection bloat)
+    if len(user_hint) > 500:
+        user_hint = user_hint[:500] + "…"
+
+    img_path = Path(image_path)
+    # Same safety guard as scan_preview_from_path
+    if not img_path.exists():
+        return jsonify({"ok": False, "error": "image not found at server path"}), 404
+    if img_path.parent != SCAN_CACHE_DIR.resolve() and not str(img_path.resolve()).startswith("/home/work/.hermes/image_cache/"):
+        return jsonify({"ok": False, "error": "image path outside permitted dirs"}), 403
+
+    img_bytes = img_path.read_bytes()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "image too large"}), 413
+
+    img_b64 = base64.b64encode(img_bytes).decode()
+
+    # 1. Re-run MiniMax vision (fresh dish desc, ~3-5s)
+    vision_prompt = (
+        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法、醬汁。"
+        "如見到餐廳 logo 或招牌字就標出。"
+        "簡短總結 estimated 卡路里 同 蛋白質 克數。"
+        "如係小票/receipt,逐項列菜名同份量。"
+        "繁體中文廣東話,一個英文字都唔好有。"
+    )
+    vision_desc = _minimax_vision(img_b64, vision_prompt)
+
+    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (v2.7.12 — Jim OOB 7/26 19:35)
+    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+
+    # 2. Augment with user hint — Jim OOB 7/31 "supplementary info to re-estimate"
+    # Prepend hint as context, then pplx/apaiyi still do recogniser role.
+    augmented_desc = f"用家補充資料（餐廳名/份量/醬汁/材料）：{user_hint}\n\n{vision_desc}"
+
+    # 3. Re-enrich via pplx + APiyi (parallel — sequential for safety, no quota burn)
+    pplx_desc = _pplx_enrich(augmented_desc)
+    apiyi_desc = _apiyi_nutrition_enrich(augmented_desc)
+
+    # 4. Merge 12-field nutrition
+    pplx_parsed = _parse_nutrition_block(pplx_desc)
+    apiyi_parsed = {}
+    if apiyi_desc and apiyi_desc.startswith("{"):
+        try:
+            apiyi_parsed = json.loads(apiyi_desc)
+        except Exception:
+            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
+
+    shared = _detect_shared_meal(augmented_desc + " " + pplx_desc)
+    jim_ratio = 0.60 if shared else 1.00
+    raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
+    raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
+
+    chain_match = re.search(r"([一-鿿]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", augmented_desc + pplx_desc)
+    restaurant_guess = chain_match.group(1) if chain_match else ""
+
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    field_entries = {}
+    for f in NUTRITION_FIELDS:
+        info = merged_nutrition.get(f)
+        if not info:
+            field_entries[f] = 0
+            continue
+        v = info.get("value", 0) or 0
+        field_entries[f] = round(v * jim_ratio, 1) if shared else v
+
+    preview = {
+        "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_re",
+        "image_path": str(img_path),
+        "image_url": f"/scan_img/{img_path.name}",
+        "vision_desc": augmented_desc,  # hint-augmented desc returned to frontend
+        "vision_short": augmented_desc[:300],
+        "pplx_short": pplx_desc[:500],
+        "apiyi_enrichment": apiyi_desc[:300] if apiyi_desc else "",
+        "nutrition_merged": merged_nutrition,
+        "suggested_entry": {
+            "date": today_iso(),
+            "time": now_hkt_dt.strftime("%H:%M"),
+            "meal_type": "scan",
+            "name": vision_desc[:120],
+            "restaurant_chain": restaurant_guess,
+            "calories": field_entries["calories"],
+            "protein": field_entries["protein"],
+            "carbs": field_entries["carbs"],
+            "fat": field_entries["fat"],
+            "fiber": field_entries["fiber"],
+            "sugar": field_entries["sugar"],
+            "sodium": field_entries["sodium"],
+            "sat_fat": field_entries["sat_fat"],
+            "trans_fat": field_entries["trans_fat"],
+            "vit_c": field_entries["vit_c"],
+            "iron": field_entries["iron"],
+            "calcium": field_entries["calcium"],
+            "is_shared_meal": shared,
+            "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
+            "raw_kcal_estimate": raw_kcal,
+            "raw_p_estimate": raw_p,
+        },
+        "user_hint": user_hint,  # echo back so frontend can store in entry.user_hints[]
+        "ready_to_commit": True,
+        "re_enriched": True,  # flag for frontend to show "✨ 已用 hint 再 estimate"
+    }
+    return jsonify({"ok": True, "preview": preview})
 
 
 # ---------- F3: /api/coach_tips ----------
@@ -3653,6 +3982,13 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
         f"\n**本週熱話（Jim 想要 cheer 識用最新潮 / 體育 / 健康 news）**：\n{news_bits}\n" if news_bits else ""
     )
 
+    # Jim OOB 2026-07-29: Liverpool fixture context (Big 6 detection)
+    liverpool_fixture = _get_liverpool_fixture_for_cheer()
+    liverpool_block = (
+        f"\n**利物浦賽事預覽（7 日內 Big 6 match）**：{liverpool_fixture}\n"
+        f"→ cheer §「明日預覽」要 reference: 「對 Big 6 前要 P 食齊 + 瞓早兩粒鐘, 比賽日身體 ready」\n" if liverpool_fixture else ""
+    )
+
     # Jim OOB 2026-07-25 10:55 HKT: pull pushed context (favourite team, rivalry,
     # dietary notes) so cheer can reference Jim's preferences naturally.
     jim_context_block = _get_jim_context_for_cheer()
@@ -3697,6 +4033,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 **今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
 {workout_detail_zh}
 {news_block}
+{liverpool_block}
 {jim_context_block}
 {nutrition_block}
 寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
@@ -3706,10 +4043,25 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 4. **.要有真實建議**：每講完一個 insight 即刻跟住「咁所以你⋯⋯」嘅 actionable 建議，唔好淨講完就算
 5. **識講 personal**：叫 Jim，唔好「你」— 直接用名；可以提小寶（如果講到食物／睡眠／早晨 routine）；可以講「教練」、「管家」
 6. **段落結構**：6-8 段，唔好 list / bullet / table / 編號。段落之間用 `\\n\\n` 分隔
-7. **長度**：**600-720 字**，唔好超 750，唔好少過 580 — voice 預計 120-150 秒 (WanLung 5.0 字/秒)
-8. **段落長度指引**：打招呼 50-70、復原 insight 110-140（最重要）、睡眠 insight 90-110、訓練 insight 60-80、營養 60-80、噉晚 routine 70-90、明日預覽 50-70、收尾打氣 40-60
+7. **長度**：**700-1000 字** (Jim OOB 2026-07-30 — bump from 600-720 to 700-1000 to allow full段落 + 收尾完整, voice 預計 140-200 秒 WanLung 5.0 字/秒)
+8. **段落長度指引**：打招呼 60-90、復原 insight 120-160（最重要）、睡眠 insight 100-130、訓練 insight 80-110、營養 80-110、噉晚 routine 90-120、明日預覽 60-90、收尾打氣 50-80 (總和 ~700-1000)
 9. **唔好 fabricate 數字**：所有 metric 必須喺上面 data 入面搵到
 10. **粵語助詞密度**：嘅/啦/咗/嗰/咁/吖/囉/嘢 ≥8 個 per 100 字
+11. **自嘲/抽水密度** (Jim OOB 2026-07-29): 全文 6-8 段，**最多 2-3 個 self-deprecation / 抽水 / 笑位** (平均每 3 段 1 個) — 唔好笑位就係悶。但**唔好段段都加笑位**, 太密會變成 mechanical。
+12. **Step insight (Jim OOB 2026-07-29)**: 用家 step widget 顯示 {withings_steps} 步 (距離 8K 目標仲差 X 步) — 要 actionable 提點「下晝 4 點前可行多兩三公里 (出街買咖啡、行商場)」或者「已達標喇, 收工前散步多 5 分鐘 hold 住個 streak」
+13. **Quantity diversity 防止「一」按鈕過密** (Jim OOB 2026-07-30): Cantonese 寫數量時常用「一」字 (一個/一場/一餐/一份/一杯/一條/一隻/一節/一課/一啖/一碟/一碗/一壺)。**全文「一」字 (Chinese 一, NOT digit 1) 不可超過 6 個**, 否則 TTS 讀出嚟像機械人重複。
+    - **嚴禁連續 3 段都出現「一」字 quantity phrase**。即係段 1 用咗「一個 X」, 段 2 同段 3 唔好用「一」起頭 quantity
+    - 改用 variety:
+      - 「幾個」/「兩三個」/「幾個鐘頭」/「幾多個」 — 適合補充/不精確 quantity
+      - 「呢個」/「嗰個」/「X 個」 — 適合指東西
+      - 講具體 metric 直接寫 number (e.g. 「2092 步」、「7.5 個鐘」、「P160g」、「8K 目標」)
+      - 「仲有」/「大概」/「差不多」/「約莫」+ number — 適合時間
+      - 零 quantity 寫法: 「你今日做咗 bench press, 個 weight 比起上次重咗」 (唔需要「一個」)
+    - **Bad example (太多 一)**:
+      - 「你今日做咗一個 workout, 做咗一個動作, 食咗一個早餐, 飲咗一杯咖啡」 (4 個 「一」)
+    - **Good example (variety)**:
+      - 「你今日做咗 workout, 動咗五六個動作, 早餐食咗份乳酪碗, 下午仲有杯 latte」 (0 個 「一」)
+    - 末尾補充可以無 quantity 直接「好喇, 收嘞」
 
 **嚴禁使用以下英文字**（會破壞 TTS 廣東話韻律）：
 - 動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
@@ -3729,7 +4081,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1300,  # 600-720 字 = ~350-500 pplx output tokens; 1300 headroom prevents mid-section truncation (Jim OOB 7/24).
+        "max_tokens": 2400,  # 600-720 字 (target) but pplx ~1.5-2 tokens/中文字, 1337 chars ≈ 2200 tokens. Bumped 1400→2400 (Jim OOB 2026-07-30) to prevent mid-sentence truncation at end of cheer.
         "temperature": 0.6,
     }
     try:
@@ -4412,9 +4764,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
     <div class="flex items-center justify-between gap-2">
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gym</h1>
-      <div class="flex flex-col items-end leading-tight">
-        <span class="text-sm font-bold text-emerald-300 tabular-nums" x-text="clockStr"></span>
-        <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
+      <div class="flex items-center gap-3">
+        <!-- v2.7.18: Withings step widget — main menu (Jim OOB 2026-07-29) -->
+        <div class="flex items-center gap-1.5 rounded-full px-2.5 py-1" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
+          <span class="text-base">👟</span>
+          <div class="flex flex-col leading-none">
+            <span class="text-base font-black tabular-nums" :class="stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'" x-text="stepsToday.toLocaleString()"></span>
+            <span class="text-[8px] text-gray-400 uppercase tracking-wide" x-text="stepsToday >= 8000 ? '達標 ✓' : '步 ' + (stepsToday / 80).toFixed(0) + '%'"></span>
+          </div>
+        </div>
+        <div class="flex flex-col items-end leading-tight">
+          <span class="text-sm font-bold text-emerald-300 tabular-nums" x-text="clockStr"></span>
+          <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
+        </div>
       </div>
     </div>
   </header>
@@ -4822,6 +5184,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span><span class="text-emerald-300 font-bold" x-text="previewCorrectForm.protein ?? 0"></span> P</span>
           <span x-show="previewEntry?.suggested_entry?.is_shared_meal" class="text-yellow-300 font-bold">👥 60/40 share</span>
         </div>
+
+        <!-- v2.7.19: Re-estimate with supplementary hint (Jim OOB 2026-07-31) -->
+        <div class="mb-3 rounded-xl border border-purple-400/40 bg-purple-500/10 p-3" x-cloak>
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-[10px] uppercase tracking-[0.15em] text-purple-300 font-bold">💬 補充資料再 estimate</div>
+            <span class="text-[10px] text-purple-200/70" x-show="previewEntry?.re_enriched">✨ 已用 hint 再 estimate</span>
+          </div>
+          <textarea x-model="previewHint" placeholder="餐廳名 / 份量 / 醬汁 / 材料…（例：太興燒臘, 兩餸飯, 多飯少汁）"
+                    class="w-full rounded-lg bg-black/40 px-2 py-1.5 text-xs text-white border border-purple-300/30 resize-none"
+                    rows="2" maxlength="500"></textarea>
+          <div class="mt-2 flex items-center gap-2">
+            <button @click="reEnrichPreview()" :disabled="reEnrichInFlight || !previewHint.trim()"
+                    class="flex-1 rounded-lg bg-purple-500 px-3 py-2 text-xs font-bold text-white active:scale-95 disabled:opacity-40">
+              <span x-text="reEnrichInFlight ? '⏳ 再 estimate 中…' : '🔄 用補充資料再 estimate'"></span>
+            </button>
+            <span class="text-[10px] text-purple-200/70" x-text="`${previewHint.length}/500`"></span>
+          </div>
+          <div class="mt-1 text-[10px] text-purple-200/70" x-show="previewUserHints.length">
+            之前已用 hint：
+            <template x-for="(h, i) in previewUserHints" :key="i">
+              <span class="inline-block bg-purple-400/20 rounded px-1.5 py-0.5 mr-1 mb-1" x-text="h.slice(0, 30) + (h.length > 30 ? '…' : '')"></span>
+            </template>
+          </div>
+        </div>
+
         <details class="mt-2" open>
           <summary class="text-xs text-emerald-300 cursor-pointer mb-2">✏️ 改資料</summary>
           <div class="grid grid-cols-2 gap-2 text-xs">
@@ -5126,22 +5513,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10 bg-black/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-2xl">
     <div class="grid grid-cols-3 grid-rows-2 gap-x-1 gap-y-1 px-2 py-1.5">
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
-        <span class="text-lg leading-none">✓</span><span class="text-xs font-bold">Set</span>
+        <span class="text-lg leading-none">✓</span><span class="text-xs font-bold">記重</span>
       </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
-        <span class="text-lg leading-none">📊</span><span class="text-xs font-bold">Workout</span>
+        <span class="text-lg leading-none">📊</span><span class="text-xs font-bold">訓練</span>
       </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="goToTab('history')">
-        <span class="text-lg leading-none">📋</span><span class="text-xs font-bold">History</span>
+        <span class="text-lg leading-none">📋</span><span class="text-xs font-bold">記錄</span>
       </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'scan' ? 'tab-active' : 'tab-inactive'" @click="tab = 'scan'" style="background:rgba(16,185,129,0.18);box-shadow:inset 0 0 0 1px rgba(16,185,129,0.45);">
-        <span class="text-lg leading-none">🍽️</span><span class="text-xs font-bold">Scan</span>
+        <span class="text-lg leading-none">🍽️</span><span class="text-xs font-bold">掃食</span>
       </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
-        <span class="text-lg leading-none">🏁</span><span class="text-xs font-bold">End</span>
+        <span class="text-lg leading-none">🏁</span><span class="text-xs font-bold">完場</span>
       </button>
       <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'cheer' ? 'tab-active' : 'tab-inactive'" @click="openCheerTab()" style="background:rgba(168,85,247,0.18);box-shadow:inset 0 0 0 1px rgba(168,85,247,0.5);">
-        <span class="text-lg leading-none">🔥</span><span class="text-xs font-bold">Cheer</span>
+        <span class="text-lg leading-none">🔥</span><span class="text-xs font-bold">打氣</span>
       </button>
     </div>
   </nav>
@@ -5151,6 +5538,10 @@ function gymApp() {
   return {
     tab: 'set',
     sessionDateStr: '',
+    // Withings step widget state (Jim OOB 2026-07-29)
+    stepsToday: 0,
+    stepsKcal: 0,
+    steps7dAvg: 0,
     currentExercise: '',
     exerciseInput: '',
     weight: 20,
@@ -5213,6 +5604,11 @@ function gymApp() {
     previewEntry: null,        // current scan preview pending Jim confirmation
     previewEditing: false,     // toggle edit-mode for preview fields
     previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
+    // v2.7.19: supplementary hint (Jim OOB 2026-07-31 13:25 HKT)
+    // After preview shown, Jim types hint → re-runs pplx + APiyi enrichment → swaps in new preview
+    previewHint: '',           // current hint textarea content (cleared after each re-enrich)
+    previewUserHints: [],      // history of hints Jim already used in this preview session
+    reEnrichInFlight: false,   // prevent double-tap on "🔄 用補充資料再 estimate"
     coachTips: null,           // pplx + MiniMax result for just-ended session
     coachTipsLoading: false,
     quote: '努力唔會辜負你',
@@ -5251,6 +5647,8 @@ function gymApp() {
       this.loadRecentScans();
       // v2.2: preload today's photostream (F1 — auto-suggest food log candidates)
       this.loadPhotostream(true);
+      // v2.7.18: Withings step widget (Jim OOB 2026-07-29)
+      this.loadSteps();
       // Pull streak (non-blocking)
       try {
         const streakRes = await fetch('/api/streak');
@@ -5304,10 +5702,8 @@ function gymApp() {
       const hh24 = d.getHours();
       const mm = String(d.getMinutes()).padStart(2, '0');
       const ss = String(d.getSeconds()).padStart(2, '0');
-      const hh12 = ((hh24 + 11) % 12) + 1;
-      const ampm = hh24 < 12 ? 'AM' : 'PM';
-      // Digital clock with blinking colon + AM/PM (Jim OOB 2026-07-19)
-      this.clockStr = `${String(hh12).padStart(2,'0')}:${mm}:${ss} ${ampm}`;
+      // Digital clock 24-hour format (Jim OOB 2026-07-29 — 24h, no AM/PM)
+      this.clockStr = `${String(hh24).padStart(2,'0')}:${mm}:${ss}`;
     },
 
     tickElapsed() {
@@ -5801,6 +6197,20 @@ function gymApp() {
       } catch(e) { /* silent */ }
     },
 
+    // v2.7.18: Withings step widget (Jim OOB 2026-07-29)
+    async loadSteps() {
+      try {
+        const r = await fetch('/api/withings_steps_today');
+        const data = await r.json();
+        this.stepsToday = data.steps || 0;
+        this.stepsKcal = data.calories || 0;
+        // 7d avg
+        const r7 = await fetch('/api/withings_steps_7d_avg');
+        const d7 = await r7.json();
+        this.steps7dAvg = d7.avg || 0;
+      } catch(e) { /* silent */ }
+    },
+
     // v2.4: tap brand heading — go back to SET tab + scroll to top, NO reload.
     // Jim OOB 2026-07-23: 'When I click the gym heading, it refresh and reload'.
     // Prevents page reload via (a) intercept click event, (b) preventDefault,
@@ -6132,6 +6542,8 @@ function gymApp() {
             entry: finalEntry,
             image_path: this.previewEntry.image_path,
             user_correction: this.previewCorrectForm.note ? this.previewCorrectForm : null,
+            // v2.7.19: send all hints Jim typed during this scan preview session
+            user_hints: this.previewUserHints,
           }),
         });
         const data = await r.json();
@@ -6139,6 +6551,8 @@ function gymApp() {
           this.flash(data.sheet_synced ? '✓ 已寫入 log + Sheet' : '✓ 已寫入 log（Sheet 跳過）');
           this.previewEntry = null;
           this.previewEditing = false;
+          this.previewHint = '';
+          this.previewUserHints = [];
           await this.loadRecentScans();
           await this.loadPhotostream(true);
         } else {
@@ -6152,7 +6566,57 @@ function gymApp() {
     cancelPreview() {
       this.previewEntry = null;
       this.previewEditing = false;
+      this.previewHint = '';
+      this.previewUserHints = [];
       this.flash('Preview 已取消');
+    },
+
+    // v2.7.19: Re-estimate with user hint (Jim OOB 2026-07-31 13:25 HKT)
+    async reEnrichPreview() {
+      const hint = (this.previewHint || '').trim();
+      if (!hint || !this.previewEntry || this.reEnrichInFlight) return;
+      this.reEnrichInFlight = true;
+      this.flash('⏳ 用補充資料再 estimate… (約 5-8 秒)');
+      try {
+        const r = await fetch('/api/scan_re_enrich', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image_path: this.previewEntry.image_path,
+            user_hint: hint,
+            original_vision_desc: this.previewEntry.vision_desc || '',
+          }),
+        });
+        const data = await r.json();
+        if (!data.ok) {
+          this.flash('Re-enrich 失敗：' + (data.error || '未知'));
+          return;
+        }
+        // Swap in new preview (swap full preview object, not just suggested_entry)
+        const newPreview = data.preview;
+        // Preserve image_path so commit still works
+        newPreview.image_path = newPreview.image_path || this.previewEntry.image_path;
+        newPreview.image_url = newPreview.image_url || this.previewEntry.image_url;
+        this.previewEntry = newPreview;
+        // Reset previewCorrectForm to reflect new suggested_entry (don't clobber Jim's edits
+        // if he's already tweaked fields; only sync if form is empty/default)
+        const s = newPreview.suggested_entry;
+        const cur = this.previewCorrectForm;
+        if (!cur.name && s.name) cur.name = s.name;
+        if (!cur.restaurant_chain && s.restaurant_chain) cur.restaurant_chain = s.restaurant_chain;
+        if (cur.calories == null && s.calories != null) cur.calories = s.calories;
+        if (cur.protein == null && s.protein != null) cur.protein = s.protein;
+        if (cur.carbs == null && s.carbs != null) cur.carbs = s.carbs;
+        if (cur.fat == null && s.fat != null) cur.fat = s.fat;
+        // Track hint + clear textarea
+        this.previewUserHints = [...this.previewUserHints, hint].slice(-20);
+        this.previewHint = '';
+        this.flash(`✨ 已用 hint 再 estimate (kcal: ${s.calories ?? '—'}, P: ${s.protein ?? '—'})`);
+      } catch(e) {
+        this.flash('Error：' + e.message);
+      } finally {
+        this.reEnrichInFlight = false;
+      }
     },
 
     async suggestLogFromPhoto(item) {
@@ -6363,7 +6827,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v42';
+const CACHE = 'gym-web-v50';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(

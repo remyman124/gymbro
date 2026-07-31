@@ -2,6 +2,12 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.19] — 2026-07-31
+
+### 💬 Food scan re-estimate with user hint (Jim OOB 2026-07-31 13:25 HKT)
+
+After scan preview returns, Jim can now type supplementary info (餐廳名 / 份量 / 醬汁 / 材料) and tap "🔄 用補充資料再 estimate" to re-run pplx + APiyi nutrition enrichment with hint as additional context. Hint appears as `用家補充資料：` block in the prompt. Each round-trip can iterate — Jim can re-hint multiple times before committing. All hints persisted in `entry.user_hints[]` + Google Sheet column M ("User Hints"). Backend: new `/api/scan_re_enrich` POST endpoint (image_path + user_hint → re-enriched preview). Frontend: purple-themed hint card in scan preview with textarea, char counter, re-enrich button, and hint history chips. SW cache v49 → v50.
+
 ## [2.2.0] — 2026-07-23
 
 ### 🎯 AI-driven personal coach pipeline (Jim OOB 2026-07-23 22:42 HKT)
