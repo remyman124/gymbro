@@ -5735,6 +5735,11 @@ function gymApp() {
       this.tickClock();
       // Pre-load history so it's ready when user taps the tab
       this.loadHistory();
+      // v2.7.21: refresh steps every 5 min so when Withings finally
+      // commits today's record, the widget auto-updates from
+      // "同步中" to real number without manual reload.
+      this.loadSteps();
+      setInterval(() => this.loadSteps(), 5 * 60 * 1000);
       // Rotate quote every 4s
       setInterval(() => {
         const next = this.quoteBank[Math.floor(Math.random() * this.quoteBank.length)];
