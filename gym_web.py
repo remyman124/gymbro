@@ -594,15 +594,26 @@ def _withings_steps_today() -> dict:
     start = end - timedelta(days=1)
 
     def _extract(data):
+        """Resolve which record to show.
+
+        Priority:
+          1. Exact today record (steps > 0) — freshest.
+          2. Exact today record (steps == 0) — Apple Watch zeroed for today,
+             honor it (real value = 0, do NOT fallback to yesterday).
+          3. No today record — return None so caller treats as no-data
+             (NOT silently swap yesterday's data into today). Jim OOB
+             2026-08-02 02:44 HKT: data[-1] fallback returned 4602
+             steps dated 2026-07-31 but `date="2026-08-02"` cache
+             mislead the UI into showing yesterday as today.
+        """
         if not data:
             return None
         for d in reversed(data):
             if d.get("date") == today_str:
                 return d
-        # Jim OOB 2026-07-29: Withings server may not have synced today's data yet
-        # (especially morning). Fallback to last available record (yesterday).
-        if data:
-            return data[-1]
+        # Today record missing (Apple Watch not yet synced — typical
+        # between 00:00–mid-morning HKT). Caller will handle as
+        # "still syncing" rather than showing yesterday as today.
         return None
 
     # Pull #1
@@ -623,16 +634,28 @@ def _withings_steps_today() -> dict:
         chosen = a2
 
     if not chosen:
-        # If we already have a cached value (older than 30s) and pull failed,
-        # keep serving the last good value rather than returning empty.
-        if isinstance(cached_steps, dict) and cached_steps.get("steps") is not None:
+        # No today record. Jim OOB 2026-08-02 02:44 HKT: Apple Watch has
+        # not yet committed today's daily-aggregation. Signal "still
+        # syncing" rather than freezing yesterday's number as today.
+        # If cache has a real today record from earlier today, honor it.
+        if (
+            isinstance(cached_steps, dict)
+            and cached_steps.get("date") == today_str
+            and cached_steps.get("steps") is not None
+        ):
             return {
                 "date": cached_steps.get("date", ""),
                 "steps": cached_steps.get("steps"),
                 "distance_km": cached_steps.get("distance_km"),
                 "calories": cached_steps.get("calories"),
             }
-        return {}
+        return {
+            "date": today_str,
+            "steps": None,
+            "distance_km": None,
+            "calories": None,
+            "syncing": True,
+        }
 
     steps = int(chosen.get("steps") or 0)
     distance_m = float(chosen.get("distance_m") or 0)
@@ -666,6 +689,7 @@ def api_health_overlay():
     """Single endpoint for the hero overlay.
     - Top-left: Whoop recovery %
     - Top-right: Withings weight kg + fat % (latest reading, drives Jim's goal)
+    - Steps: today if Withings has the day record, else "still_syncing".
     """
     steps = _withings_steps_today() or {}
     return jsonify({
@@ -674,7 +698,10 @@ def api_health_overlay():
         "fat_pct": _withings_fat_pct(),
         "weight_date": (_withings_body_latest() or {}).get("date"),
         "steps_today": steps.get("steps"),
+        "steps_date": steps.get("date"),
+        "steps_syncing": steps.get("syncing", False),
         "distance_km_today": steps.get("distance_km"),
+        "calories_today": steps.get("calories"),
     })
 
 
@@ -2653,17 +2680,26 @@ def api_scan_recent():
 # v2.7.18: Withings steps endpoints (Jim OOB 2026-07-29)
 @app.route("/api/withings_steps_today", methods=["GET"])
 def api_withings_steps_today():
-    """Return today's Withings step count + distance + calories."""
+    """Return today's Withings step count + distance + calories.
+
+    Jim OOB 2026-08-02 02:44 HKT: when Withings has no today record
+    (凌晨, Apple Watch sleep mode, HealthKit sync delay), expose
+    `syncing: true` so the UI can show "—" + 同步中 rather than
+    freezing yesterday's number as today's count.
+    """
     try:
         steps_data = _withings_steps_today() or {}
+        # steps may be None when syncing — preserve that signal.
+        raw_steps = steps_data.get("steps")
         return jsonify({
             "date": steps_data.get("date", ""),
-            "steps": int(steps_data.get("steps") or 0),
-            "distance_km": float(steps_data.get("distance_km") or 0),
-            "calories": float(steps_data.get("calories") or 0),
+            "steps": None if raw_steps is None else int(raw_steps or 0),
+            "distance_km": None if steps_data.get("distance_km") is None and steps_data.get("syncing") else steps_data.get("distance_km"),
+            "calories": None if steps_data.get("calories") is None and steps_data.get("syncing") else steps_data.get("calories"),
+            "syncing": bool(steps_data.get("syncing", False)),
         })
     except Exception as e:
-        return jsonify({"steps": 0, "distance_km": 0, "calories": 0, "error": str(e)[:120]})
+        return jsonify({"steps": 0, "distance_km": 0, "calories": 0, "syncing": False, "error": str(e)[:120]})
 
 
 @app.route("/api/withings_steps_7d_avg", methods=["GET"])
@@ -4765,12 +4801,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="flex items-center justify-between gap-2">
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gym</h1>
       <div class="flex items-center gap-3">
-        <!-- v2.7.18: Withings step widget — main menu (Jim OOB 2026-07-29) -->
+        <!-- v2.7.18: Withings step widget — main menu (Jim OOB 2026-07-29)
+             v2.7.21: handle steps_syncing (still syncing) — show
+             "—" + 同步中 note rather than misleading yesterday number. -->
         <div class="flex items-center gap-1.5 rounded-full px-2.5 py-1" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
           <span class="text-base">👟</span>
           <div class="flex flex-col leading-none">
-            <span class="text-base font-black tabular-nums" :class="stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'" x-text="stepsToday.toLocaleString()"></span>
-            <span class="text-[8px] text-gray-400 uppercase tracking-wide" x-text="stepsToday >= 8000 ? '達標 ✓' : '步 ' + (stepsToday / 80).toFixed(0) + '%'"></span>
+            <span class="text-base font-black tabular-nums"
+                  :class="stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300')"
+                  x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
+            <span class="text-[8px] uppercase tracking-wide"
+                  :class="stepsSyncing ? 'text-gray-500' : 'text-gray-400'"
+                  x-text="stepsSyncing ? '同步中' : (stepsToday >= 8000 ? '達標 ✓' : '步 ' + (stepsToday / 80).toFixed(0) + '%')"></span>
           </div>
         </div>
         <div class="flex flex-col items-end leading-tight">
@@ -5539,6 +5581,10 @@ function gymApp() {
     tab: 'set',
     sessionDateStr: '',
     // Withings step widget state (Jim OOB 2026-07-29)
+    // v2.7.21: Jim OOB 2026-08-02 02:44 HKT — stepsSyncing flag
+    // distinguishes "real 0 steps" from "Withings has not yet
+    // committed today (凌晨 / Apple Watch 還未 sync)".
+    stepsSyncing: false,
     stepsToday: 0,
     stepsKcal: 0,
     steps7dAvg: 0,
@@ -6198,12 +6244,24 @@ function gymApp() {
     },
 
     // v2.7.18: Withings step widget (Jim OOB 2026-07-29)
+    // v2.7.21: Jim OOB 2026-08-02 02:44 HKT — Withings may not have
+    // today record yet (凌晨 / Apple Watch 還未 commit). Distinguish
+    // "0 steps" (real empty day) from "still syncing" (no data).
     async loadSteps() {
       try {
         const r = await fetch('/api/withings_steps_today');
         const data = await r.json();
-        this.stepsToday = data.steps || 0;
-        this.stepsKcal = data.calories || 0;
+        if (data.syncing) {
+          // No today record from Withings yet. Show 0 + syncing flag
+          // (rather than freezing yesterday's number as today).
+          this.stepsToday = 0;
+          this.stepsKcal = 0;
+          this.stepsSyncing = true;
+        } else {
+          this.stepsToday = data.steps || 0;
+          this.stepsKcal = data.calories || 0;
+          this.stepsSyncing = false;
+        }
         // 7d avg
         const r7 = await fetch('/api/withings_steps_7d_avg');
         const d7 = await r7.json();
@@ -6747,10 +6805,13 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-// Jim OOB 2026-07-21: bump to v18 + activate-time nuclear flush of OLD
-// caches (v17 and earlier). SW skipWaiting + clients.claim ensure iPhone PWA
-// picks up the new SW on next reload. controllerchange handler below forces
-// auto-reload so the user sees fresh HTML without manual pull-to-refresh.
+// Jim OOB 2026-08-02 02:44 HKT — SW v52 (was v51). Withings steps misleading
+// display fix: when Withings has no record for today (凌晨 / Apple Watch
+// sleep mode / iPhone HealthKit sync delay), display "—" + 同步中 instead
+// of freezing yesterday's running total as today's number. Steps route
+// added stepsSyncing flag, hero widget shows neutral color, no More button
+// dim flicker as today record rolls in.
+const CACHE = 'gym-web-v52';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
@@ -6827,7 +6888,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v51';
+const CACHE = 'gym-web-v52';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
