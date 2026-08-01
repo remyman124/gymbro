@@ -2,6 +2,12 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.20] — 2026-08-01
+
+### 🎙️ Cheer voice duration sweet-zone patch (Jim OOB 2026-08-01 22:47 HKT)
+
+Cheer routine voice over-runs: pplx produced 1649-1793 chars → voice 330-353s (target 150-200s). Reduce by tightening prompt length rule (780-960 chars STRICT MAX 960) + per-section CAPs (greeting 50-70, recovery 110, sleep 95, training 70, nutrition 80, routine 85, preview 50-70, closing 50) + max_tokens 2400 → 1400. Verified 2 fresh fires: 1015 chars / 203s + 1117 chars / 221s — within 200-220s target band (was 353s = 42% over-budget). SW cache v50 → v51.
+
 ## [2.7.19] — 2026-07-31
 
 ### 💬 Food scan re-estimate with user hint (Jim OOB 2026-07-31 13:25 HKT)

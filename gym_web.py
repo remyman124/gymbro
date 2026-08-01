@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.19"
+__version__ = "2.7.20"
 
 
 def _safe_read_json(path, default=None):
@@ -4043,8 +4043,8 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 4. **.要有真實建議**：每講完一個 insight 即刻跟住「咁所以你⋯⋯」嘅 actionable 建議，唔好淨講完就算
 5. **識講 personal**：叫 Jim，唔好「你」— 直接用名；可以提小寶（如果講到食物／睡眠／早晨 routine）；可以講「教練」、「管家」
 6. **段落結構**：6-8 段，唔好 list / bullet / table / 編號。段落之間用 `\\n\\n` 分隔
-7. **長度**：**700-1000 字** (Jim OOB 2026-07-30 — bump from 600-720 to 700-1000 to allow full段落 + 收尾完整, voice 預計 140-200 秒 WanLung 5.0 字/秒)
-8. **段落長度指引**：打招呼 60-90、復原 insight 120-160（最重要）、睡眠 insight 100-130、訓練 insight 80-110、營養 80-110、噉晚 routine 90-120、明日預覽 60-90、收尾打氣 50-80 (總和 ~700-1000)
+7. **長度**：**780-960 字 sweet zone, STRICT MAX 960 字** (v2.7.20.1 patch 2026-08-01 22:48 HKT。 v2.7.20 still hit 1649 字 → 330 秒 despite 800-1100 ceiling。 pplx 對 soft ceiling 不服從, 必須縮窄 + super-strict 寫法 + 段落長度指引收緊至 sum ~580 字 target, 段落個別 cap 120 字不容超)。 voice target 156-192 秒 WanLung 5.0 字/秒 — matching Jim OOB 7/24 ~150s preference.
+8. **STRICT 段落長度指引 (SUB-100 字/段強制 — 不可超)**:打招呼 50-70、復原 insight **CAP 110**、睡眠 insight **CAP 95**、訓練 insight **CAP 70** (零 workout 日子一句過)、營養 **CAP 80**、噉晚 routine **CAP 85**、明日預覽 50-70、收尾打氣 **CAP 50** (總和 ~570-660 字 — 每段絕對唔好超 cap)。
 9. **唔好 fabricate 數字**：所有 metric 必須喺上面 data 入面搵到
 10. **粵語助詞密度**：嘅/啦/咗/嗰/咁/吖/囉/嘢 ≥8 個 per 100 字
 11. **自嘲/抽水密度** (Jim OOB 2026-07-29): 全文 6-8 段，**最多 2-3 個 self-deprecation / 抽水 / 笑位** (平均每 3 段 1 個) — 唔好笑位就係悶。但**唔好段段都加笑位**, 太密會變成 mechanical。
@@ -4081,7 +4081,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     payload = {
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2400,  # 600-720 字 (target) but pplx ~1.5-2 tokens/中文字, 1337 chars ≈ 2200 tokens. Bumped 1400→2400 (Jim OOB 2026-07-30) to prevent mid-sentence truncation at end of cheer.
+        "max_tokens": 1400,  # v2.7.20.1 STRICTER CAP (was 1800 — pplx still hit 1649 chars / 330s voice). 780-960 字 sweet zone × 1.5-2 tok/char = ~1170-1920 tokens. 1400 forces pplx to commit to shorter text per length rule.
         "temperature": 0.6,
     }
     try:
@@ -6827,7 +6827,7 @@ SERVICE_WORKER = """
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v50';
+const CACHE = 'gym-web-v51';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
