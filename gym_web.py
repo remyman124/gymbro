@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.20"
+__version__ = "2.7.22"
 
 
 def _safe_read_json(path, default=None):
@@ -533,6 +533,77 @@ def _withings_fat_pct():
         return round(float(f), 1) if f else None
     except (TypeError, ValueError):
         return None
+
+
+def _get_intraday_steps_today() -> dict:
+    """Sum Withings intraday activity entries from HKT midnight to now.
+
+    Returns dict {has_data: bool, steps, distance_km, calories}.
+    If Withings has no intraday activity for today at all, returns
+    {has_data: False} (caller should keep "syncing" signal — Rule 24
+    NEVER FABRICATE: do NOT fall back to yesterday's number).
+
+    v2.7.22 (Jim OOB 2026-08-02 19:48 HKT "step count is always syncing"):
+    solves the case where iPhone HealthKit has pushed partial sync events
+    to Withings but the daily-aggregation commit hasn't run yet.
+    """
+    try:
+        import importlib as _il
+        import sys as _sys
+        if "/home/work/.hermes/skills/withings" not in _sys.path:
+            _sys.path.insert(0, "/home/work/.hermes/skills/withings")
+        withings_mod = _il.import_module("withings")
+        get_intraday = withings_mod.get_intraday_activity
+    except Exception:
+        return {"has_data": False}
+
+    try:
+        from zoneinfo import ZoneInfo
+        hkt = ZoneInfo("Asia/Hong_Kong")
+    except Exception:
+        from datetime import timezone as _tz, timedelta as _td
+        hkt = _tz(_td(hours=8))
+
+    now_hkt = datetime.now(hkt)
+    hkt_midnight = now_hkt.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts = int(hkt_midnight.astimezone(timezone.utc).timestamp())
+    end_ts = int(datetime.now(timezone.utc).timestamp())
+
+    try:
+        body = get_intraday(start_ts, end_ts)
+    except Exception:
+        return {"has_data": False}
+
+    series = (body or {}).get("series", {})
+    if not series:
+        return {"has_data": False}
+
+    total_steps = 0
+    total_dist = 0.0
+    total_cal = 0.0
+    n = 0
+    for ts_str, entry in series.items():
+        try:
+            ts = int(ts_str)
+        except (TypeError, ValueError):
+            continue
+        # Only count entries from HKT midnight onwards (Rule 24 honesty).
+        if ts < start_ts:
+            continue
+        total_steps += entry.get("steps", 0) or 0
+        total_dist += entry.get("distance", 0) or 0
+        total_cal += entry.get("calories", 0) or 0
+        n += 1
+
+    if n == 0:
+        return {"has_data": False}
+
+    return {
+        "has_data": True,
+        "steps": int(total_steps),
+        "distance_km": round(total_dist / 1000, 2),
+        "calories": round(total_cal, 1),
+    }
 
 
 def _withings_steps_today() -> dict:
@@ -7368,7 +7439,15 @@ const CACHE = 'gym-web-v53';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v52';
+const CACHE = 'gym-web-v54';
+// v54 changes (Jim OOB 2026-08-02 19:48 HKT "step count is always syncing"):
+//   - Withings steps fallback: when daily commit is missing for today but
+//     intraday activity API has HKT-midnight-onwards entries, sum those
+//     instead. Solves the case where HealthKit has pushed partial sync
+//     events but daily rollup hasn't run yet.
+//     Backend function: _get_intraday_steps_today() in gym_web.py.
+//     Frontend behavior unchanged — widget shows real steps immediately
+//     (no "—/同步中") when intraday data exists.
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => {
   e.waitUntil(
