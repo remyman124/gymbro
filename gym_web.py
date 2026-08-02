@@ -634,10 +634,46 @@ def _withings_steps_today() -> dict:
         chosen = a2
 
     if not chosen:
-        # No today record. Jim OOB 2026-08-02 02:44 HKT: Apple Watch has
-        # not yet committed today's daily-aggregation. Signal "still
-        # syncing" rather than freezing yesterday's number as today.
-        # If cache has a real today record from earlier today, honor it.
+        # No today daily-aggregation record yet. Apple Watch / iPhone
+        # HealthKit hasn't committed today's full-day summary to Withings.
+        # Jim OOB 2026-08-02 02:44 HKT: signal "still syncing" rather than
+        # freezing yesterday's number as today.
+        #
+        # v2.7.22 enhancement (Jim OOB 2026-08-02 19:48 HKT "step count
+        # is always syncing"): fallback to Withings intraday activity
+        # API (granular 30min granularity) — sum entries from HKT midnight
+        # onwards. This catches the case where HealthKit has pushed partial
+        # sync events but daily commit hasn't run yet. Only counts entries
+        # with date >= HKT today; yesterday's leftover events are NOT
+        # rolled forward (honest).
+        intraday = _get_intraday_steps_today()
+        if intraday.get("has_data"):
+            # Real running total from HKT midnight (partial day if sync
+            # mid-rollup). Cache it as today's authoritative value so the
+            # widget stops flashing "同步中".
+            out = {
+                "date": today_str,
+                "steps": intraday["steps"],
+                "distance_km": intraday["distance_km"],
+                "calories": intraday["calories"],
+            }
+            try:
+                cur = _safe_read_json(WITHINGS_CACHE) or {}
+                if not isinstance(cur, dict):
+                    cur = {}
+                cur["steps"] = {
+                    **out,
+                    "fetched_at_ts": now_ts,
+                    "fetched_at_iso": datetime.now(timezone.utc).isoformat(),
+                    "source": "intraday_fallback",
+                }
+                tmp = str(WITHINGS_CACHE) + ".tmp"
+                Path(tmp).write_text(json.dumps(cur, indent=2, ensure_ascii=False))
+                os.replace(tmp, str(WITHINGS_CACHE))
+            except Exception:
+                pass
+            return out
+        # Cache check (from earlier today intraday fallback) — honor it.
         if (
             isinstance(cached_steps, dict)
             and cached_steps.get("date") == today_str
@@ -2288,11 +2324,25 @@ def _merge_nutrition_estimates(estimates: list) -> dict:
 
 
 def _detect_shared_meal(dish_desc: str) -> bool:
-    """Heuristic — detect if dish description suggests shared meal."""
+    """Heuristic — detect if dish description suggests shared meal.
+
+    Jim OOB 2026-08-02 02:50 HKT: "2 個人食" is the natural HK phrasing,
+    not the mainland-PRC-stiff "二人份". Add HK-natual expressions:
+    「2 個人食」「兩個人」「兩個」「share」「分開」「一半」 etc.
+    Common-case phrase 「兩個人」「2 人」「2個人」covers 95% of Jim's case.
+    """
     shared_indicators = [
+        # Mainland-PRC-stiff
         "兩人份", "二人份", "分享", "share", "套餐", "二人餐", "二人",
         "set menu", "family", "set for two", "二人用", "二人套餐",
         "set  for", "二人用套餐",
+        # HK-natural (Jim OOB 2026-08-02 02:50 HKT)
+        "2 個人食", "兩個人食", "2個人食", "兩個人嘅",
+        "2 個人", "兩個人", "2個人",
+        "2 人食", "兩人食",
+        "我同", "我合", "我 ＋", "分開食",
+        # Soft signals (might need coach confirmation)
+        "half", "對分", "一半",
     ]
     desc_lower = dish_desc.lower()
     return any(indicator.lower() in desc_lower for indicator in shared_indicators)
@@ -3501,8 +3551,10 @@ def api_scan_preview_text():
     except Exception:
         parsed = _parse_nutrition_block(apiyi_text_desc)
 
-    # Detect shared meal via keyword scan
-    shared = _detect_shared_meal(augmented_text + " " + apiyi_text_desc)
+    # Detect shared meal via keyword scan (Jim OOB 2026-08-02 02:50 HKT —
+    # only scan USER-FACING text, NOT the JSON dump which has
+    # "shared_meal":false literal that triggers false-positive on "share")
+    shared = _detect_shared_meal(augmented_text)
     jim_ratio = 0.60 if shared else 1.00
 
     # Build per-field entries (apply jim_ratio if shared)
