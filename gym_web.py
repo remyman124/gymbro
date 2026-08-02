@@ -3166,7 +3166,14 @@ def api_scan_preview_from_path():
 def api_scan_commit():
     """Jim OOB 2026-07-23 22:42: 'all food logging should be preview and allow me to confirm before logging'.
 
-    Receives the (possibly edited) suggested_entry + image_path from /api/scan_preview.
+    Receives the (possibly edited) suggested_entry + image_path from
+    /api/scan_preview or /api/scan_preview_text.
+
+    Text-only path (Jim OOB 2026-08-02 02:50 HKT):
+        image_path = "" → text-only entry. NO file rename, no scan_log
+        append image, sheet row has image_url field empty / sheet
+        column K is left blank for the entry.
+
     ONLY NOW writes to nutrition_log.json + Google Sheet.
 
     If user_corrections are submitted (correction_form), they're appended permanently.
@@ -3178,20 +3185,30 @@ def api_scan_commit():
     # v2.7.19: list of hint strings Jim typed during scan → re-estimate cycle
     user_hints_in = data.get("user_hints", []) or []
 
-    if not entry or not image_path:
-        return jsonify({"ok": False, "error": "missing entry or image_path"}), 400
+    if not entry:
+        return jsonify({"ok": False, "error": "missing entry"}), 400
 
-    img_path = Path(image_path)
-    if not img_path.exists():
-        return jsonify({"ok": False, "error": "image not found"}), 404
+    # v2.7.22 (text-only path): image_path may be empty (text-direct input).
+    if image_path:
+        img_path = Path(image_path)
+        if not img_path.exists():
+            return jsonify({"ok": False, "error": "image not found"}), 404
+    else:
+        img_path = None  # text-only entry, no image
 
     now_iso_str = now_iso()
     entry["timestamp_iso"] = now_iso_str
-    entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
-    entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
+    if img_path is not None:
+        entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
+        entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
+        entry["image_saved_to"] = str(img_path)
+    else:
+        # v2.7.22 text-direct path
+        entry["source"] = "v2.7.22-scan_text_direct (apiyi-gpt-4o-mini, no image)"
+        entry["models_used"] = ["apiyi-gpt-4o-mini"]
+        entry["image_saved_to"] = ""
     entry["confidence"] = "Jim-confirmed preview"
     entry["sheet_synced"] = False
-    entry["image_saved_to"] = str(img_path)
     entry["user_correction"] = None
     # v2.7.19: persist user hints (each round-trip = one hint in the list)
     # Dedupe + cap to 20 entries to avoid bloat
@@ -3213,34 +3230,59 @@ def api_scan_commit():
     _append_to_nutrition_log(entry)
     sheet_result = _append_to_sheet_nutrition(entry)
 
-    # Rename preview_*.jpg → scan_*.jpg
+    # v2.7.22 (text-only path): when no image, skip file rename + scan_log.
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
-    final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
-    final_path = SCAN_CACHE_DIR / final_name
-    try:
-        img_path.rename(final_path)
-        image_url = f"/scan_img/{final_name}"
-    except Exception:
-        final_path = img_path
-        image_url = f"/scan_img/{img_path.name}"
+    if img_path is not None:
+        # Rename preview_*.jpg → scan_*.jpg
+        final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+        final_path = SCAN_CACHE_DIR / final_name
+        try:
+            img_path.rename(final_path)
+            image_url = f"/scan_img/{final_name}"
+        except Exception:
+            final_path = img_path
+            image_url = f"/scan_img/{img_path.name}"
+    else:
+        # Text-only entry — no image, no scan_log image row
+        final_path = ""
+        image_url = ""
 
-    # Append to scan_log
+    # Append to scan_log (only image-backed entries; text-only goes to nutrition_log
+    # alone + scan_recent filter hides them by default)
     scan_log = _load_scan_log()
     scan_index = len(scan_log)
-    scan_log.append({
-        "scan_index": scan_index,
-        "timestamp_iso": now_iso_str,
-        "name": entry.get("name", "scan"),
-        "calories": entry.get("calories", 0),
-        "protein": entry.get("protein", 0),
-        "shared": entry.get("is_shared_meal", False),
-        "image_path": str(final_path),
-        "image_url": image_url,
-        "restaurant_chain": entry.get("restaurant_chain", ""),
-        "vision_short": entry.get("vision_raw_desc", "")[:120],
-        "user_corrections": [user_correction] if user_correction else [],
-    })
-    _save_scan_log(scan_log)
+    if img_path is not None:
+        scan_log.append({
+            "scan_index": scan_index,
+            "timestamp_iso": now_iso_str,
+            "name": entry.get("name", "scan"),
+            "calories": entry.get("calories", 0),
+            "protein": entry.get("protein", 0),
+            "shared": entry.get("is_shared_meal", False),
+            "image_path": str(final_path),
+            "image_url": image_url,
+            "restaurant_chain": entry.get("restaurant_chain", ""),
+            "vision_short": entry.get("vision_raw_desc", "")[:120],
+            "user_corrections": [user_correction] if user_correction else [],
+        })
+        _save_scan_log(scan_log)
+    else:
+        # Text-only: tag scan_log entry as text-direct so /scan_recent can show it
+        scan_log.append({
+            "scan_index": scan_index,
+            "timestamp_iso": now_iso_str,
+            "name": entry.get("name", "text"),
+            "calories": entry.get("calories", 0),
+            "protein": entry.get("protein", 0),
+            "shared": entry.get("is_shared_meal", False),
+            "image_path": "",
+            "image_url": "",
+            "restaurant_chain": entry.get("restaurant_chain", ""),
+            "vision_short": entry.get("name", "")[:120],
+            "user_corrections": [user_correction] if user_correction else [],
+            "is_text_only": True,
+        })
+        _save_scan_log(scan_log)
 
     return jsonify({
         "ok": True,
@@ -3248,6 +3290,7 @@ def api_scan_commit():
         "entry": entry,
         "sheet_synced": sheet_result.get("ok", False),
         "sheet_range": sheet_result.get("range", ""),
+        "is_text_only": img_path is None,
     })
 
 
@@ -3387,6 +3430,144 @@ def api_scan_re_enrich():
         "re_enriched": True,  # flag for frontend to show "✨ 已用 hint 再 estimate"
     }
     return jsonify({"ok": True, "preview": preview})
+
+
+# ---------- F2b: /api/scan_preview_text (Jim OOB 2026-08-02 02:50 HKT) ----------
+# Text-only food logging path. Jim types what he ate ("燒肉飯",
+# "noodle + chicken", "2 eggs + toast"), APiyi estimates nutrition,
+# preview returned, /api/scan_commit then logs it. NO image required.
+NUTRITION_FIELD_SCHEMA = (
+    "calories,protein,carbs,fat,fiber,sugar,sodium,sat_fat,"
+    "trans_fat,vit_c,iron,calcium"
+)
+
+
+@app.route("/api/scan_preview_text", methods=["POST"])
+def api_scan_preview_text():
+    """Text-only food entry preview (no image required).
+
+    Jim OOB 2026-08-02 02:50 HKT: 'I think the food log should allow
+    me to direct input the food by text'. Flow:
+      1. User types a description in textbox.
+      2. Backend sends to APiyi gpt-4o-mini (text-only — no vision).
+      3. Optional user_hints[] appended for extra context.
+      4. Returns preview shape identical to /api/scan_preview so the
+         frontend can present it in the SAME confirm card. Frontend
+         then calls /api/scan_commit with image_path="" to commit.
+    """
+    data = request.get_json(silent=True) or {}
+    text_desc = (data.get("text") or data.get("description") or "").strip()
+    user_hints_in = data.get("user_hints", []) or []
+
+    if not text_desc:
+        return jsonify({"ok": False, "error": "missing text description"}), 400
+    if len(text_desc) > 1000:
+        text_desc = text_desc[:1000]
+
+    # Sanitize hints (cap each 200 chars, max 5 hints)
+    cleaned_hints = []
+    seen = set()
+    for h in user_hints_in[:5]:
+        if not isinstance(h, str):
+            continue
+        h = h.strip()[:200]
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        cleaned_hints.append(h)
+    if cleaned_hints:
+        augmented_text = f"用家補充資料：{'；'.join(cleaned_hints)}\n\n{text_desc}"
+    else:
+        augmented_text = text_desc
+
+    # APiyi gpt-4o-mini text-only nutrition estimate
+    prompt = (
+        "你係香港營養師。根據用家輸入嘅食物描述，估算卡路里同12大營養素。"
+        "用 JSON 格式 return：(全部 value 用數字, unit 用 kcal/g/mg)\n"
+        f'{{\"name\":\"<菜名 short>\",\"portion\":<string 份量描述>,\"calories\":<int kcal>,'
+        f'\"protein\":<g>,\"carbs\":<g>,\"fat\":<g>,\"fiber\":<g>,\"sugar\":<g>,'
+        f'\"sodium\":<mg>,\"sat_fat\":<g>,\"trans_fat\":<g>,\"vit_c\":<mg>,'
+        f'\"iron\":<mg>,\"calcium\":<mg>,\"restaurant_guess\":\"<餐廳名 if any>\",'
+        f'\"shared_meal\":<bool>,\"cooking_method\":\"<煮法 short>\"}}\n\n'
+        f"用家輸入：{augmented_text}\n\n"
+        "廣東話, 一個英文字都唔好出。估算合理範圍："
+        "家常菜 300-700 kcal, 大碟 500-900 kcal, 火鍋薄切 200-400 kcal per round。"
+    )
+    apiyi_text_desc = _apiyi_nutrition_enrich(prompt)
+
+    # Parse APiyi JSON response
+    try:
+        parsed = json.loads(apiyi_text_desc)
+    except Exception:
+        parsed = _parse_nutrition_block(apiyi_text_desc)
+
+    # Detect shared meal via keyword scan
+    shared = _detect_shared_meal(augmented_text + " " + apiyi_text_desc)
+    jim_ratio = 0.60 if shared else 1.00
+
+    # Build per-field entries (apply jim_ratio if shared)
+    field_entries = {}
+    for f in NUTRITION_FIELDS:
+        info = parsed.get(f) if isinstance(parsed, dict) else None
+        raw = 0
+        if isinstance(info, dict):
+            raw = float(info.get("value", 0) or 0)
+        elif isinstance(info, (int, float)):
+            raw = float(info)
+        field_entries[f] = round(raw * jim_ratio, 1) if shared else round(raw, 1)
+
+    raw_kcal = float(parsed.get("calories", 0) or 0) if isinstance(parsed, dict) else 0
+    raw_p = float(parsed.get("protein", 0) or 0) if isinstance(parsed, dict) else 0
+
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    suggested_name = (parsed.get("name") if isinstance(parsed, dict) else "") or text_desc[:60]
+    restaurant_guess = (parsed.get("restaurant_guess") if isinstance(parsed, dict) else "") or ""
+
+    preview = {
+        "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_txt",
+        "image_path": "",  # text-only, no image
+        "image_url": "",
+        "input_mode": "text",  # flag for frontend to render label
+        "vision_desc": augmented_text,
+        "vision_short": augmented_text[:300],
+        "pplx_short": apiyi_text_desc[:500] if apiyi_text_desc else "",
+        "apiyi_enrichment": apiyi_text_desc[:300] if apiyi_text_desc else "",
+        "nutrition_merged": parsed if isinstance(parsed, dict) else {},
+        "suggested_entry": {
+            "date": today_iso(),
+            "time": now_hkt_dt.strftime("%H:%M"),
+            "meal_type": "scan",
+            "name": suggested_name,
+            "restaurant_chain": restaurant_guess,
+            "cooking_method": (parsed.get("cooking_method", "") if isinstance(parsed, dict) else ""),
+            "calories": field_entries["calories"],
+            "protein": field_entries["protein"],
+            "carbs": field_entries["carbs"],
+            "fat": field_entries["fat"],
+            "fiber": field_entries["fiber"],
+            "sugar": field_entries["sugar"],
+            "sodium": field_entries["sodium"],
+            "sat_fat": field_entries["sat_fat"],
+            "trans_fat": field_entries["trans_fat"],
+            "vit_c": field_entries["vit_c"],
+            "iron": field_entries["iron"],
+            "calcium": field_entries["calcium"],
+            "is_shared_meal": shared,
+            "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
+            "raw_kcal_estimate": int(raw_kcal),
+            "raw_p_estimate": int(raw_p),
+        },
+        "user_hints": cleaned_hints,
+        "ready_to_commit": True,
+        "is_text_only": True,
+    }
+    return jsonify({"ok": True, "preview": preview})
+
+
+def _apiyi_nutrition_enrich_local(text: str) -> dict:
+    """Wrapper retained to keep call-site readable.
+    Already imported via _apiyi_nutrition_enrich in the module."""
+    return _apiyi_nutrition_enrich(text)
 
 
 # ---------- F3: /api/coach_tips ----------
@@ -5092,6 +5273,92 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </button>
 
+      <!-- v2.7.22: Text-direct food input (Jim OOB 2026-08-02 02:50 HKT)
+           Skip the camera — type what you ate, AI estimates, you confirm. -->
+      <button @click="openScanTextInput()"
+              class="w-full rounded-2xl py-4 px-4 mb-4 transition-all active:scale-95"
+              style="background: rgba(168,85,247,0.10); border: 1.5px solid rgba(168,85,247,0.45);">
+        <div class="flex items-center justify-center gap-2">
+          <div class="text-3xl">⌨️</div>
+          <div class="text-left">
+            <div class="text-sm font-bold text-purple-300">直接打文字記食物</div>
+            <div class="text-[10px] text-gray-400 mt-0.5">打菜名／份量／餐廳，AI 自動估算 → 你確認</div>
+          </div>
+        </div>
+      </button>
+
+      <!-- Text-direct input mode (toggled by openScanTextInput) -->
+      <div x-show="scanTextMode" x-cloak class="mb-4 rounded-2xl p-4"
+           style="background: rgba(168,85,247,0.08); border: 1.5px solid rgba(168,85,247,0.35);">
+        <div class="text-[10px] uppercase tracking-[0.2em] text-purple-300 mb-2 font-bold">文字輸入模式</div>
+        <textarea x-model="scanTextInput"
+                  placeholder="例：燒肉飯 1 盒 (約 400g) ｜ 牛肉薄片 3 兩 ｜ 醬油普通 ｜ 1 個人食"
+                  class="w-full rounded-lg bg-black/40 px-3 py-2 text-sm text-white border border-white/15"
+                  rows="3" maxlength="1000"></textarea>
+        <div class="flex items-center justify-between mt-2">
+          <div class="text-[10px] text-gray-500" x-text="`${scanTextInput.length} / 1000 字`"></div>
+          <button @click="submitScanText()"
+                  :disabled="!scanTextInput.trim() || scanTextUploading"
+                  class="rounded-lg px-4 py-2 text-sm font-bold transition-all active:scale-95 disabled:opacity-50"
+                  style="background: linear-gradient(135deg, rgba(168,85,247,0.4), rgba(168,85,247,0.2)); border: 1.5px solid rgba(168,85,247,0.55);">
+            <span x-text="scanTextUploading ? '🤖 AI 估緊營養…' : '🤖 自動估算'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Text-direct preview card (once submitScanText returns) -->
+      <template x-if="scanTextPreview">
+        <div class="mb-4 rounded-2xl p-4"
+             style="background: rgba(168,85,247,0.10); border: 1.5px solid rgba(168,85,247,0.45);">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-[10px] uppercase tracking-[0.2em] text-purple-300 font-bold">📝 文字估算結果</div>
+            <button @click="scanTextPreview = null" class="text-[10px] text-gray-400 active:opacity-60">✕ 取消</button>
+          </div>
+          <div class="text-xs text-white mb-2 line-clamp-3" x-text="scanTextPreview.vision_short || ''"></div>
+          <div class="flex items-baseline gap-3 text-sm text-gray-200 mb-2">
+            <span><span class="text-purple-300 font-bold text-lg" x-text="scanTextEditForm.calories ?? scanTextPreview.suggested_entry.calories"></span> kcal</span>
+            <span><span class="text-purple-300 font-bold" x-text="scanTextEditForm.protein ?? scanTextPreview.suggested_entry.protein"></span> P</span>
+            <template x-if="scanTextPreview.suggested_entry.is_shared_meal">
+              <span class="text-yellow-300 font-bold">👥 60/40</span>
+            </template>
+          </div>
+          <div class="text-[10px] text-gray-500 mb-3" x-text="`菜名: ${scanTextEditForm.name || scanTextPreview.suggested_entry.name || '—'}`"></div>
+          <!-- Editable overrides -->
+          <div class="grid grid-cols-2 gap-2 text-xs mb-2">
+            <input type="text" placeholder="菜名" x-model="scanTextEditForm.name" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="text" placeholder="餐廳" x-model="scanTextEditForm.restaurant_chain" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="kcal" x-model.number="scanTextEditForm.calories" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="P" x-model.number="scanTextEditForm.protein" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="C" x-model.number="scanTextEditForm.carbs" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+            <input type="number" placeholder="F" x-model.number="scanTextEditForm.fat" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
+          </div>
+          <textarea x-model="scanTextEditForm.note" placeholder="備註（永久保留）" class="w-full rounded-lg bg-black/40 px-2 py-1.5 text-[11px] text-white border border-white/15" rows="2"></textarea>
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button @click="commitScanText()" :disabled="scanTextCommitting" class="rounded-lg py-2 text-sm font-bold transition-all active:scale-95 disabled:opacity-50" style="background: linear-gradient(135deg, rgba(16,185,129,0.4), rgba(16,185,129,0.2)); border: 1.5px solid rgba(16,185,129,0.55);">
+              <span x-text="scanTextCommitting ? '⏳ 寫緊…' : '✓ 確認 log'"></span>
+            </button>
+            <button @click="reEnrichScanText()" :disabled="scanTextReEnriching" class="rounded-lg py-2 text-xs font-bold transition-all active:scale-95 disabled:opacity-50" style="background: rgba(168,85,247,0.10); border: 1.5px solid rgba(168,85,247,0.4);">
+              <span x-text="scanTextReEnriching ? '🤖 再估…' : '🔄 再估算'"></span>
+            </button>
+          </div>
+          <!-- Supplementary hint input for re-estimate -->
+          <details class="mt-2" :open="scanTextHints.length > 0">
+            <summary class="text-[10px] text-purple-300 cursor-pointer">📎 加補充資料再 estimate</summary>
+            <div class="mt-2">
+              <input type="text" x-model="scanTextHintInput" @keydown.enter="addScanTextHint()" placeholder="例：真係 2 個人食 / 多了個飯底" class="w-full rounded-lg bg-black/40 px-2 py-1.5 text-[11px] text-white border border-white/15">
+              <div class="mt-2 flex flex-wrap gap-1">
+                <template x-for="(h, i) in scanTextHints" :key="i">
+                  <span class="text-[10px] bg-purple-500/20 text-purple-200 rounded-full px-2 py-0.5 flex items-center gap-1">
+                    <span x-text="h"></span>
+                    <button @click="scanTextHints.splice(i, 1)" class="text-purple-400 active:opacity-60">✕</button>
+                  </span>
+                </template>
+              </div>
+            </div>
+          </details>
+        </div>
+      </template>
+
       <!-- v2.3: Progress indicator when multi-photo queue is processing -->
       <div x-show="scanPhotosQueue.length > 0" class="mb-4 rounded-xl bg-blue-500/10 border border-blue-400/30 px-3 py-2 text-xs text-blue-200" x-cloak>
         <div class="flex items-center gap-2">
@@ -5655,6 +5922,20 @@ function gymApp() {
     previewHint: '',           // current hint textarea content (cleared after each re-enrich)
     previewUserHints: [],      // history of hints Jim already used in this preview session
     reEnrichInFlight: false,   // prevent double-tap on "🔄 用補充資料再 estimate"
+    // v2.7.22: text-direct food input mode (Jim OOB 2026-08-02 02:50 HKT)
+    // Type what you ate without taking a photo. APiyi estimates, you confirm, commit.
+    scanTextMode: false,       // toggle on by openScanTextInput()
+    scanTextInput: '',         // current textarea content
+    scanTextUploading: false,  // prevent double-tap on AI estimate
+    scanTextPreview: null,     // last preview object (same shape as image preview)
+    scanTextEditForm: {        // editable overrides for the preview
+      name: '', restaurant_chain: '',
+      calories: null, protein: null, carbs: null, fat: null, note: ''
+    },
+    scanTextCommitting: false, // prevent double-tap on "✓ 確認 log"
+    scanTextReEnriching: false,// prevent double-tap on "🔄 再估算"
+    scanTextHints: [],         // supplementary hints for re-estimate
+    scanTextHintInput: '',     // current hint input
     coachTips: null,           // pplx + MiniMax result for just-ended session
     coachTipsLoading: false,
     quote: '努力唔會辜負你',
@@ -6682,6 +6963,149 @@ function gymApp() {
       }
     },
 
+    // ---- v2.7.22 text-direct food input methods (Jim OOB 2026-08-02 02:50 HKT) ----
+
+    openScanTextInput() {
+      // Toggle text-direct input mode ON. Clear any leftover preview.
+      this.scanTextMode = !this.scanTextMode;
+      if (this.scanTextMode) {
+        this.scanTextInput = '';
+        this.scanTextPreview = null;
+        this.scanTextEditForm = {
+          name: '', restaurant_chain: '',
+          calories: null, protein: null, carbs: null, fat: null, note: ''
+        };
+        this.scanTextHints = [];
+        this.scanTextHintInput = '';
+        // Auto-focus textarea when toggled on
+        this.$nextTick(() => {
+          const ta = document.querySelector('textarea[x-model="scanTextInput"]');
+          if (ta) ta.focus();
+        });
+      }
+    },
+
+    async submitScanText() {
+      const text = (this.scanTextInput || '').trim();
+      if (!text || this.scanTextUploading) return;
+      this.scanTextUploading = true;
+      this.flash('🤖 AI 估緊營養…');
+      try {
+        // Merge stored hints into the request so iteration cycle works
+        const hintsForReq = (this.scanTextHints || []).slice();
+        if (this.scanTextHintInput.trim()) {
+          hintsForReq.push(this.scanTextHintInput.trim());
+          this.scanTextHintInput = '';
+        }
+        const r = await fetch('/api/scan_preview_text', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: text,
+            user_hints: hintsForReq,
+          }),
+        });
+        const data = await r.json();
+        if (!data.ok) {
+          this.flash('估算失敗：' + (data.error || '未知'));
+          return;
+        }
+        this.scanTextPreview = data.preview;
+        // Init edit form from suggested entry (Jim can override)
+        const s = data.preview.suggested_entry;
+        this.scanTextEditForm = {
+          name: s.name || '',
+          restaurant_chain: s.restaurant_chain || '',
+          calories: s.calories ?? null,
+          protein: s.protein ?? null,
+          carbs: s.carbs ?? null,
+          fat: s.fat ?? null,
+          note: '',
+        };
+        // Lock the hints in as part of the preview history
+        this.scanTextHints = hintsForReq.slice();
+        this.flash(`✨ 已估算 (kcal: ${s.calories ?? '—'}, P: ${s.protein ?? '—'}) — 檢查再 ✓ 確認 log`);
+      } catch(e) {
+        this.flash('Error：' + e.message);
+      } finally {
+        this.scanTextUploading = false;
+      }
+    },
+
+    addScanTextHint() {
+      const h = (this.scanTextHintInput || '').trim();
+      if (!h) return;
+      this.scanTextHints = [...this.scanTextHints, h].slice(-5);
+      this.scanTextHintInput = '';
+    },
+
+    async reEnrichScanText() {
+      // Re-run estimate with new hint appended (text-only path can't use image-based endpoint).
+      // Just re-call submitScanText() — the existing scanTextHints list gets sent through.
+      const newHint = (this.scanTextHintInput || '').trim();
+      if (newHint) this.addScanTextHint();
+      if (!this.scanTextHints.length) {
+        this.flash('請先輸入補充資料');
+        return;
+      }
+      this.scanTextReEnriching = true;
+      try {
+        await this.submitScanText();
+      } finally {
+        this.scanTextReEnriching = false;
+      }
+    },
+
+    async commitScanText() {
+      if (!this.scanTextPreview || this.scanTextCommitting) return;
+      const s = this.scanTextPreview.suggested_entry;
+      const edit = this.scanTextEditForm || {};
+      // Merge edit overrides into entry (text-only → image_path="" is handled server-side)
+      const entry = {
+        ...s,
+        name: edit.name || s.name,
+        restaurant_chain: edit.restaurant_chain || s.restaurant_chain,
+        calories: (edit.calories != null) ? edit.calories : s.calories,
+        protein: (edit.protein != null) ? edit.protein : s.protein,
+        carbs: (edit.carbs != null) ? edit.carbs : s.carbs,
+        fat: (edit.fat != null) ? edit.fat : s.fat,
+        note: edit.note || '',
+      };
+      this.scanTextCommitting = true;
+      try {
+        const r = await fetch('/api/scan_commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            entry: entry,
+            image_path: '',  // empty = text-direct entry, server skips image rename
+            user_hints: this.scanTextHints || [],
+          }),
+        });
+        const data = await r.json();
+        if (!data.ok) {
+          this.flash('Log 失敗：' + (data.error || '未知'));
+          return;
+        }
+        this.flash(
+          `✓ 已 log 落 nutrition + Sheet (${data.is_text_only ? '文字模式' : 'image'}, row ${data.scan_index})`
+        );
+        // Refresh recent scans + reset UI
+        this.scanTextPreview = null;
+        this.scanTextInput = '';
+        this.scanTextEditForm = {
+          name: '', restaurant_chain: '',
+          calories: null, protein: null, carbs: null, fat: null, note: ''
+        };
+        this.scanTextHints = [];
+        this.loadRecentScans();
+      } catch(e) {
+        this.flash('Error：' + e.message);
+      } finally {
+        this.scanTextCommitting = false;
+      }
+    },
+
     async suggestLogFromPhoto(item) {
       // Re-run scan_preview on an existing photostream image (server fetches bytes)
       try {
@@ -6810,13 +7234,12 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-// Jim OOB 2026-08-02 02:44 HKT — SW v52 (was v51). Withings steps misleading
-// display fix: when Withings has no record for today (凌晨 / Apple Watch
-// sleep mode / iPhone HealthKit sync delay), display "—" + 同步中 instead
-// of freezing yesterday's running total as today's number. Steps route
-// added stepsSyncing flag, hero widget shows neutral color, no More button
-// dim flicker as today record rolls in.
-const CACHE = 'gym-web-v52';
+// Jim OOB 2026-08-02 02:50 HKT — SW v53 (was v52). Text-direct food input
+// path: /api/scan_preview_text + text-only commit on /api/scan_commit
+// (image_path=""). No vision required, APiyi gpt-4o-mini text-only
+// estimate. Frontend adds "⌨️ 直接打文字記食物" purple button + textarea
+// card with editable preview + ✓ 確認 log / 🔄 再估算 / hint chips.
+const CACHE = 'gym-web-v53';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
