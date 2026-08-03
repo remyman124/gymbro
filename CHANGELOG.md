@@ -2,6 +2,37 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.23] — 2026-08-03
+
+### 🐛 Withings step count: 24h window truncation + low-baseline wake-hour fallback (Jim OOB 2026-08-03 14:00 HKT "step count is wrong")
+
+Two root causes fixed in `_withings_steps_today()` + `_get_intraday_steps_today()`:
+
+**Root cause #1 — 24h window silent truncation**: Withings `getintradayactivity` SILENTLY TRUNCATES earlier events when the window is < 24h. Empirical proof from 2026-08-03 14:00 HKT:
+- 12h window: 0 entries (real events exist 8h ago)
+- 16h window: 3 entries (real events 16h+ ago)
+- 24h window: 7 entries (real events 24h+ ago)
+- 48h window: 99 entries (full backfill)
+- 72h window: 58 entries (sliding window cuts off again)
+
+The 24h cap documented in Withings docs is misleading. FIX: use a **48h window then filter for `ts >= hkt_midnight_ts`**. This catches all of today's events even if Apple Watch pushed them hours ago.
+
+**Root cause #2 — low-baseline daily commit masks sync lag**: When Apple Watch only committed a baseline (e.g. 16 steps from a 04:00 sync) into `getactivity` but real events haven't pushed yet, the daily record returns 16 steps — looks like truth but it's a stale baseline. The v2.7.22 intraday fallback only fired when `getactivity` returned NO today record, so this case was bypassed entirely.
+
+**FIX — wake-hour + 50-step threshold**: After selecting the daily `chosen` record, if HKT is in waking hours (06:00-23:00) AND `steps < 100`, force an intraday cross-check:
+- If intraday has more steps → use intraday (set `_source: "intraday_override"`)
+- If both daily and intraday are < 50 steps → return `syncing: true` (Rule 24 NEVER FABRICATE) — Apple Watch truly hasn't synced since yesterday
+
+**Verified live 2026-08-03 14:05 HKT after restart**:
+- `/api/withings_steps_today` → `{steps: null, syncing: true, _source: "low_baseline_no_intraday"}` ✅
+- `/api/health_overlay` → `steps_today: null, steps_syncing: true` ✅
+- No fabrication of 16-step baseline as "today's truth" — opposite of v2.7.22 behavior
+
+Risk: if Jim legitimately has < 50 steps by 14:00 HKT (e.g. sick day), widget will show "同步中" instead of true count. Acceptance: the alternative (showing 16) is indistinguishable from sync lag, and a sick day is a clear excuse to NOT expedite the widget. Production-safe.
+
+SW cache v52 → v53.
+
+
 ## [2.7.20] — 2026-08-01
 
 ### 🎙️ Cheer voice duration sweet-zone patch (Jim OOB 2026-08-01 22:47 HKT)

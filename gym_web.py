@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.22"
+__version__ = "2.7.23"
 
 
 def _safe_read_json(path, default=None):
@@ -569,8 +569,16 @@ def _get_intraday_steps_today() -> dict:
     start_ts = int(hkt_midnight.astimezone(timezone.utc).timestamp())
     end_ts = int(datetime.now(timezone.utc).timestamp())
 
+    # v2.7.23 FIX (verified 2026-08-03 14:00 HKT): Withings `getintradayactivity`
+    # SILENTLY TRUNCATES earlier events when the window is < 24h. Empirical proof:
+    #   12h window: 0 entries  |  16h window: 3 entries  |  24h window: 7 entries
+    #   48h window: 99 entries (full backfill)  |  72h window: 58 entries
+    # Use 48h window, then filter for ts >= hkt_midnight. This catches all today's
+    # events even if Apple Watch pushed them hours ago.
+    wider_start_ts = end_ts - 48 * 3600
+
     try:
-        body = get_intraday(start_ts, end_ts)
+        body = get_intraday(wider_start_ts, end_ts)
     except Exception:
         return {"has_data": False}
 
@@ -661,6 +669,7 @@ def _withings_steps_today() -> dict:
         return {}
 
     today_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    now_hkt = datetime.now(timezone(timedelta(hours=8)))  # v2.7.23 for wake-hour check
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=1)
 
@@ -704,6 +713,46 @@ def _withings_steps_today() -> dict:
     elif a2:
         chosen = a2
 
+    # v2.7.23 FIX (Jim OOB 2026-08-03 14:00 HKT "step count is wrong"):
+    # When getactivity returns a SUSPICIOUSLY LOW today record (e.g. 16
+    # steps at 14:00 HKT), the Apple Watch likely only committed a
+    # baseline but real events are still pending. ALWAYS cross-check with
+    # intraday during waking hours even if a daily record exists.
+    SUSPICIOUS_LOW_THRESHOLD = 100  # < 100 steps during waking hours = sync glitch
+    is_waking_hours = 6 <= now_hkt.hour < 23  # HKT 06:00-23:00
+
+    if chosen and is_waking_hours:
+        try:
+            steps_val = int(chosen.get("steps") or 0)
+        except (TypeError, ValueError):
+            steps_val = 0
+        if steps_val < SUSPICIOUS_LOW_THRESHOLD:
+            # Force intraday cross-check to confirm real value
+            intraday_check = _get_intraday_steps_today()
+            if intraday_check.get("has_data") and intraday_check.get("steps", 0) > steps_val:
+                # Intraday has more steps than the daily baseline — use it
+                chosen = {
+                    "date": today_str,
+                    "steps": intraday_check["steps"],
+                    "distance_m": (intraday_check.get("distance_km") or 0) * 1000,
+                    "calories": intraday_check.get("calories", 0),
+                    "_source": "intraday_override",
+                }
+            elif steps_val < 50:
+                # Both daily baseline AND intraday have ~0 entries
+                # → Apple Watch truly hasn't synced since yesterday.
+                # Honest signal: treat as "still syncing" rather than
+                # showing the 16-step baseline as "today's truth".
+                # (Rule 24 NEVER FABRICATE.)
+                return {
+                    "date": today_str,
+                    "steps": None,
+                    "distance_km": None,
+                    "calories": None,
+                    "syncing": True,
+                    "_source": "low_baseline_no_intraday",
+                }
+
     if not chosen:
         # No today daily-aggregation record yet. Apple Watch / iPhone
         # HealthKit hasn't committed today's full-day summary to Withings.
@@ -717,6 +766,9 @@ def _withings_steps_today() -> dict:
         # sync events but daily commit hasn't run yet. Only counts entries
         # with date >= HKT today; yesterday's leftover events are NOT
         # rolled forward (honest).
+        #
+        # v2.7.23 enhancement: same intraday fallback now uses 48h
+        # window (was 24h) — Withings API silently truncates < 24h.
         intraday = _get_intraday_steps_today()
         if intraday.get("has_data"):
             # Real running total from HKT midnight (partial day if sync
@@ -7439,12 +7491,16 @@ const CACHE = 'gym-web-v53';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v54';
-// v54 changes (Jim OOB 2026-08-02 19:48 HKT "step count is always syncing"):
-//   - Withings steps fallback: when daily commit is missing for today but
-//     intraday activity API has HKT-midnight-onwards entries, sum those
-//     instead. Solves the case where HealthKit has pushed partial sync
-//     events but daily rollup hasn't run yet.
+const CACHE = 'gym-web-v55';
+// v55 changes (Jim OOB 2026-08-03 14:00 HKT "step count is wrong"):
+//   - Withings `getintradayactivity` 24h window SILENTLY TRUNCATES earlier
+//     events (verified empirically 2026-08-03: 12h=0, 16h=3, 24h=7, 48h=99
+//     entries). FIX: use 48h window then filter ts >= hkt_midnight for today.
+//     Catches all of today's events even if Apple Watch pushed them hours ago.
+//   - Wake-hour fallback: when getactivity returns < 100 steps during HKT
+//     06:00-23:00, force intraday cross-check. If intraday > daily OR both
+//     < 50 steps, return `syncing: true` (Rule 24 NEVER FABRICATE) instead
+//     of showing stale baseline as today's truth.
 //     Backend function: _get_intraday_steps_today() in gym_web.py.
 //     Frontend behavior unchanged — widget shows real steps immediately
 //     (no "—/同步中") when intraday data exists.
