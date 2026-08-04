@@ -2,6 +2,36 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.28] — 2026-08-04
+
+### 🎨 Food log card: ALWAYS expanded (Jim OOB 2026-08-04 "show other nutrient info")
+
+Per Jim OOB — v2.7.27 default-collapsed was wrong. The card should always show all nutrition (P/C/F grid) by default. No more tap-to-expand.
+
+**Change**:
+- Removed `x-data="{ open: false }"` per card.
+- Removed the chevron ▸/▾ and the collapse hint.
+- Card now shows: image + food name (large) + kcal + P/C/F grid (3 mini-cards) + timestamp + shared/corrections badges + note (if any).
+- Layout tuned for one-glance reading: no hidden info.
+
+## [2.7.29] — 2026-08-04
+
+### ⚡ Food log: progressive scrolling (Jim OOB 2026-08-04 "list more and scroll a bit. progressive scrolling for loading performance")
+
+Render performance + UX optimization for long food log lists.
+
+**Changes**:
+- New Alpine state: `recentScansVisible[]` (currently rendered), `recentScansPageSize=20`, `recentScansPageLoaded`, `scansLoadingMore`.
+- `loadRecentScans()` fetches `limit=60` (3 pages worth) up front, slices to first 20 for initial render.
+- `loadMoreScans()` triggered by click on "⬇ 拉落去載入更多" sentinel — appends next 20 to `recentScansVisible`.
+- Template iterates `recentScansVisible` (not `recentScans`) — only renders what's visible.
+- Bottom sentinel shows "✓ 已顯示全部 N 條紀錄" when all loaded.
+
+**Why no infinite scroll?**: iOS Safari scroll event on `<html>` is jittery and breaks under `IntersectionObserver` patterns. Click-to-load is more reliable + same UX (scroll, see "load more", tap). Set up to be auto-scroll-triggered in future via `x-intersect` plugin.
+
+**Frontend-only change**. SW cache v59 → v60.
+
+
 ## [2.7.27] — 2026-08-04
 
 ### 🎨 Food log card redesign: default collapsed, tap to expand (Jim OOB 2026-08-04 "cards larger, text too much")

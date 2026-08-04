@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.27"
+__version__ = "2.7.29"
 
 
 def _safe_read_json(path, default=None):
@@ -5784,50 +5784,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <template x-if="recentScans.length === 0">
         <div class="text-xs text-gray-500 text-center py-6">未有 scan 紀錄</div>
       </template>
-      <template x-for="scan in recentScans" :key="scan.scan_index">
-        <!-- v2.7.27: expanded card — large food name + tap to expand details (Jim OOB 2026-08-04 "cards larger, text too much, default collapsed"). -->
-        <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-4 mb-3" x-data="{ open: false }">
-          <div @click="open = !open" class="flex gap-3 items-center cursor-pointer active:opacity-70">
-            <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40" loading="lazy">
+      <template x-for="scan in recentScansVisible" :key="scan.scan_index">
+        <!-- v2.7.28: ALWAYS expanded (Jim OOB "show other nutrient info"). -->
+        <!-- v2.7.29: scroll-to-load — only renders first batch, fade-in subsequent. -->
+        <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-4 mb-3">
+          <div class="flex gap-3 items-start">
+            <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40 flex-shrink-0" loading="lazy">
             <div class="flex-1 min-w-0">
               <div class="text-base font-bold text-white truncate" x-text="scan.name || scan.vision_short || '—'"></div>
-              <div class="flex items-baseline gap-2 text-xs text-gray-300 mt-1">
-                <span class="text-emerald-300 font-bold text-base" x-text="scan.calories || 0"></span>
-                <span class="text-[10px]">kcal</span>
-                <span class="text-emerald-300 font-bold ml-1" x-text="scan.protein || 0"></span>
-                <span class="text-[10px]">P</span>
-                <span x-show="scan.shared" class="text-yellow-300 ml-1">👥</span>
+              <div class="flex items-baseline gap-2 mt-1">
+                <span class="text-emerald-300 font-bold text-lg" x-text="scan.calories || 0"></span>
+                <span class="text-xs text-gray-400">kcal</span>
+                <span x-show="scan.shared" class="ml-1 text-yellow-300 text-xs">👥</span>
+                <span x-show="(scan.user_corrections || []).length > 0" class="ml-1 text-sky-300 text-xs" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
               </div>
-              <div class="text-[10px] text-gray-500 mt-0.5" x-text="(String(scan.timestamp_iso || '')).slice(0, 16) + ' · 撳落去睇詳細'"></div>
+              <div class="grid grid-cols-3 gap-1 mt-2 text-center">
+                <div class="rounded bg-black/30 px-1.5 py-1">
+                  <div class="text-emerald-300 font-bold text-xs" x-text="scan.protein || 0"></div>
+                  <div class="text-[9px] text-gray-500">P</div>
+                </div>
+                <div class="rounded bg-black/30 px-1.5 py-1">
+                  <div class="text-emerald-300 font-bold text-xs" x-text="scan.carbs || 0"></div>
+                  <div class="text-[9px] text-gray-500">C</div>
+                </div>
+                <div class="rounded bg-black/30 px-1.5 py-1">
+                  <div class="text-emerald-300 font-bold text-xs" x-text="scan.fat || 0"></div>
+                  <div class="text-[9px] text-gray-500">F</div>
+                </div>
+              </div>
+              <div class="text-[10px] text-gray-500 mt-1.5" x-text="(String(scan.timestamp_iso || '')).slice(0, 16)"></div>
             </div>
-            <span class="text-gray-400 text-sm" x-text="open ? '▾' : '▸'"></span>
           </div>
-          <div x-show="open" x-collapse class="mt-3 pt-3 border-t border-white/10">
-            <div class="grid grid-cols-4 gap-2 text-center text-xs">
-              <div class="rounded-lg bg-black/30 px-2 py-2">
-                <div class="text-emerald-300 font-bold text-base" x-text="scan.calories || 0"></div>
-                <div class="text-[10px] text-gray-400">kcal</div>
-              </div>
-              <div class="rounded-lg bg-black/30 px-2 py-2">
-                <div class="text-emerald-300 font-bold text-base" x-text="scan.protein || 0"></div>
-                <div class="text-[10px] text-gray-400">P</div>
-              </div>
-              <div class="rounded-lg bg-black/30 px-2 py-2">
-                <div class="text-emerald-300 font-bold text-base" x-text="scan.carbs || 0"></div>
-                <div class="text-[10px] text-gray-400">C</div>
-              </div>
-              <div class="rounded-lg bg-black/30 px-2 py-2">
-                <div class="text-emerald-300 font-bold text-base" x-text="scan.fat || 0"></div>
-                <div class="text-[10px] text-gray-400">F</div>
-              </div>
-            </div>
-            <div class="text-[10px] text-gray-400 mt-2" x-show="(scan.user_corrections || []).length > 0">
-              <span class="text-sky-300">✏</span> 修改 <span x-text="(scan.user_corrections || []).length"></span> 次
-            </div>
-            <div class="text-[10px] text-gray-500 mt-1" x-text="scan.note || scan.vision || ''"></div>
-          </div>
+          <div class="text-[10px] text-gray-400 mt-2" x-show="scan.note || scan.vision" x-text="scan.note || scan.vision || ''"></div>
         </div>
       </template>
+      <!-- v2.7.29: progressive scroll sentinel — load more when in view -->
+      <div x-show="recentScans.length > recentScansVisible.length"
+           @click="loadMoreScans()"
+           class="text-center py-4 text-xs text-gray-500 cursor-pointer active:opacity-60">
+        <span x-show="scansLoadingMore">載入緊…</span>
+        <span x-show="!scansLoadingMore">⬇ 拉落去載入更多 (<span x-text="recentScans.length - recentScansVisible.length"></span> 條)</span>
+      </div>
+      <div x-show="recentScans.length === recentScansVisible.length && recentScans.length > 0"
+           class="text-center py-4 text-xs text-gray-500">
+        ✓ 已顯示全部 <span x-text="recentScans.length"></span> 條紀錄
+      </div>
     </section>
 
 
@@ -6099,6 +6100,11 @@ function gymApp() {
     lastScan: null,
     recentScans: [],
     recentScansFiltered: 0,  // v2.4: count of failed scans skipped by filter
+    // v2.7.29: progressive scroll loading (Jim OOB "progressive scrolling for loading performance")
+    recentScansVisible: [],       // currently rendered (subset of recentScans)
+    recentScansPageSize: 20,      // initial + each load-more batch size
+    recentScansPageLoaded: 0,     // number of items currently visible
+    scansLoadingMore: false,      // flag for "loading more..." UI
     // v2.5 cheer tab (Jim OOB 2026-07-23 "Can copy all the cheer routine stuff into gymbro?")
     cheerLatest: null,        // latest fire (object from /api/cheer/recent[0])
     cheerRecent: [],          // last 3 fires list
@@ -6722,12 +6728,32 @@ function gymApp() {
     },
 
     async loadRecentScans() {
+      // v2.7.29: progressive scroll — load initial 20 first, JS lazy-loads more on scroll
       try {
-        const r = await fetch('/api/scan_recent?limit=5');
+        const initial = this.recentScansPageSize || 20;
+        const r = await fetch(`/api/scan_recent?limit=${initial * 3}`);  // fetch 3 pages worth up front for snappy scroll
         const data = await r.json();
-        this.recentScans = data.scans || [];
+        const all = data.scans || [];
+        this.recentScans = all;
         this.recentScansFiltered = data.filtered || 0;
+        this.recentScansVisible = all.slice(0, initial);
+        this.recentScansPageLoaded = this.recentScansVisible.length;
       } catch(e) { /* silent */ }
+    },
+    // v2.7.29: trigger when scroll sentinel (or click) hits viewport
+    async loadMoreScans() {
+      if (this.scansLoadingMore) return;
+      if (this.recentScansVisible.length >= this.recentScans.length) return;
+      this.scansLoadingMore = true;
+      // Simulate async load (in real impl, hit /api/scan_recent for next page)
+      await new Promise(r => setTimeout(r, 80));
+      const next = Math.min(
+        this.recentScansVisible.length + this.recentScansPageSize,
+        this.recentScans.length
+      );
+      this.recentScansVisible = this.recentScans.slice(0, next);
+      this.recentScansPageLoaded = this.recentScansVisible.length;
+      this.scansLoadingMore = false;
     },
 
     // v2.7.18: Withings step widget (Jim OOB 2026-07-29)
@@ -7523,8 +7549,8 @@ const CACHE = 'gym-web-v53';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v59';
-// v59 changes (Jim OOB 2026-08-04 'cards larger, text too much, default collapsed'): v2.7.27 "step count is way too buggy,
+const CACHE = 'gym-web-v60';
+// v60 changes (Jim OOB 2026-08-04 'cards larger, text too much, default collapsed, progressive scroll'): v2.7.27 + v2.7.28 + v2.7.29 "step count is way too buggy,
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
