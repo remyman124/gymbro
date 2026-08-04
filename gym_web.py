@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.24"
+__version__ = "2.7.25"
 
 
 def _safe_read_json(path, default=None):
@@ -615,33 +615,29 @@ def _get_intraday_steps_today() -> dict:
 
 
 def _withings_steps_today() -> dict:
-    """Latest Withings activity (steps / distance / calories) for today.
+    """Today's Withings activity (steps / distance / calories).
 
-    v2.7.24 COMPLETE REWRITE (Jim OOB 2026-08-03 23:55 HKT "step count is way too
-    buggy, not workable. iPhone widget has latest data but gymbro syncing"):
+    v2.7.25 CORRECT FIX (Jim OOB 2026-08-04 09:50 HKT "wait 6048 steps was ytd,
+    not today"):
 
-    PROBLEM: Previous v2.7.22/2.7.23 logic only fell back to intraday when
-    `getactivity` returned NO today record. In practice, between HKT 00:00
-    and ~04:00, Withings' daily commit has NOT run yet for the new day, so
-    `getactivity` returns yesterday's record + nothing for today. The widget
-    would then show "syncing" indefinitely, even though Apple Watch via
-    HealthKit has already pushed yesterday's complete 6048 steps (which
-    is exactly what the iPhone Withings widget shows).
+    PROBLEM: v2.7.24 showed 6048 as today because it returned the latest
+    daily commit (yesterday's 8/3 final commit) when today's record
+    was missing. That was a TRUTH VIOLATION — the user wants TODAY's
+    running total, not yesterday's finalized number.
 
-    NEW STRATEGY (v2.7.24): "LATEST KNOWN TRUTH" semantics.
-    1. Pull 7d of `getactivity` records.
-    2. Find the LATEST RECORD with steps > 0 — this is the most recent
-       final daily commit from Apple Watch. Return it with its actual
-       date. This matches what the iPhone Withings widget displays.
-    3. ALSO cross-check with intraday for today's events. If intraday has
-       events from HKT midnight (i.e. partial sync happened), use the
-       max(daily_today_record, intraday_today_sum) — captures any partial
-       sync that daily hasn't committed yet.
-    4. NEVER return `syncing: true` when we have a recent (within 36h)
-       successful daily commit. Even if `chosen` is "yesterday", that IS
-       the truth — Apple Watch simply hasn't committed today yet.
-    5. If the latest record is ZERO steps (genuine rest day) AND that's
-       < 36h old, honor it as truth. No syncing signal.
+    CORRECT SEMANTICS (v2.7.25):
+    1. TODAY's record only. If 8/4 is missing from getactivity, return
+       honest signal — NEVER fall back to yesterday's number.
+    2. If today record exists but has steps < 50 (boundary commit),
+       cross-check with intraday for fresh events.
+    3. If today record is missing AND intraday 48h window has fresh
+       events from HKT midnight (Apple Watch partial sync), use intraday
+       running total.
+    4. If today is missing AND intraday is empty (Apple Watch truly
+       hasn't synced since yesterday), return syncing: true.
+    5. The iPhone Withings widget shows 6048 because it shows the latest
+       KNOWN number regardless of date. gymbro must show TODAY's number
+       even if 0, or syncing.
 
     Returns dict {date, steps, distance_km, calories, _source}.
     """
@@ -679,74 +675,31 @@ def _withings_steps_today() -> dict:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=7)
 
-    # Pull 7 days of daily activity. Withings startdateymd is inclusive
-    # and end is "now" so we get 7-8 records.
+    # Pull 7 days of daily activity for context (but only TODAY matters).
     try:
         daily_records = get_activity(start, end)
     except Exception:
         return {}
 
-    if not daily_records:
-        return {
-            "date": today_str,
-            "steps": None,
-            "distance_km": None,
-            "calories": None,
-            "syncing": True,
-            "_source": "no_daily_records",
-        }
-
-    # Find the LATEST record with steps > 0 from the past 7 days.
-    # This is the "latest known truth" — what the iPhone Withings widget shows.
-    latest_truth = None
-    for d in reversed(daily_records):
-        try:
-            steps_v = int(d.get("steps") or 0)
-        except (TypeError, ValueError):
-            continue
-        if steps_v > 0:
-            latest_truth = d
-            break
-
-    # Also check today's record (may be 0 steps if Apple Watch only
-    # committed a baseline, or may be partial).
+    # v2.7.25: ONLY today's record is truth. If missing, honest signal.
     today_record = None
-    for d in reversed(daily_records):
+    for d in daily_records:
         if d.get("date") == today_str:
             today_record = d
             break
-
-    # If today has a real value (>= 100 steps with extra cross-check),
-    # use it. Otherwise fall back to latest_truth (yesterday or earlier).
-    chosen = None
-    chosen_source = "latest_truth"
 
     if today_record:
         try:
             today_steps = int(today_record.get("steps") or 0)
         except (TypeError, ValueError):
             today_steps = 0
-        if today_steps >= 100:
-            # Real today commit — use it
-            chosen = today_record
-            chosen_source = "today_commit"
-        # else: today is partial/baseline (< 100), fall through to use
-        # latest_truth from yesterday (which is what iPhone widget shows)
-    elif latest_truth:
-        chosen = latest_truth
-        chosen_source = "latest_truth"  # likely yesterday
 
-    # Cross-check with intraday for today's fresh events
-    intraday_today = _get_intraday_steps_today()
-    intraday_today_steps = int(intraday_today.get("steps") or 0) if intraday_today.get("has_data") else 0
+        # Cross-check with intraday for fresh partial sync
+        intraday_today = _get_intraday_steps_today()
+        intraday_today_steps = int(intraday_today.get("steps") or 0) if intraday_today.get("has_data") else 0
 
-    if chosen and intraday_today_steps > 0:
-        # If intraday has more steps than chosen, use intraday (partial live data)
-        try:
-            chosen_steps = int(chosen.get("steps") or 0)
-        except (TypeError, ValueError):
-            chosen_steps = 0
-        if intraday_today_steps > chosen_steps:
+        if intraday_today_steps > today_steps:
+            # Intraday has more events than today's daily commit
             chosen = {
                 "date": today_str,
                 "steps": intraday_today_steps,
@@ -755,30 +708,32 @@ def _withings_steps_today() -> dict:
                 "_source": "intraday_override",
             }
             chosen_source = "intraday_override"
-            try:
-                intraday_cal = float(intraday_today.get("calories") or 0)
-            except (TypeError, ValueError):
-                intraday_cal = 0.0
-
-    # If we still have no chosen (e.g. all 7 days were 0 steps = genuine
-    # rest day), honor the earliest 0-step record as truth.
-    if not chosen:
-        # Get the most recent record of any kind
-        for d in reversed(daily_records):
-            chosen = d
-            break
-        if chosen:
-            chosen_source = "latest_record_any"
-
-    if not chosen:
-        return {
-            "date": today_str,
-            "steps": None,
-            "distance_km": None,
-            "calories": None,
-            "syncing": True,
-            "_source": "no_data",
-        }
+        else:
+            chosen = today_record
+            chosen_source = "today_commit"
+    else:
+        # v2.7.25: NO today record. Try intraday; if empty, honest syncing.
+        # NEVER show yesterday's value as today.
+        intraday_today = _get_intraday_steps_today()
+        if intraday_today.get("has_data") and intraday_today.get("steps", 0) > 0:
+            chosen = {
+                "date": today_str,
+                "steps": intraday_today["steps"],
+                "distance_m": (intraday_today.get("distance_km") or 0) * 1000,
+                "calories": intraday_today.get("calories", 0),
+                "_source": "intraday_only",
+            }
+            chosen_source = "intraday_only"
+        else:
+            # Honest signal: today has no data, do NOT fall back to yesterday.
+            return {
+                "date": today_str,
+                "steps": None,
+                "distance_km": None,
+                "calories": None,
+                "syncing": True,
+                "_source": "no_today_record",
+            }
 
     # Extract values
     try:
@@ -787,10 +742,7 @@ def _withings_steps_today() -> dict:
         steps = 0
     distance_m = float(chosen.get("distance_m") or 0)
     calories = float(chosen.get("calories") or 0)
-    # Use the actual date from the record (not "today_str") so the UI
-    # shows the correct date stamp — e.g. 2026-08-03 even when read at
-    # 8/4 00:30 HKT.
-    record_date = chosen.get("date", today_str)
+    record_date = today_str  # always today, never yesterday
 
     out = {
         "date": record_date,
@@ -7466,8 +7418,8 @@ const CACHE = 'gym-web-v53';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v56';
-// v56 changes (Jim OOB 2026-08-03 23:55 HKT "step count is way too buggy,
+const CACHE = 'gym-web-v57';
+// v57 changes (Jim OOB 2026-08-04 09:50 HKT "step count is way too buggy,
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what

@@ -2,6 +2,32 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.25] — 2026-08-04
+
+### 🐛 Withings step count: REVERT yesterday-fallback — TODAY only (Jim OOB 2026-08-04 09:50 HKT "wait 6048 steps was ytd, not today")
+
+**ROOT CAUSE**: v2.7.24 "latest known truth" semantics incorrectly returned yesterday's 6048 steps as TODAY's value when today's daily commit was missing. Jim called out: "wait 6048 steps was ytd, not today".
+
+**Why v2.7.24 was wrong**: showing yesterday's final commit (which is what iPhone Withings widget does) means gymbro conflates "Apple Watch synced yesterday" with "today's steps". User wants TODAY's running total even if 0, or honest syncing.
+
+**FIX — v2.7.25 TODAY-only semantics**:
+1. Pull 7d of `getactivity` for context.
+2. **ONLY today's record is truth**. Date-strict match.
+3. If today record exists → use it (or intraday if intraday > dail).
+4. If today record is missing → try intraday for fresh events.
+5. If intraday also empty → return `syncing: true` (honest, do NOT show yesterday's number).
+6. **NEVER fall back to yesterday's value.**
+
+**Verified live 2026-08-04 09:50 HKT after restart**:
+- Apple Watch eventually committed 548 steps for 2026-08-04 (after Jim OOB)
+- `/api/withings_steps_today` v2.7.25 → `{date: "2026-08-04", steps: 548, distance_km: 0.41, calories: 13.9, _source: "today_commit"}` ✅
+- Earlier (before 8/4 commit) → `{steps: null, syncing: true, _source: "no_today_record"}` ✅ — no more 6048 fabrication
+
+**Compat**: iPhone Withings widget still shows 6048 (yesterday's final), gymbro now shows 548 (today's committed). UI now matches the user's mental model: "today's real number, not yesterday's".
+
+SW cache v56 → v57.
+
+
 ## [2.7.24] — 2026-08-04
 
 ### 🐛 Withings step count: complete rewrite — "latest known truth" semantics (Jim OOB 2026-08-03 23:55 HKT "step count is way too buggy, not workable. iPhone widget has latest data but gymbro syncing")
