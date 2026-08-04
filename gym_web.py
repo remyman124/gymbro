@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.26"
+__version__ = "2.7.27"
 
 
 def _safe_read_json(path, default=None):
@@ -5785,19 +5785,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="text-xs text-gray-500 text-center py-6">未有 scan 紀錄</div>
       </template>
       <template x-for="scan in recentScans" :key="scan.scan_index">
-        <div class="rounded-xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
-          <div class="flex gap-3 items-center">
-            <img :src="scan.image_url" class="w-16 h-16 rounded-lg object-cover bg-black/40" loading="lazy">
+        <!-- v2.7.27: expanded card — large food name + tap to expand details (Jim OOB 2026-08-04 "cards larger, text too much, default collapsed"). -->
+        <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-4 mb-3" x-data="{ open: false }">
+          <div @click="open = !open" class="flex gap-3 items-center cursor-pointer active:opacity-70">
+            <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40" loading="lazy">
             <div class="flex-1 min-w-0">
-              <div class="text-xs text-white truncate" x-text="scan.name || scan.vision_short || '—'"></div>
-              <div class="flex items-baseline gap-2 text-[11px] text-gray-400 mt-0.5">
-                <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span> kcal</span>
-                <span><span class="text-emerald-300 font-bold" x-text="scan.protein || 0"></span> P</span>
-                <span x-show="scan.shared" class="text-yellow-300">👥</span>
-                <span x-show="(scan.user_corrections || []).length > 0" class="text-sky-300" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
+              <div class="text-base font-bold text-white truncate" x-text="scan.name || scan.vision_short || '—'"></div>
+              <div class="flex items-baseline gap-2 text-xs text-gray-300 mt-1">
+                <span class="text-emerald-300 font-bold text-base" x-text="scan.calories || 0"></span>
+                <span class="text-[10px]">kcal</span>
+                <span class="text-emerald-300 font-bold ml-1" x-text="scan.protein || 0"></span>
+                <span class="text-[10px]">P</span>
+                <span x-show="scan.shared" class="text-yellow-300 ml-1">👥</span>
               </div>
-              <div class="text-[10px] text-gray-500" x-text="scan.timestamp_iso || ''"></div>
+              <div class="text-[10px] text-gray-500 mt-0.5" x-text="(String(scan.timestamp_iso || '')).slice(0, 16) + ' · 撳落去睇詳細'"></div>
             </div>
+            <span class="text-gray-400 text-sm" x-text="open ? '▾' : '▸'"></span>
+          </div>
+          <div x-show="open" x-collapse class="mt-3 pt-3 border-t border-white/10">
+            <div class="grid grid-cols-4 gap-2 text-center text-xs">
+              <div class="rounded-lg bg-black/30 px-2 py-2">
+                <div class="text-emerald-300 font-bold text-base" x-text="scan.calories || 0"></div>
+                <div class="text-[10px] text-gray-400">kcal</div>
+              </div>
+              <div class="rounded-lg bg-black/30 px-2 py-2">
+                <div class="text-emerald-300 font-bold text-base" x-text="scan.protein || 0"></div>
+                <div class="text-[10px] text-gray-400">P</div>
+              </div>
+              <div class="rounded-lg bg-black/30 px-2 py-2">
+                <div class="text-emerald-300 font-bold text-base" x-text="scan.carbs || 0"></div>
+                <div class="text-[10px] text-gray-400">C</div>
+              </div>
+              <div class="rounded-lg bg-black/30 px-2 py-2">
+                <div class="text-emerald-300 font-bold text-base" x-text="scan.fat || 0"></div>
+                <div class="text-[10px] text-gray-400">F</div>
+              </div>
+            </div>
+            <div class="text-[10px] text-gray-400 mt-2" x-show="(scan.user_corrections || []).length > 0">
+              <span class="text-sky-300">✏</span> 修改 <span x-text="(scan.user_corrections || []).length"></span> 次
+            </div>
+            <div class="text-[10px] text-gray-500 mt-1" x-text="scan.note || scan.vision || ''"></div>
           </div>
         </div>
       </template>
@@ -7496,8 +7523,8 @@ const CACHE = 'gym-web-v53';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v58';
-// v58 changes (Jim OOB 2026-08-04 09:55 HKT "step count is way too buggy,
+const CACHE = 'gym-web-v59';
+// v59 changes (Jim OOB 2026-08-04 'cards larger, text too much, default collapsed'): v2.7.27 "step count is way too buggy,
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what

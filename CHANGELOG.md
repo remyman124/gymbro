@@ -2,6 +2,24 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.27] — 2026-08-04
+
+### 🎨 Food log card redesign: default collapsed, tap to expand (Jim OOB 2026-08-04 "cards larger, text too much")
+
+**Before** (v2.7.26): each food scan card was a small rounded-xl with food name + kcal + P + timestamp + corrections count crammed inline. Hard to scan, eye-strain with too many fields.
+
+**After** (v2.7.27):
+- Card becomes `rounded-2xl p-4` (larger).
+- Default shown: image (w-20 h-20) + food NAME (large, bold) + kcal + P + time + "撳落去睇詳細" hint.
+- Tap (anywhere on the card) → expands inline with P/C/F grid (4 cards side-by-side), corrections badge, and the full note.
+- Uses Alpine `x-data="{ open: false }"` per card + `x-show="open"` so collapse state is independent per entry.
+- Chevron arrow rotates between ▸ and ▾ based on state.
+
+**Compatibility**: works on all scan entries (text-only, image, multi-photo). No backend changes needed — same `/api/scan_recent` payload.
+
+**Frontend-only change**. SW cache v58 → v59.
+
+
 ## [2.7.26] — 2026-08-04
 
 ### 🐛 Withings step widget: paired today + yesterday (Jim OOB 2026-08-04 09:55 HKT "show both yesterday and today in widget, today larger")
