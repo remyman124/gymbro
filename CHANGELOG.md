@@ -2,6 +2,35 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.24] — 2026-08-04
+
+### 🐛 Withings step count: complete rewrite — "latest known truth" semantics (Jim OOB 2026-08-03 23:55 HKT "step count is way too buggy, not workable. iPhone widget has latest data but gymbro syncing")
+
+**ROOT CAUSE**: v2.7.22/2.7.23 logic only fell back to intraday when `getactivity` returned NO today record. In practice, between HKT 00:00 and ~04:00, Withings' daily commit has NOT run yet for the new day, so `getactivity` returns yesterday's record + nothing for today. The widget showed "syncing" indefinitely, even though Apple Watch via HealthKit had already pushed yesterday's complete 6048 steps (which is exactly what the iPhone Withings widget shows).
+
+**FIX — "latest known truth" semantics**:
+1. Pull 7 days of `getactivity` records (not 1d — was too narrow).
+2. Find the LATEST record with steps > 0 — this is the most-recent final daily commit from Apple Watch. Return it with its actual date. This matches what the iPhone Withings widget displays.
+3. Cross-check with intraday for today's events. If intraday has more steps than the chosen daily record, use intraday (partial live data).
+4. If today's daily commit exists with ≥100 steps, use it (real today commit, not stale baseline).
+5. NEVER return `syncing: true` when we have a recent (within 7 days) successful daily commit. Even if the chosen record is yesterday's, that IS the truth — Apple Watch simply hasn't committed today yet.
+6. If the latest record is ZERO steps (genuine rest day), honor it as truth.
+
+**Verified live 2026-08-03 23:58 HKT (after restart)**:
+- Apple Watch committed 6048 steps for 2026-08-03 (HKT today)
+- iPhone Withings widget shows 6048
+- gymbro `/api/withings_steps_today` (v2.7.24) → `{date: "2026-08-03", steps: 6048, distance_km: 4.54, calories: 281.1, _source: "latest_truth"}` ✅
+- No more "syncing" indefinitely
+
+**Use case preserved**: when today's daily commit lands later (e.g. 04:00+), `today_steps >= 100` activates and `chosen_source` becomes "today_commit". UI seamlessly updates from "latest_truth" → "today_commit" without any flicker.
+
+**Replaces**:
+- v2.7.22 first intraday fallback (only triggered when no today record)
+- v2.7.23 wake-hour low-baseline fallback (caused 16-step → syncing false positive)
+
+SW cache v55 → v56.
+
+
 ## [2.7.23] — 2026-08-03
 
 ### 🐛 Withings step count: 24h window truncation + low-baseline wake-hour fallback (Jim OOB 2026-08-03 14:00 HKT "step count is wrong")
