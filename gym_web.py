@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.31"
+__version__ = "2.7.32"
 
 
 def _safe_read_json(path, default=None):
@@ -2371,6 +2371,47 @@ def _parse_nutrition_block(text: str) -> dict:
     return out
 
 
+
+def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> str:
+    """v2.7.32: Extract first concrete dish name from vision + pplx descriptions.
+    NOT raw vision_desc[:120] — that bleeds multi-line prose into the food name field.
+    Recipes:
+      1. Numbered markdown "1. **激安二人餐**"
+      2. 菜式：xxx / 菜名：xxx
+      3. vision_desc first non-empty sentence
+      4. fallback chain + meal_type ("Xx 套餐")
+      5. fallback string (truncated to 30 chars)
+    """
+    combined = vision_desc + "\n" + pplx_desc
+    # Pattern 1: numbered dish "1. **激安二人餐**"
+    m = re.search(r"\d+\.\s*\*\*([^*\n]{2,30})\*\*", combined)
+    if m:
+        return m.group(1).strip()
+    # Pattern 2: 菜式：xxx / 菜名：xxx
+    m = re.search(r"菜式[：:]\s*([^\n.]{2,30})", combined)
+    if m:
+        return m.group(1).strip()
+    # Pattern 3: first non-empty sentence of vision (skip lines starting with 觀察/呢張)
+    for line in vision_desc.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("呢張") or line.startswith("觀察") or line.startswith("呢個") or line.startswith("我見到"):
+            continue
+        if len(line) >= 3:
+            # Cut at first Chinese comma / period / colon / semicolon, cap at 30 chars
+            cut = re.search(r"[，。；：]", line)
+            if cut:
+                return line[:cut.start()][:30]
+            return line[:30]
+    # Pattern 4: chain + meal_type fallback
+    chain_m = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", combined)
+    if chain_m:
+        return f"{chain_m.group(1)} 套餐"
+    # Pattern 5: fallback
+    if fallback:
+        return fallback[:30]
+    return vision_desc[:30] if vision_desc else "食物"
+
+
 def _merge_nutrition_estimates(estimates: list) -> dict:
     """Merge multiple nutrition estimate dicts via median + confidence.
 
@@ -3217,7 +3258,7 @@ def api_scan_preview():
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": vision_desc[:120],
+            "name": _extract_dish_name(vision_desc, pplx_desc),
             "restaurant_chain": restaurant_guess,
             "calories": preview_field_entries["calories"],
             "protein": preview_field_entries["protein"],
@@ -3310,7 +3351,7 @@ def api_scan_preview_from_path():
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": vision_desc[:120],
+            "name": _extract_dish_name(vision_desc, pplx_desc),
             "restaurant_chain": restaurant_guess,
             "calories": jim_kcal,
             "protein": jim_p,
@@ -5799,7 +5840,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40 flex-shrink-0" loading="lazy">
             </template>
             <div class="flex-1 min-w-0">
-              <div class="text-base font-bold text-white truncate" x-text="scan.name || scan.vision_short || '—'"></div>
+              <div class="text-base font-bold text-white leading-snug" style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;" x-text="scan.name || scan.vision_short || '—'"></div>
               <div class="flex items-baseline gap-2 mt-1">
                 <span class="text-emerald-300 font-bold text-lg" x-text="scan.calories || 0"></span>
                 <span class="text-xs text-gray-400">kcal</span>
@@ -7503,7 +7544,7 @@ SERVICE_WORKER = """
 // "no need to mention 今/作/步". Today's steps dominate visually (large amber),
 // yesterday's just grey number beside it. No label text. v60 also embeds
 // v2.7.30 widget fix (Jim OOB 2026-08-04 10:00 HKT).
-const CACHE = 'gym-web-v61';
+const CACHE = 'gym-web-v62';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
