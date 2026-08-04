@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.30"
+__version__ = "2.7.31"
 
 
 def _safe_read_json(path, default=None):
@@ -4949,10 +4949,18 @@ def api_cheer_status():
 
 @app.route("/api/cheer/recent", methods=["GET"])
 def api_cheer_recent():
-    """v2.5: Return last N cheer fires (default 3) for cheer tab hero card."""
+    """v2.5: Return last N cheer fires (default 3) for cheer tab hero card.
+    v2.7.31: Sanity-check image_path exists on disk — if missing (cleaned cache),
+    drop image_path / has_image so frontend doesn't try to load a 404."""
     limit = int(request.args.get("limit", 3))
     log = _load_cheer_log()
     recent = log[-limit:][::-1]
+    for fire in recent:
+        ip = fire.get("image_path")
+        if ip:
+            if not Path(ip).exists():
+                fire["image_path"] = ""
+                fire["has_image"] = False
     return jsonify({"fires": recent, "total": len(log)})
 
 
@@ -5784,9 +5792,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <template x-for="scan in recentScansVisible" :key="scan.scan_index">
         <!-- v2.7.28: ALWAYS expanded (Jim OOB "show other nutrient info"). -->
         <!-- v2.7.29: scroll-to-load — only renders first batch, fade-in subsequent. -->
+        <!-- v2.7.31: skip image element entirely if no image_url (no blank thumbnail). -->
         <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-4 mb-3">
           <div class="flex gap-3 items-start">
-            <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40 flex-shrink-0" loading="lazy">
+            <template x-if="scan.image_url">
+              <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40 flex-shrink-0" loading="lazy">
+            </template>
             <div class="flex-1 min-w-0">
               <div class="text-base font-bold text-white truncate" x-text="scan.name || scan.vision_short || '—'"></div>
               <div class="flex items-baseline gap-2 mt-1">
@@ -5982,12 +5993,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </template>
       </div>
 
-      <!-- Recent fires (last 3) -->
+      <!-- Recent fires (last 3, progressive load — v2.7.31) -->
       <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 mb-2 font-bold">最近 fires</div>
       <template x-if="cheerRecent.length === 0">
         <div class="text-xs text-gray-500 text-center py-6">未有 cheer 紀錄</div>
       </template>
-      <template x-for="(fire, idx) in cheerRecent" :key="fire.fire_id || idx">
+      <template x-for="(fire, idx) in cheerRecentVisible" :key="fire.fire_id || idx">
         <div class="rounded-xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
           <div class="flex gap-3 items-center">
             <template x-if="fire.image_path">
@@ -6012,6 +6023,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
       </template>
+      <!-- v2.7.31: cheer progressive-scroll sentinel -->
+      <div x-show="cheerRecent.length > cheerRecentVisible.length"
+           @click="loadMoreCheer()"
+           class="text-center py-4 text-xs text-gray-500 cursor-pointer active:opacity-60">
+        <span x-text="'⬇ 拉落去載入更多 (' + (cheerRecent.length - cheerRecentVisible.length) + ' cheer)'"></span>
+      </div>
+      <div x-show="cheerRecent.length === cheerRecentVisible.length && cheerRecent.length > 0"
+           class="text-center py-4 text-xs text-gray-500">
+        <span x-text="'✓ 已顯示全部 ' + cheerRecent.length + ' 個 cheer'"></span>
+      </div>
     </section>
 
   </main>
@@ -6104,7 +6125,9 @@ function gymApp() {
     scansLoadingMore: false,      // flag for "loading more..." UI
     // v2.5 cheer tab (Jim OOB 2026-07-23 "Can copy all the cheer routine stuff into gymbro?")
     cheerLatest: null,        // latest fire (object from /api/cheer/recent[0])
-    cheerRecent: [],          // last 3 fires list
+    cheerRecent: [],          // full list of fires (up to 30)
+    cheerRecentVisible: [],   // progressive subset rendered (v2.7.31)
+    cheerRecentPageSize: 3,   // initial load size
     cheerFiring: false,       // button disabled while pipeline runs
     cheerProgress: '',        // human-readable progress string
     cheerPct: 0,              // progress bar 0-100
@@ -6814,13 +6837,16 @@ function gymApp() {
     },
 
     // v2.5 cheer — load last N cheer fires from server log
+    // v2.7.31: progressive scroll — fetch 30 fires, render initial 3, load-more on demand
     async loadCheerRecent() {
       try {
-        const r = await fetch('/api/cheer/recent?limit=3');
+        const r = await fetch('/api/cheer/recent?limit=30');
         const data = await r.json();
         const fires = data.fires || [];
         this.cheerRecent = fires;
         this.cheerLatest = fires[0] || null;
+        // Initial render: first pageSize fires
+        this.cheerRecentVisible = fires.slice(0, this.cheerRecentPageSize);
         // For the hero card, also pull today's mood labels from any voice_url/image_url in log entry
         if (this.cheerLatest) {
           // The cheer_log.json stores voice_path and image_path absolute; convert to relative URL for the renderer.
@@ -6833,6 +6859,15 @@ function gymApp() {
           }
         }
       } catch (e) { /* silent */ }
+    },
+
+    // v2.7.31: cheer progressive load-more (Jim OOB 2026-08-04)
+    loadMoreCheer() {
+      const next = Math.min(
+        this.cheerRecentVisible.length + this.cheerRecentPageSize,
+        this.cheerRecent.length
+      );
+      this.cheerRecentVisible = this.cheerRecent.slice(0, next);
     },
 
     // v2.5 cheer — trigger a fire
@@ -7468,7 +7503,7 @@ SERVICE_WORKER = """
 // "no need to mention 今/作/步". Today's steps dominate visually (large amber),
 // yesterday's just grey number beside it. No label text. v60 also embeds
 // v2.7.30 widget fix (Jim OOB 2026-08-04 10:00 HKT).
-const CACHE = 'gym-web-v60';
+const CACHE = 'gym-web-v61';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
