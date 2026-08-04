@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.29"
+__version__ = "2.7.30"
 
 
 def _safe_read_json(path, default=None):
@@ -5150,21 +5150,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="flex items-center gap-3">
         <!-- v2.7.26: paired today + yesterday widget (Jim OOB 2026-08-04 09:55 HKT
              "show both yesterday and today, today larger"). -->
-        <div class="flex items-stretch gap-2 rounded-2xl px-2.5 py-1.5" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
-          <div class="flex flex-col items-center leading-none">
+        <div class="flex items-stretch gap-1.5 rounded-2xl px-2.5 py-1.5" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
+          <div class="flex flex-col items-center justify-center leading-none">
             <span class="text-base">👟</span>
-            <span class="text-[8px] uppercase tracking-wide text-gray-400 mt-0.5">步</span>
           </div>
-          <!-- TODAY (large) -->
-          <div class="flex flex-col leading-none border-r border-white/20 pr-2">
-            <span class="text-xs text-gray-400">今</span>
+          <!-- TODAY (large, amber) -->
+          <div class="flex flex-col items-center justify-center leading-none border-r border-white/20 pr-2">
             <span class="text-lg font-black tabular-nums"
                   :class="stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300')"
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
           </div>
-          <!-- YESTERDAY (small) -->
-          <div class="flex flex-col leading-none" x-show="stepsYesterday !== null">
-            <span class="text-[10px] text-gray-500">昨</span>
+          <!-- YESTERDAY (small, gray) -->
+          <div class="flex flex-col items-center justify-center leading-none" x-show="stepsYesterday !== null">
             <span class="text-sm font-bold tabular-nums text-gray-400"
                   x-text="stepsYesterday !== null ? stepsYesterday.toLocaleString() : '—'"></span>
           </div>
@@ -7467,12 +7464,11 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-// Jim OOB 2026-08-02 02:50 HKT — SW v53 (was v52). Text-direct food input
-// path: /api/scan_preview_text + text-only commit on /api/scan_commit
-// (image_path=""). No vision required, APiyi gpt-4o-mini text-only
-// estimate. Frontend adds "⌨️ 直接打文字記食物" purple button + textarea
-// card with editable preview + ✓ 確認 log / 🔄 再估算 / hint chips.
-const CACHE = 'gym-web-v53';
+// Jim OOB 2026-08-04 10:00 HKT — SW v60. Step widget simplified per Jim
+// "no need to mention 今/作/步". Today's steps dominate visually (large amber),
+// yesterday's just grey number beside it. No label text. v60 also embeds
+// v2.7.30 widget fix (Jim OOB 2026-08-04 10:00 HKT).
+const CACHE = 'gym-web-v60';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
