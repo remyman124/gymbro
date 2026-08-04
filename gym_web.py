@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.25"
+__version__ = "2.7.26"
 
 
 def _safe_read_json(path, default=None):
@@ -770,14 +770,64 @@ def _withings_steps_today() -> dict:
     return out
 
 
+def _withings_yesterday() -> dict:
+    """Yesterday's Withings daily commit (finalized value).
+
+    v2.7.26 (Jim OOB 2026-08-04 09:55 HKT "perhaps show both yesterday and
+    today record in the widget. try to squeeze two data into one widget
+    but today one is larger").
+
+    Returns dict {date, steps, distance_km, calories} or {} on no data.
+    """
+    import importlib
+    from datetime import datetime, timezone, timedelta
+
+    hkt = timezone(timedelta(hours=8))
+    today_hkt = datetime.now(hkt)
+    yesterday_str = (today_hkt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    try:
+        import sys as _sys
+        if "/home/work/.hermes/skills/withings" not in _sys.path:
+            _sys.path.insert(0, "/home/work/.hermes/skills/withings")
+        withings_mod = importlib.import_module("withings")
+        get_activity = withings_mod.get_daily_activity
+    except Exception:
+        return {}
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=2)  # yesterday falls in this window
+    try:
+        records = get_activity(start, end)
+    except Exception:
+        return {}
+
+    for d in records:
+        if d.get("date") == yesterday_str:
+            try:
+                steps = int(d.get("steps") or 0)
+            except (TypeError, ValueError):
+                steps = 0
+            distance_m = float(d.get("distance_m") or 0)
+            calories = float(d.get("calories") or 0)
+            return {
+                "date": yesterday_str,
+                "steps": steps,
+                "distance_km": round(distance_m / 1000, 2),
+                "calories": round(calories, 1),
+            }
+    return {}
+
+
 @app.route("/api/health_overlay")
 def api_health_overlay():
     """Single endpoint for the hero overlay.
     - Top-left: Whoop recovery %
     - Top-right: Withings weight kg + fat % (latest reading, drives Jim's goal)
-    - Steps: today if Withings has the day record, else "still_syncing".
+    - Steps: TODAY (large) + YESTERDAY (small) — paired widget
     """
     steps = _withings_steps_today() or {}
+    yest = _withings_yesterday() or {}
     return jsonify({
         "recovery": _recovery_pct(),
         "weight_kg": _withings_weight(),
@@ -788,7 +838,11 @@ def api_health_overlay():
         "steps_syncing": steps.get("syncing", False),
         "distance_km_today": steps.get("distance_km"),
         "calories_today": steps.get("calories"),
+        "steps_yesterday": yest.get("steps"),
+        "distance_km_yesterday": yest.get("distance_km"),
+        "calories_yesterday": yest.get("calories"),
     })
+
 
 
 # ---------- Jim context store (cheer pipeline reads this to make text more personal) ----------
@@ -2780,16 +2834,19 @@ def api_scan_recent():
 # v2.7.18: Withings steps endpoints (Jim OOB 2026-07-29)
 @app.route("/api/withings_steps_today", methods=["GET"])
 def api_withings_steps_today():
-    """Return today's Withings step count + distance + calories.
+    """Return today's Withings step count + distance + calories + yesterday.
 
-    Jim OOB 2026-08-02 02:44 HKT: when Withings has no today record
-    (凌晨, Apple Watch sleep mode, HealthKit sync delay), expose
-    `syncing: true` so the UI can show "—" + 同步中 rather than
+    v2.7.26 (Jim OOB 2026-08-04 09:55 HKT "show both yesterday and today in
+    widget, today larger"): paired response so the frontend widget can show
+    today (large) + yesterday (small) side-by-side.
+
+    Jim OOB 2026-08-02 02:44 HKT: when Withings has no today record,
+    expose `syncing: true` so the UI can show "—" + 同步中 rather than
     freezing yesterday's number as today's count.
     """
     try:
         steps_data = _withings_steps_today() or {}
-        # steps may be None when syncing — preserve that signal.
+        yest_data = _withings_yesterday() or {}
         raw_steps = steps_data.get("steps")
         return jsonify({
             "date": steps_data.get("date", ""),
@@ -2797,6 +2854,13 @@ def api_withings_steps_today():
             "distance_km": None if steps_data.get("distance_km") is None and steps_data.get("syncing") else steps_data.get("distance_km"),
             "calories": None if steps_data.get("calories") is None and steps_data.get("syncing") else steps_data.get("calories"),
             "syncing": bool(steps_data.get("syncing", False)),
+            # v2.7.26: paired yesterday for widget display
+            "yesterday": {
+                "date": yest_data.get("date", ""),
+                "steps": yest_data.get("steps"),
+                "distance_km": yest_data.get("distance_km"),
+                "calories": yest_data.get("calories"),
+            } if yest_data else None,
         })
     except Exception as e:
         return jsonify({"steps": 0, "distance_km": 0, "calories": 0, "syncing": False, "error": str(e)[:120]})
@@ -5084,18 +5148,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="flex items-center justify-between gap-2">
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gym</h1>
       <div class="flex items-center gap-3">
-        <!-- v2.7.18: Withings step widget — main menu (Jim OOB 2026-07-29)
-             v2.7.21: handle steps_syncing (still syncing) — show
-             "—" + 同步中 note rather than misleading yesterday number. -->
-        <div class="flex items-center gap-1.5 rounded-full px-2.5 py-1" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
-          <span class="text-base">👟</span>
-          <div class="flex flex-col leading-none">
-            <span class="text-base font-black tabular-nums"
+        <!-- v2.7.26: paired today + yesterday widget (Jim OOB 2026-08-04 09:55 HKT
+             "show both yesterday and today, today larger"). -->
+        <div class="flex items-stretch gap-2 rounded-2xl px-2.5 py-1.5" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
+          <div class="flex flex-col items-center leading-none">
+            <span class="text-base">👟</span>
+            <span class="text-[8px] uppercase tracking-wide text-gray-400 mt-0.5">步</span>
+          </div>
+          <!-- TODAY (large) -->
+          <div class="flex flex-col leading-none border-r border-white/20 pr-2">
+            <span class="text-xs text-gray-400">今</span>
+            <span class="text-lg font-black tabular-nums"
                   :class="stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300')"
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
-            <span class="text-[8px] uppercase tracking-wide"
-                  :class="stepsSyncing ? 'text-gray-500' : 'text-gray-400'"
-                  x-text="stepsSyncing ? '同步中' : (stepsToday >= 8000 ? '達標 ✓' : '步 ' + (stepsToday / 80).toFixed(0) + '%')"></span>
+          </div>
+          <!-- YESTERDAY (small) -->
+          <div class="flex flex-col leading-none" x-show="stepsYesterday !== null">
+            <span class="text-[10px] text-gray-500">昨</span>
+            <span class="text-sm font-bold tabular-nums text-gray-400"
+                  x-text="stepsYesterday !== null ? stepsYesterday.toLocaleString() : '—'"></span>
           </div>
         </div>
         <div class="flex flex-col items-end leading-tight">
@@ -5955,6 +6026,7 @@ function gymApp() {
     // committed today (凌晨 / Apple Watch 還未 sync)".
     stepsSyncing: false,
     stepsToday: 0,
+    stepsYesterday: null,
     stepsKcal: 0,
     steps7dAvg: 0,
     currentExercise: '',
@@ -6649,6 +6721,12 @@ function gymApp() {
           this.stepsToday = data.steps || 0;
           this.stepsKcal = data.calories || 0;
           this.stepsSyncing = false;
+        }
+        // v2.7.26: paired yesterday for widget display
+        if (data.yesterday && typeof data.yesterday.steps === 'number') {
+          this.stepsYesterday = data.yesterday.steps;
+        } else {
+          this.stepsYesterday = null;
         }
         // 7d avg
         const r7 = await fetch('/api/withings_steps_7d_avg');
@@ -7418,8 +7496,8 @@ const CACHE = 'gym-web-v53';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v57';
-// v57 changes (Jim OOB 2026-08-04 09:50 HKT "step count is way too buggy,
+const CACHE = 'gym-web-v58';
+// v58 changes (Jim OOB 2026-08-04 09:55 HKT "step count is way too buggy,
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what

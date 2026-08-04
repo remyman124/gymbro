@@ -2,6 +2,25 @@
 
 All notable changes to gymbro are documented here.
 
+## [2.7.26] — 2026-08-04
+
+### 🐛 Withings step widget: paired today + yesterday (Jim OOB 2026-08-04 09:55 HKT "show both yesterday and today in widget, today larger")
+
+v2.7.25 fixed the "yesterday-as-today" bug but lost yesterday visibility. Jim asked for a paired widget instead: TODAY (large) + YESTERDAY (small) side-by-side.
+
+**Change**:
+- Backend: `_withings_yesterday()` helper pulls yesterday's daily commit. `/api/withings_steps_today` and `/api/health_overlay` now expose both `today` and `yesterday` dicts.
+- Frontend: top-bar widget now shows `今 548` (large, color-graded) + `昨 6048` (small, gray) inside a single rounded-2xl pill. Yesterday hidden if missing.
+- State: `stepsYesterday` field added to Alpine state. `loadSteps()` populates it from `data.yesterday.steps`.
+
+**Verified live 2026-08-04 09:57 HKT**:
+- `/api/withings_steps_today` → `{steps: 548, date: "2026-08-04", ..., yesterday: {steps: 6048, date: "2026-08-03"}}`
+- `/api/health_overlay` → `steps_today: 548, steps_yesterday: 6048`
+- Widget renders today (large) + yesterday (small) side-by-side
+
+SW cache v57 → v58.
+
+
 ## [2.7.25] — 2026-08-04
 
 ### 🐛 Withings step count: REVERT yesterday-fallback — TODAY only (Jim OOB 2026-08-04 09:50 HKT "wait 6048 steps was ytd, not today")
