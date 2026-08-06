@@ -3000,6 +3000,24 @@ def api_scan_recent():
     # returned the OLDEST N entries. Now we explicitly sort.
     successful_sorted = sorted(successful, key=lambda s: s.get("timestamp_iso", ""), reverse=True)
     recent = successful_sorted[:limit]
+    # v2.7.42: inject image_url for each scan so frontend <img :src> can render
+    # the thumbnail. Without this, every card shows the empty-fallback ⌨️/🍽️
+    # icon, which makes the food log look mostly empty.
+    for entry in recent:
+        img_path = entry.get("image_path") or entry.get("image_saved_to") or ""
+        if img_path:
+            # Extract just the filename from the absolute path
+            # e.g. /home/work/.hermes/scan_cache/scan_20260806_233225.jpg
+            #   → /scan_img/scan_20260806_233225.jpg
+            fname = os.path.basename(img_path)
+            entry["image_url"] = f"/scan_img/{fname}"
+            entry["is_text_only"] = False
+        else:
+            entry["image_url"] = None
+            # v2.7.42: no image_path = text-direct entry by definition in our
+            # codebase. scan_text_direct path always sets image_path=""; user
+            # therefore knows this is a text entry.
+            entry["is_text_only"] = True
     return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
 
 
@@ -8390,7 +8408,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v78';
+const CACHE = 'gym-web-v80';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
