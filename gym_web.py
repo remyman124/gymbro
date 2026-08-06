@@ -6247,7 +6247,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <!-- v2.2 PREVIEW card (Jim confirms before log) -->
-      <div x-show="previewEntry" class="rounded-2xl bg-yellow-500/10 backdrop-blur border-2 border-yellow-400/40 p-4 mb-4" x-cloak>
+      <div x-show="previewEntry"
+           data-preview-card
+           class="rounded-2xl bg-yellow-500/10 backdrop-blur border-2 border-yellow-400/40 p-4 mb-4"
+           x-cloak>
         <div class="text-[10px] uppercase tracking-[0.15em] text-yellow-300 mb-2 font-bold">⚠️ 預覽 — 未 log，請確認</div>
         <img :src="previewEntry?.image_url" class="w-full rounded-xl mb-3 max-h-48 object-cover bg-black/40">
         <div class="text-sm text-white mb-2" x-text="previewEntry?.vision_short || ''"></div>
@@ -6329,7 +6332,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                   </template>
                 </div>
                 <template x-if="item.classification?.is_food && !item.already_logged">
-                  <button @click="suggestLogFromPhoto(item)" class="absolute top-1 right-1 bg-emerald-500 text-black text-[10px] px-1.5 py-0.5 rounded font-bold active:scale-95">AI log 呢張</button>
+                  <button type="button"
+                          @click.stop="suggestLogFromPhoto(item)"
+                          :disabled="scanUploading"
+                          :data-item-path="item.path"
+                          class="absolute top-1 right-1 bg-emerald-500 text-black text-[12px] font-bold px-2.5 py-1.5 rounded-lg shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed min-w-[64px] min-h-[28px]"
+                          :title="`AI log ${item.filename || '呢張相'}`">
+                    <span x-show="!scanUploading">AI log 呢張</span>
+                    <span x-show="scanUploading" class="inline-flex items-center gap-1">
+                      <span class="inline-block w-2 h-2 rounded-full bg-black animate-pulse"></span>
+                      處理中
+                    </span>
+                  </button>
                 </template>
               </div>
             </template>
@@ -8190,6 +8204,19 @@ function gymApp() {
         this.previewEditing = true;
         this.tab = 'scan';
         this.flash('Preview 就緒 ✓ 撳「確認」先 log');
+        // v2.7.42c: scroll the preview card into view so the user doesn't have
+        // to hunt for it after tapping a thumbnail. Preview card has x-show
+        // controlling visibility; smooth scroll after Alpine tick.
+        this.$nextTick(() => {
+          const el = document.querySelector('[x-ref="previewCard"], #previewCard, [data-preview-card]');
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          } else {
+            // Fallback: scroll to top of scan section
+            const scanSection = document.querySelector('section[x-show*="scan"]');
+            if (scanSection) scanSection.scrollTo({ top: 0, behavior: 'smooth' });
+          }
+        });
       } catch (e) { this.flash('Error: ' + e.message); }
       finally { this.scanUploading = false; }
     },
@@ -8408,7 +8435,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v80';
+const CACHE = 'gym-web-v81';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
