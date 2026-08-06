@@ -5477,43 +5477,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="file" accept="image/*" capture="environment" @change="onScanFile($event)" x-ref="scanInputEl" style="display:none">
       <input type="file" accept="image/*" multiple @change="onScanPhotosPicked($event)" x-ref="scanPhotosInputEl" style="display:none">
 
-      <!-- Big tap-to-scan card — opens live camera -->
+      <!-- v2.7.36: Compact 3-button row — pro mobile UI/UX
+           (1) Primary camera button: pill shape, full-width but compact height
+           (2) Secondary chips: 2x inline (photo stream + text input) - half width each -->
+      <!-- Primary: live camera (compact, ~64px height) -->
       <button @click="$refs.scanInputEl.click()"
               :disabled="scanUploading"
-              class="w-full rounded-2xl py-6 px-4 mb-3 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-              style="background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(255,255,255,0.05)); border: 1.5px dashed rgba(16,185,129,0.55);">
-        <div class="text-5xl mb-2" x-text="scanUploading ? '⏳' : '📸'"></div>
-        <div class="text-base font-bold text-emerald-300" x-text="scanUploading ? 'AI 睇緊你張相…' : '撳呢度影相 / 揀圖'"></div>
-        <div class="text-[10px] text-gray-400 mt-1" x-show="!scanUploading">食物、收據、外賣單都影得</div>
-      </button>
-
-      <!-- v2.3: iPhone photo stream picker — opens Photos app for multi-select (server cache independent) -->
-      <button @click="$refs.scanPhotosInputEl.click()"
-              :disabled="scanUploading || scanPhotosQueue.length > 0"
-              class="w-full rounded-2xl py-4 px-4 mb-4 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-              style="background: rgba(255,255,255,0.04); border: 1.5px solid rgba(16,185,129,0.35);">
+              class="w-full rounded-full py-3.5 px-4 mb-2.5 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+              style="background: linear-gradient(135deg, rgba(16,185,129,0.32), rgba(16,185,129,0.12)); border: 1.5px solid rgba(16,185,129,0.65); box-shadow: 0 0 0 0 rgba(16,185,129,0.0);">
         <div class="flex items-center justify-center gap-2">
-          <div class="text-3xl">📷</div>
-          <div class="text-left">
-            <div class="text-sm font-bold text-emerald-300">iPhone 相簿（多選）</div>
-            <div class="text-[10px] text-gray-400 mt-0.5">直接開 Photos app 揀幾張食物相，每張 AI 逐張 preview 確認</div>
-          </div>
+          <div class="text-2xl" x-text="scanUploading ? '⏳' : '📸'"></div>
+          <div class="text-sm font-bold text-emerald-200" x-text="scanUploading ? 'AI 睇緊你張相…' : '影相 / 揀圖 記食物'"></div>
         </div>
       </button>
 
-      <!-- v2.7.22: Text-direct food input (Jim OOB 2026-08-02 02:50 HKT)
-           Skip the camera — type what you ate, AI estimates, you confirm. -->
-      <button @click="openScanTextInput()"
-              class="w-full rounded-2xl py-4 px-4 mb-4 transition-all active:scale-95"
-              style="background: rgba(168,85,247,0.10); border: 1.5px solid rgba(168,85,247,0.45);">
-        <div class="flex items-center justify-center gap-2">
-          <div class="text-3xl">⌨️</div>
-          <div class="text-left">
-            <div class="text-sm font-bold text-purple-300">直接打文字記食物</div>
-            <div class="text-[10px] text-gray-400 mt-0.5">打菜名／份量／餐廳，AI 自動估算 → 你確認</div>
+      <!-- Secondary: 2-up chip row (photo stream + text) - each ~48px -->
+      <div class="grid grid-cols-2 gap-2 mb-3">
+        <!-- iPhone photo stream picker -->
+        <button @click="$refs.scanPhotosInputEl.click()"
+                :disabled="scanUploading || scanPhotosQueue.length > 0"
+                class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                style="background: rgba(255,255,255,0.05); border: 1px solid rgba(16,185,129,0.3);">
+          <div class="flex flex-col items-center gap-0.5">
+            <div class="text-xl">📷</div>
+            <div class="text-[11px] font-bold text-emerald-300">相簿多選</div>
           </div>
-        </div>
-      </button>
+        </button>
+
+        <!-- v2.7.22: Text-direct food input -->
+        <button @click="openScanTextInput()"
+                class="rounded-xl py-2.5 px-2 transition-all active:scale-95"
+                style="background: rgba(168,85,247,0.10); border: 1px solid rgba(168,85,247,0.4);">
+          <div class="flex flex-col items-center gap-0.5">
+            <div class="text-xl">⌨️</div>
+            <div class="text-[11px] font-bold text-purple-300">打文字</div>
+          </div>
+        </button>
+      </div>
 
       <!-- Text-direct input mode (toggled by openScanTextInput) -->
       <div x-show="scanTextMode" x-cloak class="mb-4 rounded-2xl p-4"
@@ -7555,7 +7555,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v64';
+const CACHE = 'gym-web-v67';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
