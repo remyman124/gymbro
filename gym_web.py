@@ -5976,17 +5976,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <template x-for="scan in group.items" :key="scan.scan_index">
             <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
               <div class="flex gap-3 items-center">
-                <!-- v2.7.37: large thumbnail 96x96 (was 80x80) for PT share, no detail page -->
+                <!-- v2.7.38: HUGE thumbnail 50% of screen width (was 96/128px) — easy for PT to see details -->
                 <template x-if="scan.image_url">
                   <img :src="scan.image_url"
-                       class="w-24 h-24 rounded-xl object-cover bg-black/40 flex-shrink-0 cursor-pointer active:scale-95"
+                       class="w-[50%] aspect-square rounded-xl object-cover bg-black/40 flex-shrink-0 cursor-pointer active:scale-95"
+                       style="max-width: 220px;"
                        loading="lazy"
                        @click="window.open(scan.image_url, '_blank')">
                 </template>
-                <!-- Fallback when no image: 96x96 placeholder -->
+                <!-- Fallback when no image: 50% width placeholder -->
                 <template x-if="!scan.image_url">
-                  <div class="w-24 h-24 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center flex-shrink-0">
-                    <div class="text-3xl" x-text="scan.is_text_only ? '⌨️' : '🍽️'"></div>
+                  <div class="w-[50%] aspect-square rounded-xl bg-white/5 border border-white/10 flex items-center justify-center flex-shrink-0"
+                       style="max-width: 220px;">
+                    <div class="text-5xl" x-text="scan.is_text_only ? '⌨️' : '🍽️'"></div>
                   </div>
                 </template>
                 <div class="flex-1 min-w-0">
@@ -7764,7 +7766,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v69';
+const CACHE = 'gym-web-v70';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
