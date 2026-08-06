@@ -2784,7 +2784,7 @@ def api_scan_food():
         "timestamp_iso": now_iso(),
         "meal_type": "scan",
         "meal_name": f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
-        "name": vision_desc[:200],
+        "name": _extract_dish_name(vision_desc, pplx_desc),  # v2.7.32: was vision_desc[:200] — bled prose into name field
         "vision_raw_desc": vision_desc,
         "pplx_enrichment": pplx_desc,
         "apiyi_enrichment": apiyi_desc[:500] if apiyi_desc else "",
@@ -2860,13 +2860,22 @@ def api_scan_recent():
     Filter logic: drop scans whose name/vision_short indicates MiniMax vision
     failure (calories==0 + NameError marker), so the dashboard only shows
     scans that produced a real food entry.
+    v2.7.33: drop hash-label fallback entries (e.g. '食物 #a1b2c3 (HH:xx)')
+    so the list only shows scans with real dish names.
     """
     limit = int(request.args.get("limit", 5))
     scan_log = _load_scan_log()
     # v2.4: drop failed scans (name/vision_short contain Vision failed marker)
     def _is_failed_scan(s):
-        n = str(s.get("name", "")) + " " + str(s.get("vision_short", ""))
-        return ("失敗" in n or "NameError" in n or "failed" in n.lower())
+        n = str(s.get("name", "")).strip() + " " + str(s.get("vision_short", ""))
+        # v2.7.33: drop generic '食物' label + hash fallback '食物 #xxx' + failed markers
+        return (
+            n.strip() == "食物"
+            or n.strip().startswith("食物 #")
+            or "失敗" in n
+            or "NameError" in n
+            or "failed" in n.lower()
+        )
     successful = [s for s in scan_log if not _is_failed_scan(s)]
     recent = successful[-limit:][::-1]
     return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
@@ -5834,6 +5843,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <!-- v2.7.28: ALWAYS expanded (Jim OOB "show other nutrient info"). -->
         <!-- v2.7.29: scroll-to-load — only renders first batch, fade-in subsequent. -->
         <!-- v2.7.31: skip image element entirely if no image_url (no blank thumbnail). -->
+        <!-- v2.7.33: cleaner color palette (2 colors not 5) + time as HH:MM not ISO -->
         <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-4 mb-3">
           <div class="flex gap-3 items-start">
             <template x-if="scan.image_url">
@@ -5841,27 +5851,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </template>
             <div class="flex-1 min-w-0">
               <div class="text-base font-bold text-white leading-snug" style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;" x-text="scan.name || scan.vision_short || '—'"></div>
-              <div class="flex items-baseline gap-2 mt-1">
-                <span class="text-emerald-300 font-bold text-lg" x-text="scan.calories || 0"></span>
-                <span class="text-xs text-gray-400">kcal</span>
-                <span x-show="scan.shared" class="ml-1 text-yellow-300 text-xs">👥</span>
-                <span x-show="(scan.user_corrections || []).length > 0" class="ml-1 text-sky-300 text-xs" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
+              <!-- v2.7.33: inline P/C/F + kcal (Jim OOB "why there is no other nutriention info") -->
+              <div class="flex items-baseline gap-3 mt-1.5 text-xs">
+                <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span><span class="text-gray-400"> kcal</span></span>
+                <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
+                <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
+                <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
+                <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
+                <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
               </div>
-              <div class="grid grid-cols-3 gap-1 mt-2 text-center">
-                <div class="rounded bg-black/30 px-1.5 py-1">
-                  <div class="text-emerald-300 font-bold text-xs" x-text="scan.protein || 0"></div>
-                  <div class="text-[9px] text-gray-500">P</div>
-                </div>
-                <div class="rounded bg-black/30 px-1.5 py-1">
-                  <div class="text-emerald-300 font-bold text-xs" x-text="scan.carbs || 0"></div>
-                  <div class="text-[9px] text-gray-500">C</div>
-                </div>
-                <div class="rounded bg-black/30 px-1.5 py-1">
-                  <div class="text-emerald-300 font-bold text-xs" x-text="scan.fat || 0"></div>
-                  <div class="text-[9px] text-gray-500">F</div>
-                </div>
-              </div>
-              <div class="text-[10px] text-gray-500 mt-1.5" x-text="(String(scan.timestamp_iso || '')).slice(0, 16)"></div>
+              <div class="text-[10px] text-gray-500 mt-1" x-text="formatScanTime(scan.timestamp_iso)"></div>
             </div>
           </div>
           <div class="text-[10px] text-gray-400 mt-2" x-show="scan.note || scan.vision" x-text="scan.note || scan.vision || ''"></div>
@@ -6116,6 +6115,15 @@ function gymApp() {
     stepsYesterday: null,
     stepsKcal: 0,
     steps7dAvg: 0,
+    // v2.7.33: format scan timestamp as 'MM/DD HH:MM' (was raw ISO T-separated)
+    formatScanTime(iso) {
+      if (!iso) return '';
+      const s = String(iso);
+      // Extract 'YYYY-MM-DDTHH:MM' → 'MM/DD HH:MM'
+      const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+      if (m) return `${m[2]}/${m[3]} ${m[4]}:${m[5]}`;
+      return s.slice(0, 16).replace('T', ' ');
+    },
     currentExercise: '',
     exerciseInput: '',
     weight: 20,
@@ -7540,11 +7548,14 @@ if ('serviceWorker' in navigator) {
 
 # ---------- Service worker for PWA ----------
 SERVICE_WORKER = """
-// Jim OOB 2026-08-04 10:00 HKT — SW v60. Step widget simplified per Jim
-// "no need to mention 今/作/步". Today's steps dominate visually (large amber),
-// yesterday's just grey number beside it. No label text. v60 also embeds
-// v2.7.30 widget fix (Jim OOB 2026-08-04 10:00 HKT).
-const CACHE = 'gym-web-v62';
+// Jim OOB 2026-08-06 14:20 HKT — SW v64. Food log cleanup.
+// "i saw many 食物 in the list. very bad" — Jim OOB 2026-08-06.
+// Filter now drops any entry with name='食物' (literal) or '食物 #hash',
+// so the PWA list only shows entries with real dish names.
+// "and some color code as title #" — hash labels dropped via filter.
+// "and why there is no other nutriention info" — restored P/C/F display
+// inline next to kcal (was deleted in v63 overzealous cleanup).
+const CACHE = 'gym-web-v64';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
