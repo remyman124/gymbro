@@ -2994,7 +2994,12 @@ def api_scan_recent():
             or "failed" in n.lower()
         )
     successful = [s for s in scan_log if not _is_failed_scan(s)]
-    recent = successful[-limit:][::-1]
+    # v2.7.42: explicit sort by timestamp_iso DESC (newest first) — was buggy
+    # `successful[-limit:][::-1]` only worked if successful was already in
+    # reverse-chronological order; the file is actually chronological so this
+    # returned the OLDEST N entries. Now we explicitly sort.
+    successful_sorted = sorted(successful, key=lambda s: s.get("timestamp_iso", ""), reverse=True)
+    recent = successful_sorted[:limit]
     return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
 
 
@@ -6506,14 +6511,15 @@ function gymApp() {
     stepsYesterday: null,
     stepsKcal: 0,
     steps7dAvg: 0,
-    // v2.7.33: format scan timestamp as 'MM/DD HH:MM' (was raw ISO T-separated)
+    // v2.7.42: HH:MM only 24h format (Jim OOB 2026-08-06 "HH:mm only")
+    // Date is shown in the group header so per-entry display is just the time
     formatScanTime(iso) {
       if (!iso) return '';
       const s = String(iso);
-      // Extract 'YYYY-MM-DDTHH:MM' → 'MM/DD HH:MM'
+      // Extract 'YYYY-MM-DDTHH:MM' → 'HH:MM'
       const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
-      if (m) return `${m[2]}/${m[3]} ${m[4]}:${m[5]}`;
-      return s.slice(0, 16).replace('T', ' ');
+      if (m) return `${m[4]}:${m[5]}`;
+      return s.slice(11, 16);
     },
     currentExercise: '',
     exerciseInput: '',
@@ -6805,9 +6811,10 @@ function gymApp() {
         const time = ts.slice(11, 16);  // 'HH:MM'
         groups[date].items.push({ ...s, time_label: time });
       }
-      // Sort items within each group by time ascending (chronological)
+      // Sort items within each group by time DESC (newest first) — Jim OOB
+      // "decreasing order based on date time" 2026-08-06
       for (const g of Object.values(groups)) {
-        g.items.sort((a, b) => (a.timestamp_iso || '').localeCompare(b.timestamp_iso || ''));
+        g.items.sort((a, b) => (b.timestamp_iso || '').localeCompare(a.timestamp_iso || ''));
         g.total_kcal = Math.round(g.total_kcal);
       }
       // Return as array sorted by date DESC (newest first)
@@ -8084,7 +8091,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v73';
+const CACHE = 'gym-web-v75';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
