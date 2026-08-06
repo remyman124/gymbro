@@ -5867,7 +5867,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
           <textarea x-model="scanTextEditForm.note" placeholder="備註（永久保留）" class="w-full rounded-lg bg-black/40 px-2 py-1.5 text-[11px] text-white border border-white/15" rows="2"></textarea>
           <div class="mt-3 grid grid-cols-2 gap-2">
-            <button @click="commitScanText()" :disabled="scanTextCommitting" class="rounded-lg py-2 text-sm font-bold transition-all active:scale-95 disabled:opacity-50" style="background: linear-gradient(135deg, rgba(16,185,129,0.4), rgba(16,185,129,0.2)); border: 1.5px solid rgba(16,185,129,0.55);">
+            <button @click="commitScanText()" :disabled="scanTextCommitting || !scanTextPreview" class="rounded-lg py-2 text-sm font-bold transition-all active:scale-95 disabled:opacity-50" style="background: linear-gradient(135deg, rgba(16,185,129,0.4), rgba(16,185,129,0.2)); border: 1.5px solid rgba(16,185,129,0.55);">
               <span x-text="scanTextCommitting ? '⏳ 寫緊…' : '✓ 確認 log'"></span>
             </button>
             <button @click="reEnrichScanText()" :disabled="scanTextReEnriching" class="rounded-lg py-2 text-xs font-bold transition-all active:scale-95 disabled:opacity-50" style="background: rgba(168,85,247,0.10); border: 1.5px solid rgba(168,85,247,0.4);">
@@ -7877,7 +7877,8 @@ function gymApp() {
         this.flash(
           `✓ 已 log 落 nutrition + Sheet (${data.is_text_only ? '文字模式' : 'image'}, row ${data.scan_index})`
         );
-        // Refresh recent scans + reset UI
+        // Refresh recent scans + reset UI (also close text-input mode so the panel
+        // collapses, otherwise user sees an empty box with no feedback)
         this.scanTextPreview = null;
         this.scanTextInput = '';
         this.scanTextEditForm = {
@@ -7885,6 +7886,7 @@ function gymApp() {
           calories: null, protein: null, carbs: null, fat: null, note: ''
         };
         this.scanTextHints = [];
+        this.scanTextMode = false;  // v2.7.41: close the text-input panel
         this.loadRecentScans();
       } catch(e) {
         this.flash('Error：' + e.message);
@@ -8082,7 +8084,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v72';
+const CACHE = 'gym-web-v73';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
