@@ -3107,6 +3107,103 @@ def api_scan_correct():
     return jsonify({"ok": True, "scan_index": scan_index, "correction": correction})
 
 
+# v2.7.39: Rename existing scan + auto re-recognize macros (Jim OOB 2026-08-06
+# 14:50 HKT: "is there a way to adjust the existing record by text and recognize
+# it again. e.g. the current recognized one is called 白切雞, but actually it is
+# Hai nan chicken rice"). Flow:
+#  1. User types new dish name in inline popover
+#  2. Backend overwrites name field (so iPhone display updates immediately)
+#  3. Backend auto-calls _apiyi_nutrition_enrich(new_name) for re-estimate macros
+#  4. Old name + macros saved to user_corrections as audit trail (never trimmed)
+#  5. Returns new entry state so frontend can update display
+@app.route("/api/scan_rename", methods=["POST"])
+def api_scan_rename():
+    data = request.get_json(silent=True) or {}
+    scan_index = data.get("scan_index")
+    new_name = (data.get("new_name") or "").strip()
+    if scan_index is None:
+        return jsonify({"ok": False, "error": "no scan_index"}), 400
+    if not new_name:
+        return jsonify({"ok": False, "error": "new_name required"}), 400
+    scan_log = _load_scan_log()
+    if not isinstance(scan_index, int) or scan_index < 0 or scan_index >= len(scan_log):
+        return jsonify({"ok": False, "error": "scan_index out of range"}), 404
+    entry = scan_log[scan_index]
+    old_name = entry.get("name", "")
+    old_kcal = entry.get("calories", 0)
+    old_p = entry.get("protein", 0)
+    old_c = entry.get("carbs", 0)
+    old_f = entry.get("fat", 0)
+    # Build text description for re-estimate (using new name + restaurant if any)
+    restaurant = entry.get("restaurant_chain", "") or ""
+    re_text = f"{new_name} (餐廳: {restaurant})" if restaurant else new_name
+    # Re-estimate macros from text (uses APiyi gpt-4o-mini nutrition enrichment, JSON mode)
+    new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
+    try:
+        enrich = _apiyi_nutrition_enrich(re_text)
+        if enrich and enrich.strip().startswith("{"):
+            parsed = json.loads(enrich)
+            new_kcal = int(parsed.get("calories", old_kcal) or old_kcal)
+            new_p = float(parsed.get("protein", old_p) or old_p)
+            new_c = float(parsed.get("carbs", old_c) or old_c)
+            new_f = float(parsed.get("fat", old_f) or old_f)
+    except Exception as e:
+        # If re-estimate fails, keep old macros + log warning
+        print(f"[scan_rename] re-estimate failed: {e}")
+    # Apply share ratio (Jim 60% / 小寶 40% if shared) — same as new scan flow
+    shared = entry.get("is_shared_meal", False) or _detect_shared_meal(re_text)
+    jim_ratio = 0.60 if shared else 1.00
+    jim_kcal = round(new_kcal * jim_ratio)
+    jim_p = round(new_p * jim_ratio, 1)
+    jim_c = round(new_c * jim_ratio, 1)
+    jim_f = round(new_f * jim_ratio, 1)
+    # Append audit trail (NEVER trimmed)
+    correction = {
+        "type": "rename",
+        "corrected_at": now_iso(),
+        "from_name": old_name,
+        "to_name": new_name,
+        "from_macros": {"calories": old_kcal, "protein": old_p, "carbs": old_c, "fat": old_f},
+        "to_macros": {"calories": jim_kcal, "protein": jim_p, "carbs": jim_c, "fat": jim_f},
+    }
+    entry.setdefault("user_corrections", []).append(correction)
+    # Overwrite name + macros fields
+    entry["name"] = new_name[:30]
+    entry["calories"] = jim_kcal
+    entry["protein"] = jim_p
+    entry["protein_g"] = jim_p
+    entry["carbs"] = jim_c
+    entry["carbs_g"] = jim_c
+    entry["fat"] = jim_f
+    entry["fat_g"] = jim_f
+    # v2.7.37: regenerate coach comment for new dish
+    entry["coach_comment"] = _coach_comment(new_name, jim_kcal, jim_p, jim_c, jim_f, restaurant)
+    # Mark for downstream (e.g. Google Sheet resync)
+    entry["_renamed_at"] = now_iso()
+    _save_scan_log(scan_log)
+    # Also update nutrition_log.json entry if scan_index matches timestamp
+    if NUTRITION_LOG_PATH.exists():
+        log = json.loads(NUTRITION_LOG_PATH.read_text())
+        meals = log.get("meals", [])
+        ts_iso = entry.get("timestamp_iso")
+        for m in meals:
+            if m.get("timestamp_iso") == ts_iso and m.get("meal_type") == "scan":
+                m.setdefault("user_corrections", []).append(correction)
+                m["name"] = new_name[:30]
+                m["calories"] = jim_kcal
+                m["protein"] = jim_p
+                m["carbs"] = jim_c
+                m["fat"] = jim_f
+                NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+                break
+    return jsonify({
+        "ok": True,
+        "scan_index": scan_index,
+        "entry": entry,
+        "correction": correction,
+    })
+
+
 @app.route("/scan_img/<path:filename>", methods=["GET"])
 def serve_scan_image(filename):
     """Serve scanned food images (for dashboard thumbnail)."""
@@ -6008,6 +6105,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                            }"
                            x-text="scan.coach_comment.grade"></div>
                     </template>
+                    <!-- v2.7.39: rename button (opens inline popover) -->
+                    <button @click="openRenamePopover(scan)"
+                            class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                            title="改名 / 重新辨識">✏️</button>
+                  </div>
+
+                  <!-- v2.7.39: inline rename popover (shown when editingScanIndex === scan.scan_index) -->
+                  <div x-show="editingScanIndex === scan.scan_index" x-cloak
+                       class="mt-2 rounded-lg p-2.5 border border-emerald-400/40 bg-emerald-900/20">
+                    <div class="text-[10px] uppercase tracking-wider text-emerald-300 font-bold mb-1.5">改名 + 自動重新估算營養</div>
+                    <div class="text-[10px] text-gray-400 mb-1.5">
+                      原名：<span class="text-gray-300 line-through" x-text="editingScanOldName"></span>
+                    </div>
+                    <input type="text"
+                           x-model="editingScanNewName"
+                           @keydown.enter="submitRename()"
+                           @keydown.escape="closeRenamePopover()"
+                           placeholder="例：海南雞飯 / Hainanese chicken rice"
+                           class="w-full rounded-lg bg-black/50 px-2.5 py-2 text-sm text-white border border-emerald-400/40 focus:border-emerald-300 outline-none"
+                           maxlength="30"
+                           autofocus>
+                    <div class="flex gap-2 mt-2">
+                      <button @click="submitRename()"
+                              :disabled="!editingScanNewName.trim() || renameSubmitting"
+                              class="flex-1 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span x-show="!renameSubmitting">✓ 改名 + 重新估算</span>
+                        <span x-show="renameSubmitting">⏳ 估算中…</span>
+                      </button>
+                      <button @click="closeRenamePopover()"
+                              class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
+                        ✕ 取消
+                      </button>
+                    </div>
+                    <div x-show="renameSubmitMsg" class="mt-1.5 text-[10px]" x-text="renameSubmitMsg"
+                         :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
+                    <div class="text-[9px] text-gray-500 mt-1">舊名會保留喺 audit trail（永久）</div>
                   </div>
                   <!-- inline P/C/F + kcal + time + flags -->
                   <div class="flex items-baseline gap-2 mt-1 text-xs flex-wrap">
@@ -6350,6 +6483,12 @@ function gymApp() {
     cheerPollTimer: null,     // setInterval handle for status polling
     correctForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: '', note: '' },
     correctSubmitMsg: '',
+    // v2.7.39: inline rename popover per scan (Jim OOB "rename 白切雞 → 海南雞飯")
+    editingScanIndex: null,
+    editingScanNewName: '',
+    editingScanOldName: '',
+    renameSubmitting: false,
+    renameSubmitMsg: '',
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
     photostream: [],           // today's images with optional classification
     photostreamClassifying: false,
@@ -7686,6 +7825,60 @@ function gymApp() {
       }
     },
 
+    // v2.7.39: Open inline rename popover for a scan card
+    openRenamePopover(scan) {
+      this.editingScanIndex = scan.scan_index;
+      this.editingScanNewName = scan.name || '';
+      this.editingScanOldName = scan.name || '';
+      this.renameSubmitting = false;
+      this.renameSubmitMsg = '';
+      this.haptic(10);
+    },
+    closeRenamePopover() {
+      this.editingScanIndex = null;
+      this.editingScanNewName = '';
+      this.editingScanOldName = '';
+      this.renameSubmitMsg = '';
+    },
+    async submitRename() {
+      if (this.editingScanIndex == null) return;
+      const newName = (this.editingScanNewName || '').trim();
+      if (!newName) {
+        this.renameSubmitMsg = '新名唔可以空';
+        return;
+      }
+      if (newName === this.editingScanOldName) {
+        this.renameSubmitMsg = '同原名一樣，唔使改';
+        return;
+      }
+      this.renameSubmitting = true;
+      this.renameSubmitMsg = '';
+      try {
+        const r = await fetch('/api/scan_rename', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scan_index: this.editingScanIndex,
+            new_name: newName,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          this.renameSubmitMsg = '✓ 改名 + 重新估算成功';
+          this.haptic(40);
+          // Reload scans to reflect new name + macros
+          await this.loadRecentScans();
+          setTimeout(() => this.closeRenamePopover(), 800);
+        } else {
+          this.renameSubmitMsg = '失敗：' + (data.error || '未知');
+        }
+      } catch(e) {
+        this.renameSubmitMsg = 'Error：' + e.message;
+      } finally {
+        this.renameSubmitting = false;
+      }
+    },
+
     haptic(pattern = 30) {
       try { if (navigator.vibrate) navigator.vibrate(pattern); } catch(e) {}
     },
@@ -7766,7 +7959,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v70';
+const CACHE = 'gym-web-v71';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
