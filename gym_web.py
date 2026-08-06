@@ -6621,175 +6621,173 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
           </div>
 
-          <!-- Per-day entries — large thumbnail (96px) for PT screenshot/share -->
+          <!-- Per-day entries — vertical layout, full-width title (Jim OOB 2026-08-07
+               "Food title display is very bad. Pls give more space to display. No wrap") -->
           <template x-for="scan in group.items" :key="scan.scan_index">
             <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
-              <div class="flex gap-3 items-center">
-                <!-- v2.7.38: HUGE thumbnail 50% of screen width (was 96/128px) — easy for PT to see details -->
-                <template x-if="scan.image_url">
-                  <img :src="scan.image_url"
-                       class="w-[50%] aspect-square rounded-xl object-cover bg-black/40 flex-shrink-0 cursor-pointer active:scale-95"
-                       style="max-width: 220px;"
-                       loading="lazy"
-                       @click="window.open(scan.image_url, '_blank')">
-                </template>
-                <!-- Fallback when no image: 50% width placeholder -->
-                <template x-if="!scan.image_url">
-                  <div class="w-[50%] aspect-square rounded-xl bg-white/5 border border-white/10 flex items-center justify-center flex-shrink-0"
-                       style="max-width: 220px;">
-                    <div class="text-5xl" x-text="scan.is_text_only ? '⌨️' : '🍽️'"></div>
-                  </div>
-                </template>
-                <div class="flex-1 min-w-0">
-                  <div class="flex items-baseline gap-2 mb-0.5">
-                    <div class="text-base font-bold text-white leading-relaxed flex-1 min-w-0"
-                         style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;"
-                         x-text="scan.name || scan.vision_short || '—'"></div>
-                    <!-- v2.7.37: coach grade badge (A+/A/B/C/D/F) -->
-                    <template x-if="scan.coach_comment?.grade">
-                      <div class="text-xs font-black px-1.5 py-0.5 rounded-md flex-shrink-0"
-                           :class="{
-                             'bg-emerald-500/30 text-emerald-200': ['A+','A'].includes(scan.coach_comment.grade),
-                             'bg-lime-500/25 text-lime-200': scan.coach_comment.grade === 'B',
-                             'bg-yellow-500/25 text-yellow-200': scan.coach_comment.grade === 'C',
-                             'bg-orange-500/30 text-orange-200': scan.coach_comment.grade === 'D',
-                             'bg-red-500/30 text-red-200': scan.coach_comment.grade === 'F',
-                           }"
-                           x-text="scan.coach_comment.grade"></div>
-                    </template>
-                    <!-- v2.7.39: rename button (opens inline popover) -->
-                    <button @click="openRenamePopover(scan)"
-                            class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
-                            title="改名 / 重新辨識">✏️</button>
-                    <!-- v2.7.43: edit date/time button -->
-                    <button @click="openEditDateTimePopover(scan)"
-                            class="text-xs text-sky-300 hover:text-sky-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
-                            title="改日期 / 時間">⏰</button>
-                    <!-- v2.7.42: delete button (cascade food_scan_log + nutrition_log + Sheet) -->
-                    <button @click="openDeleteConfirm(scan)"
-                            class="text-xs text-red-300 hover:text-red-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
-                            title="刪除呢個 entry（連 Sheet 都會刪）">🗑️</button>
-                  </div>
-
-                  <!-- v2.7.43: edit date/time popover -->
-                  <div x-show="editingDateTimeIndex === scan.scan_index" x-cloak
-                       class="mt-2 rounded-lg p-2.5 border border-sky-400/40 bg-sky-900/20"
-                       @keydown.escape="closeEditDateTimePopover()">
-                    <div class="text-[10px] uppercase tracking-wider text-sky-300 font-bold mb-1.5">改日期 / 時間</div>
-                    <div class="text-[10px] text-gray-400 mb-1.5">
-                      原：<span class="text-gray-300" x-text="editingDateTimeOld"></span>
-                    </div>
-                    <div class="grid grid-cols-2 gap-2">
-                      <div>
-                        <label class="block text-[9px] text-gray-400 mb-0.5 uppercase">新日期</label>
-                        <input type="date"
-                               x-model="editingDateTimeNewDate"
-                               @keydown.enter="submitEditDateTime()"
-                               @keydown.escape="closeEditDateTimePopover()"
-                               class="w-full rounded-lg bg-black/50 px-2 py-1.5 text-xs text-white border border-sky-400/40 focus:border-sky-300 outline-none"
-                               autofocus>
-                      </div>
-                      <div>
-                        <label class="block text-[9px] text-gray-400 mb-0.5 uppercase">新時間 (24h)</label>
-                        <input type="time"
-                               x-model="editingDateTimeNewTime"
-                               @keydown.enter="submitEditDateTime()"
-                               @keydown.escape="closeEditDateTimePopover()"
-                               class="w-full rounded-lg bg-black/50 px-2 py-1.5 text-xs text-white border border-sky-400/40 focus:border-sky-300 outline-none">
-                      </div>
-                    </div>
-                    <div class="flex gap-2 mt-2">
-                      <button @click="submitEditDateTime()"
-                              :disabled="!editingDateTimeNewDate || !editingDateTimeNewTime || editDateTimeSubmitting"
-                              class="flex-1 rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
-                        <span x-show="!editDateTimeSubmitting">✓ 改日期時間</span>
-                        <span x-show="editDateTimeSubmitting">⏳ 更新中…</span>
-                      </button>
-                      <button @click="closeEditDateTimePopover()"
-                              class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
-                        ✕ 取消
-                      </button>
-                    </div>
-                    <div x-show="editDateTimeSubmitMsg" class="mt-1.5 text-[10px]" x-text="editDateTimeSubmitMsg"
-                         :class="editDateTimeSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
-                    <div class="text-[9px] text-gray-500 mt-1">會更新 food log + nutrition log + Google Sheet，audit trail 永久保留</div>
-                  </div>
-
-                  <!-- v2.7.39: inline rename popover (shown when editingScanIndex === scan.scan_index) -->
-                  <div x-show="editingScanIndex === scan.scan_index" x-cloak
-                       class="mt-2 rounded-lg p-2.5 border border-emerald-400/40 bg-emerald-900/20">
-                    <div class="text-[10px] uppercase tracking-wider text-emerald-300 font-bold mb-1.5">改名 + 自動重新估算營養</div>
-                    <div class="text-[10px] text-gray-400 mb-1.5">
-                      原名：<span class="text-gray-300 line-through" x-text="editingScanOldName"></span>
-                    </div>
-                    <input type="text"
-                           x-model="editingScanNewName"
-                           @keydown.enter="submitRename()"
-                           @keydown.escape="closeRenamePopover()"
-                           placeholder="例：海南雞飯 / Hainanese chicken rice"
-                           class="w-full rounded-lg bg-black/50 px-2.5 py-2 text-sm text-white border border-emerald-400/40 focus:border-emerald-300 outline-none"
-                           maxlength="30"
-                           autofocus>
-                    <div class="flex gap-2 mt-2">
-                      <button @click="submitRename()"
-                              :disabled="!editingScanNewName.trim() || renameSubmitting"
-                              class="flex-1 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
-                        <span x-show="!renameSubmitting">✓ 改名 + 重新估算</span>
-                        <span x-show="renameSubmitting">⏳ 估算中…</span>
-                      </button>
-                      <button @click="closeRenamePopover()"
-                              class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
-                        ✕ 取消
-                      </button>
-                    </div>
-                    <div x-show="renameSubmitMsg" class="mt-1.5 text-[10px]" x-text="renameSubmitMsg"
-                         :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
-                    <div class="text-[9px] text-gray-500 mt-1">舊名會保留喺 audit trail（永久）</div>
-                  </div>
-                  <!-- v2.7.42: delete confirm popover (cascade food_scan_log + nutrition_log + Sheet) -->
-                  <div x-show="deletingScanIndex === scan.scan_index" x-cloak
-                       class="mt-2 rounded-xl border border-red-400/40 bg-red-500/10 p-2.5"
-                       @keydown.escape="closeDeleteConfirm()">
-                    <div class="text-[11px] text-red-200 mb-1.5 font-semibold">⚠️ 確認刪除？</div>
-                    <div class="text-[10px] text-gray-300 mb-2 leading-snug">
-                      會一併刪：<span class="text-white font-semibold">food log</span> ·
-                      <span class="text-white font-semibold">nutrition log</span> ·
-                      <span class="text-white font-semibold">Google Sheet 對應 row</span><br>
-                      圖片檔會保留（audit trail）。<span class="text-gray-500">呢個操作<span class="text-red-300 font-bold">唔可以 undo</span>。</span>
-                    </div>
-                    <div class="flex gap-2">
-                      <button @click="confirmDeleteScan()"
-                              :disabled="deleteSubmitting"
-                              class="flex-1 rounded-lg bg-red-500 px-3 py-1.5 text-xs font-bold text-white active:scale-95 disabled:opacity-50">
-                        <span x-show="!deleteSubmitting">🗑️ 確認刪除</span>
-                        <span x-show="deleteSubmitting">⏳ 刪緊…</span>
-                      </button>
-                      <button @click="closeDeleteConfirm()"
-                              class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
-                        ✕ 取消
-                      </button>
-                    </div>
-                    <div x-show="deleteSubmitMsg" class="mt-1.5 text-[10px]"
-                         :class="deleteSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"
-                         x-text="deleteSubmitMsg"></div>
-                  </div>
-                  <!-- inline P/C/F + kcal + time + flags -->
-                  <div class="flex items-baseline gap-2 mt-1 text-xs flex-wrap">
-                    <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span><span class="text-gray-400"> kcal</span></span>
-                    <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
-                    <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
-                    <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
-                    <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
-                    <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
-                  </div>
-                  <div class="text-[10px] text-gray-500 mt-0.5" x-text="scan.time_label || formatScanTime(scan.timestamp_iso)"></div>
-                  <!-- v2.7.37: coach comment (one-liner) -->
-                  <template x-if="scan.coach_comment?.comment">
-                    <div class="mt-1.5 text-[11px] text-emerald-200/80 leading-snug"
-                         x-text="`🧑‍🏫 ${scan.coach_comment.comment}`"></div>
-                  </template>
+              <!-- Row 1: full-width image on top (max 200px, 16:9 ratio) -->
+              <template x-if="scan.image_url">
+                <img :src="scan.image_url"
+                     class="w-full aspect-[16/9] rounded-xl object-cover bg-black/40 mb-2 cursor-pointer active:scale-95"
+                     style="max-height: 200px;"
+                     loading="lazy"
+                     @click="window.open(scan.image_url, '_blank')">
+              </template>
+              <!-- Fallback when no image: full-width icon strip -->
+              <template x-if="!scan.image_url">
+                <div class="w-full aspect-[16/9] rounded-xl bg-white/5 border border-white/10 flex items-center justify-center mb-2"
+                     style="max-height: 80px;">
+                  <div class="text-4xl" x-text="scan.is_text_only ? '⌨️' : '🍽️'"></div>
                 </div>
+              </template>
+              <!-- Row 2: title — full width, single line, horizontal scroll if too long -->
+              <div class="flex items-center gap-2 mb-1.5">
+                <div class="text-lg font-bold text-white whitespace-nowrap flex-1 min-w-0 overflow-x-auto"
+                     style="scrollbar-width: none; -ms-overflow-style: none;"
+                     x-text="scan.name || scan.vision_short || '—'"></div>
+                <!-- v2.7.37: coach grade badge (A+/A/B/C/D/F) -->
+                <template x-if="scan.coach_comment?.grade">
+                  <div class="text-xs font-black px-1.5 py-0.5 rounded-md flex-shrink-0"
+                       :class="{
+                         'bg-emerald-500/30 text-emerald-200': ['A+','A'].includes(scan.coach_comment.grade),
+                         'bg-lime-500/25 text-lime-200': scan.coach_comment.grade === 'B',
+                         'bg-yellow-500/25 text-yellow-200': scan.coach_comment.grade === 'C',
+                         'bg-orange-500/30 text-orange-200': scan.coach_comment.grade === 'D',
+                         'bg-red-500/30 text-red-200': scan.coach_comment.grade === 'F',
+                       }"
+                       x-text="scan.coach_comment.grade"></div>
+                </template>
+                <!-- v2.7.39: rename button (opens inline popover) -->
+                <button @click="openRenamePopover(scan)"
+                        class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                        title="改名 / 重新辨識">✏️</button>
+                <!-- v2.7.43: edit date/time button -->
+                <button @click="openEditDateTimePopover(scan)"
+                        class="text-xs text-sky-300 hover:text-sky-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                        title="改日期 / 時間">⏰</button>
+                <!-- v2.7.42: delete button (cascade food_scan_log + nutrition_log + Sheet) -->
+                <button @click="openDeleteConfirm(scan)"
+                        class="text-xs text-red-300 hover:text-red-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                        title="刪除呢個 entry（連 Sheet 都會刪）">🗑️</button>
               </div>
+
+              <!-- v2.7.43: edit date/time popover -->
+              <div x-show="editingDateTimeIndex === scan.scan_index" x-cloak
+                   class="mt-2 rounded-lg p-2.5 border border-sky-400/40 bg-sky-900/20"
+                   @keydown.escape="closeEditDateTimePopover()">
+                <div class="text-[10px] uppercase tracking-wider text-sky-300 font-bold mb-1.5">改日期 / 時間</div>
+                <div class="text-[10px] text-gray-400 mb-1.5">
+                  原：<span class="text-gray-300" x-text="editingDateTimeOld"></span>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                  <div>
+                    <label class="block text-[9px] text-gray-400 mb-0.5 uppercase">新日期</label>
+                    <input type="date"
+                           x-model="editingDateTimeNewDate"
+                           @keydown.enter="submitEditDateTime()"
+                           @keydown.escape="closeEditDateTimePopover()"
+                           class="w-full rounded-lg bg-black/50 px-2 py-1.5 text-xs text-white border border-sky-400/40 focus:border-sky-300 outline-none"
+                           autofocus>
+                  </div>
+                  <div>
+                    <label class="block text-[9px] text-gray-400 mb-0.5 uppercase">新時間 (24h)</label>
+                    <input type="time"
+                           x-model="editingDateTimeNewTime"
+                           @keydown.enter="submitEditDateTime()"
+                           @keydown.escape="closeEditDateTimePopover()"
+                           class="w-full rounded-lg bg-black/50 px-2 py-1.5 text-xs text-white border border-sky-400/40 focus:border-sky-300 outline-none">
+                  </div>
+                </div>
+                <div class="flex gap-2 mt-2">
+                  <button @click="submitEditDateTime()"
+                          :disabled="!editingDateTimeNewDate || !editingDateTimeNewTime || editDateTimeSubmitting"
+                          class="flex-1 rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                    <span x-show="!editDateTimeSubmitting">✓ 改日期時間</span>
+                    <span x-show="editDateTimeSubmitting">⏳ 更新中…</span>
+                  </button>
+                  <button @click="closeEditDateTimePopover()"
+                          class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
+                    ✕ 取消
+                  </button>
+                </div>
+                <div x-show="editDateTimeSubmitMsg" class="mt-1.5 text-[10px]" x-text="editDateTimeSubmitMsg"
+                     :class="editDateTimeSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
+                <div class="text-[9px] text-gray-500 mt-1">會更新 food log + nutrition log + Google Sheet，audit trail 永久保留</div>
+              </div>
+
+              <!-- v2.7.39: inline rename popover (shown when editingScanIndex === scan.scan_index) -->
+              <div x-show="editingScanIndex === scan.scan_index" x-cloak
+                   class="mt-2 rounded-lg p-2.5 border border-emerald-400/40 bg-emerald-900/20">
+                <div class="text-[10px] uppercase tracking-wider text-emerald-300 font-bold mb-1.5">改名 + 自動重新估算營養</div>
+                <div class="text-[10px] text-gray-400 mb-1.5">
+                  原名：<span class="text-gray-300 line-through" x-text="editingScanOldName"></span>
+                </div>
+                <input type="text"
+                       x-model="editingScanNewName"
+                       @keydown.enter="submitRename()"
+                       @keydown.escape="closeRenamePopover()"
+                       placeholder="例：海南雞飯 / Hainanese chicken rice"
+                       class="w-full rounded-lg bg-black/50 px-2.5 py-2 text-sm text-white border border-emerald-400/40 focus:border-emerald-300 outline-none"
+                       maxlength="30"
+                       autofocus>
+                <div class="flex gap-2 mt-2">
+                  <button @click="submitRename()"
+                          :disabled="!editingScanNewName.trim() || renameSubmitting"
+                          class="flex-1 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                    <span x-show="!renameSubmitting">✓ 改名 + 重新估算</span>
+                    <span x-show="renameSubmitting">⏳ 估算中…</span>
+                  </button>
+                  <button @click="closeRenamePopover()"
+                          class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
+                    ✕ 取消
+                  </button>
+                </div>
+                <div x-show="renameSubmitMsg" class="mt-1.5 text-[10px]" x-text="renameSubmitMsg"
+                     :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
+                <div class="text-[9px] text-gray-500 mt-1">舊名會保留喺 audit trail（永久）</div>
+              </div>
+              <!-- v2.7.42: delete confirm popover (cascade food_scan_log + nutrition_log + Sheet) -->
+              <div x-show="deletingScanIndex === scan.scan_index" x-cloak
+                   class="mt-2 rounded-xl border border-red-400/40 bg-red-500/10 p-2.5"
+                   @keydown.escape="closeDeleteConfirm()">
+                <div class="text-[11px] text-red-200 mb-1.5 font-semibold">⚠️ 確認刪除？</div>
+                <div class="text-[10px] text-gray-300 mb-2 leading-snug">
+                  會一併刪：<span class="text-white font-semibold">food log</span> ·
+                  <span class="text-white font-semibold">nutrition log</span> ·
+                  <span class="text-white font-semibold">Google Sheet 對應 row</span><br>
+                  圖片檔會保留（audit trail）。<span class="text-gray-500">呢個操作<span class="text-red-300 font-bold">唔可以 undo</span>。</span>
+                </div>
+                <div class="flex gap-2">
+                  <button @click="confirmDeleteScan()"
+                          :disabled="deleteSubmitting"
+                          class="flex-1 rounded-lg bg-red-500 px-3 py-1.5 text-xs font-bold text-white active:scale-95 disabled:opacity-50">
+                    <span x-show="!deleteSubmitting">🗑️ 確認刪除</span>
+                    <span x-show="deleteSubmitting">⏳ 刪緊…</span>
+                  </button>
+                  <button @click="closeDeleteConfirm()"
+                          class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
+                    ✕ 取消
+                  </button>
+                </div>
+                <div x-show="deleteSubmitMsg" class="mt-1.5 text-[10px]"
+                     :class="deleteSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"
+                     x-text="deleteSubmitMsg"></div>
+              </div>
+              <!-- inline P/C/F + kcal + time + flags -->
+              <div class="flex items-baseline gap-2 mt-1 text-xs flex-wrap">
+                <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span><span class="text-gray-400"> kcal</span></span>
+                <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
+                <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
+                <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
+                <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
+                <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
+              </div>
+              <div class="text-[10px] text-gray-500 mt-0.5" x-text="scan.time_label || formatScanTime(scan.timestamp_iso)"></div>
+              <!-- v2.7.37: coach comment (one-liner) -->
+              <template x-if="scan.coach_comment?.comment">
+                <div class="mt-1.5 text-[11px] text-emerald-200/80 leading-snug"
+                     x-text="`🧑‍🏫 ${scan.coach_comment.comment}`"></div>
+              </template>
             </div>
           </template>
         </div>
@@ -8769,7 +8767,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v82';
+const CACHE = 'gym-web-v83';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
