@@ -2468,6 +2468,117 @@ def _merge_nutrition_estimates(estimates: list) -> dict:
     return merged
 
 
+# v2.7.37: Coach comment + food grading (Jim OOB 2026-08-06: "It would be great if
+# there is a coach comment and suggest on the food that i log. therefore, it should
+# not be just recognizing but also what are good selection and bad selection of food")
+# Uses MiniMax M3 text-only (no image needed) to score + suggest.
+# Returns: {grade: 'A+'|'A'|'B'|'C'|'D'|'F', comment: str, suggestions: [str, ...], rationale: str}
+def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "", user_context: str = "") -> dict:
+    """Generate coach comment for a logged food.
+    Scoring rubric (rough HK fitness coach perspective):
+      - A+: 80%+ calories from protein, low fat, high micronutrient density
+      - A:  good macros, balanced, < 30% kcal from fat
+      - B:  acceptable, moderate macros, < 40% kcal from fat
+      - C:  high carb or high fat, but still reasonable
+      - D:  high fat > 50% or high sodium expected
+      - F:   deep fried + sugary combo, very low protein/calorie
+    """
+    if not dish_name or calories <= 0:
+        return {"grade": "—", "comment": "資料不足", "suggestions": [], "rationale": "calories = 0, 冇資料可以評"}
+    # Heuristic pre-grade (deterministic, no API call needed for fast feedback)
+    protein_pct = (protein * 4) / max(calories, 1) * 100
+    fat_pct = (fat * 9) / max(calories, 1) * 100
+    carb_pct = (carbs * 4) / max(calories, 1) * 100
+    pre_grade = "B"
+    if protein_pct >= 35 and fat_pct < 30:
+        pre_grade = "A+"
+    elif protein_pct >= 25 and fat_pct < 35:
+        pre_grade = "A"
+    elif fat_pct > 55 or (protein_pct < 10 and carb_pct > 70):
+        pre_grade = "F"
+    elif fat_pct > 45 or protein_pct < 12:
+        pre_grade = "D"
+    elif fat_pct > 40 or protein_pct < 18:
+        pre_grade = "C"
+    # Pre-comment based on macros
+    pre_comment = ""
+    suggestions = []
+    if fat_pct > 50:
+        pre_comment = f"脂肪佔 {fat_pct:.0f}% 卡路里，偏高。"
+        suggestions.append("下次可選少油版本（走醬 / 少汁 / 走炸皮）")
+    if protein_pct < 15 and calories > 300:
+        pre_comment = f"蛋白質只佔 {protein_pct:.0f}%，偏低。"
+        suggestions.append("加一隻蛋 / 雞胸 / 豆腐提升蛋白比例")
+    if carb_pct > 65 and calories > 400:
+        pre_comment = (pre_comment + " 碳水比例高。").strip()
+        suggestions.append("配菜加多啲菜，飯量減 1/3")
+    if protein_pct >= 30 and fat_pct < 30:
+        pre_comment = f"蛋白質 {protein_pct:.0f}%，脂肪 {fat_pct:.0f}%，比例好。"
+    if not pre_comment:
+        pre_comment = "中規中矩，可以接受。"
+    # Call MiniMax M3 for richer 1-line coach comment + extra suggestions
+    api_comment = None
+    try:
+        prompt = (
+            f"你係香港私人健身教練，操繁體中文廣東話。一句講晒，最多 50 字。\n"
+            f"食物：{dish_name}\n"
+            f"餐廳：{restaurant or '無'}\n"
+            f"營養：{calories:.0f} kcal · 蛋白 {protein:.0f}g · 碳 {carbs:.0f}g · 脂 {fat:.0f}g\n"
+            f"用戶目標：{user_context or '減脂 + 增肌'}\n\n"
+            f"格式：先講「好/普通/差」一句，再比 1 個具體改善建議。例：「脂肪佔 65% 太高，建議下次走皮走醬。」\n"
+            f"唔好講廢話，直接 point。"
+        )
+        payload = {
+            "model": "MiniMax-Text-01",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 120,
+            "temperature": 0.3,
+        }
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "".join(["Bearer ", os.environ.get("MINIMAX_API_KEY", "")]),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        api_comment = data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        api_comment = None
+    final_comment = api_comment or pre_comment
+    return {
+        "grade": pre_grade,
+        "comment": final_comment,
+        "suggestions": suggestions[:2],  # max 2
+        "rationale": f"蛋白 {protein_pct:.0f}% · 碳 {carb_pct:.0f}% · 脂 {fat_pct:.0f}%",
+    }
+
+
+# v2.7.37: DDG web search (Jim OOB 2026-08-06: "bundled with all the search tools
+# such as pplx, ddg"). Use for brand/origin/portion verification when scan has
+# branded or unclear dish. Returns top 5 result snippets.
+def _ddg_search(query: str, max_results: int = 5) -> list:
+    """Search DuckDuckGo for brand/origin/portion confirmation.
+    Returns list of {'title', 'snippet', 'url'}.
+    """
+    try:
+        from ddgs import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results, region="hk-tw"))
+        return [{"title": r.get("title", ""), "snippet": r.get("body", "")[:200], "url": r.get("href", "")} for r in results]
+    except Exception:
+        # Fallback: try duckduckgo_search package
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results, region="hk-tw"))
+            return [{"title": r.get("title", ""), "snippet": r.get("body", "")[:200], "url": r.get("href", "")} for r in results]
+        except Exception:
+            return []
+
+
 def _detect_shared_meal(dish_desc: str) -> bool:
     """Heuristic — detect if dish description suggests shared meal.
 
@@ -2813,6 +2924,12 @@ def api_scan_food():
         "confidence": "12-field median-merged (Jim can correct via /api/scan_correct)",
         "sheet_synced": False,
         "image_saved_to": "",  # filled below
+        # v2.7.37: coach comment + grading (Jim OOB 2026-08-06)
+        "coach_comment": _coach_comment(
+            field_entries.get("name") or _extract_dish_name(vision_desc, pplx_desc),
+            field_entries["calories"], field_entries["protein"],
+            field_entries["carbs"], field_entries["fat"],
+        ),
         "user_correction": None,  # permanent — never trimmed (Jim OOB 2026-07-23 22:30 HKT "no trimming of data")
     }
 
@@ -2863,7 +2980,7 @@ def api_scan_recent():
     v2.7.33: drop hash-label fallback entries (e.g. '食物 #a1b2c3 (HH:xx)')
     so the list only shows scans with real dish names.
     """
-    limit = int(request.args.get("limit", 5))
+    limit = int(request.args.get("limit", 100))
     scan_log = _load_scan_log()
     # v2.4: drop failed scans (name/vision_short contain Vision failed marker)
     def _is_failed_scan(s):
@@ -5829,49 +5946,95 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </details>
       </div>
 
-      <!-- Recent scans (last 5) — v2.4 filters out failed uploads -->
-      <div class="flex items-baseline justify-between mb-2">
-        <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 font-bold">最近 5 個 scan</div>
+      <!-- v2.7.37: Pro mobile UI/UX — group by date + large thumbnails for PT sharing -->
+      <div class="flex items-baseline justify-between mb-3">
+        <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 font-bold">食物紀錄（按日分組）</div>
         <div x-show="recentScansFiltered > 0" class="text-[10px] text-gray-500">
-          過濾咗 <span class="text-yellow-300 font-bold" x-text="recentScansFiltered"></span> 條 failed upload
+          過濾咗 <span class="text-yellow-300 font-bold" x-text="recentScansFiltered"></span> 條 failed
         </div>
       </div>
       <template x-if="recentScans.length === 0">
         <div class="text-xs text-gray-500 text-center py-6">未有 scan 紀錄</div>
       </template>
-      <template x-for="scan in recentScansVisible" :key="scan.scan_index">
-        <!-- v2.7.28: ALWAYS expanded (Jim OOB "show other nutrient info"). -->
-        <!-- v2.7.29: scroll-to-load — only renders first batch, fade-in subsequent. -->
-        <!-- v2.7.31: skip image element entirely if no image_url (no blank thumbnail). -->
-        <!-- v2.7.33: cleaner color palette (2 colors not 5) + time as HH:MM not ISO -->
-        <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-4 mb-3">
-          <div class="flex gap-3 items-start">
-            <template x-if="scan.image_url">
-              <img :src="scan.image_url" class="w-20 h-20 rounded-xl object-cover bg-black/40 flex-shrink-0" loading="lazy">
-            </template>
-            <div class="flex-1 min-w-0">
-              <div class="text-base font-bold text-white leading-snug" style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;" x-text="scan.name || scan.vision_short || '—'"></div>
-              <!-- v2.7.33: inline P/C/F + kcal (Jim OOB "why there is no other nutriention info") -->
-              <div class="flex items-baseline gap-3 mt-1.5 text-xs">
-                <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span><span class="text-gray-400"> kcal</span></span>
-                <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
-                <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
-                <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
-                <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
-                <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
-              </div>
-              <div class="text-[10px] text-gray-500 mt-1" x-text="formatScanTime(scan.timestamp_iso)"></div>
+
+      <!-- Group scans by date — render one section per day -->
+      <template x-for="group in recentScansGrouped" :key="group.date">
+        <div class="mb-5">
+          <!-- Date header: date + count + day total kcal -->
+          <div class="flex items-baseline justify-between mb-2 px-1">
+            <div class="flex items-baseline gap-2">
+              <div class="text-base font-black text-emerald-300" x-text="group.date_label"></div>
+              <div class="text-[11px] text-gray-500 font-semibold" x-text="group.weekday"></div>
+              <div class="text-[10px] text-gray-500" x-text="`· ${group.count} 項`"></div>
+            </div>
+            <div class="text-[11px] text-gray-400">
+              <span class="text-white font-bold" x-text="group.total_kcal"></span> kcal
             </div>
           </div>
-          <div class="text-[10px] text-gray-400 mt-2" x-show="scan.note || scan.vision" x-text="scan.note || scan.vision || ''"></div>
+
+          <!-- Per-day entries — large thumbnail (96px) for PT screenshot/share -->
+          <template x-for="scan in group.items" :key="scan.scan_index">
+            <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
+              <div class="flex gap-3 items-center">
+                <!-- v2.7.37: large thumbnail 96x96 (was 80x80) for PT share, no detail page -->
+                <template x-if="scan.image_url">
+                  <img :src="scan.image_url"
+                       class="w-24 h-24 rounded-xl object-cover bg-black/40 flex-shrink-0 cursor-pointer active:scale-95"
+                       loading="lazy"
+                       @click="window.open(scan.image_url, '_blank')">
+                </template>
+                <!-- Fallback when no image: 96x96 placeholder -->
+                <template x-if="!scan.image_url">
+                  <div class="w-24 h-24 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center flex-shrink-0">
+                    <div class="text-3xl" x-text="scan.is_text_only ? '⌨️' : '🍽️'"></div>
+                  </div>
+                </template>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-baseline gap-2 mb-0.5">
+                    <div class="text-base font-bold text-white leading-snug flex-1 min-w-0"
+                         style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;"
+                         x-text="scan.name || scan.vision_short || '—'"></div>
+                    <!-- v2.7.37: coach grade badge (A+/A/B/C/D/F) -->
+                    <template x-if="scan.coach_comment?.grade">
+                      <div class="text-xs font-black px-1.5 py-0.5 rounded-md flex-shrink-0"
+                           :class="{
+                             'bg-emerald-500/30 text-emerald-200': ['A+','A'].includes(scan.coach_comment.grade),
+                             'bg-lime-500/25 text-lime-200': scan.coach_comment.grade === 'B',
+                             'bg-yellow-500/25 text-yellow-200': scan.coach_comment.grade === 'C',
+                             'bg-orange-500/30 text-orange-200': scan.coach_comment.grade === 'D',
+                             'bg-red-500/30 text-red-200': scan.coach_comment.grade === 'F',
+                           }"
+                           x-text="scan.coach_comment.grade"></div>
+                    </template>
+                  </div>
+                  <!-- inline P/C/F + kcal + time + flags -->
+                  <div class="flex items-baseline gap-2 mt-1 text-xs flex-wrap">
+                    <span><span class="text-emerald-300 font-bold" x-text="scan.calories || 0"></span><span class="text-gray-400"> kcal</span></span>
+                    <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
+                    <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
+                    <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
+                    <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
+                    <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
+                  </div>
+                  <div class="text-[10px] text-gray-500 mt-0.5" x-text="scan.time_label || formatScanTime(scan.timestamp_iso)"></div>
+                  <!-- v2.7.37: coach comment (one-liner) -->
+                  <template x-if="scan.coach_comment?.comment">
+                    <div class="mt-1.5 text-[11px] text-emerald-200/80 leading-snug"
+                         x-text="`🧑‍🏫 ${scan.coach_comment.comment}`"></div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </template>
         </div>
       </template>
-      <!-- v2.7.29: progressive scroll sentinel — load more when in view -->
+
+      <!-- Progressive load sentinel -->
       <div x-show="recentScans.length > recentScansVisible.length"
            @click="loadMoreScans()"
            class="text-center py-4 text-xs text-gray-500 cursor-pointer active:opacity-60">
         <span x-show="scansLoadingMore">載入緊…</span>
-        <span x-show="!scansLoadingMore">⬇ 拉落去載入更多 (<span x-text="recentScans.length - recentScansVisible.length"></span> 條)</span>
+        <span x-show="!scansLoadingMore">⬇ 載入更多 (<span x-text="recentScans.length - recentScansVisible.length"></span> 條)</span>
       </div>
       <div x-show="recentScans.length === recentScansVisible.length && recentScans.length > 0"
            class="text-center py-4 text-xs text-gray-500">
@@ -6369,6 +6532,52 @@ function gymApp() {
         groups[e.exercise].vol += (e.weight_kg || 0) * (e.reps || 0);
       }
       return Object.values(groups);
+    },
+
+    // v2.7.37: Group recentScansVisible by date for day-by-day rendering
+    // (Jim OOB 2026-08-06: "i don't see any grouping by days")
+    // Each group: { date: 'YYYY-MM-DD', date_label: '08/06', weekday: '星期三',
+    //                count: 3, total_kcal: 1810, items: [scan, ...] }
+    get recentScansGrouped() {
+      const groups = {};
+      const weekdayNames = ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'];
+      for (const s of this.recentScansVisible) {
+        const ts = s.timestamp_iso || '';
+        const date = ts.slice(0, 10);  // 'YYYY-MM-DD'
+        if (!date || date.length < 10) continue;
+        if (!groups[date]) {
+          // Compute weekday from the date string
+          const [y, m, d] = date.split('-').map(Number);
+          const dt = new Date(y, m - 1, d);
+          const weekday = weekdayNames[dt.getDay()];
+          // Label: today = '今日 HH/MM', yesterday = '昨日 HH/MM', else 'MM/DD'
+          const today = new Date();
+          const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+          const yestMs = today.getTime() - 86400000;
+          const yestDt = new Date(yestMs);
+          const yestStr = `${yestDt.getFullYear()}-${String(yestDt.getMonth() + 1).padStart(2,'0')}-${String(yestDt.getDate()).padStart(2,'0')}`;
+          let label;
+          if (date === todayStr) label = '今日';
+          else if (date === yestStr) label = '昨日';
+          else label = `${String(m).padStart(2,'0')}/${String(d).padStart(2,'0')}`;
+          groups[date] = {
+            date, date_label: label, weekday,
+            count: 0, total_kcal: 0, items: [],
+          };
+        }
+        groups[date].count += 1;
+        groups[date].total_kcal += (s.calories || 0);
+        // Add HH:MM time_label inline (avoid formatScanTime round-trip)
+        const time = ts.slice(11, 16);  // 'HH:MM'
+        groups[date].items.push({ ...s, time_label: time });
+      }
+      // Sort items within each group by time ascending (chronological)
+      for (const g of Object.values(groups)) {
+        g.items.sort((a, b) => (a.timestamp_iso || '').localeCompare(b.timestamp_iso || ''));
+        g.total_kcal = Math.round(g.total_kcal);
+      }
+      // Return as array sorted by date DESC (newest first)
+      return Object.values(groups).sort((a, b) => b.date.localeCompare(a.date));
     },
 
     pickExercise(name) {
@@ -7555,7 +7764,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v67';
+const CACHE = 'gym-web-v69';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
