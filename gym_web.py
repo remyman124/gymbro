@@ -3677,6 +3677,213 @@ def api_scan_preview_from_path():
     return jsonify({"ok": True, "preview": preview})
 
 
+def _sheet_delete_nutrition_rows(matcher_fn) -> dict:
+    """Delete rows from Google Sheet Nutrition tab where matcher_fn(row, idx) -> bool.
+
+    Uses batchUpdate deleteDimension. matcher_fn receives the row values array
+    (already 1-indexed in display but 0-indexed in array — header is at index 0
+    if header row exists, otherwise data starts at 0). Returns
+    {"ok": bool, "deleted": int, "errors": list[str]}.
+    """
+    try:
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        if "token" not in tok or not tok.get("refresh_token"):
+            return {"ok": False, "deleted": 0, "errors": ["no_token"]}
+        # Refresh access token
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        access = resp["access_token"]
+        tok["token"] = access
+        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        NUTRITION_SHEET_ID = 474877075  # numeric sheetId, not tab name
+        # Read all rows
+        url_read = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:M1000?valueRenderOption=FORMATTED_VALUE"
+        req_read = urllib.request.Request(url_read, headers={"Authorization": f"Bearer {access}"})
+        all_rows = json.loads(urllib.request.urlopen(req_read, timeout=10).read()).get("values", [])
+        # Find matching rows (skip header at index 0)
+        # collect (0-based sheet row index, list row) pairs
+        matches = []
+        for idx, row in enumerate(all_rows):
+            if idx == 0:
+                continue  # skip header
+            if matcher_fn(row, idx):
+                matches.append(idx)  # 0-based row index in the sheet (header=row 0)
+        if not matches:
+            return {"ok": True, "deleted": 0, "errors": []}
+        # Build deleteDimension requests — must delete from bottom up to preserve indices
+        matches.sort(reverse=True)
+        requests = []
+        for row_idx in matches:
+            requests.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": NUTRITION_SHEET_ID,
+                        "dimension": "ROWS",
+                        "startIndex": row_idx,
+                        "endIndex": row_idx + 1,
+                    }
+                }
+            })
+        body = {"requests": requests}
+        url_batch = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}:batchUpdate"
+        req_batch = urllib.request.Request(
+            url_batch, data=json.dumps(body).encode(), method="POST",
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req_batch, timeout=15).read()
+        return {"ok": True, "deleted": len(matches), "errors": []}
+    except Exception as e:
+        return {"ok": False, "deleted": 0, "errors": [str(e)]}
+
+
+@app.route("/api/scan_delete", methods=["POST"])
+def api_scan_delete():
+    """Jim OOB 2026-08-06: 'Add function to remove historical upload. And cascade
+    delete/update g sheet'.
+
+    Cascades across 3 stores:
+      1. food_scan_log.json → pop entry at scan_index (or by fallback matcher)
+      2. nutrition_log.json → drop matching meal (by timestamp_iso + meal_type=scan)
+      3. Google Sheet Nutrition tab → delete row(s) matching (date, time, calories, name)
+
+    Image file on disk is preserved (audit trail).
+
+    Body: { scan_index: int, timestamp_iso?: str, name?: str, calories?: int }
+    The scan_index is a HINT (array index in current scan_log snapshot); the
+    server uses (timestamp_iso, name, calories) for authoritative matching to
+    avoid stale-index issues after multiple deletes shift the array.
+    Returns: { ok, scan_index_removed, nutrition_log_removed, sheet_rows_deleted, errors }
+    """
+    data = request.get_json(silent=True) or {}
+    scan_index_hint = data.get("scan_index")
+    ts_iso_hint = data.get("timestamp_iso")
+    name_hint = data.get("name") or data.get("meal_name")
+    cal_hint = data.get("calories")
+
+    scan_log = _load_scan_log()
+    removed_entry = None
+    removed_idx = None
+    # Authoritative match: (timestamp_iso + name) — handles multi-delete index shifts
+    if ts_iso_hint and name_hint:
+        for i, e in enumerate(scan_log):
+            if (e.get("timestamp_iso") == ts_iso_hint
+                    and e.get("name") == name_hint):
+                removed_entry = scan_log.pop(i)
+                removed_idx = i
+                break
+    # Fallback: by scan_index (works only if no prior delete shifted array)
+    if removed_entry is None and isinstance(scan_index_hint, int) and 0 <= scan_index_hint < len(scan_log):
+        # If hint came with timestamp+name, also verify the hint entry matches
+        # the hint tuple — otherwise the index is stale from a prior delete.
+        hint_entry = scan_log[scan_index_hint]
+        if (ts_iso_hint and hint_entry.get("timestamp_iso") != ts_iso_hint):
+            # Stale index — do NOT delete (would shift other entries)
+            return jsonify({
+                "ok": False,
+                "error": "stale_index",
+                "hint": "頁面可能有過時嘅 scan_index，請 reload 後再試。Server 同時接 (timestamp_iso, name) 做權威 match。",
+                "current_index_length": len(scan_log),
+            }), 409
+        removed_entry = scan_log.pop(scan_index_hint)
+        removed_idx = scan_index_hint
+    if removed_entry is None:
+        return jsonify({"ok": False, "error": "entry not found"}), 404
+
+    # Persist scan log
+    _save_scan_log(scan_log)
+
+    # Cascade 1: nutrition_log.json — match by timestamp_iso + meal_type=scan
+    nutrition_removed = 0
+    try:
+        if NUTRITION_LOG_PATH.exists():
+            nlog = json.loads(NUTRITION_LOG_PATH.read_text())
+            meals = nlog.get("meals", [])
+            ts_iso = removed_entry.get("timestamp_iso")
+            entry_name = removed_entry.get("name")
+            new_meals = []
+            for m in meals:
+                if (m.get("timestamp_iso") == ts_iso
+                        and m.get("meal_type") == "scan"
+                        and m.get("name") == entry_name):
+                    nutrition_removed += 1
+                    continue  # drop
+                new_meals.append(m)
+            nlog["meals"] = new_meals
+            NUTRITION_LOG_PATH.write_text(json.dumps(nlog, ensure_ascii=False, indent=2))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"nutrition_log write failed: {e}",
+                        "scan_index_removed": removed_idx}), 500
+
+    # Cascade 2: Google Sheet Nutrition tab — match by (date, time ~±1 min, calories)
+    # Note: do NOT match by name — sheet column D uses raw vision description
+    # (e.g. "呢張相顯示咗一碟炸龍蝦肉，配有幾塊麵包...") which is different from
+    # the user-facing name field in scan_log (e.g. "椒鹽龍蝦"). Sheet's time column
+    # is also rounded to whole minutes ("09:35:32" → "09:35:00"), so allow ±1 min.
+    sheet_result = {"ok": False, "deleted": 0, "errors": ["not_attempted"]}
+    try:
+        ts_iso = removed_entry.get("timestamp_iso", "")
+        entry_date = ts_iso[:10] if ts_iso else ""
+        # Normalize entry time to HH:MM (sheet is whole-minute)
+        entry_time_hhmm = ts_iso[11:16] if len(ts_iso) >= 16 else ""
+        entry_time_minutes = None
+        if entry_time_hhmm and ':' in entry_time_hhmm:
+            try:
+                hh, mm = entry_time_hhmm.split(':')[:2]
+                entry_time_minutes = int(hh) * 60 + int(mm)
+            except Exception:
+                pass
+        entry_cal = str(int(removed_entry.get("calories", 0) or 0))
+
+        def matcher(row, idx):
+            if not row:
+                return False
+            row_date = row[0] if len(row) > 0 else ""
+            row_time_full = row[1] if len(row) > 1 else ''
+            row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
+            row_cal = row[5] if len(row) > 5 else ''
+            # Time tolerance: ±3 minutes
+            # Note: sheet's time column records PUSH time (when _append_to_sheet_nutrition
+            # was called), which can drift from scan_log's COMMIT time by up to ~3 min
+            # due to background processing latency.
+            if entry_time_minutes is not None and ':' in row_time:
+                try:
+                    hh, mm = row_time.split(':')[:2]
+                    row_minutes = int(hh) * 60 + int(mm)
+                    if abs(row_minutes - entry_time_minutes) > 3:
+                        return False
+                except Exception:
+                    pass
+            else:
+                if row_time != entry_time_hhmm:
+                    return False
+            return (row_date == entry_date and row_cal == entry_cal)
+
+        sheet_result = _sheet_delete_nutrition_rows(matcher)
+    except Exception as e:
+        sheet_result = {"ok": False, "deleted": 0, "errors": [str(e)]}
+
+    return jsonify({
+        "ok": True,
+        "scan_index_removed": removed_idx,
+        "removed_name": removed_entry.get("name", ""),
+        "removed_timestamp_iso": removed_entry.get("timestamp_iso", ""),
+        "nutrition_log_removed": nutrition_removed,
+        "sheet_rows_deleted": sheet_result.get("deleted", 0),
+        "sheet_errors": sheet_result.get("errors", []),
+    })
+
+
 @app.route("/api/scan_commit", methods=["POST"])
 def api_scan_commit():
     """Jim OOB 2026-07-23 22:42: 'all food logging should be preview and allow me to confirm before logging'.
@@ -6205,6 +6412,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <button @click="openRenamePopover(scan)"
                             class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
                             title="改名 / 重新辨識">✏️</button>
+                    <!-- v2.7.42: delete button (cascade food_scan_log + nutrition_log + Sheet) -->
+                    <button @click="openDeleteConfirm(scan)"
+                            class="text-xs text-red-300 hover:text-red-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                            title="刪除呢個 entry（連 Sheet 都會刪）">🗑️</button>
                   </div>
 
                   <!-- v2.7.39: inline rename popover (shown when editingScanIndex === scan.scan_index) -->
@@ -6237,6 +6448,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <div x-show="renameSubmitMsg" class="mt-1.5 text-[10px]" x-text="renameSubmitMsg"
                          :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
                     <div class="text-[9px] text-gray-500 mt-1">舊名會保留喺 audit trail（永久）</div>
+                  </div>
+                  <!-- v2.7.42: delete confirm popover (cascade food_scan_log + nutrition_log + Sheet) -->
+                  <div x-show="deletingScanIndex === scan.scan_index" x-cloak
+                       class="mt-2 rounded-xl border border-red-400/40 bg-red-500/10 p-2.5"
+                       @keydown.escape="closeDeleteConfirm()">
+                    <div class="text-[11px] text-red-200 mb-1.5 font-semibold">⚠️ 確認刪除？</div>
+                    <div class="text-[10px] text-gray-300 mb-2 leading-snug">
+                      會一併刪：<span class="text-white font-semibold">food log</span> ·
+                      <span class="text-white font-semibold">nutrition log</span> ·
+                      <span class="text-white font-semibold">Google Sheet 對應 row</span><br>
+                      圖片檔會保留（audit trail）。<span class="text-gray-500">呢個操作<span class="text-red-300 font-bold">唔可以 undo</span>。</span>
+                    </div>
+                    <div class="flex gap-2">
+                      <button @click="confirmDeleteScan()"
+                              :disabled="deleteSubmitting"
+                              class="flex-1 rounded-lg bg-red-500 px-3 py-1.5 text-xs font-bold text-white active:scale-95 disabled:opacity-50">
+                        <span x-show="!deleteSubmitting">🗑️ 確認刪除</span>
+                        <span x-show="deleteSubmitting">⏳ 刪緊…</span>
+                      </button>
+                      <button @click="closeDeleteConfirm()"
+                              class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
+                        ✕ 取消
+                      </button>
+                    </div>
+                    <div x-show="deleteSubmitMsg" class="mt-1.5 text-[10px]"
+                         :class="deleteSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"
+                         x-text="deleteSubmitMsg"></div>
                   </div>
                   <!-- inline P/C/F + kcal + time + flags -->
                   <div class="flex items-baseline gap-2 mt-1 text-xs flex-wrap">
@@ -6588,6 +6826,10 @@ function gymApp() {
     editingScanOldName: '',
     renameSubmitting: false,
     renameSubmitMsg: '',
+    // v2.7.42: cascade delete (Jim OOB 8/6 23:32 HKT "Add function to remove historical upload. And cascade delete/update g sheet")
+    deletingScanIndex: null,
+    deleteSubmitting: false,
+    deleteSubmitMsg: '',
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
     photostream: [],           // today's images with optional classification
     photostreamClassifying: false,
@@ -7617,6 +7859,9 @@ function gymApp() {
         if (data.ok) {
           item.status = 'committed';
           this.flash(`✓ 張 ${idx+1} (${item.filename.slice(0,12)}) 寫入 log + Sheet`);
+          // v2.7.42: align with commitScanText + commitPreview — refresh recent scans
+          // so the food log card shows grade + coach_comment immediately
+          await this.loadRecentScans();
         } else {
           item.status = 'failed';
           item.error = data.error || 'commit failed';
@@ -8010,6 +8255,60 @@ function gymApp() {
         this.renameSubmitting = false;
       }
     },
+    // v2.7.42: cascade delete (Jim OOB 8/6 23:32 HKT)
+    openDeleteConfirm(scan) {
+      this.deletingScanIndex = scan.scan_index;
+      this.deleteSubmitting = false;
+      this.deleteSubmitMsg = '';
+      this.haptic(15);
+    },
+    closeDeleteConfirm() {
+      this.deletingScanIndex = null;
+      this.deleteSubmitting = false;
+      this.deleteSubmitMsg = '';
+    },
+    async confirmDeleteScan() {
+      if (this.deletingScanIndex == null) return;
+      // Find the scan object so we can pass stable identifiers (timestamp_iso + name)
+      // to the backend — array index may have shifted due to prior deletes.
+      const target = (this.recentScansVisible || []).find(
+        s => s.scan_index === this.deletingScanIndex
+      ) || (this.recentScans || []).find(
+        s => s.scan_index === this.deletingScanIndex
+      );
+      this.deleteSubmitting = true;
+      this.deleteSubmitMsg = '';
+      try {
+        const r = await fetch('/api/scan_delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scan_index: this.deletingScanIndex,
+            timestamp_iso: target ? target.timestamp_iso : null,
+            name: target ? target.name : null,
+            calories: target ? target.calories : null,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          const parts = [];
+          parts.push('food log');
+          if (data.nutrition_log_removed > 0) parts.push('nutrition log');
+          if (data.sheet_rows_deleted > 0) parts.push(`Sheet ${data.sheet_rows_deleted} row`);
+          this.deleteSubmitMsg = `✓ 已刪：${parts.join(' + ')}`;
+          this.haptic(60);
+          // Reload to reflect deleted entry gone
+          await this.loadRecentScans();
+          setTimeout(() => this.closeDeleteConfirm(), 1000);
+        } else {
+          this.deleteSubmitMsg = '失敗：' + (data.error || '未知');
+        }
+      } catch(e) {
+        this.deleteSubmitMsg = 'Error：' + e.message;
+      } finally {
+        this.deleteSubmitting = false;
+      }
+    },
 
     haptic(pattern = 30) {
       try { if (navigator.vibrate) navigator.vibrate(pattern); } catch(e) {}
@@ -8091,7 +8390,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v75';
+const CACHE = 'gym-web-v78';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
