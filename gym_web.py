@@ -1042,8 +1042,8 @@ def serve_static(filename):
 def pwa_manifest():
     """PWA web app manifest — referenced from <link rel=manifest>."""
     return jsonify({
-        "name": "Gym · Jim",
-        "short_name": "GymBro",
+        "name": "Gymbro · Jim",
+        "short_name": "Gymbro",
         "description": "Quick gym workout logger with Whoop + Withings overlay",
         "start_url": "/",
         "display": "standalone",
@@ -3765,6 +3765,223 @@ def _sheet_delete_nutrition_rows(matcher_fn) -> dict:
         return {"ok": False, "deleted": 0, "errors": [str(e)]}
 
 
+def _sheet_update_nutrition_cells(row_idx: int, updates: list) -> dict:
+    """Update specific cells in Google Sheet Nutrition tab at given row.
+
+    row_idx: 1-indexed row number (1 = first data row after header)
+    updates: list of (col_letter, value) tuples, e.g. [("A", "2026-08-06"), ("B", "2026-08-06T01:01:00+08:00")]
+
+    Uses batchUpdate values:batchUpdate API. Returns {ok, updated, errors}.
+    """
+    try:
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        if "token" not in tok or not tok.get("refresh_token"):
+            return {"ok": False, "updated": 0, "errors": ["no_token"]}
+        # Refresh access token
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        access = resp["access_token"]
+        tok["token"] = access
+        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        # Build batchUpdate data array
+        data_array = []
+        for col, val in updates:
+            data_array.append({
+                "range": f"Nutrition!{col}{row_idx}",
+                "values": [[val]]
+            })
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": data_array
+        }
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values:batchUpdate"
+        req_batch = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {access}",
+                "Content-Type": "application/json",
+            }
+        )
+        result = json.loads(urllib.request.urlopen(req_batch, timeout=15).read())
+        return {
+            "ok": True,
+            "updated": result.get("totalUpdatedCells", 0),
+            "ranges": [d["range"] for d in data_array],
+            "errors": []
+        }
+    except Exception as e:
+        return {"ok": False, "updated": 0, "errors": [str(e)]}
+
+
+@app.route("/api/scan_edit_datetime", methods=["POST"])
+def api_scan_edit_datetime():
+    """Jim OOB 2026-08-07: 'in gymbro, allow me to edit date time of food log'.
+
+    Edits date/time of an existing food scan entry. Cascades across 3 stores:
+      1. food_scan_log.json → update timestamp_iso + date + time fields
+      2. nutrition_log.json → update matching meal (by timestamp_iso + meal_type=scan)
+      3. Google Sheet Nutrition tab → update A (date) + B (time) cells at the matching row
+
+    Body: { scan_index: int, timestamp_iso: str, new_date: "YYYY-MM-DD", new_time: "HH:MM" }
+
+    Returns: { ok, entry, sheet_cells_updated, errors }
+    """
+    data = request.get_json(silent=True) or {}
+    scan_index_hint = data.get("scan_index")
+    ts_iso_hint = data.get("timestamp_iso")
+    new_date = (data.get("new_date") or "").strip()
+    new_time = (data.get("new_time") or "").strip()
+    if not new_date or not new_time:
+        return jsonify({"ok": False, "error": "new_date + new_time required (YYYY-MM-DD + HH:MM)"}), 400
+    # Validate date format
+    import re as _re
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", new_date):
+        return jsonify({"ok": False, "error": "new_date 必須係 YYYY-MM-DD 格式"}), 400
+    if not _re.match(r"^\d{1,2}:\d{2}$", new_time):
+        return jsonify({"ok": False, "error": "new_time 必須係 HH:MM 格式"}), 400
+    # Normalize time to HH:MM
+    hh, mm = new_time.split(":")[:2]
+    new_time = f"{int(hh):02d}:{int(mm):02d}"
+    # Build new ISO timestamp
+    new_ts_iso = f"{new_date}T{new_time}:00+08:00"
+    old_date = ""
+    old_time = ""
+    old_ts_iso = ""
+    new_time_full = f"{new_date}T{new_time}:00+08:00"  # full ISO for sheet column B
+
+    scan_log = _load_scan_log()
+    entry = None
+    # Authoritative match: (timestamp_iso + scan_index fallback)
+    if ts_iso_hint:
+        for i, e in enumerate(scan_log):
+            if e.get("timestamp_iso") == ts_iso_hint:
+                entry = e
+                break
+    if entry is None and isinstance(scan_index_hint, int) and 0 <= scan_index_hint < len(scan_log):
+        entry = scan_log[scan_index_hint]
+    if entry is None:
+        return jsonify({"ok": False, "error": "entry not found"}), 404
+
+    old_ts_iso = entry.get("timestamp_iso", "")
+    old_date = old_ts_iso[:10] if old_ts_iso else entry.get("date", "")
+    old_time = old_ts_iso[11:16] if len(old_ts_iso) >= 16 else entry.get("time", "")
+
+    # Update entry fields
+    entry["timestamp_iso"] = new_ts_iso
+    entry["date"] = new_date
+    entry["time"] = new_time
+    # v2.7.43 audit trail
+    correction = {
+        "type": "edit_datetime",
+        "corrected_at": now_iso(),
+        "from_date": old_date,
+        "from_time": old_time,
+        "to_date": new_date,
+        "to_time": new_time,
+    }
+    entry.setdefault("user_corrections", []).append(correction)
+    _save_scan_log(scan_log)
+
+    # Cascade 1: nutrition_log.json — match by old timestamp_iso + meal_type=scan
+    nutrition_updated = 0
+    try:
+        if NUTRITION_LOG_PATH.exists():
+            nlog = json.loads(NUTRITION_LOG_PATH.read_text())
+            meals = nlog.get("meals", [])
+            for m in meals:
+                if (m.get("timestamp_iso") == old_ts_iso
+                        and m.get("meal_type") == "scan"):
+                    m["timestamp_iso"] = new_ts_iso
+                    m["date"] = new_date
+                    m["time"] = new_time
+                    m.setdefault("user_corrections", []).append(correction)
+                    nutrition_updated += 1
+            nlog["meals"] = meals
+            NUTRITION_LOG_PATH.write_text(json.dumps(nlog, ensure_ascii=False, indent=2))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"nutrition_log write failed: {e}"}), 500
+
+    # Cascade 2: Google Sheet Nutrition tab — find row by (old_date, old_time, calories)
+    sheet_result = {"ok": False, "updated": 0, "errors": ["not_attempted"]}
+    try:
+        entry_cal = str(int(entry.get("calories", 0) or 0))
+        old_time_minutes = None
+        if old_time and ':' in old_time:
+            h, m = old_time.split(':')[:2]
+            old_time_minutes = int(h) * 60 + int(m)
+
+        # Read current sheet rows to find match
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        access = tok.get("token") or tok.get("access_token")
+        if not access:
+            raise Exception("no access token")
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:M500"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access}"})
+        rows = json.loads(urllib.request.urlopen(req, timeout=15).read()).get("values", [])
+
+        matched_row = None
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue  # skip header
+            if not row:
+                continue
+            row_date = row[0] if len(row) > 0 else ""
+            row_time_full = row[1] if len(row) > 1 else ""
+            row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
+            row_cal = row[5] if len(row) > 5 else ""
+            if row_date != old_date:
+                continue
+            if old_time_minutes is not None and ':' in row_time:
+                try:
+                    h, m = row_time.split(':')[:2]
+                    row_minutes = int(h) * 60 + int(m)
+                    if abs(row_minutes - old_time_minutes) > 3:
+                        continue
+                except Exception:
+                    if row_time != old_time:
+                        continue
+            else:
+                if row_time != old_time:
+                    continue
+            if row_cal == entry_cal:
+                matched_row = i + 1  # 1-indexed for sheets API
+                break
+        if matched_row:
+            sheet_result = _sheet_update_nutrition_cells(matched_row, [
+                ("A", new_date),
+                ("B", new_time_full),
+            ])
+        else:
+            sheet_result = {"ok": False, "updated": 0, "errors": [f"no matching sheet row for {old_date} {old_time} cal={entry_cal}"]}
+    except Exception as e:
+        sheet_result = {"ok": False, "updated": 0, "errors": [str(e)]}
+
+    return jsonify({
+        "ok": True,
+        "entry": entry,
+        "old_date": old_date,
+        "old_time": old_time,
+        "new_date": new_date,
+        "new_time": new_time,
+        "nutrition_updated": nutrition_updated,
+        "sheet": sheet_result,
+    })
+
+
 @app.route("/api/scan_delete", methods=["POST"])
 def api_scan_delete():
     """Jim OOB 2026-08-06: 'Add function to remove historical upload. And cascade
@@ -5550,7 +5767,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#000000">
-<title>Gym · Jim</title>
+<title>Gymbro · Jim</title>
 <link rel="icon" type="image/png" sizes="32x32" href="/static/gymbro_favicon-32.png">
 <link rel="icon" type="image/png" sizes="192x192" href="/static/gymbro_icon-192.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/gymbro_apple-touch-icon.png">
@@ -5730,7 +5947,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Top Bar -->
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
     <div class="flex items-center justify-between gap-2">
-      <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gym</h1>
+      <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
       <div class="flex items-center gap-3">
         <!-- v2.7.26: paired today + yesterday widget (Jim OOB 2026-08-04 09:55 HKT
              "show both yesterday and today, today larger").
@@ -6425,8 +6642,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </template>
                 <div class="flex-1 min-w-0">
                   <div class="flex items-baseline gap-2 mb-0.5">
-                    <div class="text-base font-bold text-white leading-snug flex-1 min-w-0"
-                         style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;"
+                    <div class="text-base font-bold text-white leading-relaxed flex-1 min-w-0"
+                         style="word-break: break-word; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;"
                          x-text="scan.name || scan.vision_short || '—'"></div>
                     <!-- v2.7.37: coach grade badge (A+/A/B/C/D/F) -->
                     <template x-if="scan.coach_comment?.grade">
@@ -6444,10 +6661,58 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <button @click="openRenamePopover(scan)"
                             class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
                             title="改名 / 重新辨識">✏️</button>
+                    <!-- v2.7.43: edit date/time button -->
+                    <button @click="openEditDateTimePopover(scan)"
+                            class="text-xs text-sky-300 hover:text-sky-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                            title="改日期 / 時間">⏰</button>
                     <!-- v2.7.42: delete button (cascade food_scan_log + nutrition_log + Sheet) -->
                     <button @click="openDeleteConfirm(scan)"
                             class="text-xs text-red-300 hover:text-red-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
                             title="刪除呢個 entry（連 Sheet 都會刪）">🗑️</button>
+                  </div>
+
+                  <!-- v2.7.43: edit date/time popover -->
+                  <div x-show="editingDateTimeIndex === scan.scan_index" x-cloak
+                       class="mt-2 rounded-lg p-2.5 border border-sky-400/40 bg-sky-900/20"
+                       @keydown.escape="closeEditDateTimePopover()">
+                    <div class="text-[10px] uppercase tracking-wider text-sky-300 font-bold mb-1.5">改日期 / 時間</div>
+                    <div class="text-[10px] text-gray-400 mb-1.5">
+                      原：<span class="text-gray-300" x-text="editingDateTimeOld"></span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2">
+                      <div>
+                        <label class="block text-[9px] text-gray-400 mb-0.5 uppercase">新日期</label>
+                        <input type="date"
+                               x-model="editingDateTimeNewDate"
+                               @keydown.enter="submitEditDateTime()"
+                               @keydown.escape="closeEditDateTimePopover()"
+                               class="w-full rounded-lg bg-black/50 px-2 py-1.5 text-xs text-white border border-sky-400/40 focus:border-sky-300 outline-none"
+                               autofocus>
+                      </div>
+                      <div>
+                        <label class="block text-[9px] text-gray-400 mb-0.5 uppercase">新時間 (24h)</label>
+                        <input type="time"
+                               x-model="editingDateTimeNewTime"
+                               @keydown.enter="submitEditDateTime()"
+                               @keydown.escape="closeEditDateTimePopover()"
+                               class="w-full rounded-lg bg-black/50 px-2 py-1.5 text-xs text-white border border-sky-400/40 focus:border-sky-300 outline-none">
+                      </div>
+                    </div>
+                    <div class="flex gap-2 mt-2">
+                      <button @click="submitEditDateTime()"
+                              :disabled="!editingDateTimeNewDate || !editingDateTimeNewTime || editDateTimeSubmitting"
+                              class="flex-1 rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span x-show="!editDateTimeSubmitting">✓ 改日期時間</span>
+                        <span x-show="editDateTimeSubmitting">⏳ 更新中…</span>
+                      </button>
+                      <button @click="closeEditDateTimePopover()"
+                              class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
+                        ✕ 取消
+                      </button>
+                    </div>
+                    <div x-show="editDateTimeSubmitMsg" class="mt-1.5 text-[10px]" x-text="editDateTimeSubmitMsg"
+                         :class="editDateTimeSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
+                    <div class="text-[9px] text-gray-500 mt-1">會更新 food log + nutrition log + Google Sheet，audit trail 永久保留</div>
                   </div>
 
                   <!-- v2.7.39: inline rename popover (shown when editingScanIndex === scan.scan_index) -->
@@ -6854,10 +7119,17 @@ function gymApp() {
     correctSubmitMsg: '',
     // v2.7.39: inline rename popover per scan (Jim OOB "rename 白切雞 → 海南雞飯")
     editingScanIndex: null,
-    editingScanNewName: '',
     editingScanOldName: '',
+    editingScanNewName: '',
     renameSubmitting: false,
     renameSubmitMsg: '',
+    // v2.7.43: edit date/time state
+    editingDateTimeIndex: null,
+    editingDateTimeOld: '',
+    editingDateTimeNewDate: '',
+    editingDateTimeNewTime: '',
+    editDateTimeSubmitting: false,
+    editDateTimeSubmitMsg: '',
     // v2.7.42: cascade delete (Jim OOB 8/6 23:32 HKT "Add function to remove historical upload. And cascade delete/update g sheet")
     deletingScanIndex: null,
     deleteSubmitting: false,
@@ -8300,6 +8572,68 @@ function gymApp() {
         this.renameSubmitting = false;
       }
     },
+    // v2.7.43: edit date/time popover (Jim OOB 8/7 "in gymbro, allow me to edit date time of food log")
+    openEditDateTimePopover(scan) {
+      this.editingDateTimeIndex = scan.scan_index;
+      const ts = scan.timestamp_iso || '';
+      this.editingDateTimeNewDate = ts.slice(0, 10) || '';
+      this.editingDateTimeNewTime = (ts.slice(11, 16) || '').replace(/^(\d):/, '0$1:');
+      this.editingDateTimeOld = `${(ts.slice(0, 10) || '?')} ${(ts.slice(11, 16) || '?')}`;
+      this.editDateTimeSubmitting = false;
+      this.editDateTimeSubmitMsg = '';
+      this.haptic(15);
+    },
+    closeEditDateTimePopover() {
+      this.editingDateTimeIndex = null;
+      this.editingDateTimeNewDate = '';
+      this.editingDateTimeNewTime = '';
+      this.editDateTimeSubmitting = false;
+      this.editDateTimeSubmitMsg = '';
+    },
+    async submitEditDateTime() {
+      if (this.editingDateTimeIndex == null) return;
+      if (!this.editingDateTimeNewDate || !this.editingDateTimeNewTime) {
+        this.editDateTimeSubmitMsg = '請填日期同時間';
+        return;
+      }
+      // Find target scan for stable identifier
+      const target = (this.recentScansVisible || []).find(
+        s => s.scan_index === this.editingDateTimeIndex
+      ) || (this.recentScans || []).find(
+        s => s.scan_index === this.editingDateTimeIndex
+      );
+      this.editDateTimeSubmitting = true;
+      this.editDateTimeSubmitMsg = '';
+      try {
+        const r = await fetch('/api/scan_edit_datetime', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scan_index: this.editingDateTimeIndex,
+            timestamp_iso: target ? target.timestamp_iso : null,
+            new_date: this.editingDateTimeNewDate,
+            new_time: this.editingDateTimeNewTime,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          const parts = [`${data.old_date} ${data.old_time} → ${data.new_date} ${data.new_time}`];
+          if (data.nutrition_updated > 0) parts.push(`nutrition log ${data.nutrition_updated}`);
+          if (data.sheet && data.sheet.updated > 0) parts.push(`Sheet ${data.sheet.updated} cells`);
+          this.editDateTimeSubmitMsg = `✓ ${parts.join(' · ')}`;
+          this.haptic(40);
+          // Reload scans to reflect new date/time
+          await this.loadRecentScans();
+          setTimeout(() => this.closeEditDateTimePopover(), 1500);
+        } else {
+          this.editDateTimeSubmitMsg = '失敗：' + (data.error || '未知');
+        }
+      } catch(e) {
+        this.editDateTimeSubmitMsg = 'Error：' + e.message;
+      } finally {
+        this.editDateTimeSubmitting = false;
+      }
+    },
     // v2.7.42: cascade delete (Jim OOB 8/6 23:32 HKT)
     openDeleteConfirm(scan) {
       this.deletingScanIndex = scan.scan_index;
@@ -8435,7 +8769,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v81';
+const CACHE = 'gym-web-v82';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
