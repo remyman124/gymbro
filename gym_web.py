@@ -3033,6 +3033,88 @@ def api_withings_steps_today():
         return jsonify({"steps": 0, "distance_km": 0, "calories": 0, "syncing": False, "error": str(e)[:120]})
 
 
+# v2.7.40: Force-refresh Withings steps (Jim OOB 2026-08-06: "tap shoes → refresh
+# steps from withings"). Calls the withings.py activity script to fetch fresh
+# data, refreshes WITHINGS_CACHE atomically, then returns same shape as
+# /api/withings_steps_today. Designed to be fast (~3-5s) for tap-to-refresh UX.
+@app.route("/api/withings_refresh", methods=["POST", "GET"])
+def api_withings_refresh():
+    """Force-refresh Withings step data by calling withings.py activity getactivity
+    and update WITHINGS_CACHE. Returns {ok, steps, distance_km, calories, syncing, pulled_at}."""
+    import subprocess, json as _json
+    try:
+        # Step 1: call withings.py steps 1 (today's step count, fresh from API)
+        r = subprocess.run(
+            ["python3", "/home/work/.hermes/skills/withings/withings.py", "steps", "1"],
+            capture_output=True, text=True, timeout=30,
+        )
+        pulled_at = now_iso()
+        new_steps = None
+        new_distance = None
+        new_calories = None
+        if r.returncode == 0 and r.stdout.strip():
+            # Parse tabular output: "2026-08-06      3,113     2.32km      708kcal        0m"
+            import re
+            from datetime import datetime, timezone, timedelta
+            hkt = timezone(timedelta(hours=8))
+            today_hkt_str = datetime.now(hkt).strftime("%Y-%m-%d")
+            # Walk all rows; prefer today's row, fall back to most recent
+            today_row = None
+            latest_row = None
+            for line in r.stdout.strip().splitlines():
+                m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+([\d,]+)\s+([\d.]+)km\s+(\d+)kcal", line)
+                if not m:
+                    continue
+                row = (m.group(1), int(m.group(2).replace(",", "")), float(m.group(3)), int(m.group(4)))
+                if row[0] == today_hkt_str:
+                    today_row = row
+                    break  # found today, use it
+                if latest_row is None or row[0] > latest_row[0]:
+                    latest_row = row
+            chosen = today_row or latest_row
+            if chosen:
+                new_steps = chosen[1]
+                new_distance = chosen[2]
+                new_calories = chosen[3]
+        # Step 2: update WITHINGS_CACHE so subsequent /api/withings_steps_today
+        # returns fresh data
+        try:
+            cur = _safe_read_json(WITHINGS_CACHE)
+            if not isinstance(cur, dict):
+                cur = {}
+            cur["_last_forced_refresh"] = pulled_at
+            if new_steps is not None:
+                # Save under a "today" key so steps_today picks it up
+                from datetime import datetime, timezone, timedelta
+                hkt = timezone(timedelta(hours=8))
+                today_hkt = datetime.now(hkt).strftime("%Y-%m-%d")
+                cur.setdefault("activities", {})
+                cur["activities"][today_hkt] = {
+                    "steps": new_steps, "distance_km": new_distance, "calories": new_calories,
+                    "syncing": False, "source": "forced_refresh",
+                }
+                cur["_today_override"] = {"date": today_hkt, "steps": new_steps, "distance_km": new_distance, "calories": new_calories}
+            tmp = str(WITHINGS_CACHE) + ".tmp"
+            Path(tmp).write_text(_json.dumps(cur, indent=2, ensure_ascii=False))
+            os.replace(tmp, str(WITHINGS_CACHE))
+        except Exception as cache_err:
+            print(f"[withings_refresh] cache update failed: {cache_err}")
+        # Step 3: return fresh step data (caller can use this OR re-fetch /api/withings_steps_today)
+        return jsonify({
+            "ok": True,
+            "steps": new_steps,
+            "distance_km": new_distance,
+            "calories": new_calories,
+            "pulled_at": pulled_at,
+            "stdout_preview": (r.stdout or "")[:300],
+            "stderr_preview": (r.stderr or "")[:200] if r.returncode != 0 else "",
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "withings.py timeout (>30s)"}), 504
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+
 @app.route("/api/withings_steps_7d_avg", methods=["GET"])
 def api_withings_steps_7d_avg():
     """Return 7-day average steps (Jim OOB 2026-07-29)."""
@@ -5421,15 +5503,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gym</h1>
       <div class="flex items-center gap-3">
         <!-- v2.7.26: paired today + yesterday widget (Jim OOB 2026-08-04 09:55 HKT
-             "show both yesterday and today, today larger"). -->
-        <div class="flex items-stretch gap-1.5 rounded-2xl px-2.5 py-1.5" style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45);">
+             "show both yesterday and today, today larger").
+             v2.7.40: tap-to-refresh from Withings (Jim OOB 2026-08-06 "tap shoes
+             triggers refresh"). 3-state visual feedback:
+             - idle:  static 👟
+             - refreshing: 👟 spinning (animate-spin)
+             - after: pulse-glow on the number for 1.2s -->
+        <div @click="refreshSteps()"
+             :class="stepsRefreshing ? 'opacity-90' : 'active:opacity-70'"
+             class="flex items-stretch gap-1.5 rounded-2xl px-2.5 py-1.5 cursor-pointer select-none transition-opacity"
+             style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45); -webkit-tap-highlight-color: transparent;"
+             :title="stepsRefreshing ? '從 Withings 拉緊新數據…' : '撳一下即時 refresh Withings 步數'">
           <div class="flex flex-col items-center justify-center leading-none">
-            <span class="text-base">👟</span>
+            <span class="text-base" :class="stepsRefreshing ? 'animate-spin inline-block' : ''">👟</span>
           </div>
           <!-- TODAY (large, amber) -->
           <div class="flex flex-col items-center justify-center leading-none border-r border-white/20 pr-2">
             <span class="text-lg font-black tabular-nums"
-                  :class="stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300')"
+                  :class="stepsRefreshing ? 'text-sky-300 animate-pulse' : (stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'))"
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
           </div>
           <!-- YESTERDAY (small, gray) -->
@@ -6410,6 +6501,8 @@ function gymApp() {
     // committed today (凌晨 / Apple Watch 還未 sync)".
     stepsSyncing: false,
     stepsToday: 0,
+    // v2.7.40: tap-to-refresh withings (Jim OOB 2026-08-06 "tap shoes triggers refresh")
+    stepsRefreshing: false,
     stepsYesterday: null,
     stepsKcal: 0,
     steps7dAvg: 0,
@@ -7179,6 +7272,36 @@ function gymApp() {
     // v2.7.21: Jim OOB 2026-08-02 02:44 HKT — Withings may not have
     // today record yet (凌晨 / Apple Watch 還未 commit). Distinguish
     // "0 steps" (real empty day) from "still syncing" (no data).
+    // v2.7.40: Force-refresh from Withings (called by tap on 👟 widget)
+    // 1. Call /api/withings_refresh to trigger backend subprocess
+    // 2. Backend runs withings.py activity getactivity, updates WITHINGS_CACHE
+    // 3. Re-fetch /api/withings_steps_today + /api/withings_steps_7d_avg for display
+    // Visual: stepsRefreshing = true → 👟 spins + number pulses sky blue
+    async refreshSteps() {
+      if (this.stepsRefreshing) return;  // debounce: ignore taps during refresh
+      this.stepsRefreshing = true;
+      this.haptic(15);
+      this.flash('從 Withings 拉新步數…');
+      try {
+        // Step 1: trigger backend force refresh (~3-5s)
+        const r = await fetch('/api/withings_refresh', { method: 'POST' });
+        const data = await r.json();
+        if (data.ok) {
+          this.flash(`✓ Withings 已更新 (${data.pulled_at?.slice(11, 16) || 'now'})`);
+        } else {
+          this.flash('Withings refresh 失敗：' + (data.error || '未知'));
+        }
+      } catch(e) {
+        this.flash('Error：' + e.message);
+      }
+      // Step 2: always re-fetch today's display data (whether ok or not)
+      try {
+        await this.loadSteps();
+        this.haptic(40);  // success feedback
+      } catch(e) { /* silent */ }
+      this.stepsRefreshing = false;
+    },
+
     async loadSteps() {
       try {
         const r = await fetch('/api/withings_steps_today');
@@ -7959,7 +8082,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v71';
+const CACHE = 'gym-web-v72';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
