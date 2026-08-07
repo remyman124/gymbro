@@ -4399,6 +4399,121 @@ NUTRITION_FIELD_SCHEMA = (
 )
 
 
+@app.route("/api/transcribe", methods=["POST"])
+def api_transcribe():
+    """Audio file → Cantonese transcript via gpt-4o-transcribe.
+
+    Jim OOB 2026-08-07: 'I have been using gpt-4o-mini for image recognition
+    via apiyi. can we use gpt-4o-mini-transcribe?'. v2.7.45 P3.
+
+    Accepts: multipart/form-data with 'audio' field (mp3/m4a/wav/webm/ogg)
+    Optional: 'language' (default yue), 'prompt' (default Cantonese bias)
+    Returns: {ok, text, language, model, duration_estimate, usage}
+    """
+    if "audio" not in request.files:
+        return jsonify({"ok": False, "error": "missing 'audio' file"}), 400
+
+    audio_file = request.files["audio"]
+    if not audio_file.filename:
+        return jsonify({"ok": False, "error": "empty filename"}), 400
+
+    # Read file
+    audio_bytes = audio_file.read()
+    size_mb = len(audio_bytes) / (1024 * 1024)
+    if size_mb > 25:
+        return jsonify({"ok": False, "error": f"file too large ({size_mb:.1f} MB > 25 MB limit)"}), 413
+
+    # Optional params
+    language = request.form.get("language", "yue")
+    user_prompt = request.form.get("prompt", None)
+
+    # Cantonese default prompt (matches config.yaml stt.openai.prompt)
+    if user_prompt is None:
+        user_prompt = (
+            "以下係一段廣東話 (香港, Cantonese) 對話或獨白。 "
+            "請用繁體中文 (香港常用字) 逐字輸出,保留語氣詞「嘅/啦/咗/嗰/咁/啲/嚟/咩/㗎/喎/吖/囉/㖭」等。 "
+            "人名食物名盡量保留原音 (例: 灣仔/旺角/茶餐廟/絲襪奶茶/叉燒飯/星巴克/肯德基/麥當勞)。 "
+            "中英夾雜 (code-switch) 係正常, 唔好強制翻譯英文品牌名。"
+        )
+
+    # APiyi gpt-4o-transcribe
+    api_key = _apiyi_api_key()
+
+    if not api_key:
+        return jsonify({"ok": False, "error": "APIYI_API_KEY not set"}), 500
+
+    # Save to temp file for multipart upload
+    import tempfile, os as _os
+    suffix = _os.path.splitext(audio_file.filename)[1] or ".mp3"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        boundary = "----formdata-gymbro"
+        with open(tmp_path, "rb") as f:
+            file_content = f.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{audio_file.filename}"\r\n'
+            f"Content-Type: {audio_file.mimetype or 'audio/mpeg'}\r\n\r\n"
+        ).encode() + file_content + (
+            f"\r\n--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="model"\r\n\r\n'
+            f"gpt-4o-transcribe\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="language"\r\n\r\n'
+            f"{language}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+            f"{user_prompt}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
+            f"json\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+
+        req = urllib.request.Request(
+            "https://api.apiyi.com/v1/audio/transcriptions",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Authorization": "".join(["Bearer ", api_key]),
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result = json.loads(r.read())
+
+        text = result.get("text", "").strip()
+        usage = result.get("usage", {})
+
+        return jsonify({
+            "ok": True,
+            "text": text,
+            "language": language,
+            "model": "gpt-4o-transcribe",
+            "size_mb": round(size_mb, 2),
+            "usage": usage,
+            "char_count": len(text),
+        })
+
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()[:500]
+        return jsonify({
+            "ok": False,
+            "error": f"APiyi API error: HTTP {e.code}",
+            "detail": err_body,
+        }), 502
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"transcribe failed: {e}"}), 500
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 @app.route("/api/scan_preview_text", methods=["POST"])
 def api_scan_preview_text():
     """Text-only food entry preview (no image required).
@@ -6265,6 +6380,74 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="text-[11px] font-bold text-purple-300">打文字</div>
           </div>
         </button>
+        <!-- v2.7.45: Voice memo → text via gpt-4o-transcribe -->
+        <button @click="openVoiceInput()"
+                class="rounded-xl py-2.5 px-2 transition-all active:scale-95"
+                style="background: rgba(56,189,248,0.10); border: 1px solid rgba(56,189,248,0.4);">
+          <div class="flex flex-col items-center gap-0.5">
+            <div class="text-xl">🎙️</div>
+            <div class="text-[11px] font-bold text-sky-300">錄語音</div>
+          </div>
+        </button>
+      </div>
+
+      <!-- v2.7.45: Voice input panel (audio → transcript → food entry) -->
+      <div x-show="voiceInputMode" x-cloak class="mb-4 rounded-2xl p-4"
+           style="background: rgba(56,189,248,0.08); border: 1.5px solid rgba(56,189,248,0.35);">
+        <div class="text-[10px] uppercase tracking-[0.2em] text-sky-300 mb-2 font-bold">🎙️ 語音輸入模式 (廣東話)</div>
+
+        <!-- Recording controls -->
+        <div class="flex flex-col items-center gap-3 py-3">
+          <button @click="toggleVoiceRecording()"
+                  :disabled="voiceTranscribing"
+                  class="rounded-full w-20 h-20 flex items-center justify-center transition-all active:scale-95 disabled:opacity-50"
+                  :class="voiceRecording ? 'animate-pulse' : ''"
+                  :style="voiceRecording
+                    ? 'background: rgba(239,68,68,0.4); border: 3px solid rgba(239,68,68,0.7);'
+                    : 'background: rgba(56,189,248,0.3); border: 3px solid rgba(56,189,248,0.7);'">
+            <span class="text-3xl" x-text="voiceRecording ? '⏸' : '🎙️'"></span>
+          </button>
+          <div class="text-xs text-gray-300" x-text="voiceRecording ? '錄音中… 撳多次停止' : '撳住開始錄音 (最長 60 秒)'"></div>
+          <div class="text-[10px] text-gray-500" x-show="voiceRecordingTime > 0">
+            <span x-text="`${voiceRecordingTime}s`"></span>
+          </div>
+          <input type="file" accept="audio/*" capture="microphone" x-ref="voiceFileInput" @change="onVoiceFileSelected($event)" class="hidden">
+          <button @click="$refs.voiceFileInput.click()"
+                  :disabled="voiceTranscribing"
+                  class="text-[10px] text-sky-300 underline disabled:opacity-50">
+            或選擇 audio 檔
+          </button>
+        </div>
+
+        <!-- Transcribing indicator -->
+        <div x-show="voiceTranscribing" class="text-center text-sm text-sky-300 py-2">
+          🤖 gpt-4o-transcribe 處理緊…
+        </div>
+
+        <!-- Error -->
+        <div x-show="voiceError" class="text-center text-xs text-red-300 py-2" x-text="voiceError"></div>
+
+        <!-- Transcript result + commit button -->
+        <template x-if="voiceTranscript && !voiceTranscribing">
+          <div class="mt-3 rounded-lg p-3" style="background: rgba(0,0,0,0.4); border: 1px solid rgba(56,189,248,0.4);">
+            <div class="text-[10px] text-sky-300 mb-1.5">📝 Transcript:</div>
+            <textarea x-model="voiceTranscript"
+                      class="w-full rounded bg-black/40 px-2 py-1.5 text-xs text-white"
+                      rows="3" maxlength="2000"></textarea>
+            <div class="flex gap-2 mt-2">
+              <button @click="voiceTranscriptToFoodEntry()"
+                      :disabled="!voiceTranscript.trim()"
+                      class="flex-1 rounded-lg py-2 text-xs font-bold active:scale-95 disabled:opacity-50"
+                      style="background: linear-gradient(135deg, rgba(56,189,248,0.4), rgba(56,189,248,0.2)); border: 1.5px solid rgba(56,189,248,0.55);">
+                🍽️ 用呢段文字落 food log
+              </button>
+              <button @click="voiceTranscript = null; voiceRecording = false; voiceRecordingTime = 0;"
+                      class="rounded-lg bg-white/10 px-3 py-2 text-xs text-gray-300 active:scale-95">
+                取消
+              </button>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- Text-direct input mode (toggled by openScanTextInput) -->
@@ -7096,6 +7279,17 @@ function gymApp() {
     scanProgress: 0,
     lastScan: null,
     recentScans: [],
+
+    // v2.7.45 P3: Voice memo → text (gpt-4o-transcribe)
+    voiceInputMode: false,
+    voiceRecording: false,
+    voiceRecordingTime: 0,
+    voiceTranscribing: false,
+    voiceTranscript: null,
+    voiceError: null,
+    voiceMediaRecorder: null,
+    voiceAudioChunks: [],
+    voiceTimer: null,
     recentScansFiltered: 0,  // v2.4: count of failed scans skipped by filter
     // v2.7.29: progressive scroll loading (Jim OOB "progressive scrolling for loading performance")
     recentScansVisible: [],       // currently rendered (subset of recentScans)
@@ -8304,6 +8498,168 @@ function gymApp() {
       }
     },
 
+    // ---- v2.7.45 voice memo → text (gpt-4o-transcribe) ----
+
+    openVoiceInput() {
+      this.voiceInputMode = !this.voiceInputMode;
+      this.voiceError = null;
+      if (!this.voiceInputMode) {
+        this.cancelVoiceRecording();
+      }
+    },
+
+    async toggleVoiceRecording() {
+      if (this.voiceTranscribing) return;
+      if (this.voiceRecording) {
+        await this.stopVoiceRecording();
+      } else {
+        await this.startVoiceRecording();
+      }
+    },
+
+    async startVoiceRecording() {
+      this.voiceError = null;
+      this.voiceTranscript = null;
+
+      // Check MediaRecorder support
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        this.voiceError = '此裝置唔支援錄音 (iOS 14.3+ 需要 HTTPS)';
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Pick supported MIME type (iOS Safari needs mp4)
+        const mimeOptions = ['audio/mp4', 'audio/webm', 'audio/ogg'];
+        let mimeType = '';
+        for (const m of mimeOptions) {
+          if (MediaRecorder.isTypeSupported(m)) {
+            mimeType = m;
+            break;
+          }
+        }
+        const opts = mimeType ? { mimeType } : {};
+        this.voiceMediaRecorder = new MediaRecorder(stream, opts);
+        this.voiceAudioChunks = [];
+
+        this.voiceMediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) this.voiceAudioChunks.push(e.data);
+        };
+
+        this.voiceMediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop());
+          const blob = new Blob(this.voiceAudioChunks, { type: mimeType || 'audio/webm' });
+          await this.sendAudioToTranscribe(blob);
+        };
+
+        this.voiceMediaRecorder.start();
+        this.voiceRecording = true;
+        this.voiceRecordingTime = 0;
+
+        // Timer + auto-stop at 60s
+        this.voiceTimer = setInterval(() => {
+          this.voiceRecordingTime += 1;
+          if (this.voiceRecordingTime >= 60) {
+            this.stopVoiceRecording();
+          }
+        }, 1000);
+      } catch (e) {
+        this.voiceError = '錄音失敗：' + e.message + ' (記得要撳「使用麥克風」授權)';
+      }
+    },
+
+    async stopVoiceRecording() {
+      if (this.voiceTimer) {
+        clearInterval(this.voiceTimer);
+        this.voiceTimer = null;
+      }
+      if (this.voiceMediaRecorder && this.voiceMediaRecorder.state === 'recording') {
+        this.voiceMediaRecorder.stop();
+        this.voiceRecording = false;
+        this.voiceTranscribing = true;
+      }
+    },
+
+    cancelVoiceRecording() {
+      if (this.voiceTimer) {
+        clearInterval(this.voiceTimer);
+        this.voiceTimer = null;
+      }
+      if (this.voiceMediaRecorder) {
+        try {
+          this.voiceMediaRecorder.ondataavailable = null;
+          this.voiceMediaRecorder.onstop = null;
+          if (this.voiceMediaRecorder.state === 'recording') {
+            this.voiceMediaRecorder.stop();
+          }
+        } catch (e) {}
+        this.voiceMediaRecorder = null;
+      }
+      this.voiceRecording = false;
+      this.voiceRecordingTime = 0;
+      this.voiceTranscribing = false;
+      this.voiceTranscript = null;
+    },
+
+    async onVoiceFileSelected(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      this.voiceError = null;
+      this.voiceTranscript = null;
+      this.voiceTranscribing = true;
+      await this.sendAudioToTranscribe(file);
+      // reset input so same file can be selected again
+      event.target.value = '';
+    },
+
+    async sendAudioToTranscribe(blobOrFile) {
+      this.voiceError = null;
+      this.voiceTranscribing = true;
+      try {
+        // Determine filename + extension
+        let filename = 'voice.webm';
+        if (blobOrFile instanceof File) {
+          filename = blobOrFile.name;
+        } else {
+          const ext = blobOrFile.type?.includes('mp4') ? '.m4a'
+                    : blobOrFile.type?.includes('ogg') ? '.ogg'
+                    : '.webm';
+          filename = 'voice_' + Date.now() + ext;
+        }
+
+        const fd = new FormData();
+        fd.append('audio', blobOrFile, filename);
+        fd.append('language', 'yue');
+
+        const r = await fetch('/api/transcribe', { method: 'POST', body: fd });
+        const data = await r.json();
+        if (!data.ok) {
+          this.voiceError = data.error || 'transcribe failed';
+          return;
+        }
+        this.voiceTranscript = data.text || '';
+        if (!this.voiceTranscript) {
+          this.voiceError = '冇 transcript 出嚟 (可能 audio 太空 / 淨係靜音)';
+        }
+      } catch (e) {
+        this.voiceError = '網絡錯誤：' + e.message;
+      } finally {
+        this.voiceTranscribing = false;
+        this.voiceRecordingTime = 0;
+      }
+    },
+
+    async voiceTranscriptToFoodEntry() {
+      // Hand off to text-direct flow: set scanTextInput + open text mode, then submit
+      if (!this.voiceTranscript || !this.voiceTranscript.trim()) return;
+      this.scanTextInput = this.voiceTranscript.trim();
+      this.voiceInputMode = false;
+      this.voiceTranscript = null;
+      this.scanTextMode = true;
+      // Auto submit
+      await this.submitScanText();
+    },
+
     // ---- v2.7.22 text-direct food input methods (Jim OOB 2026-08-02 02:50 HKT) ----
 
     openScanTextInput() {
@@ -8767,7 +9123,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v83';
+const CACHE = 'gym-web-v85';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
