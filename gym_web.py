@@ -6452,8 +6452,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               :title="cheerInFlight ? '🔥...' : '🔥'">
         <span x-text="cheerInFlight ? '⏳' : '🔥'"></span>
       </button>
-      <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
-      <div class="flex items-center gap-3">
+      <h1 @click="onBrandTap()" class="text-2xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
+      <div class="flex items-center gap-2">
         <!-- v2.7.52: Header mic button removed (Jim OOB 2026-08-07 13:45 HKT
              'REmove the mic frontend on gymbro. keep backend'). iOS Safari
              PWA mic on plain HTTP is blocked by Apple; user is going via
@@ -6466,27 +6466,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
              numerator'). Today large / yesterday small inline. -->
         <div @click="refreshSteps()"
              :class="stepsRefreshing ? 'opacity-90' : 'active:opacity-70'"
-             class="flex items-stretch gap-1.5 rounded-2xl px-2.5 py-1.5 cursor-pointer select-none transition-opacity"
+             class="flex items-stretch gap-1 rounded-xl px-1.5 py-1 cursor-pointer select-none transition-opacity"
              style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45); -webkit-tap-highlight-color: transparent;"
              :title="stepsRefreshing ? '從 Withings 拉緊新數據…' : '撳一下即時 refresh Withings 步數'">
           <div class="flex flex-col items-center justify-center leading-none">
-            <span class="text-base" :class="stepsRefreshing ? 'animate-spin inline-block' : ''">👟</span>
+            <span class="text-sm" :class="stepsRefreshing ? 'animate-spin inline-block' : ''">👟</span>
           </div>
           <!-- Numerator: TODAY (large, amber/green/red by threshold) -->
-          <div class="flex flex-col items-center justify-center leading-none border-r border-white/20 pr-2">
-            <span class="text-lg font-black tabular-nums"
+          <div class="flex flex-col items-center justify-center leading-none border-r border-white/20 pr-1.5">
+            <span class="text-base font-black tabular-nums"
                   :class="stepsRefreshing ? 'text-sky-300 animate-pulse' : (stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'))"
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
           </div>
-          <!-- Denominator: YESTERDAY (small, gray) -->
+          <!-- Denominator: YESTERDAY (small, gray) — compact format (K/M) -->
           <div class="flex flex-col items-center justify-center leading-none" x-show="stepsYesterday !== null">
-            <span class="text-sm font-bold tabular-nums text-gray-400"
-                  x-text="stepsYesterday !== null ? stepsYesterday.toLocaleString() : '—'"></span>
+            <span class="text-[11px] font-bold tabular-nums text-gray-400"
+                  x-text="stepsYesterday !== null ? formatStepCompact(stepsYesterday) : '—'"></span>
           </div>
         </div>
         <div class="flex flex-col items-end leading-tight">
-          <span class="text-sm font-bold text-emerald-300 tabular-nums" x-text="clockStr"></span>
-          <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStr"></span>
+          <span class="text-sm font-bold text-emerald-300 tabular-nums" x-text="clockStrShort"></span>
+          <span class="text-[10px] uppercase tracking-[0.2em] text-gray-400" x-text="sessionDateStrShort"></span>
         </div>
       </div>
     </div>
@@ -7584,6 +7584,9 @@ function gymApp() {
       return (reverse[legacyName] || []).includes(this.tab);
     },
     sessionDateStr: '',
+    // v3.2.2: compact header strings (HH:MM + MM-DD instead of HH:MM:SS + YYYY-MM-DD)
+    sessionDateStrShort: '',
+    clockStrShort: '',
     // Withings step widget state (Jim OOB 2026-07-29)
     // v2.7.21: Jim OOB 2026-08-02 02:44 HKT — stepsSyncing flag
     // distinguishes "real 0 steps" from "Withings has not yet
@@ -7750,6 +7753,8 @@ function gymApp() {
       const data = await res.json();
       this.session = data.session;
       this.sessionDateStr = data.today;
+      // v3.2.2: compact header date (MM-DD) for slim top bar
+      this.sessionDateStrShort = (data.today || '').slice(5);
       // Pull today's motivation image (non-blocking). Loads the full list so
       // the cycle button can move between cheer / gymbro variants.
       try {
@@ -7823,6 +7828,14 @@ function gymApp() {
       this.haptic();
     },
 
+    // v3.2.2: compact step number formatter (14151 → 14.1K, 2,000,000 → 2.0M)
+    formatStepCompact(n) {
+      if (n == null) return '—';
+      if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\\.0$/, '') + 'M';
+      if (n >= 10000) return (n / 1000).toFixed(1).replace(/\\.0$/, '') + 'K';
+      if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+      return n.toLocaleString();
+    },
     tickClock() {
       const d = new Date();
       const hh24 = d.getHours();
@@ -7830,6 +7843,8 @@ function gymApp() {
       const ss = String(d.getSeconds()).padStart(2, '0');
       // Digital clock 24-hour format (Jim OOB 2026-07-29 — 24h, no AM/PM)
       this.clockStr = `${String(hh24).padStart(2,'0')}:${mm}:${ss}`;
+      // v3.2.2: header compact version (HH:MM only) for slim top bar
+      this.clockStrShort = `${String(hh24).padStart(2,'0')}:${mm}`;
     },
 
     tickElapsed() {
@@ -9866,8 +9881,8 @@ SERVICE_WORKER = """
 // inline next to kcal (was deleted in v63 overzealous cleanup).
 // v3.2.0: schedule tab (weekly + monthly calendar) + header cheer button
 // at top-left + food log rating badge moved to image overlay (top-right).
-const CACHE = 'gym-web-v93';
-// v18 changes (Jim OOB 2026-07-21):
+// v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
+const CACHE = 'gym-web-v94';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -9945,8 +9960,8 @@ const CACHE = 'gym-web-v93';
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
 // v3.1.0: 4-tab nav + landscape food grid + gym focus mode + PT/Whoop share +
 // frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
-const CACHE = 'gym-web-v93';
-// v60 changes (Jim OOB 2026-08-04 'cards larger, text too much, default collapsed, progressive scroll'): v2.7.27 + v2.7.28 + v2.7.29 "step count is way too buggy,
+// v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
+const CACHE = 'gym-web-v94';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
