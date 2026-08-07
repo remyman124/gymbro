@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.53"
+__version__ = "2.7.54"
 
 
 def _safe_read_json(path, default=None):
@@ -6365,34 +6365,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="file" accept="image/*" capture="environment" @change="onScanFile($event)" x-ref="scanInputEl" style="display:none">
       <input type="file" accept="image/*" multiple @change="onScanPhotosPicked($event)" x-ref="scanPhotosInputEl" style="display:none">
 
-      <!-- v2.7.36: Compact 3-button row — pro mobile UI/UX
-           (1) Primary camera button: pill shape, full-width but compact height
-           (2) Secondary chips: 2x inline (photo stream + text input) - half width each -->
-      <!-- Primary: live camera (compact, ~64px height) -->
-      <button @click="$refs.scanInputEl.click()"
-              :disabled="scanUploading"
-              class="w-full rounded-full py-3.5 px-4 mb-2.5 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-              style="background: linear-gradient(135deg, rgba(16,185,129,0.32), rgba(16,185,129,0.12)); border: 1.5px solid rgba(16,185,129,0.65); box-shadow: 0 0 0 0 rgba(16,185,129,0.0);">
-        <div class="flex items-center justify-center gap-2">
-          <div class="text-2xl" x-text="scanUploading ? '⏳' : '📸'"></div>
-          <div class="text-sm font-bold text-emerald-200" x-text="scanUploading ? 'AI 睇緊你張相…' : '影相 / 揀圖 記食物'"></div>
-        </div>
-      </button>
-
-      <!-- v2.7.49: 2-up chip row (photo stream only) - ⌨️ keyboard icon removed
-           (Jim OOB 2026-08-07 12:35 HKT 'the keyboard icon placeholder is
-           useless. if there is no impact, just left it empty and not occupying
-           any space'). PTT mic moved to top header (Gymbro logo旁) as single
-           global trigger. -->
-      <div class="grid grid-cols-1 gap-2 mb-2">
-        <!-- iPhone photo stream picker (full-width now) -->
+      <!-- v2.7.36 → v2.7.54: Photo action buttons (camera + photo stream) —
+           both on one line, small chips, half-width each.
+           (Jim OOB 2026-08-07 14:35 HKT 'for the two photo action button.
+           make one line. small button.')
+           Prior v2.7.36 was: large primary (full-width 64px) + small chip
+           (full-width 48px) stacked. New: both equal-weight, 1 line, ~44px,
+           icon + 3-4 char label, half-width each. Text-direct input
+           moved to inline mode (openScanTextInput via purple chip). -->
+      <div class="grid grid-cols-2 gap-2 mb-3">
+        <!-- Live camera (left) -->
+        <button @click="$refs.scanInputEl.click()"
+                :disabled="scanUploading"
+                class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                style="background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)); border: 1px solid rgba(16,185,129,0.45);">
+          <div class="flex items-center justify-center gap-1.5">
+            <div class="text-lg" x-text="scanUploading ? '⏳' : '📸'"></div>
+            <div class="text-[11px] font-bold text-emerald-300" x-text="scanUploading ? '影緊…' : '影相'"></div>
+          </div>
+        </button>
+        <!-- iPhone photo stream picker (right) -->
         <button @click="$refs.scanPhotosInputEl.click()"
                 :disabled="scanUploading || scanPhotosQueue.length > 0"
-                class="rounded-xl py-2.5 px-3 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                 style="background: rgba(255,255,255,0.05); border: 1px solid rgba(16,185,129,0.3);">
-          <div class="flex items-center justify-center gap-2">
-            <div class="text-xl">📷</div>
-            <div class="text-[12px] font-bold text-emerald-300">相簿多選</div>
+          <div class="flex items-center justify-center gap-1.5">
+            <div class="text-lg">📷</div>
+            <div class="text-[11px] font-bold text-emerald-300">相簿多選</div>
           </div>
         </button>
       </div>
@@ -6649,54 +6648,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- v2.2 PHOTOSTREAM strip — today's photos with food/non-food classification -->
-      <template x-if="photostream.length > 0">
-        <div class="mb-4">
-          <div class="flex items-center justify-between mb-2">
-            <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 font-bold">今日相片
-              <span class="text-emerald-300" x-text="`(${photostream.filter(p => p.classification?.is_food && !p.already_logged).length} 建議 log)`"></span>
-            </div>
-            <button @click="loadPhotostream(true)" class="text-[10px] text-emerald-300" :disabled="photostreamClassifying">
-              <span x-text="photostreamClassifying ? '分類中...' : '↻ 重分類'"></span>
-            </button>
-          </div>
-          <div class="grid grid-cols-3 gap-2">
-            <template x-for="item in photostream" :key="item.path">
-              <div class="relative rounded-xl overflow-hidden border" :class="item.classification?.is_food ? (item.already_logged ? 'border-white/10 opacity-50' : 'border-emerald-400/60') : 'border-white/10'">
-                <img :src="item.url" class="w-full h-20 object-cover" loading="lazy">
-                <div class="absolute inset-x-0 bottom-0 bg-black/70 text-[9px] p-1 leading-tight">
-                  <template x-if="item.classification?.is_food && !item.already_logged">
-                    <div class="text-emerald-300 font-bold" x-text="item.classification?.suggested_name?.slice(0, 14) || '食物'"></div>
-                  </template>
-                  <template x-if="item.classification?.is_food && item.already_logged">
-                    <div class="text-gray-400">✓ 已 log</div>
-                  </template>
-                  <template x-if="item.classification && !item.classification.is_food">
-                    <div class="text-gray-400">非食物</div>
-                  </template>
-                  <template x-if="!item.classification">
-                    <div class="text-gray-500">— 分類中 —</div>
-                  </template>
-                </div>
-                <template x-if="item.classification?.is_food && !item.already_logged">
-                  <button type="button"
-                          @click.stop="suggestLogFromPhoto(item)"
-                          :disabled="scanUploading"
-                          :data-item-path="item.path"
-                          class="absolute top-1 right-1 bg-emerald-500 text-black text-[12px] font-bold px-2.5 py-1.5 rounded-lg shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed min-w-[64px] min-h-[28px]"
-                          :title="`AI log ${item.filename || '呢張相'}`">
-                    <span x-show="!scanUploading">AI log 呢張</span>
-                    <span x-show="scanUploading" class="inline-flex items-center gap-1">
-                      <span class="inline-block w-2 h-2 rounded-full bg-black animate-pulse"></span>
-                      處理中
-                    </span>
-                  </button>
-                </template>
-              </div>
-            </template>
-          </div>
-        </div>
-      </template>
+      <!-- v2.7.54: PHOTOSTREAM "今日相片" section removed (Jim OOB
+           2026-08-07 14:30 HKT 'remove section of 今日相片. not really
+           useful'). The classifier + 建議 log UX added complexity without
+           much value — Jim's primary flow is "相簿多選" button + direct
+           image scan. Backend API (GET /api/photostream) preserved for
+           possible future revival. -->
 
       <!-- Last scan summary -->
       <div x-show="lastScan" class="rounded-2xl bg-white/[0.06] backdrop-blur border border-white/10 p-4 mb-4" x-cloak>
