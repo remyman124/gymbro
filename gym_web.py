@@ -7338,7 +7338,23 @@ function gymApp() {
       return alias[this.tab] || this.tab;
     },
     isTabVisible(legacyName) {
-      const reverse = { 'set': ['gym'], 'workout': ['gym'], 'history': ['schedule'], 'scan': ['food'], 'end': ['gym'], 'cheer': ['cheer'] };
+      // v3.1.0: 4-tab nav aliases. Each new tab name maps to one or more
+      // legacy sections so we don't have to duplicate the 6000+ lines of
+      // existing HTML. The frontpage button is a floating element outside
+      // the section tree.
+      //   food     → set (入口) + scan (拍照/文字 log)
+      //   gym      → workout + end (session + 完場)
+      //   cheer    → cheer section
+      //   schedule → history (calendar placeholder v3.2.0 — history section
+      //              re-used as a temporary schedule list for now)
+      const reverse = {
+        'set':     ['food'],
+        'workout': ['gym'],
+        'end':     ['gym'],
+        'scan':    ['food'],
+        'history': ['schedule'],
+        'cheer':   ['cheer'],
+      };
       return (reverse[legacyName] || []).includes(this.tab);
     },
     sessionDateStr: '',
@@ -9429,6 +9445,9 @@ setTimeout(checkLandscapeFood, 500);
 </div>
 
 <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
+</div>
+
+</body>
 </html>
 """
 
@@ -9442,7 +9461,9 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v88';
+// v3.1.0: 4-tab nav + landscape food grid + gym focus mode + PT/Whoop share +
+// frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
+const CACHE = 'gym-web-v90';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
@@ -9519,7 +9540,9 @@ const CACHE = 'gym-web-v88';
 //   - /api/repair_sheet endpoint: surgical clear+repush from local for one
 //     date. Use this to clean up accumulated dupes from older sync passes.
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
-const CACHE = 'gym-web-v60';
+// v3.1.0: 4-tab nav + landscape food grid + gym focus mode + PT/Whoop share +
+// frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
+const CACHE = 'gym-web-v70';
 // v60 changes (Jim OOB 2026-08-04 'cards larger, text too much, default collapsed, progressive scroll'): v2.7.27 + v2.7.28 + v2.7.29 "step count is way too buggy,
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
