@@ -6449,9 +6449,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               data-testid="cheer-header-btn"
               class="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-black transition-all active:scale-95 disabled:opacity-50"
               style="background: linear-gradient(135deg, rgba(168,85,247,0.55), rgba(236,72,153,0.45)); border: 1.5px solid rgba(168,85,247,0.7); box-shadow: 0 0 16px -4px rgba(168,85,247,0.6); color: white;"
-              :title="cheerInFlight ? '打氣緊...' : '一撳打氣 (AI 自動揀 timing)'">
+              :title="cheerInFlight ? '🔥...' : '🔥'">
         <span x-text="cheerInFlight ? '⏳' : '🔥'"></span>
-        <span x-text="cheerInFlight ? '打氣中' : '打氣'"></span>
       </button>
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
       <div class="flex items-center gap-3">
@@ -7512,7 +7511,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="text-lg leading-none">🏋️</span><span class="text-xs font-bold">Gym</span>
       </button>
       <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'cheer' ? 'tab-active' : 'tab-inactive'" @click="tab = 'cheer'">
-        <span class="text-lg leading-none">🔥</span><span class="text-xs font-bold">打氣</span>
+        <span class="text-lg leading-none">🔥</span>
       </button>
       <!-- v3.2.0: schedule tab button — hidden when no activities in the
            past 42 days AND this week (Jim OOB 2026-08-07 16:40 HKT 'no
@@ -9646,7 +9645,7 @@ function triggerCheer() {
       setTimeout(() => {
         const tgBanner = document.createElement('div');
         tgBanner.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(168,85,247,0.95);color:white;padding:8px 16px;border-radius:12px;z-index:9999;font-size:12px;font-weight:bold;box-shadow:0 4px 20px rgba(168,85,247,0.5);';
-        tgBanner.textContent = '🔥 打氣 (' + data.fire_type + ') sent — check Telegram';
+        tgBanner.textContent = '🔥 ' + data.fire_type + ' sent — check Telegram';
         document.body.appendChild(tgBanner);
         setTimeout(() => tgBanner.remove(), 5000);
       }, 2000);
@@ -9867,7 +9866,7 @@ SERVICE_WORKER = """
 // inline next to kcal (was deleted in v63 overzealous cleanup).
 // v3.2.0: schedule tab (weekly + monthly calendar) + header cheer button
 // at top-left + food log rating badge moved to image overlay (top-right).
-const CACHE = 'gym-web-v92';
+const CACHE = 'gym-web-v93';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
@@ -9946,7 +9945,7 @@ const CACHE = 'gym-web-v92';
 //     POST {"date": "YYYY-MM-DD"} clears+rebuilds that date idempotently.
 // v3.1.0: 4-tab nav + landscape food grid + gym focus mode + PT/Whoop share +
 // frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
-const CACHE = 'gym-web-v70';
+const CACHE = 'gym-web-v93';
 // v60 changes (Jim OOB 2026-08-04 'cards larger, text too much, default collapsed, progressive scroll'): v2.7.27 + v2.7.28 + v2.7.29 "step count is way too buggy,
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
