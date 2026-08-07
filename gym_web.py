@@ -2775,31 +2775,104 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
 
 
 def _compute_rating(vision_desc: str, macros: dict = None) -> int:
-    """v3.2.7: derive a 1-5 star rating from vision description + macros.
+    """v3.2.7.1: derive a 1-5 star rating from food keywords + macros.
 
-    Heuristics:
-      - 5 stars: rich description (>=80 chars) + at least 2 macros
-      - 4 stars: rich description OR (>=40 chars + 1 macro)
-      - 3 stars: medium description (>=20 chars) + at least 1 macro
-      - 2 stars: any description OR 1 macro present
-      - 1 star: empty/very short description + no macros
+    Tier 1 (5★) = 清淡零負擔 (coffee/tea/water/clear soup/steamed veg/egg white)
+    Tier 2 (4★) = 健康均衡 (grilled chicken, salad, fish, sashimi, oats, yogurt)
+    Tier 3 (3★) = 中性 (rice/noodle/porridge, congee, regular home-cooked)
+    Tier 4 (2★) = 偏heavy (cake/dessert/cream/fried rice/pizza/sushi >2pc)
+    Tier 5 (1★) = 極heavy (deep-fried/BBQ/processed meat/large cake/buffet/sugary drink)
 
+    Description-quality fallback: macro count + description length (for unknown dishes).
     Used by scan_preview_text + scan_commit so the food list view
     shows a star rating column (Jim OOB 2026-08-07 23:50 HKT 'no
     rating' on new entries).
     """
-    desc_len = len((vision_desc or "").strip())
+    desc = (vision_desc or "").strip()
+    desc_lower = desc.lower()
+    # name field (if macros dict has 'name', use it for keyword match)
+    name_hint = ""
+    if isinstance(macros, dict):
+        name_hint = (macros.get("name") or macros.get("meal_name") or "").strip()
+    combined = (name_hint + " " + desc).lower()
+
+    # Tier 1: 5★
+    tier1_kw = ["黑咖啡", "齋啡", "凍咖啡", "咖啡", "綠茶", "紅茶", "烏龍", "麥茶",
+                "清水", "白開水", "齋水", "檸水", "蜂蜜水", "豆漿", "脫脂奶",
+                "蛋白", "雞胸", "雞胸肉", "三文魚刺身", "沙律", "沙拉", "生菜",
+                "西蘭花", "椰菜花", "蘆筍", "蒸雞", "清蒸", "白灼", "烚菜",
+                "希臘乳酪", "茅屋芝士", "豆腐", "枝豆", "海帶", "紫菜湯"]
+    if any(k in combined for k in tier1_kw):
+        return 5
+
+    # Tier 2: 4★
+    tier2_kw = ["魚", "蝦", "帶子", "刺身", "壽司 (1-2 件)", "壽司", "和牛 (細份)",
+                "牛扒 (細)", "牛柳", "烤雞", "燒雞", "蒸魚", "煎魚", "蒸蛋",
+                "番茄", "菠菜", "甘藍", "羽衣甘藍", "蘑菇", "茄子", "彩椒",
+                "燕麥", "乳酪", "酸奶", "香蕉", "蘋果", "藍莓", "奇異果",
+                "牛油果", "番薯", "紫薯", "糙米", "藜麥", "扁糧",
+                "毛豆", "蝦仁", "海鮮", "貝殼類", "蟹肉 (蒸)", "蜆", "青口",
+                "豬里脊", "牛腱", "雞腿 (去皮)", "火雞", "鴨胸", "鵪鶉蛋"]
+    if any(k in combined for k in tier2_kw):
+        return 4
+
+    # Tier 5: 1★ (deep fried/BBQ/buffet/heavy dessert)
+    tier5_kw = ["炸雞", "炸魚", "炸薯條", "炸魷", "炸春卷", "天婦羅", "炸蝦",
+                "炸排骨", "炸雞翼", "炸雞塊", "炸雞扒", "炸豬排", "炸物",
+                "燒烤 (自助)", "bbq 自助", "燒肉自助", "韓燒", "日式燒肉",
+                "自助餐", "all-you-can", "放題", "buffet",
+                "漢堡包", "巨無霸", "whopper", "雙層芝士", "double double",
+                "蛋糕 (> 500 卡)", "朱古力蛋糕", "芝士蛋糕 (重)", "忌廉蛋糕",
+                "全脂奶", "雪糕 (大)", "奶昔 (大)", "星冰樂", "frappuccino",
+                "珍珠奶茶 (大杯)", "bubble tea (大)", "coca-cola (大)",
+                "煙肉", "bacon (重份)", "香腸 (2 條+)", "午餐肉", "罐頭肉",
+                "即食麵", "杯麵", "公仔麵"]
+    if any(k in combined for k in tier5_kw):
+        return 1
+
+    # Tier 4: 2★ (heavy dessert / creamy / sweet)
+    tier4_kw = ["千層蛋糕", "瑞士卷", "tiramisu", "泡芙", "蛋撻",
+                "曲奇", "餅乾", "donut", "冬甩", "muffin", "鬆餅", "班戟",
+                "pancake", "waffle", "窩夫", "朱古力", "雪糕", "冰淇淋",
+                "奶昔", "pudding", "布丁", "焦糖", "糖水", "芝麻糊",
+                "楊枝甘露", "芒果糯米", "pizza (1 塊)", "薄餅 (1 塊)",
+                "焗芝士", "mac & cheese", "拉麵 (濃湯)", "豚骨拉麵",
+                "薯片", "蝦條", "popcorn", "粟米片", "焦糖爆谷",
+                "炸雞 (1 塊)", "薯條 (小)", "壽司 (3 件+)",
+                "咖喱飯", "焗飯", "焗豬扒飯", "星洲炒米", "揚州炒飯"]
+    # Tier 4b: 2★ for generic 蛋糕 (after dessert-specific 4★ check)
+    tier4_generic_kw = ["蛋糕", "芝士蛋糕", "朱古力蛋糕", "忌廉蛋糕",
+                        "cupcake", "紙杯蛋糕"]
+    if any(k in combined for k in tier4_kw):
+        return 2
+    if any(k in combined for k in tier4_generic_kw):
+        return 2
+
+    # Tier 3: 3★ (default for most Hong Kong home-style + rice/noodle neutral)
+    tier3_kw = ["飯", "粥", "麵", "米粉", "河粉", "瀨粉", "烏冬", "蕎麥麵",
+                "饅頭", "餃子", "包子", "雲吞", "燒賣", "腸粉", "蘿蔔糕",
+                "牛肉餅", "蒸肉餅", "肉碎", "蒸排骨", "蒸水蛋", "燉湯",
+                "雞翼", "雞腳", "鳳爪", "豬手", "牛腩", "炆牛腩",
+                "炒菜", "青菜", "菜心", "芥蘭", "通菜", "豆苗", "白菜",
+                "蒸饅頭", "小籠包", "生煎包", "鍋貼", "水餃", "湯圓",
+                "豆腐花", "豆花", "豆漿 (甜)", "油條", "煎餅", "葱油餅",
+                "蛋炒飯", "星洲炒米", "公仔麵 (1 個)"]
+    if any(k in combined for k in tier3_kw):
+        return 3
+
+    # Fallback: description-quality heuristic (legacy behaviour)
+    desc_len = len(desc)
     macro_n = sum(1 for v in (macros or {}).values()
                   if isinstance(v, (int, float)) and v and v > 0)
     if desc_len >= 80 and macro_n >= 2:
-        return 5
+        return 4
     if desc_len >= 40 and macro_n >= 1:
         return 4
     if desc_len >= 20 and macro_n >= 1:
         return 3
     if desc_len >= 5 or macro_n >= 1:
-        return 2
-    return 1
+        return 3
+    return 2
 
 
 def _merge_nutrition_estimates(estimates: list) -> dict:
@@ -10206,7 +10279,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v100';
+const CACHE = 'gym-web-v101';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10294,7 +10367,7 @@ const CACHE = 'gym-web-v100';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v100';
+const CACHE = 'gym-web-v101';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
