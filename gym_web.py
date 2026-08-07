@@ -213,43 +213,125 @@ def _whoop_activities_normalized():
     return out
 
 
+def _schedule_enrichment():
+    """v3.2.7: enrich calendar days with workout-log + Whoop recovery + sleep.
+
+    Returns dict keyed by ISO date -> {
+      gym_volume_kg, gym_set_count, gym_exercises,
+      hrv_ms, recovery_pct, sleep_pct
+    }
+    """
+    out = {}
+    log_path = WORKOUT_LOG
+    if log_path.exists():
+        try:
+            log = json.loads(log_path.read_text())
+        except Exception:
+            log = {}
+        for date_iso, entry in log.items():
+            exercises = entry.get("exercises") or []
+            if not isinstance(exercises, list):
+                continue
+            vol = 0.0
+            sets = 0
+            seen, ordered = set(), []
+            for ex in exercises:
+                try:
+                    w = float(ex.get("weight_kg") or 0)
+                    r = float(ex.get("reps") or 0)
+                    vol += w * r
+                    sets += 1
+                except (TypeError, ValueError):
+                    continue
+                name = (ex.get("exercise") or "").strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    ordered.append(name)
+            if sets > 0:
+                out[date_iso] = {
+                    **out.get(date_iso, {}),
+                    "gym_volume_kg": round(vol, 1),
+                    "gym_set_count": sets,
+                    "gym_exercises": ordered[:3],
+                }
+    whoop_cache = Path("/home/work/.whoop_data_latest.json")
+    if whoop_cache.exists():
+        try:
+            whoop = json.loads(whoop_cache.read_text())
+        except Exception:
+            whoop = {}
+        for rec in (whoop.get("recovery") or []):
+            if not isinstance(rec, dict):
+                continue
+            created_at = rec.get("created_at") or ""
+            if not created_at:
+                continue
+            try:
+                ts = _dt.fromisoformat(created_at.replace("Z", "+00:00"))
+                ts_hkt = ts.astimezone(HKT)
+                d_iso = ts_hkt.date().isoformat()
+            except Exception:
+                continue
+            score = rec.get("score") or {}
+            if not isinstance(score, dict):
+                continue
+            rec_pct = score.get("recovery_score")
+            hrv = score.get("hrv_rmssd_milli")
+            out[d_iso] = {
+                **out.get(d_iso, {}),
+                "recovery_pct": int(round(float(rec_pct))) if rec_pct is not None else None,
+                "hrv_ms": round(float(hrv), 1) if hrv is not None else None,
+            }
+        for s in (whoop.get("sleep") or []):
+            if not isinstance(s, dict):
+                continue
+            end = s.get("end") or ""
+            if not end:
+                continue
+            try:
+                ts = _dt.fromisoformat(end.replace("Z", "+00:00"))
+                ts_hkt = ts.astimezone(HKT)
+                d_iso = ts_hkt.date().isoformat()
+            except Exception:
+                continue
+            score = s.get("score") or {}
+            if not isinstance(score, dict):
+                continue
+            sp = score.get("sleep_performance_percentage")
+            out[d_iso] = {
+                **out.get(d_iso, {}),
+                "sleep_pct": int(round(float(sp))) if sp is not None else None,
+            }
+    return out
+
+
 @app.route("/api/whoop_activities_calendar")
 def api_whoop_activities_calendar():
-    """v3.2.0: monthly calendar grid for schedule tab.
+    """v3.2.0/v3.2.7: monthly calendar for schedule tab — enriched.
 
-    Returns activities grouped by date for the past N days (default 42 =
-    6 weeks, enough for a clean month-grid). Frontend builds the grid
-    by day-of-week alignment.
-
-    Response shape:
-    {
-      "days": [
-        {"date": "2026-08-07", "weekday": 4, "count": 1,
-         "activities": [{"sport":"weightlifting", ...}, ...],
-         "has_gym": true, "total_strain": 11.2},
-        ...
-      ],
-      "range_start": "2026-06-27",
-      "range_end": "2026-08-07",
-      "total_activities": 25,
-      "gym_count": 6,
-      "other_count": 19,
-    }
+    Returns activities grouped by date for the past N days (default 42),
+    enriched with workout-log volume/sets/exercises + Whoop recovery
+    (HRV + recovery %) + Whoop sleep performance %.
     """
     try:
         days_n = int(request.args.get("days", 42))
     except (TypeError, ValueError):
         days_n = 42
-    days_n = max(7, min(days_n, 90))  # clamp 1 week - 3 months
+    days_n = max(7, min(days_n, 90))
     today = datetime.now(HKT).date()
     start_date = today - timedelta(days=days_n - 1)
     activities = _whoop_activities_normalized()
     by_date = {}
     for a in activities:
         by_date.setdefault(a["date"], []).append(a)
+    enrich = _schedule_enrichment()
     days = []
     gym_count = 0
     other_count = 0
+    total_volume = 0.0
+    total_sets = 0
+    rec_pcts_sum = 0
+    rec_pcts_n = 0
     for i in range(days_n):
         d = start_date + timedelta(days=i)
         iso = d.isoformat()
@@ -261,13 +343,27 @@ def api_whoop_activities_calendar():
         else:
             other_count += len(acts)
         total_strain = sum((a["strain"] or 0) for a in acts)
+        ed = enrich.get(iso, {})
+        if ed.get("gym_volume_kg"):
+            total_volume += ed["gym_volume_kg"]
+        if ed.get("gym_set_count"):
+            total_sets += ed["gym_set_count"]
+        if ed.get("recovery_pct") is not None:
+            rec_pcts_sum += ed["recovery_pct"]
+            rec_pcts_n += 1
         days.append({
             "date": iso,
-            "weekday": d.weekday(),  # 0=Mon
+            "weekday": d.weekday(),
             "count": len(acts),
             "activities": acts,
             "has_gym": has_gym,
             "total_strain": round(total_strain, 1),
+            "gym_volume_kg": ed.get("gym_volume_kg"),
+            "gym_set_count": ed.get("gym_set_count"),
+            "gym_exercises": ed.get("gym_exercises", []),
+            "hrv_ms": ed.get("hrv_ms"),
+            "recovery_pct": ed.get("recovery_pct"),
+            "sleep_pct": ed.get("sleep_pct"),
             "is_today": iso == today.isoformat(),
         })
     return jsonify({
@@ -277,6 +373,10 @@ def api_whoop_activities_calendar():
         "total_activities": len(activities),
         "gym_count": gym_count,
         "other_count": other_count,
+        "total_volume_kg": round(total_volume, 1),
+        "total_sets": total_sets,
+        "avg_recovery_pct": round(rec_pcts_sum / rec_pcts_n, 1) if rec_pcts_n > 0 else None,
+        "enriched_dates": len(enrich),
     })
 
 
@@ -2607,23 +2707,59 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
     # (Jim OOB 2026-08-07 14:15 HKT 'the recognized food name is showing
     # 首先 only'). We strip the connective prefix AND keep searching the
     # remaining meaningful content on the same line.
+    # v3.2.7: more connectives — APiyi gpt-4o-mini often starts with
+    # "相顯示...", "圖片可見...", "睇到..." etc. (Jim OOB 2026-08-07 23:50
+    # HKT 'food title not shown, just shows 相顯示xxx').
     skip_prefixes = ("呢張", "觀察", "呢個", "呢份", "我見到", "呢碟", "呢碗", "呢個餐",
                     "首先", "再來", "另外", "最後", "然後", "接著", "至於",
-                    "從圖", "從相", "圖中", "相中", "照片中")
+                    "從圖", "從相", "圖中", "相中", "照片中",
+                    "相顯示", "圖顯示", "圖中可見", "相中可見",
+                    "可見到", "睇到", "見到一", "睇到一", "可以見到", "可以睇到")
     def _strip_prefix(s: str) -> str:
         for p in skip_prefixes:
             if s.startswith(p):
                 rest = s[len(p):].lstrip(" ，,。、")
                 return rest
         return s
+    dish_suffixes = ("飯", "麵", "粥", "餅", "糕", "包", "卷", "雞", "牛", "豬", "魚", "蝦",
+                    "菜", "湯", "茶", "咖啡", "酒", "水", "奶", "糖", "蛋", "豆", "瓜",
+                    "梨", "桃", "莓", "果", "條", "片", "粒", "碗", "碟", "盤", "杯", "盒")
+    bad_nouns = ("透明", "塑料", "餐廳", "場景", "容器",
+                 "白色", "黑色", "綠色", "紅色", "黃色", "棕色")
+    containers = ("盒入面裝住嘅", "盒裝住嘅", "盒裝住", "入面裝住嘅",
+                  "入面裝住", "碗", "碟", "盒", "個", "裝住嘅", "裝住")
+    articles = ("咗一個透明嘅", "咗一個", "咗一塊", "咗一",
+                "一個透明嘅", "一個透明", "一個", "一",
+                "透明嘅", "透明塑料", "透明", "塑料",
+                "嘅", "咁")
     for line in vision_desc.split("\n"):
         line = line.strip()
         if not line:
             continue
         line = _strip_prefix(line)
-        if not line or len(line) < 3:
+        if not line or len(line) < 2:
             continue
-        # Cut at first Chinese comma / period / colon / semicolon, cap at 30 chars
+        # v3.2.7b: multi-pass strip articles + containers (Cantonese
+        # can stack connectors: 相顯示咗一個透明嘅食物盒)
+        for _ in range(3):
+            prev = line
+            for art in articles:
+                if line.startswith(art):
+                    line = line[len(art):].lstrip(" ，,。、")
+                    break
+            if line == prev:
+                break
+        for c in containers:
+            if line.startswith(c):
+                line = line[len(c):].lstrip(" ，,。、")
+                break
+        # v3.2.7b: try a few candidate lengths (2, 3, 4, 5, 6 chars)
+        for L in (6, 5, 4, 3, 2):
+            if len(line) >= L:
+                cand = line[:L]
+                if cand not in bad_nouns and any(cand.endswith(suf) for suf in dish_suffixes):
+                    return cand
+        # Final fallback: cut at first Chinese comma / period / colon
         cut = re.search(r"[，。；：]", line)
         if cut:
             return line[:cut.start()][:30]
@@ -2636,6 +2772,34 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
     if fallback:
         return fallback[:30]
     return vision_desc[:30] if vision_desc else "食物"
+
+
+def _compute_rating(vision_desc: str, macros: dict = None) -> int:
+    """v3.2.7: derive a 1-5 star rating from vision description + macros.
+
+    Heuristics:
+      - 5 stars: rich description (>=80 chars) + at least 2 macros
+      - 4 stars: rich description OR (>=40 chars + 1 macro)
+      - 3 stars: medium description (>=20 chars) + at least 1 macro
+      - 2 stars: any description OR 1 macro present
+      - 1 star: empty/very short description + no macros
+
+    Used by scan_preview_text + scan_commit so the food list view
+    shows a star rating column (Jim OOB 2026-08-07 23:50 HKT 'no
+    rating' on new entries).
+    """
+    desc_len = len((vision_desc or "").strip())
+    macro_n = sum(1 for v in (macros or {}).values()
+                  if isinstance(v, (int, float)) and v and v > 0)
+    if desc_len >= 80 and macro_n >= 2:
+        return 5
+    if desc_len >= 40 and macro_n >= 1:
+        return 4
+    if desc_len >= 20 and macro_n >= 1:
+        return 3
+    if desc_len >= 5 or macro_n >= 1:
+        return 2
+    return 1
 
 
 def _merge_nutrition_estimates(estimates: list) -> dict:
@@ -3813,6 +3977,7 @@ def api_scan_preview():
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": _extract_dish_name(vision_desc, pplx_desc),
+            "rating": _compute_rating(vision_desc, merged_nutrition),
             "restaurant_chain": restaurant_guess,
             "calories": preview_field_entries["calories"],
             "protein": preview_field_entries["protein"],
@@ -3906,6 +4071,7 @@ def api_scan_preview_from_path():
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": _extract_dish_name(vision_desc, pplx_desc),
+            "rating": _compute_rating(vision_desc, merged_nutrition),
             "restaurant_chain": restaurant_guess,
             "calories": jim_kcal,
             "protein": jim_p,
@@ -4415,6 +4581,42 @@ def api_scan_commit():
 
     # v2.7.22 (text-only path): when no image, skip file rename + scan_log.
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    # v3.2.7: enforce dish-name extraction + rating on every commit
+    # (Jim OOB 2026-08-07 23:50 HKT 'the food title is not shown on
+    # the list view. Moreover, it does not have rating').
+    # If name is a hash / path / generic, re-derive via _extract_dish_name.
+    current_name = (entry.get("name") or "").strip()
+    if (not current_name
+        or current_name.startswith("img_")
+        or current_name.endswith(".jpg")
+        or current_name == "食物"
+        or current_name.startswith("相顯示")
+        or current_name.startswith("圖顯示")
+        or current_name.startswith("呢張")
+        or len(current_name) > 60):
+        vision_hint = (entry.get("vision_raw_desc")
+                       or entry.get("vision_desc")
+                       or entry.get("source_text")
+                       or entry.get("vision_short")
+                       or "")
+        pplx_hint = (entry.get("pplx_short")
+                     or entry.get("apiyi_enrichment")
+                     or "")
+        redrive = _extract_dish_name(vision_hint, pplx_hint, fallback=current_name or "")
+        if redrive and redrive.strip() != "食物":
+            entry["name"] = redrive
+            current_name = redrive
+    # Compute / override rating from available description + macros
+    if "rating" not in entry or not isinstance(entry.get("rating"), int):
+        macro_dict = {k: entry.get(k) for k in
+                      ("calories", "protein", "carbs", "fat",
+                       "fiber", "sugar", "sodium", "sat_fat",
+                       "trans_fat", "vit_c", "iron", "calcium")
+                      if isinstance(entry.get(k), (int, float))}
+        entry["rating"] = _compute_rating(
+            entry.get("vision_raw_desc") or entry.get("vision_desc") or "",
+            macro_dict,
+        )
     if img_path is not None:
         # Rename preview_*.jpg → scan_*.jpg
         final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
@@ -4439,13 +4641,14 @@ def api_scan_commit():
             "scan_index": scan_index,
             "timestamp_iso": now_iso_str,
             "name": entry.get("name", "scan"),
+            "rating": entry.get("rating", 3),
             "calories": entry.get("calories", 0),
             "protein": entry.get("protein", 0),
             "shared": entry.get("is_shared_meal", False),
             "image_path": str(final_path),
             "image_url": image_url,
             "restaurant_chain": entry.get("restaurant_chain", ""),
-            "vision_short": entry.get("vision_raw_desc", "")[:120],
+            "vision_short": (entry.get("vision_raw_desc") or entry.get("vision_desc") or "")[:120],
             "user_corrections": [user_correction] if user_correction else [],
         })
         _save_scan_log(scan_log)
@@ -4455,13 +4658,14 @@ def api_scan_commit():
             "scan_index": scan_index,
             "timestamp_iso": now_iso_str,
             "name": entry.get("name", "text"),
+            "rating": entry.get("rating", 3),
             "calories": entry.get("calories", 0),
             "protein": entry.get("protein", 0),
             "shared": entry.get("is_shared_meal", False),
             "image_path": "",
             "image_url": "",
             "restaurant_chain": entry.get("restaurant_chain", ""),
-            "vision_short": entry.get("name", "")[:120],
+            "vision_short": (entry.get("vision_raw_desc") or entry.get("name", ""))[:120],
             "user_corrections": [user_correction] if user_correction else [],
             "is_text_only": True,
         })
@@ -4820,8 +5024,19 @@ def api_scan_preview_text():
     raw_p = float(parsed.get("protein", 0) or 0) if isinstance(parsed, dict) else 0
 
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
-    suggested_name = (parsed.get("name") if isinstance(parsed, dict) else "") or text_desc[:60]
+    # v3.2.7: route through _extract_dish_name() + _compute_rating() so the
+    # preview shows a proper dish name + star rating, NOT the raw APiyi
+    # prose (Jim OOB 2026-08-07 23:50 HKT 'the food title is not shown
+    # on the list view. Moreover, it does not have rating').
+    apiyi_name_raw = (parsed.get("name") if isinstance(parsed, dict) else "") or ""
     restaurant_guess = (parsed.get("restaurant_guess") if isinstance(parsed, dict) else "") or ""
+    # Use APiyi's name as the dish-name extractor input (it's the
+    # most relevant text), with the user input as fallback.
+    suggested_name = _extract_dish_name(apiyi_name_raw, apiyi_text_desc, fallback=text_desc[:60])
+    # If still empty or the generic "食物" fallback, try the user input directly
+    if not suggested_name or suggested_name.strip() == "食物":
+        suggested_name = _extract_dish_name(text_desc, "", fallback=text_desc[:60])
+    rating_now = _compute_rating(apiyi_text_desc, parsed if isinstance(parsed, dict) else None)
 
     preview = {
         "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_txt",
@@ -4838,6 +5053,7 @@ def api_scan_preview_text():
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": suggested_name,
+            "rating": rating_now,
             "restaurant_chain": restaurant_guess,
             "cooking_method": (parsed.get("cooking_method", "") if isinstance(parsed, dict) else ""),
             "calories": field_entries["calories"],
@@ -6641,58 +6857,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div x-show="!sessionGrouped.length" class="text-gray-500 text-center py-20">No sets logged yet</div>
     </section>
 
-    <!-- HISTORY TAB -->
-    <section x-show="isTabVisible('history')">
-      <div class="flex items-baseline justify-between my-3">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">Recent Sessions</div>
-        <button class="text-xs text-gray-400 underline tap" @click="refreshHistory(true)" x-show="!loadingHistory">↻ Refresh</button>
-        <span class="text-xs text-gray-400" x-show="loadingHistory">Loading…</span>
-      </div>
-
-      <!-- Jim OOB 2026-07-21: Removed date-range chips + global Copy.
-           New pattern: ONE copy button per row in history list.
-           Always copies that single day's data. No date-range. -->
-
-      <div x-show="loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">Loading history…</div>
-      <div x-show="!loadingHistory && history.length === 0" class="text-gray-500 text-center py-12">No sessions yet — go log some 🔥</div>
-      <template x-for="row in history" :key="row.date">
-        <div class="bg-white/5 backdrop-blur border border-white/10 rounded-2xl p-4 mb-3 relative fade-up"
-             :class="row.date === today ? 'ring-2 ring-yellow-400/50' : ''">
-          <button class="absolute top-2 right-11 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
-                  :style="copyingDate === row.date
-                            ? 'background: rgba(250,204,21,0.25); border: 1px solid rgba(250,204,21,0.5); color: #fde68a; animation: spin 1s linear infinite;'
-                            : 'background: rgba(99,102,241,0.20); border: 1px solid rgba(99,102,241,0.40); color: #c7d2fe;'"
-                  :class="copyInFlight ? 'opacity-60 cursor-wait' : ''"
-                  :disabled="copyInFlight"
-                  @click="copyDay(row.date)"
-                  :aria-label="copyingDate === row.date ? `Copying ${row.date}` : `Copy ${row.date}`"
-                  :title="copyingDate === row.date ? 'Copying…' : '複製呢一日 workout log'"
-                  x-text="copyingDate === row.date ? '⏳' : '📋'">📋</button>
-          <button class="absolute top-2 right-2 w-8 h-8 rounded-full flex items-center justify-center text-lg tap"
-                  style="background: rgba(239,68,68,0.20); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5;"
-                  @click="deleteSession(row.date)"
-                  :aria-label="`Delete ${row.date}`"
-                  title="Delete session">🗑</button>
-          <div class="flex items-baseline gap-2 mb-1 pr-10">
-            <div class="text-2xl font-black tracking-tight" x-text="row.date"></div>
-            <span x-show="row.date === today"
-                  class="text-[10px] uppercase tracking-[0.15em] font-bold px-2 py-0.5 rounded-full"
-                  style="background: rgba(255,214,10,0.15); color: var(--gold); border: 1px solid rgba(255,214,10,0.35);">Today</span>
-            <span x-show="row.completed"
-                  class="text-[10px] uppercase tracking-[0.15em] font-bold px-2 py-0.5 rounded-full text-emerald-400"
-                  style="background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.30);">✓ Done</span>
-          </div>
-          <div class="text-sm text-gray-300">
-            <span class="font-bold" x-text="`${row.sets} set${row.sets === 1 ? '' : 's'}`"></span>
-            <span class="text-gray-500"> · </span>
-            <span class="font-bold" x-text="`${row.total_vol_kg}kg vol`"></span>
-            <span x-show="row.exercises.length" class="text-gray-500" x-text="` · ${row.exercises.length} exercise${row.exercises.length === 1 ? '' : 's'}`"></span>
-          </div>
-          <div x-show="row.exercises.length" class="text-xs text-gray-400 mt-1 truncate" x-text="row.exercises.join(' · ')"</div>
-        </div>
-      </template>
-    </section>
-
+    <!-- v3.2.7: legacy HISTORY TAB removed (Jim OOB 2026-08-07 23:40 HKT
+         'In gymbro schedule. Remove the top list of activities too').
+         The schedule tab now shows ONLY the month calendar + day
+         popover. The 'Recent Sessions' list was previously aliased to
+         'schedule' via isTabVisible('history') → ['schedule'], but
+         gym sessions now live on the calendar grid itself with
+         volume + sets + exercises per day. -->
 
     <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
     <section x-show="isTabVisible('scan')" x-cloak class="px-4 pb-32 pt-3">
@@ -7531,6 +7702,8 @@ function gymApp() {
     scheduleMonthAligned: [],
     scheduleMonthGymCount: 0,
     scheduleMonthOtherCount: 0,
+    scheduleTotalVolume: 0,
+    scheduleTotalSets: 0,
     scheduleRangeLabel: '',
     scheduleHasAny: false,
     // v3.2.5: month calendar popover — tap a day to see full details.
@@ -7553,8 +7726,14 @@ function gymApp() {
       //              workflow is: tap motivation image, input exercise,
       //              log set, see pyramid, end + share
       //   cheer    → cheer section
-      //   schedule → history (calendar placeholder v3.2.0 — history section
-      //              re-used as a temporary schedule list for now)
+      //   schedule → history (the calendar section uses
+      //              isTabVisible('history') for back-compat; the
+      //              legacy 'Recent Sessions' list was removed in
+      //              v3.2.7 — Jim OOB 2026-08-07 23:40 HKT
+      //              'Remove the top list of activities too'.
+      //              The 42-day monthly calendar at the bottom of
+      //              this file is the only visible element on the
+      //              schedule tab now.)
       const reverse = {
         'set':     ['gym'],
         'workout': ['gym'],
@@ -8447,6 +8626,8 @@ function gymApp() {
         this.scheduleMonth = monthRes.days || [];
         this.scheduleMonthGymCount = monthRes.gym_count || 0;
         this.scheduleMonthOtherCount = monthRes.other_count || 0;
+        this.scheduleTotalVolume = monthRes.total_volume_kg || 0;
+        this.scheduleTotalSets = monthRes.total_sets || 0;
         const rs = monthRes.range_start || '';
         const re = monthRes.range_end || '';
         this.scheduleRangeLabel = rs && re
@@ -8588,9 +8769,50 @@ function gymApp() {
     // calendar beautifully'). Tap a day to see full activity list.
     openDayPopover(day) {
       try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
-      if (!day || !day.activities || day.activities.length === 0) return;
+      // v3.2.7: allow opening popover for any day with data, not just
+      // activity days. A rest day with recovery/HRV/sleep data is also
+      // worth showing. (Jim OOB 2026-08-07 23:40 HKT 'beatify the
+      // month view with enriched data'.)
+      if (!day) return;
+      const hasData = (day.activities && day.activities.length > 0)
+        || day.gym_volume_kg != null
+        || day.recovery_pct != null
+        || day.sleep_pct != null
+        || day.hrv_ms != null;
+      if (!hasData) return;
       this.scheduleSelectedDay = day;
       try { this.haptic && this.haptic('light'); } catch(e) { /* noop */ }
+    },
+    // v3.2.7: formatVolume(kg) — "1.5k" for >=1000, "850" for <1000.
+    formatVolume(kg) {
+      if (kg == null || isNaN(kg)) return '—';
+      if (kg >= 1000) return (kg / 1000).toFixed(1) + 'k';
+      return Math.round(kg).toString();
+    },
+    // v3.2.7: recoveryPillClass(pct) — green ≥66, sky 33-65, rose <33.
+    recoveryPillClass(pct) {
+      if (pct == null) return 'text-gray-500';
+      if (pct >= 66) return 'text-emerald-300';
+      if (pct >= 33) return 'text-sky-300';
+      return 'text-rose-300';
+    },
+    // v3.2.7: dayCellClass(day) — bg color + ring + clickability.
+    // (Replaces the inline ternary chain — too complex to read in HTML.)
+    dayCellClass(day) {
+      if (day.empty) return 'invisible';
+      if (day.count === 0 && !day.is_today) {
+        // Rest day: show only if recovery data exists, else blank.
+        return day.recovery_pct != null
+          ? 'bg-white/[0.025] ring-1 ring-white/[0.05] cursor-pointer'
+          : 'bg-transparent';
+      }
+      if (day.is_today) {
+        return 'bg-emerald-500/25 ring-2 ring-emerald-300/70 shadow-lg shadow-emerald-500/20';
+      }
+      if (day.has_gym) {
+        return 'bg-emerald-500/12 ring-1 ring-emerald-500/40 active:scale-95 cursor-pointer';
+      }
+      return 'bg-sky-500/12 ring-1 ring-sky-500/30 active:scale-95 cursor-pointer';
     },
     closeDayPopover() {
       this.scheduleSelectedDay = null;
@@ -9750,16 +9972,22 @@ setTimeout(checkLandscapeFood, 500);
          is the single source of truth — tap any day to see full
          activity details in the popover below. -->
 
-    <!-- ============ MONTHLY CALENDAR (42 days back, primary view) ============ -->
+    <!-- ============ MONTHLY CALENDAR (42 days back, enriched) ============ -->
+    <!-- v3.2.7: cells now show gym volume + sets + recovery %, enriched
+         via /api/whoop_activities_calendar. (Jim OOB 2026-08-07 23:40 HKT
+         'beatify the month view with enriched data'.) -->
     <div>
       <div class="flex items-center justify-between mb-2">
         <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
           月曆 <span class="text-gray-300" x-text="scheduleRangeLabel"></span>
         </div>
-        <div class="text-[10px] text-gray-500">
-          🏋️<span x-text="scheduleMonthGymCount" class="ml-0.5 font-bold text-emerald-400"></span>
-          <span class="mx-1.5">·</span>
-          <span x-text="scheduleMonthOtherCount" class="font-bold text-sky-400"></span> 其他
+        <div class="text-[10px] text-gray-500 flex items-center gap-1.5">
+          <span class="font-bold text-emerald-400">🏋️<span x-text="scheduleMonthGymCount"></span></span>
+          <span class="text-gray-600">·</span>
+          <span class="font-bold text-sky-400" x-text="scheduleMonthOtherCount"></span><span>其他</span>
+          <template x-if="scheduleTotalVolume != null">
+            <span class="ml-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-bold tabular-nums" x-text="formatVolume(scheduleTotalVolume) + 'kg'"></span>
+          </template>
         </div>
       </div>
       <!-- Weekday header row -->
@@ -9771,40 +9999,54 @@ setTimeout(checkLandscapeFood, 500);
       <!-- Calendar grid: align first day to its weekday slot -->
       <div class="grid grid-cols-7 gap-1">
         <template x-for="day in scheduleMonthAligned" :key="day.date">
-          <!-- v3.2.5: empty days (count=0, not today, not padding) now render
-               as a truly blank cell — no background, no day number, no ring.
-               Padding cells keep `invisible` so they reserve their grid slot
-               for column alignment. (Jim OOB 2026-08-07 18:25 HKT 'no need
-               to show date without activities')
-               Active days are clickable — open popover with full activity
-               details (Jim OOB 2026-08-07 18:40 HKT 'need to put the info
-               on the calendar beautifully'). -->
-          <div class="aspect-square rounded-lg p-1 flex flex-col items-center justify-start transition-all"
-               :class="day.empty
-                          ? 'invisible'
-                          : (day.count === 0 && !day.is_today
-                              ? 'bg-transparent'
-                              : (day.is_today
-                                  ? 'bg-emerald-500/25 ring-2 ring-emerald-300/70 shadow-lg shadow-emerald-500/20'
-                                  : (day.has_gym
-                                      ? 'bg-emerald-500/12 ring-1 ring-emerald-500/40 active:scale-95 cursor-pointer'
-                                      : 'bg-sky-500/12 ring-1 ring-sky-500/30 active:scale-95 cursor-pointer')))"
-               @click="day.activities && day.activities.length > 0 ? openDayPopover(day) : null">
-            <div class="text-[10px] tabular-nums font-black"
-                 :class="day.count === 0 && !day.is_today ? 'text-transparent' : (day.is_today ? 'text-emerald-200' : (day.has_gym ? 'text-emerald-200' : 'text-sky-200'))"
-                 x-text="day.day_num"></div>
-            <div class="mt-0.5 flex flex-wrap justify-center gap-0.5 text-[11px] leading-none"
-                 x-show="day.activities && day.activities.length > 0">
-              <template x-for="(act, idx) in (day.activities || []).slice(0, 3)" :key="idx">
-                <span x-text="act.icon"></span>
+          <!-- v3.2.7: enriched cell layout — 3 visual states:
+               (1) gym day  → bg-emerald + day-num + volume + sets + recovery chip
+               (2) activity → bg-sky + day-num + icon + strain
+               (3) rest     → bg-transparent + day-num + recovery chip (if data)
+               Empty days + non-today are blank. Today always gets a ring.
+               (Jim OOB 2026-08-07 23:40 HKT 'beatify the month view with
+               enriched data'.) -->
+          <div class="aspect-square rounded-lg p-0.5 flex flex-col items-stretch justify-start transition-all overflow-hidden"
+               :class="dayCellClass(day)"
+               @click="day.activities && day.activities.length > 0 ? openDayPopover(day) : (day.recovery_pct != null ? openDayPopover(day) : null)">
+            <!-- Top row: day number + recovery/sleep chip -->
+            <div class="flex items-start justify-between px-0.5 pt-0.5">
+              <div class="text-[10px] tabular-nums font-black leading-none"
+                   :class="day.count === 0 && !day.is_today ? 'text-transparent' : (day.is_today ? 'text-emerald-200' : (day.has_gym ? 'text-emerald-200' : 'text-sky-200'))"
+                   x-text="day.day_num"></div>
+              <template x-if="day.recovery_pct != null">
+                <div class="text-[8px] tabular-nums font-black leading-none px-1 rounded-sm"
+                     :class="recoveryPillClass(day.recovery_pct)"
+                     x-text="day.recovery_pct + '%'"></div>
+              </template>
+            </div>
+            <!-- Bottom area: gym volume + sets OR activity icon + strain -->
+            <div class="flex-1 flex flex-col items-center justify-end pb-0.5">
+              <template x-if="day.has_gym && day.gym_volume_kg != null">
+                <div class="flex flex-col items-center leading-none">
+                  <div class="text-[10px] font-black tabular-nums text-emerald-200" x-text="formatVolume(day.gym_volume_kg) + 'kg'"></div>
+                  <div class="text-[8px] font-bold text-emerald-300/80 tabular-nums" x-text="day.gym_set_count + ' 套'"></div>
+                </div>
+              </template>
+              <template x-if="!day.has_gym && day.activities && day.activities.length > 0">
+                <div class="flex flex-wrap justify-center gap-0.5 text-[11px] leading-none">
+                  <template x-for="(act, idx) in (day.activities || []).slice(0, 2)" :key="idx">
+                    <span class="text-sky-300" x-text="act.icon"></span>
+                  </template>
+                </div>
+              </template>
+              <template x-if="day.sleep_pct != null && !day.has_gym && (!day.activities || day.activities.length === 0)">
+                <div class="text-[8px] font-bold tabular-nums"
+                     :class="day.sleep_pct >= 80 ? 'text-emerald-300/80' : (day.sleep_pct >= 60 ? 'text-sky-300/80' : 'text-rose-300/80')"
+                     x-text="'💤' + day.sleep_pct + '%'"></div>
               </template>
             </div>
           </div>
         </template>
       </div>
 
-      <!-- Legend -->
-      <div class="mt-3 flex items-center justify-center gap-3 text-[10px] text-gray-400">
+      <!-- Legend (v3.2.7: enriched) -->
+      <div class="mt-3 flex items-center justify-center gap-3 text-[10px] text-gray-400 flex-wrap">
         <div class="flex items-center gap-1">
           <span class="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500/30 ring-1 ring-emerald-500/40"></span>
           <span>Gym</span>
@@ -9814,12 +10056,19 @@ setTimeout(checkLandscapeFood, 500);
           <span>其他活動</span>
         </div>
         <div class="flex items-center gap-1">
-          <span class="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500/40 ring-1 ring-emerald-300/60"></span>
+          <span class="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500/40 ring-2 ring-emerald-300/60"></span>
           <span>今日</span>
+        </div>
+        <div class="flex items-center gap-1">
+          <span class="px-1 rounded-sm bg-emerald-500/30 text-emerald-200 font-black text-[8px]">≥66%</span>
+          <span class="text-emerald-300/80">高 recovery</span>
+        </div>
+        <div class="flex items-center gap-1">
+          <span class="px-1 rounded-sm bg-rose-500/30 text-rose-200 font-black text-[8px]">≤33%</span>
+          <span class="text-rose-300/80">低 recovery</span>
         </div>
       </div>
     </div>
-
     <!-- v3.2.5: Day detail popover (Jim OOB 2026-08-07 18:40 HKT 'need to
          put the info on the calendar beautifully'). Tap a day in the
          calendar to see full activity list with sport + strain + time. -->
@@ -9842,22 +10091,48 @@ setTimeout(checkLandscapeFood, 500);
             <span class="text-lg">✕</span>
           </button>
         </div>
-        <!-- Day summary stats -->
-        <div class="grid grid-cols-3 gap-2 mb-4">
-          <div class="rounded-xl bg-white/[0.04] p-2.5 text-center">
-            <div class="text-[9px] uppercase tracking-wider text-gray-500">活動</div>
-            <div class="text-xl font-black text-emerald-300" x-text="scheduleSelectedDay?.count || 0"></div>
+        <!-- v3.2.7: enriched day summary stats — volume, sets, recovery, HRV, sleep -->
+        <div class="grid grid-cols-4 gap-1.5 mb-3">
+          <div class="rounded-xl bg-white/[0.04] p-2 text-center">
+            <div class="text-[8px] uppercase tracking-wider text-gray-500">Gym vol</div>
+            <div class="text-base font-black text-emerald-300 tabular-nums" x-text="scheduleSelectedDay?.gym_volume_kg ? scheduleSelectedDay.gym_volume_kg + 'kg' : '—'"></div>
           </div>
-          <div class="rounded-xl bg-white/[0.04] p-2.5 text-center">
-            <div class="text-[9px] uppercase tracking-wider text-gray-500">總 strain</div>
-            <div class="text-xl font-black text-amber-300" x-text="scheduleSelectedDay?.total_strain || 0"></div>
+          <div class="rounded-xl bg-white/[0.04] p-2 text-center">
+            <div class="text-[8px] uppercase tracking-wider text-gray-500">套數</div>
+            <div class="text-base font-black text-emerald-300 tabular-nums" x-text="scheduleSelectedDay?.gym_set_count || '—'"></div>
           </div>
-          <div class="rounded-xl bg-white/[0.04] p-2.5 text-center">
-            <div class="text-[9px] uppercase tracking-wider text-gray-500">Gym</div>
-            <div class="text-xl font-black" :class="scheduleSelectedDay?.has_gym ? 'text-emerald-300' : 'text-gray-600'" x-text="scheduleSelectedDay?.has_gym ? '✓' : '—'"></div>
+          <div class="rounded-xl bg-white/[0.04] p-2 text-center">
+            <div class="text-[8px] uppercase tracking-wider text-gray-500">Recovery</div>
+            <div class="text-base font-black tabular-nums" :class="recoveryPillClass(scheduleSelectedDay?.recovery_pct)" x-text="scheduleSelectedDay?.recovery_pct != null ? scheduleSelectedDay.recovery_pct + '%' : '—'"></div>
+          </div>
+          <div class="rounded-xl bg-white/[0.04] p-2 text-center">
+            <div class="text-[8px] uppercase tracking-wider text-gray-500">HRV</div>
+            <div class="text-base font-black text-sky-300 tabular-nums" x-text="scheduleSelectedDay?.hrv_ms != null ? scheduleSelectedDay.hrv_ms.toFixed(1) : '—'"></div>
           </div>
         </div>
-        <!-- Activity list -->
+        <div class="grid grid-cols-2 gap-1.5 mb-4">
+          <div class="rounded-xl bg-white/[0.04] p-2 text-center">
+            <div class="text-[8px] uppercase tracking-wider text-gray-500">Sleep</div>
+            <div class="text-base font-black tabular-nums" :class="(scheduleSelectedDay?.sleep_pct ?? 0) >= 80 ? 'text-emerald-300' : ((scheduleSelectedDay?.sleep_pct ?? 0) >= 60 ? 'text-sky-300' : 'text-rose-300')" x-text="scheduleSelectedDay?.sleep_pct != null ? scheduleSelectedDay.sleep_pct + '%' : '—'"></div>
+          </div>
+          <div class="rounded-xl bg-white/[0.04] p-2 text-center">
+            <div class="text-[8px] uppercase tracking-wider text-gray-500">總 strain</div>
+            <div class="text-base font-black text-amber-300 tabular-nums" x-text="scheduleSelectedDay?.total_strain || 0"></div>
+          </div>
+        </div>
+        <!-- v3.2.7: gym exercises list (if any) -->
+        <template x-if="scheduleSelectedDay?.gym_exercises && scheduleSelectedDay.gym_exercises.length > 0">
+          <div class="mb-4">
+            <div class="text-[10px] uppercase tracking-[0.15em] text-emerald-400/80 mb-1.5 font-bold">動作</div>
+            <div class="flex flex-wrap gap-1.5">
+              <template x-for="(ex, idx) in (scheduleSelectedDay?.gym_exercises || [])" :key="idx">
+                <span class="text-[11px] font-bold px-2 py-1 rounded-full bg-emerald-500/15 text-emerald-200 border border-emerald-500/30" x-text="ex"></span>
+              </template>
+            </div>
+          </div>
+        </template>
+        <!-- Activity list (Whoop raw activities — walking etc) -->
+        <div class="text-[10px] uppercase tracking-[0.15em] text-sky-400/80 mb-1.5 font-bold" x-show="scheduleSelectedDay?.activities && scheduleSelectedDay.activities.length > 0">活動</div>
         <div class="space-y-2">
           <template x-for="(act, idx) in (scheduleSelectedDay?.activities || [])" :key="idx">
             <div class="flex items-center gap-3 rounded-xl bg-white/[0.04] p-3 border border-white/[0.06]">
@@ -9865,8 +10140,6 @@ setTimeout(checkLandscapeFood, 500);
               <div class="flex-1 min-w-0">
                 <div class="text-sm font-black" x-text="act.label"></div>
                 <div class="text-[10px] text-gray-500 mt-0.5 tabular-nums">
-                  <span x-text="(act.start || '').slice(0, 10)"></span>
-                  <span class="mx-1">·</span>
                   <span x-text="(act.start || '').slice(11, 16)"></span>
                   <span class="mx-1">→</span>
                   <span x-text="(act.end || '').slice(11, 16)"></span>
@@ -9933,7 +10206,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v99';
+const CACHE = 'gym-web-v100';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10021,7 +10294,7 @@ const CACHE = 'gym-web-v99';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v99';
+const CACHE = 'gym-web-v100';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
