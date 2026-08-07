@@ -6358,8 +6358,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </button>
 
-      <!-- Secondary: 2-up chip row (photo stream + text) - each ~48px -->
-      <div class="grid grid-cols-2 gap-2 mb-3">
+      <!-- v2.7.45: 2-up chip row (photo stream + text) - each ~48px -->
+      <div class="grid grid-cols-2 gap-2 mb-2">
         <!-- iPhone photo stream picker -->
         <button @click="$refs.scanPhotosInputEl.click()"
                 :disabled="scanUploading || scanPhotosQueue.length > 0"
@@ -6380,16 +6380,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="text-[11px] font-bold text-purple-300">打文字</div>
           </div>
         </button>
-        <!-- v2.7.45: Voice memo → text via gpt-4o-transcribe -->
-        <button @click="openVoiceInput()"
-                class="rounded-xl py-2.5 px-2 transition-all active:scale-95"
-                style="background: rgba(56,189,248,0.10); border: 1px solid rgba(56,189,248,0.4);">
-          <div class="flex flex-col items-center gap-0.5">
-            <div class="text-xl">🎙️</div>
-            <div class="text-[11px] font-bold text-sky-300">錄語音</div>
-          </div>
-        </button>
       </div>
+
+      <!-- v2.7.48 (Jim OOB 2026-08-07 11:00 HKT 'make the ptt button larger and
+           visible. not easy to fat finger'): PTT voice button is now a
+           separate full-width pill below the chip row — biggest, most
+           visible, with mic glyph + label + subtitle so it can't be confused
+           with the other secondary actions. -->
+      <button @click="openVoiceInput()"
+              class="w-full rounded-2xl py-4 px-4 mb-2 transition-all active:scale-[0.97]"
+              style="background: linear-gradient(135deg, rgba(56,189,248,0.32), rgba(56,189,248,0.12)); border: 2px solid rgba(56,189,248,0.7); box-shadow: 0 0 0 1px rgba(56,189,248,0.2), 0 0 24px -4px rgba(56,189,248,0.4);">
+        <div class="flex items-center justify-center gap-3">
+          <div class="text-3xl">🎙️</div>
+          <div class="text-left">
+            <div class="text-base font-black text-sky-100 leading-tight">按住講嘢</div>
+            <div class="text-[10px] text-sky-300/80 leading-tight">廣東話直入 food log · gpt-4o-transcribe</div>
+          </div>
+          <div class="ml-auto text-sky-400 text-2xl">›</div>
+        </div>
+      </button>
 
       <!-- v2.7.45: Voice input panel (audio → transcript → food entry) -->
       <div x-show="voiceInputMode" x-cloak class="mb-4 rounded-2xl p-4"
@@ -9123,7 +9132,7 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-const CACHE = 'gym-web-v86';
+const CACHE = 'gym-web-v88';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
