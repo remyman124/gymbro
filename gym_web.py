@@ -7457,6 +7457,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
                 <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
                 <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
+                <!-- v3.2.7.1: 食物健康度 1-5 星 (food keyword tier via _compute_rating) -->
+                <span x-show="scan.rating"
+                      class="font-bold tabular-nums"
+                      :class="{
+                        'text-emerald-300': scan.rating >= 5,
+                        'text-lime-300': scan.rating === 4,
+                        'text-yellow-300': scan.rating === 3,
+                        'text-orange-300': scan.rating === 2,
+                        'text-rose-300': scan.rating === 1,
+                      }"
+                      x-text="'⭐'.repeat(scan.rating || 0)"></span>
                 <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
                 <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
               </div>
