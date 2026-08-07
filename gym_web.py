@@ -7374,8 +7374,11 @@ function gymApp() {
     formatScanTime(iso) {
       if (!iso) return '';
       const s = String(iso);
-      // Extract 'YYYY-MM-DDTHH:MM' → 'HH:MM'
-      const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+      // Extract 'YYYY-MM-DDTHH:MM' → 'HH:MM'.
+      // Doubled backslashes below are needed: Python 3.12+ emits a
+      // SyntaxWarning for raw \d inside a string literal. Python emits
+      // the doubled form to HTML, where JS reads it as a single \d.
+      const m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})/);
       if (m) return `${m[4]}:${m[5]}`;
       return s.slice(11, 16);
     },
@@ -9159,7 +9162,7 @@ function gymApp() {
       this.editingDateTimeIndex = scan.scan_index;
       const ts = scan.timestamp_iso || '';
       this.editingDateTimeNewDate = ts.slice(0, 10) || '';
-      this.editingDateTimeNewTime = (ts.slice(11, 16) || '').replace(/^(\d):/, '0$1:');
+      this.editingDateTimeNewTime = (ts.slice(11, 16) || '').replace(/^(\\d):/, '0$1:');
       this.editingDateTimeOld = `${(ts.slice(0, 10) || '?')} ${(ts.slice(11, 16) || '?')}`;
       this.editDateTimeSubmitting = false;
       this.editDateTimeSubmitMsg = '';
