@@ -7284,9 +7284,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <div x-show="!endSummary">
+        <!-- v3.2.3: RPE slider (Jim OOB 2026-08-07 18:00 HKT 'make RPE is slide bar rather than input'). 1-10 with color-coded zones + real-time display. -->
         <div class="my-6">
-          <label class="text-[10px] uppercase tracking-[0.2em] text-gray-400 mb-2 block">RPE (1-10)</label>
-          <input type="number" min="1" max="10" placeholder="例: 7" x-model.number="endRPE" />
+          <div class="flex items-end justify-between mb-3">
+            <label class="text-[10px] uppercase tracking-[0.2em] text-gray-400">RPE 自覺強度</label>
+            <div class="flex items-baseline gap-1.5">
+              <span class="text-3xl font-black tabular-nums"
+                    :class="endRPE <= 3 ? 'text-emerald-300' : (endRPE <= 6 ? 'text-sky-300' : (endRPE <= 8 ? 'text-amber-300' : 'text-rose-300'))"
+                    x-text="endRPE"></span>
+              <span class="text-sm text-gray-500">/10</span>
+            </div>
+          </div>
+          <input type="range" min="1" max="10" step="1" x-model.number="endRPE"
+                 class="w-full h-3 rounded-full appearance-none cursor-pointer"
+                 style="background: linear-gradient(to right, #34d399 0%, #34d399 30%, #38bdf8 30%, #38bdf8 60%, #fbbf24 60%, #fbbf24 80%, #fb7185 80%, #fb7185 100%);"
+                 :style="`background: linear-gradient(to right, #34d399 0%, #34d399 ${(endRPE-1)*10}%, #38bdf8 ${(endRPE-1)*10}%, #38bdf8 ${(endRPE-1)*10 + 30}%, #fbbf24 ${(endRPE-1)*10 + 30}%, #fbbf24 ${(endRPE-1)*10 + 50}%, #fb7185 ${(endRPE-1)*10 + 50}%, #fb7185 100%);`" />
+          <div class="flex justify-between text-[10px] text-gray-500 mt-2 px-0.5 tabular-nums">
+            <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span>
+          </div>
+          <div class="mt-2 text-xs text-center"
+               :class="endRPE <= 3 ? 'text-emerald-300' : (endRPE <= 6 ? 'text-sky-300' : (endRPE <= 8 ? 'text-amber-300' : 'text-rose-300'))"
+               x-text="endRPE <= 3 ? '很輕鬆 — warmup 級數' : (endRPE <= 6 ? '中等 — 留到呼吸順' : (endRPE <= 8 ? '高強度 — 開始喘但 hold 得住' : '極限 — 最後一兩下要 push 自己'))"></div>
         </div>
         <button class="primary-btn w-full py-6 text-2xl tap mt-8 glow-ready" @click="endSession()" :class="{'saving': saving}">🏁 END SESSION</button>
         <div class="text-xs text-gray-500 text-center mt-3">Telegram 同步 ON by default (Jim 7/19 config)</div>
@@ -9882,7 +9900,8 @@ SERVICE_WORKER = """
 // v3.2.0: schedule tab (weekly + monthly calendar) + header cheer button
 // at top-left + food log rating badge moved to image overlay (top-right).
 // v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
-const CACHE = 'gym-web-v94';
+// v3.2.3: RPE slider with color zones (1-10) replacing number input.
+const CACHE = 'gym-web-v95';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -9961,7 +9980,8 @@ const CACHE = 'gym-web-v94';
 // v3.1.0: 4-tab nav + landscape food grid + gym focus mode + PT/Whoop share +
 // frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
 // v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
-const CACHE = 'gym-web-v94';
+// v3.2.3: RPE slider with color zones (1-10) replacing number input.
+const CACHE = 'gym-web-v95';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
