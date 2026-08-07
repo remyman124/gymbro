@@ -7376,8 +7376,12 @@ function gymApp() {
       const s = String(iso);
       // Extract 'YYYY-MM-DDTHH:MM' → 'HH:MM'.
       // Doubled backslashes below are needed: Python 3.12+ emits a
-      // SyntaxWarning for raw \d inside a string literal. Python emits
-      // the doubled form to HTML, where JS reads it as a single \d.
+      // SyntaxWarning for raw 'backslash-d' inside a string literal.
+      // Python emits the doubled form to HTML, where JS reads it as a
+      // single 'backslash-d' digit class.
+      // NOTE: this comment itself uses the spelled-out form
+      // ('backslash-d') instead of the raw escape, to avoid triggering
+      // the very warning it describes.
       const m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})/);
       if (m) return `${m[4]}:${m[5]}`;
       return s.slice(11, 16);
