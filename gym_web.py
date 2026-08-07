@@ -6415,17 +6415,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       gap: 0.75rem;
     }
   }
-  /* v3.1.0: Gym focus mode — larger text + minimal UI for in-gym use.
-     Toggled via .gym-focus class on body (set by requestLandscapeGym()). */
+  /* v3.2.4: Gym focus mode — larger text + minimal UI for in-gym use.
+     Toggled via .gym-focus class on body (set by toggleGymFocus()).
+     Fix: was scale(1.08) which pushed visible content past the fold,
+     making the user feel they were 'scrolled to the bottom' when they
+     just tapped focus. Reduced to 1.04 + transform-origin: top center
+     so any scale-up grows downward predictably. */
   body.gym-focus {
-    font-size: 1.15em;
+    font-size: 1.08em;
   }
   body.gym-focus .gym-focus-hide {
     display: none !important;
   }
   body.gym-focus .gym-focus-enlarge {
-    transform: scale(1.08);
-    transform-origin: center;
+    transform: scale(1.04);
+    transform-origin: top center;
   }
   /* v3.1.0: Food tab content (default tab now) — make header slightly
      smaller to give food log more vertical space. */
@@ -8629,6 +8633,41 @@ function gymApp() {
       this.flash('返到 SET 主頁');
     },
 
+    // v3.2.4: gym focus mode — toggles body class + state + scrolls to top
+    // (Jim OOB 2026-08-07 18:10 HKT 'Why focus in gym always wrong' + 'It
+    // focus on the bottom which is weird'). Fixes 3 bugs:
+    //   (1) gymFocusMode Alpine state never updated (was DOM-only toggle)
+    //   (2) x-text="gymFocusMode ? '🎯' : '🎯'" was identical on both branches
+    //   (3) focus mode triggered scroll-to-bottom instead of top
+    toggleGymFocus() {
+      try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
+      const next = !this.gymFocusMode;
+      this.gymFocusMode = next;
+      // Toggle body class
+      document.body.classList.toggle('gym-focus', next);
+      // v3.2.4: explicitly scroll to TOP of gym tab — was the source of
+      // the "focus on the bottom" weirdness. Without this, font-size 1.15em
+      // scaling + transform: scale(1.08) on enlarge elements could push
+      // the user's scroll position past the visible content.
+      try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e) { window.scrollTo(0, 0); }
+      // Try landscape lock (only works on Android Chrome, iOS PWA in
+      // standalone mode silently rejects; treat both as no-op fallback).
+      if (next) {
+        try {
+          if (screen.orientation && typeof screen.orientation.lock === 'function') {
+            screen.orientation.lock('landscape').catch(() => { /* iOS rejects silently */ });
+          }
+        } catch(e) { /* API not available */ }
+      } else {
+        try {
+          if (screen.orientation && typeof screen.orientation.unlock === 'function') {
+            screen.orientation.unlock();
+          }
+        } catch(e) { /* API not available */ }
+      }
+      this.flash(next ? '🎯 Focus ON — 大字 + 簡化 UI' : '🎯 Focus OFF');
+    },
+
     triggerHeroScan() {
       this.tab = 'scan';
       this.$nextTick(() => {
@@ -9687,30 +9726,12 @@ function triggerCheer() {
   .catch(e => console.error('[cheer] trigger failed', e));
 }
 
-// v3.1.0: requestLandscapeGym() handler (gym focus mode).
-// Tries to lock to landscape via Screen Orientation API. Falls back to
-// a visual "focus mode" overlay (large text, simplified UI) if the
-// device rejects orientation lock (iOS Safari doesn't support it).
-function requestLandscapeGym() {
-  try {
-    if (screen.orientation && screen.orientation.lock) {
-      screen.orientation.lock('landscape').then(() => {
-        console.log('[gym] locked to landscape');
-      }).catch(e => {
-        console.log('[gym] orientation lock denied:', e.message);
-        // Fall back to visual focus mode only
-      });
-    }
-  } catch(e) { /* iOS Safari throws on unsupported */ }
-  // Toggle visual focus class on body
-  document.body.classList.toggle('gym-focus');
-  // Tell user via toast
-  const toast = document.createElement('div');
-  toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(234,179,8,0.95);color:black;padding:8px 16px;border-radius:12px;z-index:9999;font-size:12px;font-weight:bold;';
-  toast.textContent = document.body.classList.contains('gym-focus') ? '🎯 Focus mode ON — 大字 + 語音' : '🎯 Focus mode OFF';
-  document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 3000);
-}
+// v3.2.4: legacy requestLandscapeGym() removed — replaced by Alpine
+// toggleGymFocus() method (line ~8632). Old global function had 3 bugs:
+// state never synced, iOS orientation.lock rejected silently, no scroll
+// management. Kept no-op stub to prevent "ReferenceError" if stale PWA
+// service worker serves cached HTML that still references the old name.
+function requestLandscapeGym() { /* deprecated — use Alpine toggleGymFocus() */ }
 
 // v3.1.0: Landscape detection — auto-switch food history to grid view when
 // device is in landscape orientation. (Jim OOB 2026-08-07 14:50 HKT 'for
@@ -9863,20 +9884,18 @@ setTimeout(checkLandscapeFood, 500);
      in the global header before the Gymbro title — visible on every
      tab without scrolling. -->
 
-<!-- v3.1.0: Gym focus mode floating action — when on gym tab, show a
-     landscape-request + audio coach tip floating button. Jim OOB 2026-08-07
-     14:50 HKT 'during gym, i have to be focusing on that tab and may let
-     me listen to song or listen to coach advice'. The focus button
-     requests landscape orientation and starts a voice coach tip TTS. -->
+<!-- v3.2.4: Gym focus mode floating action (rewired from broken global
+     requestLandscapeGym() to Alpine toggleGymFocus() method). Fixes
+     the bottom-scroll weirdness + state desync. -->
 <div x-show="tab === 'gym'" x-cloak
      class="fixed top-[60px] left-3 z-40 flex flex-col gap-2">
-  <button @click="requestLandscapeGym()"
-          :class="gymFocusMode ? 'opacity-100 ring-2 ring-yellow-300' : 'active:scale-95'"
+  <button @click="toggleGymFocus()"
+          :class="gymFocusMode ? 'opacity-100 ring-2 ring-yellow-300 bg-yellow-300/25' : 'opacity-80 active:scale-95'"
           class="flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-black transition-all"
-          style="background: linear-gradient(135deg, rgba(234,179,8,0.4), rgba(234,179,8,0.15)); border: 1.5px solid rgba(234,179,8,0.7); color: white;"
-          title="Focus mode: 大字 + landscape + voice coach tip">
+          :style="gymFocusMode ? 'background: linear-gradient(135deg, rgba(234,179,8,0.55), rgba(234,179,8,0.25)); border: 1.5px solid rgba(234,179,8,0.9); color: black;' : 'background: linear-gradient(135deg, rgba(234,179,8,0.4), rgba(234,179,8,0.15)); border: 1.5px solid rgba(234,179,8,0.7); color: white;'"
+          :title="gymFocusMode ? 'Focus mode 開緊 — 撳一下熄' : 'Focus mode 熄緊 — 撳一下開 (大字 + 簡化 UI)'">
     <span x-text="gymFocusMode ? '🎯' : '🎯'"></span>
-    <span x-text="gymFocusMode ? 'Focus' : 'Focus'"></span>
+    <span x-text="gymFocusMode ? 'Focus ON' : 'Focus'"></span>
   </button>
 </div>
 
@@ -9901,7 +9920,8 @@ SERVICE_WORKER = """
 // at top-left + food log rating badge moved to image overlay (top-right).
 // v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
 // v3.2.3: RPE slider with color zones (1-10) replacing number input.
-const CACHE = 'gym-web-v95';
+// v3.2.4: gym focus mode fix — toggleGymFocus() syncs Alpine state + scrolls to top.
+const CACHE = 'gym-web-v96';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -9981,7 +10001,8 @@ const CACHE = 'gym-web-v95';
 // frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
 // v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
 // v3.2.3: RPE slider with color zones (1-10) replacing number input.
-const CACHE = 'gym-web-v95';
+// v3.2.4: gym focus mode fix — toggleGymFocus() syncs Alpine state + scrolls to top.
+const CACHE = 'gym-web-v96';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
