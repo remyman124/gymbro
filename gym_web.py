@@ -2938,47 +2938,132 @@ def _merge_nutrition_estimates(estimates: list) -> dict:
 # Returns: {grade: 'A+'|'A'|'B'|'C'|'D'|'F', comment: str, suggestions: [str, ...], rationale: str}
 def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "", user_context: str = "") -> dict:
     """Generate coach comment for a logged food.
-    Scoring rubric (rough HK fitness coach perspective):
-      - A+: 80%+ calories from protein, low fat, high micronutrient density
-      - A:  good macros, balanced, < 30% kcal from fat
-      - B:  acceptable, moderate macros, < 40% kcal from fat
-      - C:  high carb or high fat, but still reasonable
-      - D:  high fat > 50% or high sodium expected
-      - F:   deep fried + sugary combo, very low protein/calorie
+
+    v3.2.7.3: combined keyword + macro grade (Jim OOB 2026-08-08 16:25 HKT
+    'Not just macro. But overall good food or bad food' — grade reflects
+    the food's OVERALL healthiness, not just macro ratios).
+
+    Step 1: keyword-based pre-grade from food name (A+ very healthy ... F very bad)
+    Step 2: macro adjustment — fat_pct > 60% worsens 2 grades, fat > 50% worsens 1,
+             protein > 30% + fat < 30% improves 1, protein < 10% worsens 1.
+
+    Rubric:
+      - A+: 清淡零負擔 (coffee/tea/water/steamed veg/chicken breast/salad)
+      - A:  健康均衡 (fish/shrimp/sashimi/grilled chicken/oats/yogurt)
+      - B:  中性 (rice/noodle/steamed meat/HK home-cooked)
+      - C:  普通 (carb-heavy or unknown dish)
+      - D:  偏heavy (cake/dessert/cream/fried rice/焗飯)
+      - F:  極heavy (deep-fried/BBQ/buffet/sugary drink/processed meat)
     """
     if not dish_name or calories <= 0:
         return {"grade": "—", "comment": "資料不足", "suggestions": [], "rationale": "calories = 0, 冇資料可以評"}
-    # Heuristic pre-grade (deterministic, no API call needed for fast feedback)
+
+    combined = (dish_name or "").lower()
+
+    # ----- Step 1: keyword tier pre-grade -----
+    tier_a_plus = [
+        "黑咖啡", "齋啡", "凍咖啡", "espresso", "美式咖啡",
+        "綠茶", "紅茶", "烏龍", "麥茶", "抹茶",
+        "清水", "白開水", "齋水", "檸水", "蜂蜜水",
+        "豆漿", "脫脂奶", "蛋白", "蛋白質飲品", "蛋白粉",
+        "雞胸", "雞胸肉", "三文魚刺身", "沙律", "沙拉",
+        "西蘭花", "椰菜花", "蘆筍", "蒸雞", "清蒸", "白灼", "烚菜",
+        "希臘乳酪", "茅屋芝士", "豆腐", "枝豆", "海帶", "紫菜湯",
+        "燙青菜", "灼菜", "蒸魚", "蒸蛋白", "蛋白奶昔",
+    ]
+    tier_a = [
+        "魚", "蝦", "帶子", "刺身", "壽司", "和牛 (細份)",
+        "牛扒 (細)", "牛柳", "烤雞", "燒雞", "煎魚",
+        "蒸蛋", "番茄", "菠菜", "甘藍", "羽衣甘藍", "蘑菇", "茄子", "彩椒",
+        "燕麥", "乳酪", "酸奶", "香蕉", "蘋果", "藍莓", "奇異果",
+        "牛油果", "番薯", "紫薯", "糙米", "藜麥", "扁糧",
+        "毛豆", "蝦仁", "海鮮", "貝殼類", "蟹肉 (蒸)", "蜆", "青口",
+        "豬里脊", "牛腱", "雞腿 (去皮)", "火雞", "鴨胸", "鵪鶉蛋",
+        "麥皮", "粥 (清)", "豆腐花 (清)", "蒸饅頭",
+    ]
+    tier_f = [
+        "炸雞", "炸魚", "炸薯條", "炸魷", "炸春卷", "天婦羅", "炸蝦",
+        "炸排骨", "炸雞翼", "炸雞塊", "炸雞扒", "炸豬排", "炸物",
+        "燒烤 (自助)", "bbq 自助", "燒肉自助", "韓燒", "日式燒肉",
+        "自助餐", "all-you-can", "放題", "buffet",
+        "漢堡包", "巨無霸", "whopper", "雙層芝士", "double double",
+        "朱古力蛋糕", "芝士蛋糕 (重)", "忌廉蛋糕",
+        "全脂奶", "星冰樂", "frappuccino",
+        "珍珠奶茶 (大杯)", "bubble tea (大)",
+        "煙肉", "bacon (重份)", "午餐肉", "罐頭肉",
+        "即食麵", "杯麵", "公仔麵", "豬骨濃湯拉麵", "豚骨拉麵",
+    ]
+    tier_d = [
+        "千層蛋糕", "瑞士卷", "tiramisu", "泡芙", "蛋撻",
+        "曲奇", "餅乾", "donut", "冬甩", "muffin", "鬆餅", "班戟",
+        "pancake", "waffle", "窩夫", "雪糕", "冰淇淋",
+        "奶昔", "pudding", "布丁", "焦糖", "糖水", "芝麻糊",
+        "楊枝甘露", "芒果糯米", "pizza (1 塊)", "薄餅 (1 塊)",
+        "焗芝士", "mac & cheese",
+        "薯片", "蝦條", "popcorn", "粟米片", "焦糖爆谷",
+        "炸雞 (1 塊)", "薯條 (小)", "壽司 (3 件+)",
+        "咖喱飯", "焗飯", "焗豬扒飯", "星洲炒米", "揚州炒飯",
+        "蛋糕", "cupcake", "紙杯蛋糕",
+    ]
+    tier_b = [
+        "飯", "粥", "麵", "米粉", "河粉", "瀨粉", "烏冬", "蕎麥麵",
+        "饅頭", "餃子", "包子", "雲吞", "燒賣", "腸粉", "蘿蔔糕",
+        "牛肉餅", "蒸肉餅", "肉碎", "蒸排骨", "蒸水蛋", "燉湯",
+        "雞翼", "雞腳", "鳳爪", "豬手", "牛腩", "炆牛腩",
+        "炒菜", "青菜", "菜心", "芥蘭", "通菜", "豆苗", "白菜",
+        "蒸饅頭", "小籠包", "生煎包", "鍋貼", "水餃", "湯圓",
+        "油條", "煎餅", "葱油餅",
+        "海南雞飯", "燒味飯", "叉燒飯", "燒鵝飯", "燒鴨飯", "燒臘飯",
+    ]
+
+    if any(k in combined for k in tier_a_plus):
+        pre_grade = "A+"
+    elif any(k in combined for k in tier_a):
+        pre_grade = "A"
+    elif any(k in combined for k in tier_f):
+        pre_grade = "F"
+    elif any(k in combined for k in tier_d):
+        pre_grade = "D"
+    elif any(k in combined for k in tier_b):
+        pre_grade = "B"
+    else:
+        pre_grade = "C"
+
+    # ----- Step 2: macro adjustment -----
     protein_pct = (protein * 4) / max(calories, 1) * 100
     fat_pct = (fat * 9) / max(calories, 1) * 100
     carb_pct = (carbs * 4) / max(calories, 1) * 100
-    pre_grade = "B"
-    if protein_pct >= 35 and fat_pct < 30:
-        pre_grade = "A+"
-    elif protein_pct >= 25 and fat_pct < 35:
-        pre_grade = "A"
-    elif fat_pct > 55 or (protein_pct < 10 and carb_pct > 70):
-        pre_grade = "F"
-    elif fat_pct > 45 or protein_pct < 12:
-        pre_grade = "D"
-    elif fat_pct > 40 or protein_pct < 18:
-        pre_grade = "C"
-    # Pre-comment based on macros
-    pre_comment = ""
+
+    grade_order = {"A+": 5, "A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
+    rank = grade_order[pre_grade]
+
+    if fat_pct > 60 and rank > 0:
+        rank = max(rank - 2, 0)
+    elif fat_pct > 50 and rank > 0:
+        rank = max(rank - 1, 0)
+    elif protein_pct > 30 and fat_pct < 30 and rank < 5:
+        rank = min(rank + 1, 5)
+    if protein_pct < 10 and rank > 0:
+        rank = max(rank - 1, 0)
+
+    final_rank = rank
+    final_grade = {v: k for k, v in grade_order.items()}[final_rank]
+
+    # Comment
+    if final_grade == pre_grade:
+        pre_comment = "整體均衡，可以接受。"
+    elif final_rank > grade_order[pre_grade]:
+        pre_comment = f"蛋白質 {protein_pct:.0f}%，脂肪 {fat_pct:.0f}%，比例好。"
+    else:
+        pre_comment = f"脂肪佔 {fat_pct:.0f}% 卡路里，偏高。" if fat_pct > 35 else f"蛋白質只佔 {protein_pct:.0f}%，偏低。"
+
     suggestions = []
-    if fat_pct > 50:
-        pre_comment = f"脂肪佔 {fat_pct:.0f}% 卡路里，偏高。"
+    if final_rank <= 1:
         suggestions.append("下次可選少油版本（走醬 / 少汁 / 走炸皮）")
     if protein_pct < 15 and calories > 300:
-        pre_comment = f"蛋白質只佔 {protein_pct:.0f}%，偏低。"
         suggestions.append("加一隻蛋 / 雞胸 / 豆腐提升蛋白比例")
     if carb_pct > 65 and calories > 400:
-        pre_comment = (pre_comment + " 碳水比例高。").strip()
         suggestions.append("配菜加多啲菜，飯量減 1/3")
-    if protein_pct >= 30 and fat_pct < 30:
-        pre_comment = f"蛋白質 {protein_pct:.0f}%，脂肪 {fat_pct:.0f}%，比例好。"
-    if not pre_comment:
-        pre_comment = "中規中矩，可以接受。"
     # Call MiniMax M3 for richer 1-line coach comment + extra suggestions
     api_comment = None
     try:
@@ -3012,7 +3097,7 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         api_comment = None
     final_comment = api_comment or pre_comment
     return {
-        "grade": pre_grade,
+        "grade": final_grade,
         "comment": final_comment,
         "suggestions": suggestions[:2],  # max 2
         "rationale": f"蛋白 {protein_pct:.0f}% · 碳 {carb_pct:.0f}% · 脂 {fat_pct:.0f}%",
@@ -7307,19 +7392,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                        style="max-height: 200px;"
                        loading="lazy"
                        @click="window.open(scan.image_url, '_blank')">
-                  <!-- v3.2.0: coach grade as image overlay (Jim OOB 2026-08-07
+                  <!-- v3.2.0 + v3.2.7.3: coach grade as image overlay (Jim OOB 2026-08-07
                        17:00 HKT 'under food log, move the rating on the picture
                        thumbnail as overlay, larger in size. pick a good corner').
                        Top-right is least likely to overlap with food subject
-                       and reads naturally with the iOS PWA full-bleed grid. -->
-                  <template x-if="scan.coach_comment?.grade">
-                    <div class="absolute top-2 right-2 text-base font-black px-2.5 py-1 rounded-lg shadow-lg shadow-black/50 backdrop-blur-md ring-1 ring-white/10"
+                       and reads naturally with the iOS PWA full-bleed grid.
+                       v3.2.7.3: single rating scheme only (A+/A/B/C/D/F), bigger
+                       font (text-2xl), thicker ring + drop shadow for legibility. -->
+                  <template x-if="scan.coach_comment?.grade && scan.coach_comment.grade !== '—'">
+                    <div class="absolute top-2 right-2 text-2xl font-black px-3 py-1.5 rounded-xl shadow-2xl shadow-black/70 backdrop-blur-md ring-2 ring-white/20"
                          :class="{
-                           'bg-emerald-500/85 text-white': ['A+','A'].includes(scan.coach_comment.grade),
-                           'bg-lime-500/80 text-black': scan.coach_comment.grade === 'B',
-                           'bg-yellow-500/80 text-black': scan.coach_comment.grade === 'C',
-                           'bg-orange-500/85 text-white': scan.coach_comment.grade === 'D',
-                           'bg-red-500/85 text-white': scan.coach_comment.grade === 'F',
+                           'bg-emerald-500/90 text-white': ['A+','A'].includes(scan.coach_comment.grade),
+                           'bg-lime-500/85 text-black': scan.coach_comment.grade === 'B',
+                           'bg-yellow-500/85 text-black': scan.coach_comment.grade === 'C',
+                           'bg-orange-500/90 text-white': scan.coach_comment.grade === 'D',
+                           'bg-red-500/90 text-white': scan.coach_comment.grade === 'F',
                          }"
                          :title="`Coach grade: ${scan.coach_comment.grade}`"
                          x-text="scan.coach_comment.grade"></div>
@@ -7457,17 +7544,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span class="text-gray-400">P <span class="text-white font-semibold" x-text="scan.protein || 0"></span></span>
                 <span class="text-gray-400">C <span class="text-white font-semibold" x-text="scan.carbs || 0"></span></span>
                 <span class="text-gray-400">F <span class="text-white font-semibold" x-text="scan.fat || 0"></span></span>
-                <!-- v3.2.7.1: 食物健康度 1-5 星 (food keyword tier via _compute_rating) -->
-                <span x-show="scan.rating"
-                      class="font-bold tabular-nums"
-                      :class="{
-                        'text-emerald-300': scan.rating >= 5,
-                        'text-lime-300': scan.rating === 4,
-                        'text-yellow-300': scan.rating === 3,
-                        'text-orange-300': scan.rating === 2,
-                        'text-rose-300': scan.rating === 1,
-                      }"
-                      x-text="'⭐'.repeat(scan.rating || 0)"></span>
                 <span x-show="scan.shared" class="text-yellow-300" title="Shared with 小寶">👥</span>
                 <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
               </div>
@@ -10290,7 +10366,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v102';
+const CACHE = 'gym-web-v103';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10378,7 +10454,7 @@ const CACHE = 'gym-web-v102';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v102';
+const CACHE = 'gym-web-v103';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
