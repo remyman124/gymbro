@@ -8115,41 +8115,46 @@ function gymApp() {
       }
     },
 
-    // v3.1.0: PT-format workout text (繁中, friendly, WhatsApp-style)
+    // v3.1.0: PT-format workout text (繁中, friendly, WhatsApp-style).
+    // NOTE: Rule 23 — use template literal (backticks) for any string with
+    // embedded newlines. Python source backslash-n becomes a raw LF byte,
+    // which breaks single/double-quoted JS string literals.
     _formatWorkoutForPT() {
       const exs = this.session?.exercises || [];
-      if (!exs.length) return '今日未做 gym';
+      if (!exs.length) return `今日未做 gym`;
       const lines = [];
-      lines.push('今日 gym summary:');
-      lines.push('---');
+      lines.push(`今日 gym summary:`);
+      lines.push(`---`);
       for (const ex of exs) {
-        const name = ex.exercise || ex.name || '?';
-        const sets = (ex.sets || []).map(s => `${s.weight || 0}kg x ${s.reps || 0}`).join(' / ');
+        const name = ex.exercise || ex.name || `?`;
+        const sets = (ex.sets || []).map(s => `${s.weight || 0}kg x ${s.reps || 0}`).join(` / `);
         lines.push(`• ${name}: ${sets}`);
       }
       const totalVol = exs.flatMap(e => (e.sets || [])).reduce((a, s) => a + ((s.weight || 0) * (s.reps || 0)), 0);
       const totalSets = exs.flatMap(e => (e.sets || [])).length;
-      lines.push('---');
+      lines.push(`---`);
       lines.push(`Total: ${totalSets} sets · ${totalVol}kg vol`);
       if (this.endRPE) lines.push(`RPE: ${this.endRPE}/10`);
-      return lines.join('\n');
+      return lines.join(`\n`);
     },
 
-    // v3.1.0: Whoop-format workout text (compact, English, AI-friendly)
+    // v3.1.0: Whoop-format workout text (compact, English, AI-friendly).
+    // Rule 23 — template literal throughout to avoid Python backslash-n
+    // becoming raw LF inside a JS string literal.
     _formatWorkoutForWhoop() {
       const exs = this.session?.exercises || [];
-      if (!exs.length) return 'No workout today';
+      if (!exs.length) return `No workout today`;
       const lines = [];
-      lines.push('Gym session — please log to Whoop:');
+      lines.push(`Gym session — please log to Whoop:`);
       for (const ex of exs) {
-        const name = ex.exercise || ex.name || 'Unknown';
-        const sets = (ex.sets || []).map(s => `${s.weight || 0}kg x ${s.reps || 0}`).join(', ');
+        const name = ex.exercise || ex.name || `Unknown`;
+        const sets = (ex.sets || []).map(s => `${s.weight || 0}kg x ${s.reps || 0}`).join(`, `);
         lines.push(`- ${name}: ${sets}`);
       }
       const totalVol = exs.flatMap(e => (e.sets || [])).reduce((a, s) => a + ((s.weight || 0) * (s.reps || 0)), 0);
       lines.push(`Total volume: ${totalVol}kg`);
       if (this.endRPE) lines.push(`RPE: ${this.endRPE}/10`);
-      return lines.join('\n');
+      return lines.join(`\n`);
     },
 
     async fetchCoachTips() {
