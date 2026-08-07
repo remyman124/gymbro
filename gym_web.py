@@ -280,49 +280,11 @@ def api_whoop_activities_calendar():
     })
 
 
-@app.route("/api/whoop_activities_week")
-def api_whoop_activities_week():
-    """v3.2.0: this-week (Mon-Sun) summary for the schedule tab.
-
-    Returns 7 entries, one per day, with activity list and totals.
-    """
-    today = datetime.now(HKT).date()
-    week_start = today - timedelta(days=today.weekday())  # Monday
-    week_end = week_start + timedelta(days=6)  # Sunday
-    activities = _whoop_activities_normalized()
-    by_date = {}
-    for a in activities:
-        by_date.setdefault(a["date"], []).append(a)
-    days = []
-    week_gym = 0
-    week_total = 0
-    for i in range(7):
-        d = week_start + timedelta(days=i)
-        iso = d.isoformat()
-        acts = by_date.get(iso, [])
-        has_gym = any(a["sport"] == "weightlifting" for a in acts)
-        week_gym += sum(1 for a in acts if a["sport"] == "weightlifting")
-        week_total += len(acts)
-        total_strain = sum((a["strain"] or 0) for a in acts)
-        days.append({
-            "date": iso,
-            "weekday": i,
-            "weekday_label": ["一", "二", "三", "四", "五", "六", "日"][i],
-            "day_label": f"{d.month}/{d.day}",
-            "is_today": iso == today.isoformat(),
-            "activities": acts,
-            "count": len(acts),
-            "has_gym": has_gym,
-            "total_strain": round(total_strain, 1),
-        })
-    return jsonify({
-        "week_start": week_start.isoformat(),
-        "week_end": week_end.isoformat(),
-        "days": days,
-        "week_gym_count": week_gym,
-        "week_total_count": week_total,
-        "is_empty_week": week_total == 0,
-    })
+# v3.2.6: /api/whoop_activities_week endpoint removed (Jim OOB
+# 2026-08-07 23:30 HKT 'Remove its list view and weekly view').
+# The schedule tab now shows the monthly calendar only — feed by
+# /api/whoop_activities_calendar. Backend route deleted to avoid
+# dead endpoints polluting /api/health + the docs.
 
 
 @app.route("/api/health")
@@ -7559,28 +7521,18 @@ function gymApp() {
     ptCopied: false,
     whoopCopied: false,
     endSummaryVisible: false,
-    // v3.2.0: schedule tab state — weekly + monthly calendar of Whoop
-    // activities (Jim OOB 2026-08-07 16:40 HKT 'have a monthly calendar
-    // view on which date i have done gym. Moreover, have you downloaded
-    // whoop other activities such as walking and view it on the calendar
-    // too?'). Data source: /api/whoop_activities_week + /api/whoop_activities_calendar.
+    // v3.2.6: schedule tab state — monthly calendar ONLY (Jim OOB
+    // 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its list
+    // view and weekly view'). Week strip + list view removed; the
+    // 42-day monthly calendar is the single source of truth. Data
+    // source: /api/whoop_activities_calendar only.
     scheduleLoading: true,
-    scheduleWeek: [],
-    scheduleWeekLabel: '',
-    scheduleWeekGymCount: 0,
-    scheduleWeekTotalCount: 0,
     scheduleMonth: [],
     scheduleMonthAligned: [],
     scheduleMonthGymCount: 0,
     scheduleMonthOtherCount: 0,
     scheduleRangeLabel: '',
     scheduleHasAny: false,
-    // v3.2.5: schedule view toggle — 'week' strip OR 'month' calendar.
-    // Default = 'month' (Jim OOB 2026-08-07 18:40 HKT 'Week view is not an
-    // option' / 18:35 HKT 'monthly calendar view also an option' — the
-    // user wants the month to be the primary view, with the week strip
-    // staying as a quick overview above it. No toggle needed.)
-    scheduleView: 'month',
     // v3.2.5: month calendar popover — tap a day to see full details.
     scheduleSelectedDay: null,
     // v3.1.0: legacy tab aliases. Old 6 tabs (set/workout/history/scan/end/cheer)
@@ -8483,24 +8435,15 @@ function gymApp() {
       this.flash('New session ready');
     },
 
-    // v3.2.0: load schedule tab data — week strip + monthly calendar.
-    // Two parallel API calls, then format the calendar grid by aligning
-    // the first day to its weekday slot.
+    // v3.2.6: load schedule tab data — monthly calendar ONLY.
+    // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove
+    // its list view and weekly view'.) Week strip + list view removed;
+    // single fetch from /api/whoop_activities_calendar drives the
+    // 42-day grid + day popover.
     async loadSchedule() {
       this.scheduleLoading = true;
       try {
-        const [weekRes, monthRes] = await Promise.all([
-          fetch('/api/whoop_activities_week').then(r => r.json()),
-          fetch('/api/whoop_activities_calendar?days=42').then(r => r.json()),
-        ]);
-        this.scheduleWeek = weekRes.days || [];
-        this.scheduleWeekGymCount = weekRes.week_gym_count || 0;
-        this.scheduleWeekTotalCount = weekRes.week_total_count || 0;
-        const ws = weekRes.week_start || '';
-        const we = weekRes.week_end || '';
-        this.scheduleWeekLabel = ws && we
-          ? `${ws.slice(5)} – ${we.slice(5)}`
-          : '';
+        const monthRes = await fetch('/api/whoop_activities_calendar?days=42').then(r => r.json());
         this.scheduleMonth = monthRes.days || [];
         this.scheduleMonthGymCount = monthRes.gym_count || 0;
         this.scheduleMonthOtherCount = monthRes.other_count || 0;
@@ -8527,8 +8470,7 @@ function gymApp() {
           }
         }
         this.scheduleMonthAligned = aligned;
-        this.scheduleHasAny = this.scheduleWeekTotalCount > 0
-          || this.scheduleMonth.some(d => d.count > 0);
+        this.scheduleHasAny = this.scheduleMonth.some(d => d.count > 0);
       } catch (e) {
         console.error('[loadSchedule] failed', e);
         this.scheduleHasAny = false;
@@ -9802,44 +9744,11 @@ setTimeout(checkLandscapeFood, 500);
 
   <div x-show="!scheduleLoading && scheduleHasAny">
 
-    <!-- v3.2.5: month calendar popover — tap a day for full activity details. -->
-
-    <!-- ============ WEEK STRIP (Mon-Sun, always shown as quick overview) ============ -->
-    <div class="mb-5">
-      <div class="flex items-center justify-between mb-2">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
-          本週 <span class="text-gray-300" x-text="scheduleWeekLabel"></span>
-        </div>
-        <div class="text-[10px] text-gray-500">
-          🏋️<span x-text="scheduleWeekGymCount" class="ml-0.5 font-bold text-emerald-400"></span>
-          <span class="mx-1.5">·</span>
-          <span x-text="scheduleWeekTotalCount" class="font-bold text-gray-300"></span> 全部
-        </div>
-      </div>
-      <div class="flex flex-wrap gap-1.5 justify-center">
-        <template x-for="day in scheduleWeek" :key="day.date">
-          <div x-show="day.count > 0 || day.is_today"
-               class="flex flex-col items-center rounded-xl p-2 transition-all w-[calc((100%-1.5rem*6)/7)] min-w-[44px]"
-               :class="day.is_today
-                          ? 'bg-emerald-500/15 ring-1 ring-emerald-400/40'
-                          : (day.count > 0 ? 'bg-white/[0.04]' : 'bg-transparent')">
-            <div class="text-[10px] font-bold text-gray-500 mb-1"
-                 :class="day.is_today ? 'text-emerald-300' : ''"
-                 x-text="day.weekday_label"></div>
-            <div class="text-sm font-black tabular-nums"
-                 :class="day.is_today ? 'text-emerald-200' : 'text-gray-200'"
-                 x-text="day.day_label"></div>
-            <div class="mt-1.5 min-h-[28px] flex flex-wrap justify-center gap-0.5">
-              <template x-for="(act, idx) in day.activities" :key="idx">
-                <span class="text-base leading-none"
-                      :title="`${act.label} · strain ${act.strain ?? '?'}`"
-                      x-text="act.icon"></span>
-              </template>
-            </div>
-          </div>
-        </template>
-      </div>
-    </div>
+    <!-- v3.2.6: monthly calendar ONLY. The week strip + list view were
+         removed (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar
+         view. Remove its list view and weekly view'). The 42-day grid
+         is the single source of truth — tap any day to see full
+         activity details in the popover below. -->
 
     <!-- ============ MONTHLY CALENDAR (42 days back, primary view) ============ -->
     <div>
@@ -10018,8 +9927,13 @@ SERVICE_WORKER = """
 // v3.2.3: RPE slider with color zones (1-10) replacing number input.
 // v3.2.4: gym focus mode fix — toggleGymFocus() syncs Alpine state + scrolls to top.
 // v3.2.5: schedule tab hides days without activities (week strip + month grid).
-// v3.2.5b: month calendar default + tap-day popover with full activity details.
-const CACHE = 'gym-web-v98';
+// v3.2.6: schedule tab simplified — week strip + list view removed.
+// Monthly calendar is the single source of truth, fed by
+// /api/whoop_activities_calendar. /api/whoop_activities_week endpoint
+// deleted (returns 404). state.scheduleWeek + scheduleView removed.
+// (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
+// list view and weekly view'.)
+const CACHE = 'gym-web-v99';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10101,8 +10015,13 @@ const CACHE = 'gym-web-v98';
 // v3.2.3: RPE slider with color zones (1-10) replacing number input.
 // v3.2.4: gym focus mode fix — toggleGymFocus() syncs Alpine state + scrolls to top.
 // v3.2.5: schedule tab hides days without activities (week strip + month grid).
-// v3.2.5b: month calendar default + tap-day popover with full activity details.
-const CACHE = 'gym-web-v98';
+// v3.2.6: schedule tab simplified — week strip + list view removed.
+// Monthly calendar is the single source of truth, fed by
+// /api/whoop_activities_calendar. /api/whoop_activities_week endpoint
+// deleted (returns 404). state.scheduleWeek + scheduleView removed.
+// (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
+// list view and weekly view'.)
+const CACHE = 'gym-web-v99';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
