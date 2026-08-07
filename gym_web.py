@@ -122,6 +122,73 @@ def healthz():
     return jsonify({"status": "ok", "time": now_iso(), "today": today_iso()})
 
 
+# v3.1.0: P4 — diagnostic endpoints
+@app.route("/api/version")
+def api_version():
+    """P4: expose app version, git commit, deploy time, module load status."""
+    import subprocess as _sp
+    try:
+        commit = _sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd="/home/work/projects/gymbro", stderr=_sp.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        commit = "unknown"
+    return jsonify({
+        "version": __version__,
+        "git_commit": commit,
+        "branch": "3.x-overhaul" if commit != "unknown" else "main",
+        "modules_loaded": [
+            "gym_web.core", "gym_web.whoop", "gym_web.withings",
+        ],
+        "legacy_file": "gym_web.py (9202 lines, will migrate per-version)",
+        "uptime_since": now_iso(),
+    })
+
+
+@app.route("/api/health")
+def api_health():
+    """P4: full health check — Whoop, Withings, Sheet, scan log, gym log all reachable?"""
+    import os as _os
+    checks = {}
+    # Whoop
+    whoop_tok = Path("/home/work/.whoop_tokens.json")
+    checks["whoop_token"] = whoop_tok.exists()
+    whoop_cache = Path("/home/work/.whoop_data_latest.json")
+    checks["whoop_cache"] = whoop_cache.exists()
+    if whoop_cache.exists():
+        try:
+            data = json.loads(whoop_cache.read_text())
+            meta = data.get("_meta", {})
+            checks["whoop_cache_age_minutes"] = meta.get("sync_time_hkt_age_min", None)
+        except Exception:
+            checks["whoop_cache_age_minutes"] = "corrupt"
+    # Withings
+    withings_cache = Path("/home/work/.withings_latest_cache.json")
+    checks["withings_cache"] = withings_cache.exists()
+    # Google creds
+    google_tok = Path("/home/work/.hermes/google_token.json")
+    checks["google_token"] = google_tok.exists()
+    # TG bot
+    checks["telegram_bot_configured"] = bool(_os.environ.get("TELEGRAM_BOT_TOKEN")) or _os.path.exists("/home/work/.hermes/.env")
+    # Local logs
+    checks["nutrition_log"] = Path("/home/work/.hermes/nutrition_log.json").exists()
+    checks["workout_log"] = Path("/home/work/.whoop_workout_log.json").exists()
+    checks["food_scan_log"] = Path("/home/work/.hermes/food_scan_log.json").exists()
+    # Health overlay API (composite)
+    overall = all([
+        checks.get("whoop_token"),
+        checks.get("withings_cache"),
+        checks.get("google_token"),
+    ])
+    return jsonify({
+        "ok": overall,
+        "checks": checks,
+        "version": __version__,
+        "checked_at": now_iso(),
+    })
+
+
 @app.route("/api/state")
 def api_state():
     """Return full session state for client sync."""
@@ -363,7 +430,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 
 def _safe_read_json(path, default=None):
@@ -5805,11 +5872,93 @@ def _background_cheer_job(job_id: str, fire_type: str):
             }
 
 
+def _decide_cheer_fire_type() -> str:
+    """v3.1.0: AI-decide cheer fire_type based on current HKT time + recent activity.
+
+    Jim OOB 2026-08-07 ~15:00 HKT 'I want to trigger cheer on frontpage. it
+    is not useful to specify cheer in morning, evening, or ad-hoc mode. just
+    cheer with latest time. the ai will decide it.'
+
+    Decision tree (HKT time + last activity timestamp):
+    - 04:30-11:00  → morning
+    - 11:00-13:30  → pre_lunch (motivational before food)
+    - 13:30-17:30  → afternoon
+    - 17:30-22:00  → evening
+    - 22:00-04:30  → late_night (lighter touch, no big intervention)
+    - last gym finished <90 min ago → post_gym (congrats, recovery focus)
+    - last food log <30 min ago     → post_meal (digest, hydration)
+    """
+    now = now_hkt()
+    hr = now.hour
+
+    # 1. Time-based baseline
+    if 4 <= hr < 11:
+        base = "morning"
+    elif 11 <= hr < 13:
+        base = "pre_lunch"
+    elif 13 <= hr < 17:
+        base = "afternoon"
+    elif 17 <= hr < 22:
+        base = "evening"
+    else:
+        base = "late_night"
+
+    # 2. Activity-based override (post_gym / post_meal win)
+    try:
+        log = load_log()
+        today = today_iso()
+        session = log.get(today, {})
+        if session.get("end_time"):
+            # last gym ended — check how long ago
+            from datetime import datetime as _dt
+            try:
+                end_dt = _dt.fromisoformat(session["end_time"])
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=HKT)
+                mins_since = (now_hkt() - end_dt).total_seconds() / 60
+                if 0 < mins_since < 90:
+                    return "post_gym"
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3. last food log <30 min → post_meal (hydration, walk)
+    try:
+        nlog_path = Path("/home/work/.hermes/nutrition_log.json")
+        if nlog_path.exists():
+            nlog = json.loads(nlog_path.read_text())
+            meals = nlog.get("meals", [])
+            if meals:
+                last = meals[-1]
+                ts = last.get("timestamp_iso") or last.get("time_iso", "")
+                if ts:
+                    from datetime import datetime as _dt
+                    try:
+                        last_dt = _dt.fromisoformat(ts)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=HKT)
+                        mins_since = (now_hkt() - last_dt).total_seconds() / 60
+                        if 0 < mins_since < 30:
+                            return "post_meal"
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return base
+
+
 @app.route("/api/cheer", methods=["POST"])
 def api_cheer_trigger():
     """v2.5: Trigger a cheer fire from inside gymbro PWA.
 
     Jim OOB 2026-07-23: "Can copy all the cheer routine stuff into gymbro?".
+
+    v3.1.0: accepts `fire_type` "auto" (default) — AI decides morning /
+    evening / pre_lunch / afternoon / post_gym / post_meal / late_night
+    based on current HKT time + recent activity. Caller no longer needs
+    to specify — just press the frontpage button.
 
     Returns immediately with {job_id}; pipeline runs in background thread
     (Whoop pull → pplx text → Edge TTS → MiniMax image → cheer_artifacts +
@@ -5818,9 +5967,12 @@ def api_cheer_trigger():
     Poll /api/cheer/status?job_id=... for progress.
     """
     data = request.get_json(silent=True) or {}
-    fire_type = data.get("fire_type", "manual")
-    if fire_type not in ("morning", "evening", "manual"):
-        fire_type = "manual"
+    requested = data.get("fire_type", "auto")
+    if requested == "auto" or requested not in ("morning", "evening", "manual", "pre_lunch", "afternoon", "post_gym", "post_meal", "late_night"):
+        # AI-decide (v3.1.0 default)
+        fire_type = _decide_cheer_fire_type()
+    else:
+        fire_type = requested
 
     job_id = f"cheer_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     with CHEER_JOBS_LOCK:
@@ -6073,6 +6225,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     line-height: 1.25;
   }
   [x-cloak] { display: none !important; }
+
+  /* v3.1.0: Landscape food history — 2-column grid (Jim OOB 2026-08-07
+     14:50 HKT 'food history is best view as landscape'). Portrait keeps
+     vertical list; landscape uses CSS Grid 2-col. */
+  @media (orientation: landscape) {
+    .food-history-list {
+      display: grid !important;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+  }
+  /* v3.1.0: Gym focus mode — larger text + minimal UI for in-gym use.
+     Toggled via .gym-focus class on body (set by requestLandscapeGym()). */
+  body.gym-focus {
+    font-size: 1.15em;
+  }
+  body.gym-focus .gym-focus-hide {
+    display: none !important;
+  }
+  body.gym-focus .gym-focus-enlarge {
+    transform: scale(1.08);
+    transform-origin: center;
+  }
+  /* v3.1.0: Food tab content (default tab now) — make header slightly
+     smaller to give food log more vertical space. */
+  main[data-tab="food"] .hero-banner {
+    height: 5rem !important;
+  }
 </style>
 </head>
 <body x-data="gymApp()" x-init="init()">
@@ -6127,7 +6307,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <main class="px-4 pb-20 pt-2">
 
     <!-- SET TAB (default) -->
-    <section x-show="tab === 'set'" class="flex min-h-[calc(100dvh-14rem)] flex-col" x-cloak>
+    <section x-show="isTabVisible('set')" class="flex min-h-[calc(100dvh-14rem)] flex-col" x-cloak>
 
       <!-- Hero motivation banner -->
       <div class="relative mb-3 h-40 w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-black via-gray-800 to-emerald-950 shadow-2xl">
@@ -6284,7 +6464,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- WORKOUT / PYRAMID TAB -->
-    <section x-show="tab === 'workout'">
+    <section x-show="isTabVisible('workout')">
       <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400 my-3">Today's Pyramid</div>
       <template x-for="(ex, idx) in sessionGrouped" :key="ex.name">
         <div class="mb-6 fade-up" :style="`animation-delay: ${idx * 60}ms`">
@@ -6304,7 +6484,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- HISTORY TAB -->
-    <section x-show="tab === 'history'">
+    <section x-show="isTabVisible('history')">
       <div class="flex items-baseline justify-between my-3">
         <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">Recent Sessions</div>
         <button class="text-xs text-gray-400 underline tap" @click="refreshHistory(true)" x-show="!loadingHistory">↻ Refresh</button>
@@ -6357,7 +6537,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
     <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
-    <section x-show="tab === 'scan'" x-cloak class="px-4 pb-32 pt-3">
+    <section x-show="isTabVisible('scan')" x-cloak class="px-4 pb-32 pt-3">
       <div class="text-[10px] uppercase tracking-[0.2em] text-emerald-400 mb-2 text-center font-bold">掃描食物 / 餐單</div>
       <div class="text-xs text-gray-400 text-center mb-4">影相 → 自動記錄卡路里、蛋白質、餐廳</div>
 
@@ -6893,7 +7073,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
     <!-- END TAB -->
-    <section x-show="tab === 'end'" x-cloak>
+    <section x-show="isTabVisible('end')" x-cloak>
       <div class="text-center my-6">
         <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">End Session</div>
         <h2 class="text-4xl font-black tracking-tighter mt-2">收檔時間</h2>
@@ -6907,6 +7087,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <button class="primary-btn w-full py-6 text-2xl tap mt-8 glow-ready" @click="endSession()" :class="{'saving': saving}">🏁 END SESSION</button>
         <div class="text-xs text-gray-500 text-center mt-3">Telegram 同步 ON by default (Jim 7/19 config)</div>
+      </div>
+
+      <!-- v3.1.0: PT/Whoop share buttons (Jim OOB 2026-08-07 14:50 HKT
+           'i use to copy the gym result to my PT after the gym session and
+           manually update whoop pasting into whoop ai'). Two share options
+           after session ends: (1) copy formatted text for PT message,
+           (2) copy whoop-friendly paste for Whoop AI manual entry. -->
+      <div x-show="endSummary" class="mt-4 space-y-2">
+        <button @click="copyWorkoutForPT()"
+                :class="ptCopied ? 'bg-emerald-500/30' : ''"
+                class="w-full rounded-lg py-3 text-sm font-bold active:scale-95 transition-all"
+                style="background: rgba(16,185,129,0.18); border: 1.5px solid rgba(16,185,129,0.5); color: #a7f3d0;">
+          <span x-text="ptCopied ? '✓ 已複製俾 PT' : '📋 複製俾 PT'"></span>
+        </button>
+        <button @click="copyWorkoutForWhoop()"
+                :class="whoopCopied ? 'bg-sky-500/30' : ''"
+                class="w-full rounded-lg py-3 text-sm font-bold active:scale-95 transition-all"
+                style="background: rgba(56,189,248,0.18); border: 1.5px solid rgba(56,189,248,0.5); color: #bae6fd;">
+          <span x-text="whoopCopied ? '✓ 已複製俾 Whoop' : '🏋️ 複製俾 Whoop AI'"></span>
+        </button>
+        <div class="text-[10px] text-gray-500 text-center mt-2">貼上 message / Whoop AI 即可</div>
       </div>
 
       <!-- v2.2 Coach tips panel (pplx + MiniMax render Traditional Chinese form cues + progression) -->
@@ -6944,7 +7145,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- CHEER TAB (v2.5 — gym-internal cheer routine, Jim OOB 2026-07-23 "Can copy all the cheer routine stuff into gymbro?") -->
-    <section x-show="tab === 'cheer'" x-cloak class="px-4 pb-32 pt-3">
+    <section x-show="isTabVisible('cheer')" x-cloak class="px-4 pb-32 pt-3">
       <div class="text-[10px] uppercase tracking-[0.2em] text-purple-400 mb-2 text-center font-bold">🔥 Cheer Routine</div>
       <div class="text-xs text-gray-400 text-center mb-4">100% 繁中廣東話 · 復原指數 + 教練評語 · 勵志圖 + 語音</div>
 
@@ -7091,24 +7292,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Bottom Tab Bar — 2x2 grid (Jim OOB 2026-07-19) -->
   <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-white/10 bg-black/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-2xl">
-    <div class="grid grid-cols-3 grid-rows-2 gap-x-1 gap-y-1 px-2 py-1.5">
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'set' ? 'tab-active' : 'tab-inactive'" @click="tab = 'set'">
-        <span class="text-lg leading-none">✓</span><span class="text-xs font-bold">記重</span>
+    <!-- v3.1.0: 4-tab reorganization. Food is the default + most-frequent,
+         gym is focus-mode (landscape, audio, voice coach), cheer is one-tap
+         AI-decide, schedule for calendar. Old 6-tab layout (set/workout/
+         history/scan/end/cheer) merged into 4 to reduce tap-friction.
+         (Jim OOB 2026-08-07 14:50 HKT 'organize the tab. food logging is
+         more frequent. gym is around 2-3 times a week. during gym, i have
+         to be focusing on that tab and may let me listen to song or listen
+         to coach advice.') -->
+    <div class="grid grid-cols-4 gap-1 px-2 py-1.5">
+      <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'food' ? 'tab-active' : 'tab-inactive'" @click="tab = 'food'">
+        <span class="text-lg leading-none">🍽️</span><span class="text-xs font-bold">食物</span>
       </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'workout' ? 'tab-active' : 'tab-inactive'" @click="tab = 'workout'">
-        <span class="text-lg leading-none">📊</span><span class="text-xs font-bold">訓練</span>
+      <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'gym' ? 'tab-active' : 'tab-inactive'" @click="tab = 'gym'">
+        <span class="text-lg leading-none">🏋️</span><span class="text-xs font-bold">Gym</span>
       </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'history' ? 'tab-active' : 'tab-inactive'" @click="goToTab('history')">
-        <span class="text-lg leading-none">📋</span><span class="text-xs font-bold">記錄</span>
-      </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'scan' ? 'tab-active' : 'tab-inactive'" @click="tab = 'scan'" style="background:rgba(16,185,129,0.18);box-shadow:inset 0 0 0 1px rgba(16,185,129,0.45);">
-        <span class="text-lg leading-none">🍽️</span><span class="text-xs font-bold">掃食</span>
-      </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'end' ? 'tab-active' : 'tab-inactive'" @click="tab = 'end'">
-        <span class="text-lg leading-none">🏁</span><span class="text-xs font-bold">完場</span>
-      </button>
-      <button class="flex items-center justify-center gap-2 rounded-lg py-1.5 transition-all" :class="tab === 'cheer' ? 'tab-active' : 'tab-inactive'" @click="openCheerTab()" style="background:rgba(168,85,247,0.18);box-shadow:inset 0 0 0 1px rgba(168,85,247,0.5);">
+      <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'cheer' ? 'tab-active' : 'tab-inactive'" @click="tab = 'cheer'">
         <span class="text-lg leading-none">🔥</span><span class="text-xs font-bold">打氣</span>
+      </button>
+      <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'schedule' ? 'tab-active' : 'tab-inactive'" @click="tab = 'schedule'">
+        <span class="text-lg leading-none">📅</span><span class="text-xs font-bold">日程</span>
       </button>
     </div>
   </nav>
@@ -7116,7 +7319,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <script>
 function gymApp() {
   return {
-    tab: 'set',
+    // v3.1.0: 4-tab reorganization. 'food' is the new default + most frequent.
+    // (Jim OOB 2026-08-07 14:50 HKT 'organize the tab. food logging is more frequent')
+    tab: 'food',
+    // v3.1.0: frontpage cheer button state
+    cheerInFlight: false,
+    // v3.1.0: gym focus mode state
+    gymFocusMode: false,
+    // v3.1.0: PT/Whoop share button state
+    ptCopied: false,
+    whoopCopied: false,
+    endSummaryVisible: false,
+    // v3.1.0: legacy tab aliases. Old 6 tabs (set/workout/history/scan/end/cheer)
+    // are aliased to new 4 (food/gym/cheer/schedule). getActiveTab() is used
+    // by old sections that still check tab === 'set' / 'workout' / etc.
+    getActiveTab() {
+      const alias = { 'food': 'scan', 'gym': 'workout', 'schedule': 'history', 'cheer': 'cheer' };
+      return alias[this.tab] || this.tab;
+    },
+    isTabVisible(legacyName) {
+      const reverse = { 'set': ['gym'], 'workout': ['gym'], 'history': ['schedule'], 'scan': ['food'], 'end': ['gym'], 'cheer': ['cheer'] };
+      return (reverse[legacyName] || []).includes(this.tab);
+    },
     sessionDateStr: '',
     // Withings step widget state (Jim OOB 2026-07-29)
     // v2.7.21: Jim OOB 2026-08-02 02:44 HKT — stepsSyncing flag
@@ -7836,8 +8060,80 @@ function gymApp() {
         this.flash('Session ended ✓');
         // v2.2: trigger coach tips generation for the just-ended session
         try { await this.fetchCoachTips(); } catch (e) { /* non-blocking */ }
+        // v3.1.0: show share buttons (PT/Whoop) by triggering endSummary visible
+        this.endSummaryVisible = true;
       } catch(e) { this.flash('Error: ' + e.message); }
       this.saving = false;
+    },
+
+    // v3.1.0: PT share — copy gym result formatted for PT message.
+    // Jim OOB 2026-08-07 14:50 HKT 'i use to copy the gym result to my PT
+    // after the gym session and manually update whoop pasting into whoop ai'.
+    // Format: friendly Cantonese, exercise list with sets x reps x weight.
+    async copyWorkoutForPT() {
+      try {
+        const text = this._formatWorkoutForPT();
+        await navigator.clipboard.writeText(text);
+        this.ptCopied = true;
+        this.haptic([60]);
+        this.flash('已複製俾 PT ✓');
+        setTimeout(() => { this.ptCopied = false; }, 3000);
+      } catch (e) {
+        this.flash('複製失敗：' + e.message);
+      }
+    },
+
+    // v3.1.0: Whoop AI share — copy gym result formatted for Whoop AI
+    // manual entry. Compact, machine-readable, includes total volume +
+    // exercise list. Use plain English (Whoop AI understands mixed lang).
+    async copyWorkoutForWhoop() {
+      try {
+        const text = this._formatWorkoutForWhoop();
+        await navigator.clipboard.writeText(text);
+        this.whoopCopied = true;
+        this.haptic([60]);
+        this.flash('已複製俾 Whoop ✓');
+        setTimeout(() => { this.whoopCopied = false; }, 3000);
+      } catch (e) {
+        this.flash('複製失敗：' + e.message);
+      }
+    },
+
+    // v3.1.0: PT-format workout text (繁中, friendly, WhatsApp-style)
+    _formatWorkoutForPT() {
+      const exs = this.session?.exercises || [];
+      if (!exs.length) return '今日未做 gym';
+      const lines = [];
+      lines.push('今日 gym summary:');
+      lines.push('---');
+      for (const ex of exs) {
+        const name = ex.exercise || ex.name || '?';
+        const sets = (ex.sets || []).map(s => `${s.weight || 0}kg x ${s.reps || 0}`).join(' / ');
+        lines.push(`• ${name}: ${sets}`);
+      }
+      const totalVol = exs.flatMap(e => (e.sets || [])).reduce((a, s) => a + ((s.weight || 0) * (s.reps || 0)), 0);
+      const totalSets = exs.flatMap(e => (e.sets || [])).length;
+      lines.push('---');
+      lines.push(`Total: ${totalSets} sets · ${totalVol}kg vol`);
+      if (this.endRPE) lines.push(`RPE: ${this.endRPE}/10`);
+      return lines.join('\n');
+    },
+
+    // v3.1.0: Whoop-format workout text (compact, English, AI-friendly)
+    _formatWorkoutForWhoop() {
+      const exs = this.session?.exercises || [];
+      if (!exs.length) return 'No workout today';
+      const lines = [];
+      lines.push('Gym session — please log to Whoop:');
+      for (const ex of exs) {
+        const name = ex.exercise || ex.name || 'Unknown';
+        const sets = (ex.sets || []).map(s => `${s.weight || 0}kg x ${s.reps || 0}`).join(', ');
+        lines.push(`- ${name}: ${sets}`);
+      }
+      const totalVol = exs.flatMap(e => (e.sets || [])).reduce((a, s) => a + ((s.weight || 0) * (s.reps || 0)), 0);
+      lines.push(`Total volume: ${totalVol}kg`);
+      if (this.endRPE) lines.push(`RPE: ${this.endRPE}/10`);
+      return lines.join('\n');
     },
 
     async fetchCoachTips() {
@@ -9018,7 +9314,119 @@ if ('serviceWorker' in navigator) {
     }, 3000);  // 3s delay after page load — don't compete with hero
   } catch(e) { /* noop */ }
 })();
+
+// v3.1.0: triggerCheer() handler (frontpage cheer button).
+// Calls /api/cheer with fire_type=auto, AI decides morning/evening/etc.
+// On success, shows last cheer artifact if any. Polls /api/cheer/status
+// for completion and shows toast.
+function triggerCheer() {
+  // Alpine.js component — find via DOM walk or just use direct fetch
+  fetch('/api/cheer', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({fire_type: 'auto'})
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      // Show what type AI picked + poll for completion
+      console.log('[cheer] auto → ' + data.fire_type + ' job ' + data.job_id);
+      // Optionally: load last cheer artifact after ~20s
+      setTimeout(() => {
+        const tgBanner = document.createElement('div');
+        tgBanner.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(168,85,247,0.95);color:white;padding:8px 16px;border-radius:12px;z-index:9999;font-size:12px;font-weight:bold;box-shadow:0 4px 20px rgba(168,85,247,0.5);';
+        tgBanner.textContent = '🔥 打氣 (' + data.fire_type + ') sent — check Telegram';
+        document.body.appendChild(tgBanner);
+        setTimeout(() => tgBanner.remove(), 5000);
+      }, 2000);
+    }
+  })
+  .catch(e => console.error('[cheer] trigger failed', e));
+}
+
+// v3.1.0: requestLandscapeGym() handler (gym focus mode).
+// Tries to lock to landscape via Screen Orientation API. Falls back to
+// a visual "focus mode" overlay (large text, simplified UI) if the
+// device rejects orientation lock (iOS Safari doesn't support it).
+function requestLandscapeGym() {
+  try {
+    if (screen.orientation && screen.orientation.lock) {
+      screen.orientation.lock('landscape').then(() => {
+        console.log('[gym] locked to landscape');
+      }).catch(e => {
+        console.log('[gym] orientation lock denied:', e.message);
+        // Fall back to visual focus mode only
+      });
+    }
+  } catch(e) { /* iOS Safari throws on unsupported */ }
+  // Toggle visual focus class on body
+  document.body.classList.toggle('gym-focus');
+  // Tell user via toast
+  const toast = document.createElement('div');
+  toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(234,179,8,0.95);color:black;padding:8px 16px;border-radius:12px;z-index:9999;font-size:12px;font-weight:bold;';
+  toast.textContent = document.body.classList.contains('gym-focus') ? '🎯 Focus mode ON — 大字 + 語音' : '🎯 Focus mode OFF';
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
+// v3.1.0: Landscape detection — auto-switch food history to grid view when
+// device is in landscape orientation. (Jim OOB 2026-08-07 14:50 HKT 'for
+// food logging, i used do it in portrait but the food history is best view
+// as landscape. please find it out.')
+function checkLandscapeFood() {
+  const isLandscape = window.matchMedia('(orientation: landscape)').matches;
+  document.body.classList.toggle('food-landscape', isLandscape);
+  // Re-render the food log if visible
+  const event = new CustomEvent('gymbro:orientation', {detail: {isLandscape}});
+  window.dispatchEvent(event);
+}
+window.addEventListener('orientationchange', checkLandscapeFood);
+window.addEventListener('resize', checkLandscapeFood);
+// Initial check on load
+setTimeout(checkLandscapeFood, 500);
 </script>
+
+<!-- v3.1.0: Schedule tab content (placeholder — calendar will be wired in
+     v3.2.0; for now it's hidden since isTabVisible('history') is the alias
+     and the existing history section already shows.) -->
+<section x-show="false"></section>
+
+<!-- v3.1.0: Frontpage Cheer button + gym focus mode + landscape detection
+     (Jim OOB 2026-08-07 14:50 + 15:00 HKT). The 4-tab nav uses new tab
+     names but legacy sections still drive most content. This block adds
+     the missing frontpage cheer entry on food tab + gym focus on gym tab. -->
+<div x-show="tab === 'food' || tab === 'cheer' || tab === 'gym' || tab === 'schedule'"
+     x-cloak
+     class="fixed top-[60px] right-3 z-40">
+  <!-- v3.1.0: frontpage cheer button. Single tap → /api/cheer fire_type=auto
+       → AI decides morning/evening/post_gym/post_meal based on HKT time +
+       recent activity. Small floating button (top-right, below header). -->
+  <button @click="triggerCheer()"
+          :disabled="cheerInFlight"
+          class="flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-black transition-all active:scale-95 disabled:opacity-50"
+          style="background: linear-gradient(135deg, rgba(168,85,247,0.55), rgba(236,72,153,0.45)); border: 1.5px solid rgba(168,85,247,0.7); box-shadow: 0 0 20px -4px rgba(168,85,247,0.6); color: white;"
+          :title="cheerInFlight ? '打氣緊...' : '一撳打氣 (AI 自動揀 timing)'">
+    <span x-text="cheerInFlight ? '⏳' : '🔥'"></span>
+    <span x-text="cheerInFlight ? '打氣中' : '打氣'"></span>
+  </button>
+</div>
+
+<!-- v3.1.0: Gym focus mode floating action — when on gym tab, show a
+     landscape-request + audio coach tip floating button. Jim OOB 2026-08-07
+     14:50 HKT 'during gym, i have to be focusing on that tab and may let
+     me listen to song or listen to coach advice'. The focus button
+     requests landscape orientation and starts a voice coach tip TTS. -->
+<div x-show="tab === 'gym'" x-cloak
+     class="fixed top-[60px] left-3 z-40 flex flex-col gap-2">
+  <button @click="requestLandscapeGym()"
+          :class="gymFocusMode ? 'opacity-100 ring-2 ring-yellow-300' : 'active:scale-95'"
+          class="flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-black transition-all"
+          style="background: linear-gradient(135deg, rgba(234,179,8,0.4), rgba(234,179,8,0.15)); border: 1.5px solid rgba(234,179,8,0.7); color: white;"
+          title="Focus mode: 大字 + landscape + voice coach tip">
+    <span x-text="gymFocusMode ? '🎯' : '🎯'"></span>
+    <span x-text="gymFocusMode ? 'Focus' : 'Focus'"></span>
+  </button>
+</div>
 
 <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
 </html>
