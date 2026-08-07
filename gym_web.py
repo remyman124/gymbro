@@ -7342,13 +7342,16 @@ function gymApp() {
       // legacy sections so we don't have to duplicate the 6000+ lines of
       // existing HTML. The frontpage button is a floating element outside
       // the section tree.
-      //   food     → set (入口) + scan (拍照/文字 log)
-      //   gym      → workout + end (session + 完場)
+      //   food     → scan (拍照/文字 log)
+      //   gym      → set (motivation banner + log set form) + workout
+      //              (pyramid) + end (完場) — gym needs all 3 because
+      //              workflow is: tap motivation image, input exercise,
+      //              log set, see pyramid, end + share
       //   cheer    → cheer section
       //   schedule → history (calendar placeholder v3.2.0 — history section
       //              re-used as a temporary schedule list for now)
       const reverse = {
-        'set':     ['food'],
+        'set':     ['gym'],
         'workout': ['gym'],
         'end':     ['gym'],
         'scan':    ['food'],
