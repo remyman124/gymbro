@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.52"
+__version__ = "2.7.53"
 
 
 def _safe_read_json(path, default=None):
@@ -2392,16 +2392,34 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
     if m:
         return m.group(1).strip()
     # Pattern 3: first non-empty sentence of vision (skip lines starting with 觀察/呢張)
+    # v2.7.53: also skip common Chinese sentence-initial adverbs/connectives
+    # (首先/再來/另外/最後/然後/接著/至於) that often appear in prose
+    # descriptions before the actual dish name. Without this filter, the
+    # extractor returned just "首先" for many image-only entries
+    # (Jim OOB 2026-08-07 14:15 HKT 'the recognized food name is showing
+    # 首先 only'). We strip the connective prefix AND keep searching the
+    # remaining meaningful content on the same line.
+    skip_prefixes = ("呢張", "觀察", "呢個", "呢份", "我見到", "呢碟", "呢碗", "呢個餐",
+                    "首先", "再來", "另外", "最後", "然後", "接著", "至於",
+                    "從圖", "從相", "圖中", "相中", "照片中")
+    def _strip_prefix(s: str) -> str:
+        for p in skip_prefixes:
+            if s.startswith(p):
+                rest = s[len(p):].lstrip(" ，,。、")
+                return rest
+        return s
     for line in vision_desc.split("\n"):
         line = line.strip()
-        if not line or line.startswith("呢張") or line.startswith("觀察") or line.startswith("呢個") or line.startswith("我見到"):
+        if not line:
             continue
-        if len(line) >= 3:
-            # Cut at first Chinese comma / period / colon / semicolon, cap at 30 chars
-            cut = re.search(r"[，。；：]", line)
-            if cut:
-                return line[:cut.start()][:30]
-            return line[:30]
+        line = _strip_prefix(line)
+        if not line or len(line) < 3:
+            continue
+        # Cut at first Chinese comma / period / colon / semicolon, cap at 30 chars
+        cut = re.search(r"[，。；：]", line)
+        if cut:
+            return line[:cut.start()][:30]
+        return line[:30]
     # Pattern 4: chain + meal_type fallback
     chain_m = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", combined)
     if chain_m:
@@ -6737,20 +6755,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                "Food title display is very bad. Pls give more space to display. No wrap") -->
           <template x-for="scan in group.items" :key="scan.scan_index">
             <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
-              <!-- Row 1: full-width image on top (max 200px, 16:9 ratio) -->
+              <!-- Row 1: full-width image on top (max 200px, 16:9 ratio) — only if
+                   image exists. v2.7.53 (Jim OOB 2026-08-07 14:15 HKT 'for those
+                   without image, you are showing a dummy keyboard image, don't
+                   do that. just don't show any image for this case'): removed
+                   the ⌨️/🍽️ fallback div entirely. Text-only and no-image
+                   entries just show no image at all — clean, no placeholder. -->
               <template x-if="scan.image_url">
                 <img :src="scan.image_url"
                      class="w-full aspect-[16/9] rounded-xl object-cover bg-black/40 mb-2 cursor-pointer active:scale-95"
                      style="max-height: 200px;"
                      loading="lazy"
                      @click="window.open(scan.image_url, '_blank')">
-              </template>
-              <!-- Fallback when no image: full-width icon strip -->
-              <template x-if="!scan.image_url">
-                <div class="w-full aspect-[16/9] rounded-xl bg-white/5 border border-white/10 flex items-center justify-center mb-2"
-                     style="max-height: 80px;">
-                  <div class="text-4xl" x-text="scan.is_text_only ? '⌨️' : '🍽️'"></div>
-                </div>
               </template>
               <!-- Row 2: title — full width, single line, horizontal scroll if too long -->
               <div class="flex items-center gap-2 mb-1.5">
