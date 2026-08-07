@@ -146,6 +146,185 @@ def api_version():
     })
 
 
+# v3.2.0: schedule tab — calendar + week of activities (Jim OOB 2026-08-07
+# 'in gymbro, under schedule tab, no need to show the tab if there is no
+# activities. put the week of the day. i think it's also good to have a
+# monthly calendar view on which date i have done gym. Moreover, have you
+# downloaded whoop other activities such as walking and view it on the
+# calendar too?').
+#
+# Read from local whoop_data_latest.json cache (already includes all
+# workouts: weightlifting, walking, cycling, etc.). No live API call —
+# schedule tab loads fast even on iPhone over Tailscale.
+WHOOP_ACTIVITY_LABELS = {
+    "weightlifting": ("🏋️", "Gym"),
+    "walking": ("🚶", "Walk"),
+    "running": ("🏃", "Run"),
+    "cycling": ("🚴", "Ride"),
+    "swimming": ("🏊", "Swim"),
+    "yoga": ("🧘", "Yoga"),
+    "rowing": ("🚣", "Row"),
+    "hiking": ("🥾", "Hike"),
+    "basketball": ("🏀", "Hoops"),
+    "soccer": ("⚽", "Footy"),
+    "tennis": ("🎾", "Tennis"),
+    "golf": ("⛳", "Golf"),
+    "boxing": ("🥊", "Box"),
+    "crossfit": ("💪", "Crossfit"),
+    "pilates": ("🤸", "Pilates"),
+    "meditation": ("🧘", "Meditate"),
+}
+
+
+def _whoop_activities_normalized():
+    """Pull workouts from cache, normalize into list[dict] for frontend.
+
+    Each entry: {date (YYYY-MM-DD), sport, icon, label, strain, start, end}
+    Sorted descending by start (newest first).
+    """
+    cache = Path("/home/work/.whoop_data_latest.json")
+    if not cache.exists():
+        return []
+    try:
+        data = json.loads(cache.read_text())
+    except Exception:
+        return []
+    out = []
+    for w in (data.get("workouts") or []):
+        sport = (w.get("sport_name") or "").lower().strip()
+        icon, label = WHOOP_ACTIVITY_LABELS.get(
+            sport, ("🏅", sport.title() if sport else "Activity")
+        )
+        start = w.get("start", "")
+        end = w.get("end", "")
+        date_iso = start[:10] if start else ""
+        score = w.get("score") or {}
+        strain = score.get("strain") if isinstance(score, dict) else None
+        out.append({
+            "date": date_iso,
+            "sport": sport or "activity",
+            "icon": icon,
+            "label": label,
+            "strain": round(float(strain), 1) if strain is not None else None,
+            "start": start,
+            "end": end,
+        })
+    out.sort(key=lambda a: a["start"], reverse=True)
+    return out
+
+
+@app.route("/api/whoop_activities_calendar")
+def api_whoop_activities_calendar():
+    """v3.2.0: monthly calendar grid for schedule tab.
+
+    Returns activities grouped by date for the past N days (default 42 =
+    6 weeks, enough for a clean month-grid). Frontend builds the grid
+    by day-of-week alignment.
+
+    Response shape:
+    {
+      "days": [
+        {"date": "2026-08-07", "weekday": 4, "count": 1,
+         "activities": [{"sport":"weightlifting", ...}, ...],
+         "has_gym": true, "total_strain": 11.2},
+        ...
+      ],
+      "range_start": "2026-06-27",
+      "range_end": "2026-08-07",
+      "total_activities": 25,
+      "gym_count": 6,
+      "other_count": 19,
+    }
+    """
+    try:
+        days_n = int(request.args.get("days", 42))
+    except (TypeError, ValueError):
+        days_n = 42
+    days_n = max(7, min(days_n, 90))  # clamp 1 week - 3 months
+    today = datetime.now(HKT).date()
+    start_date = today - timedelta(days=days_n - 1)
+    activities = _whoop_activities_normalized()
+    by_date = {}
+    for a in activities:
+        by_date.setdefault(a["date"], []).append(a)
+    days = []
+    gym_count = 0
+    other_count = 0
+    for i in range(days_n):
+        d = start_date + timedelta(days=i)
+        iso = d.isoformat()
+        acts = by_date.get(iso, [])
+        has_gym = any(a["sport"] == "weightlifting" for a in acts)
+        if has_gym:
+            gym_count += len([a for a in acts if a["sport"] == "weightlifting"])
+            other_count += len([a for a in acts if a["sport"] != "weightlifting"])
+        else:
+            other_count += len(acts)
+        total_strain = sum((a["strain"] or 0) for a in acts)
+        days.append({
+            "date": iso,
+            "weekday": d.weekday(),  # 0=Mon
+            "count": len(acts),
+            "activities": acts,
+            "has_gym": has_gym,
+            "total_strain": round(total_strain, 1),
+            "is_today": iso == today.isoformat(),
+        })
+    return jsonify({
+        "days": days,
+        "range_start": start_date.isoformat(),
+        "range_end": today.isoformat(),
+        "total_activities": len(activities),
+        "gym_count": gym_count,
+        "other_count": other_count,
+    })
+
+
+@app.route("/api/whoop_activities_week")
+def api_whoop_activities_week():
+    """v3.2.0: this-week (Mon-Sun) summary for the schedule tab.
+
+    Returns 7 entries, one per day, with activity list and totals.
+    """
+    today = datetime.now(HKT).date()
+    week_start = today - timedelta(days=today.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)  # Sunday
+    activities = _whoop_activities_normalized()
+    by_date = {}
+    for a in activities:
+        by_date.setdefault(a["date"], []).append(a)
+    days = []
+    week_gym = 0
+    week_total = 0
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        iso = d.isoformat()
+        acts = by_date.get(iso, [])
+        has_gym = any(a["sport"] == "weightlifting" for a in acts)
+        week_gym += sum(1 for a in acts if a["sport"] == "weightlifting")
+        week_total += len(acts)
+        total_strain = sum((a["strain"] or 0) for a in acts)
+        days.append({
+            "date": iso,
+            "weekday": i,
+            "weekday_label": ["一", "二", "三", "四", "五", "六", "日"][i],
+            "day_label": f"{d.month}/{d.day}",
+            "is_today": iso == today.isoformat(),
+            "activities": acts,
+            "count": len(acts),
+            "has_gym": has_gym,
+            "total_strain": round(total_strain, 1),
+        })
+    return jsonify({
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
+        "days": days,
+        "week_gym_count": week_gym,
+        "week_total_count": week_total,
+        "is_empty_week": week_total == 0,
+    })
+
+
 @app.route("/api/health")
 def api_health():
     """P4: full health check — Whoop, Withings, Sheet, scan log, gym log all reachable?"""
@@ -6260,6 +6439,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Top Bar -->
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
     <div class="flex items-center justify-between gap-2">
+      <!-- v3.2.0: Global cheer button (Jim OOB 2026-08-07 16:45 HKT
+           'there should be global way to trigger cheer and not necessary
+           to go into cheer tab. perhaps put the cheer button at the top
+           left, before Gymbro title'). Single tap → /api/cheer
+           fire_type=auto → AI decides morning/evening/post_gym timing. -->
+      <button @click="triggerCheer()"
+              :disabled="cheerInFlight"
+              data-testid="cheer-header-btn"
+              class="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-black transition-all active:scale-95 disabled:opacity-50"
+              style="background: linear-gradient(135deg, rgba(168,85,247,0.55), rgba(236,72,153,0.45)); border: 1.5px solid rgba(168,85,247,0.7); box-shadow: 0 0 16px -4px rgba(168,85,247,0.6); color: white;"
+              :title="cheerInFlight ? '打氣緊...' : '一撳打氣 (AI 自動揀 timing)'">
+        <span x-text="cheerInFlight ? '⏳' : '🔥'"></span>
+        <span x-text="cheerInFlight ? '打氣中' : '打氣'"></span>
+      </button>
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
       <div class="flex items-center gap-3">
         <!-- v2.7.52: Header mic button removed (Jim OOB 2026-08-07 13:45 HKT
@@ -6899,29 +7092,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                    the ⌨️/🍽️ fallback div entirely. Text-only and no-image
                    entries just show no image at all — clean, no placeholder. -->
               <template x-if="scan.image_url">
-                <img :src="scan.image_url"
-                     class="w-full aspect-[16/9] rounded-xl object-cover bg-black/40 mb-2 cursor-pointer active:scale-95"
-                     style="max-height: 200px;"
-                     loading="lazy"
-                     @click="window.open(scan.image_url, '_blank')">
+                <div class="relative w-full mb-2">
+                  <img :src="scan.image_url"
+                       class="w-full aspect-[16/9] rounded-xl object-cover bg-black/40 cursor-pointer active:scale-95"
+                       style="max-height: 200px;"
+                       loading="lazy"
+                       @click="window.open(scan.image_url, '_blank')">
+                  <!-- v3.2.0: coach grade as image overlay (Jim OOB 2026-08-07
+                       17:00 HKT 'under food log, move the rating on the picture
+                       thumbnail as overlay, larger in size. pick a good corner').
+                       Top-right is least likely to overlap with food subject
+                       and reads naturally with the iOS PWA full-bleed grid. -->
+                  <template x-if="scan.coach_comment?.grade">
+                    <div class="absolute top-2 right-2 text-base font-black px-2.5 py-1 rounded-lg shadow-lg shadow-black/50 backdrop-blur-md ring-1 ring-white/10"
+                         :class="{
+                           'bg-emerald-500/85 text-white': ['A+','A'].includes(scan.coach_comment.grade),
+                           'bg-lime-500/80 text-black': scan.coach_comment.grade === 'B',
+                           'bg-yellow-500/80 text-black': scan.coach_comment.grade === 'C',
+                           'bg-orange-500/85 text-white': scan.coach_comment.grade === 'D',
+                           'bg-red-500/85 text-white': scan.coach_comment.grade === 'F',
+                         }"
+                         :title="`Coach grade: ${scan.coach_comment.grade}`"
+                         x-text="scan.coach_comment.grade"></div>
+                  </template>
+                </div>
               </template>
               <!-- Row 2: title — full width, single line, horizontal scroll if too long -->
               <div class="flex items-center gap-2 mb-1.5">
                 <div class="text-lg font-bold text-white whitespace-nowrap flex-1 min-w-0 overflow-x-auto"
                      style="scrollbar-width: none; -ms-overflow-style: none;"
                      x-text="scan.name || scan.vision_short || '—'"></div>
-                <!-- v2.7.37: coach grade badge (A+/A/B/C/D/F) -->
-                <template x-if="scan.coach_comment?.grade">
-                  <div class="text-xs font-black px-1.5 py-0.5 rounded-md flex-shrink-0"
-                       :class="{
-                         'bg-emerald-500/30 text-emerald-200': ['A+','A'].includes(scan.coach_comment.grade),
-                         'bg-lime-500/25 text-lime-200': scan.coach_comment.grade === 'B',
-                         'bg-yellow-500/25 text-yellow-200': scan.coach_comment.grade === 'C',
-                         'bg-orange-500/30 text-orange-200': scan.coach_comment.grade === 'D',
-                         'bg-red-500/30 text-red-200': scan.coach_comment.grade === 'F',
-                       }"
-                       x-text="scan.coach_comment.grade"></div>
-                </template>
+                <!-- v3.2.0: coach grade badge moved to image overlay (top-right).
+                     The inline badge below the title was duplicating the
+                     visual signal. Now the image overlay is the only place
+                     the grade shows, keeping the title row clean. -->
                 <!-- v2.7.39: rename button (opens inline popover) -->
                 <button @click="openRenamePopover(scan)"
                         class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
@@ -7310,7 +7514,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'cheer' ? 'tab-active' : 'tab-inactive'" @click="tab = 'cheer'">
         <span class="text-lg leading-none">🔥</span><span class="text-xs font-bold">打氣</span>
       </button>
-      <button class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'schedule' ? 'tab-active' : 'tab-inactive'" @click="tab = 'schedule'">
+      <!-- v3.2.0: schedule tab button — hidden when no activities in the
+           past 42 days AND this week (Jim OOB 2026-08-07 16:40 HKT 'no
+           need to show the tab if there is no activities'). -->
+      <button x-show="scheduleHasAny"
+              class="flex items-center justify-center gap-1.5 rounded-lg py-2 transition-all" :class="tab === 'schedule' ? 'tab-active' : 'tab-inactive'" @click="tab = 'schedule'">
         <span class="text-lg leading-none">📅</span><span class="text-xs font-bold">日程</span>
       </button>
     </div>
@@ -7330,6 +7538,22 @@ function gymApp() {
     ptCopied: false,
     whoopCopied: false,
     endSummaryVisible: false,
+    // v3.2.0: schedule tab state — weekly + monthly calendar of Whoop
+    // activities (Jim OOB 2026-08-07 16:40 HKT 'have a monthly calendar
+    // view on which date i have done gym. Moreover, have you downloaded
+    // whoop other activities such as walking and view it on the calendar
+    // too?'). Data source: /api/whoop_activities_week + /api/whoop_activities_calendar.
+    scheduleLoading: true,
+    scheduleWeek: [],
+    scheduleWeekLabel: '',
+    scheduleWeekGymCount: 0,
+    scheduleWeekTotalCount: 0,
+    scheduleMonth: [],
+    scheduleMonthAligned: [],
+    scheduleMonthGymCount: 0,
+    scheduleMonthOtherCount: 0,
+    scheduleRangeLabel: '',
+    scheduleHasAny: false,
     // v3.1.0: legacy tab aliases. Old 6 tabs (set/workout/history/scan/end/cheer)
     // are aliased to new 4 (food/gym/cheer/schedule). getActiveTab() is used
     // by old sections that still check tab === 'set' / 'workout' / etc.
@@ -7545,6 +7769,8 @@ function gymApp() {
       this.loadPhotostream(true);
       // v2.7.18: Withings step widget (Jim OOB 2026-07-29)
       this.loadSteps();
+      // v3.2.0: schedule tab data (weekly + monthly calendar)
+      this.loadSchedule();
       // Pull streak (non-blocking)
       try {
         const streakRes = await fetch('/api/streak');
@@ -8211,6 +8437,60 @@ function gymApp() {
       const state = await (await fetch('/api/state')).json();
       this.session = state.session;
       this.flash('New session ready');
+    },
+
+    // v3.2.0: load schedule tab data — week strip + monthly calendar.
+    // Two parallel API calls, then format the calendar grid by aligning
+    // the first day to its weekday slot.
+    async loadSchedule() {
+      this.scheduleLoading = true;
+      try {
+        const [weekRes, monthRes] = await Promise.all([
+          fetch('/api/whoop_activities_week').then(r => r.json()),
+          fetch('/api/whoop_activities_calendar?days=42').then(r => r.json()),
+        ]);
+        this.scheduleWeek = weekRes.days || [];
+        this.scheduleWeekGymCount = weekRes.week_gym_count || 0;
+        this.scheduleWeekTotalCount = weekRes.week_total_count || 0;
+        const ws = weekRes.week_start || '';
+        const we = weekRes.week_end || '';
+        this.scheduleWeekLabel = ws && we
+          ? `${ws.slice(5)} – ${we.slice(5)}`
+          : '';
+        this.scheduleMonth = monthRes.days || [];
+        this.scheduleMonthGymCount = monthRes.gym_count || 0;
+        this.scheduleMonthOtherCount = monthRes.other_count || 0;
+        const rs = monthRes.range_start || '';
+        const re = monthRes.range_end || '';
+        this.scheduleRangeLabel = rs && re
+          ? `${rs.slice(5)} – ${re.slice(5)}`
+          : '';
+        // Build aligned grid: prepend invisible filler cells so day 1 of
+        // range lands in its correct weekday column.
+        const aligned = [];
+        if (this.scheduleMonth.length > 0) {
+          const firstDow = this.scheduleMonth[0].weekday || 0;  // 0=Mon
+          for (let i = 0; i < firstDow; i++) {
+            aligned.push({ date: `pad-${i}`, empty: true, day_num: '', activities: [] });
+          }
+          for (const day of this.scheduleMonth) {
+            const dn = parseInt(day.date.slice(8, 10), 10) || '';
+            aligned.push({
+              ...day,
+              day_num: dn,
+              empty: false,
+            });
+          }
+        }
+        this.scheduleMonthAligned = aligned;
+        this.scheduleHasAny = this.scheduleWeekTotalCount > 0
+          || this.scheduleMonth.some(d => d.count > 0);
+      } catch (e) {
+        console.error('[loadSchedule] failed', e);
+        this.scheduleHasAny = false;
+      } finally {
+        this.scheduleLoading = false;
+      }
     },
 
     async loadRecentScans() {
@@ -9417,30 +9697,139 @@ window.addEventListener('resize', checkLandscapeFood);
 setTimeout(checkLandscapeFood, 500);
 </script>
 
-<!-- v3.1.0: Schedule tab content (placeholder — calendar will be wired in
-     v3.2.0; for now it's hidden since isTabVisible('history') is the alias
-     and the existing history section already shows.) -->
-<section x-show="false"></section>
+<!-- v3.2.0: Schedule tab content (Jim OOB 2026-08-07: weekly + monthly
+     calendar view of Whoop activities — gym + walking + everything else
+     from the Whoop cache, not just gym sessions).
+     - Hide the whole tab when there are no activities (is_empty_week &&
+     no other activities in past 42 days).
+     - Top: this week (Mon-Sun) as a 7-day strip with sport icons.
+     - Bottom: monthly calendar grid (6 weeks back) with color-coded
+     day cells (gym = green, walking = sky, etc.) and is_today ring. -->
+<section x-show="isTabVisible('schedule')"
+         x-cloak
+         class="px-3 pb-32 pt-3"
+         x-init="loadSchedule()">
 
-<!-- v3.1.0: Frontpage Cheer button + gym focus mode + landscape detection
-     (Jim OOB 2026-08-07 14:50 + 15:00 HKT). The 4-tab nav uses new tab
-     names but legacy sections still drive most content. This block adds
-     the missing frontpage cheer entry on food tab + gym focus on gym tab. -->
-<div x-show="tab === 'food' || tab === 'cheer' || tab === 'gym' || tab === 'schedule'"
-     x-cloak
-     class="fixed top-[60px] right-3 z-40">
-  <!-- v3.1.0: frontpage cheer button. Single tap → /api/cheer fire_type=auto
-       → AI decides morning/evening/post_gym/post_meal based on HKT time +
-       recent activity. Small floating button (top-right, below header). -->
-  <button @click="triggerCheer()"
-          :disabled="cheerInFlight"
-          class="flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-black transition-all active:scale-95 disabled:opacity-50"
-          style="background: linear-gradient(135deg, rgba(168,85,247,0.55), rgba(236,72,153,0.45)); border: 1.5px solid rgba(168,85,247,0.7); box-shadow: 0 0 20px -4px rgba(168,85,247,0.6); color: white;"
-          :title="cheerInFlight ? '打氣緊...' : '一撳打氣 (AI 自動揀 timing)'">
-    <span x-text="cheerInFlight ? '⏳' : '🔥'"></span>
-    <span x-text="cheerInFlight ? '打氣中' : '打氣'"></span>
-  </button>
-</div>
+  <!-- Empty state — if no activities in the past 42 days AND this week,
+       the section is hidden entirely (handled by parent x-show on the
+       tab nav button). But for within-tab UX, also show a friendly hint
+       if data is still loading or only this-week is empty. -->
+  <div x-show="scheduleLoading" class="text-center py-10 text-gray-500">
+    <div class="text-2xl mb-2">⏳</div>
+    <div class="text-sm">Loading activities...</div>
+  </div>
+
+  <div x-show="!scheduleLoading && !scheduleHasAny"
+       class="text-center py-16 px-4">
+    <div class="text-4xl mb-3">📅</div>
+    <div class="text-base text-gray-300 mb-1">呢 6 週冇活動紀錄</div>
+    <div class="text-xs text-gray-500">做 gym 或者出街行下, 紀錄會即刻出現</div>
+  </div>
+
+  <div x-show="!scheduleLoading && scheduleHasAny">
+
+    <!-- ============ WEEK STRIP (Mon-Sun) ============ -->
+    <div class="mb-5">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
+          本週 <span class="text-gray-300" x-text="scheduleWeekLabel"></span>
+        </div>
+        <div class="text-[10px] text-gray-500">
+          🏋️<span x-text="scheduleWeekGymCount" class="ml-0.5 font-bold text-emerald-400"></span>
+          <span class="mx-1.5">·</span>
+          <span x-text="scheduleWeekTotalCount" class="font-bold text-gray-300"></span> 全部
+        </div>
+      </div>
+      <div class="grid grid-cols-7 gap-1.5">
+        <template x-for="day in scheduleWeek" :key="day.date">
+          <div class="flex flex-col items-center rounded-xl p-2 transition-all"
+               :class="day.is_today
+                          ? 'bg-emerald-500/15 ring-1 ring-emerald-400/40'
+                          : (day.count > 0 ? 'bg-white/[0.04]' : 'bg-transparent')">
+            <div class="text-[10px] font-bold text-gray-500 mb-1"
+                 :class="day.is_today ? 'text-emerald-300' : ''"
+                 x-text="day.weekday_label"></div>
+            <div class="text-sm font-black tabular-nums"
+                 :class="day.is_today ? 'text-emerald-200' : 'text-gray-200'"
+                 x-text="day.day_label"></div>
+            <div class="mt-1.5 min-h-[28px] flex flex-wrap justify-center gap-0.5">
+              <template x-for="(act, idx) in day.activities" :key="idx">
+                <span class="text-base leading-none"
+                      :title="`${act.label} · strain ${act.strain ?? '?'}`"
+                      x-text="act.icon"></span>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ============ MONTHLY CALENDAR (42 days back) ============ -->
+    <div>
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
+          月曆 <span class="text-gray-300" x-text="scheduleRangeLabel"></span>
+        </div>
+        <div class="text-[10px] text-gray-500">
+          🏋️<span x-text="scheduleMonthGymCount" class="ml-0.5 font-bold text-emerald-400"></span>
+          <span class="mx-1.5">·</span>
+          <span x-text="scheduleMonthOtherCount" class="font-bold text-sky-400"></span> 其他
+        </div>
+      </div>
+      <!-- Weekday header row -->
+      <div class="grid grid-cols-7 gap-1 mb-1">
+        <template x-for="wd in ['一','二','三','四','五','六','日']" :key="wd">
+          <div class="text-center text-[10px] text-gray-500 font-bold" x-text="wd"></div>
+        </template>
+      </div>
+      <!-- Calendar grid: align first day to its weekday slot -->
+      <div class="grid grid-cols-7 gap-1">
+        <template x-for="day in scheduleMonthAligned" :key="day.date">
+          <div class="aspect-square rounded-lg p-1 flex flex-col items-center justify-start transition-all"
+               :class="day.empty
+                          ? 'invisible'
+                          : (day.is_today
+                              ? 'bg-emerald-500/20 ring-1 ring-emerald-400/50'
+                              : (day.has_gym
+                                  ? 'bg-emerald-500/10 ring-1 ring-emerald-500/30'
+                                  : (day.count > 0
+                                      ? 'bg-sky-500/10 ring-1 ring-sky-500/25'
+                                      : 'bg-white/[0.025]')))">
+            <div class="text-[10px] tabular-nums font-bold"
+                 :class="day.is_today ? 'text-emerald-300' : (day.has_gym ? 'text-emerald-300' : 'text-gray-300')"
+                 x-text="day.day_num"></div>
+            <div class="mt-0.5 flex flex-wrap justify-center gap-0.5 text-[10px] leading-none">
+              <template x-for="(act, idx) in (day.activities || []).slice(0, 3)" :key="idx">
+                <span x-text="act.icon"></span>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Legend -->
+      <div class="mt-3 flex items-center justify-center gap-3 text-[10px] text-gray-400">
+        <div class="flex items-center gap-1">
+          <span class="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500/30 ring-1 ring-emerald-500/40"></span>
+          <span>Gym</span>
+        </div>
+        <div class="flex items-center gap-1">
+          <span class="inline-block h-2.5 w-2.5 rounded-sm bg-sky-500/20 ring-1 ring-sky-500/30"></span>
+          <span>其他活動</span>
+        </div>
+        <div class="flex items-center gap-1">
+          <span class="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500/40 ring-1 ring-emerald-300/60"></span>
+          <span>今日</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- v3.2.0: Old floating cheer button removed (Jim OOB 2026-08-07
+     16:45 HKT 'put the cheer button at the top left'). Cheer is now
+     in the global header before the Gymbro title — visible on every
+     tab without scrolling. -->
 
 <!-- v3.1.0: Gym focus mode floating action — when on gym tab, show a
      landscape-request + audio coach tip floating button. Jim OOB 2026-08-07
@@ -9476,9 +9865,9 @@ SERVICE_WORKER = """
 // "and some color code as title #" — hash labels dropped via filter.
 // "and why there is no other nutriention info" — restored P/C/F display
 // inline next to kcal (was deleted in v63 overzealous cleanup).
-// v3.1.0: 4-tab nav + landscape food grid + gym focus mode + PT/Whoop share +
-// frontpage cheer auto-trigger. 4 tabs (food / gym / cheer / schedule), default = food.
-const CACHE = 'gym-web-v90';
+// v3.2.0: schedule tab (weekly + monthly calendar) + header cheer button
+// at top-left + food log rating badge moved to image overlay (top-right).
+const CACHE = 'gym-web-v92';
 // v18 changes (Jim OOB 2026-07-21):
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
