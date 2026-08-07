@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.49"
+__version__ = "2.7.50"
 
 
 def _safe_read_json(path, default=None):
@@ -6384,65 +6384,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </button>
       </div>
 
-      <!-- v2.7.45: Voice input panel (audio → transcript → food entry) -->
-      <div x-show="voiceInputMode" x-cloak class="mb-4 rounded-2xl p-4"
-           style="background: rgba(56,189,248,0.08); border: 1.5px solid rgba(56,189,248,0.35);">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-sky-300 mb-2 font-bold">🎙️ 語音輸入模式 (廣東話)</div>
-
-        <!-- Recording controls -->
-        <div class="flex flex-col items-center gap-3 py-3">
-          <button @click="toggleVoiceRecording()"
-                  :disabled="voiceTranscribing"
-                  class="rounded-full w-20 h-20 flex items-center justify-center transition-all active:scale-95 disabled:opacity-50"
-                  :class="voiceRecording ? 'animate-pulse' : ''"
-                  :style="voiceRecording
-                    ? 'background: rgba(239,68,68,0.4); border: 3px solid rgba(239,68,68,0.7);'
-                    : 'background: rgba(56,189,248,0.3); border: 3px solid rgba(56,189,248,0.7);'">
-            <span class="text-3xl" x-text="voiceRecording ? '⏸' : '🎙️'"></span>
-          </button>
-          <div class="text-xs text-gray-300" x-text="voiceRecording ? '錄音中… 撳多次停止' : '撳住開始錄音 (最長 60 秒)'"></div>
-          <div class="text-[10px] text-gray-500" x-show="voiceRecordingTime > 0">
-            <span x-text="`${voiceRecordingTime}s`"></span>
-          </div>
-          <input type="file" accept="audio/*" capture="microphone" x-ref="voiceFileInput" @change="onVoiceFileSelected($event)" class="hidden">
-          <button @click="$refs.voiceFileInput.click()"
-                  :disabled="voiceTranscribing"
-                  class="text-[10px] text-sky-300 underline disabled:opacity-50">
-            或選擇 audio 檔
-          </button>
-        </div>
-
-        <!-- Transcribing indicator -->
-        <div x-show="voiceTranscribing" class="text-center text-sm text-sky-300 py-2">
-          🤖 gpt-4o-transcribe 處理緊…
-        </div>
-
-        <!-- Error -->
-        <div x-show="voiceError" class="text-center text-xs text-red-300 py-2" x-text="voiceError"></div>
-
-        <!-- Transcript result + commit button -->
-        <template x-if="voiceTranscript && !voiceTranscribing">
-          <div class="mt-3 rounded-lg p-3" style="background: rgba(0,0,0,0.4); border: 1px solid rgba(56,189,248,0.4);">
-            <div class="text-[10px] text-sky-300 mb-1.5">📝 Transcript:</div>
-            <textarea x-model="voiceTranscript"
-                      class="w-full rounded bg-black/40 px-2 py-1.5 text-xs text-white"
-                      rows="3" maxlength="2000"></textarea>
-            <div class="flex gap-2 mt-2">
-              <button @click="voiceTranscriptToFoodEntry()"
-                      :disabled="!voiceTranscript.trim()"
-                      class="flex-1 rounded-lg py-2 text-xs font-bold active:scale-95 disabled:opacity-50"
-                      style="background: linear-gradient(135deg, rgba(56,189,248,0.4), rgba(56,189,248,0.2)); border: 1.5px solid rgba(56,189,248,0.55);">
-                🍽️ 用呢段文字落 food log
-              </button>
-              <button @click="voiceTranscript = null; voiceRecording = false; voiceRecordingTime = 0;"
-                      class="rounded-lg bg-white/10 px-3 py-2 text-xs text-gray-300 active:scale-95">
-                取消
-              </button>
-            </div>
-          </div>
-        </template>
-      </div>
-
       <!-- Text-direct input mode (toggled by openScanTextInput) -->
       <div x-show="scanTextMode" x-cloak class="mb-4 rounded-2xl p-4"
            style="background: rgba(168,85,247,0.08); border: 1.5px solid rgba(168,85,247,0.35);">
@@ -9101,6 +9042,80 @@ if ('serviceWorker' in navigator) {
   } catch(e) { /* noop */ }
 })();
 </script>
+
+<!-- v2.7.49: Global voice input bottom-sheet (moved out of scan tab so header
+     mic button works from any tab). Jim OOB 2026-08-07 13:05 HKT 'the mic
+     button is not functioning' — the panel was inside scan tab so it only
+     rendered when scan tab active. Now fixed bottom sheet, any tab, with
+     close X button + clear visual frame. -->
+<div x-show="voiceInputMode" x-cloak
+     x-transition.opacity
+     class="fixed inset-0 z-50 flex items-end justify-center"
+     style="background: rgba(0,0,0,0.55); backdrop-filter: blur(4px);">
+  <div @click.outside="openVoiceInput()"
+       class="w-full max-w-md mx-3 mb-3 rounded-2xl p-4 shadow-2xl"
+       style="background: rgba(15,23,42,0.98); border: 1.5px solid rgba(56,189,248,0.55);">
+    <div class="flex items-center justify-between mb-3">
+      <div class="text-[11px] uppercase tracking-[0.2em] text-sky-300 font-bold">🎙️ 語音輸入模式 (廣東話)</div>
+      <button @click="openVoiceInput()"
+              class="text-gray-400 hover:text-white text-lg leading-none px-2 py-0.5 -mr-1 rounded active:bg-white/10"
+              title="關閉">✕</button>
+    </div>
+
+    <!-- Recording controls -->
+    <div class="flex flex-col items-center gap-3 py-2">
+      <button @click="toggleVoiceRecording()"
+              :disabled="voiceTranscribing"
+              class="rounded-full w-20 h-20 flex items-center justify-center transition-all active:scale-95 disabled:opacity-50"
+              :class="voiceRecording ? 'animate-pulse' : ''"
+              :style="voiceRecording
+                ? 'background: rgba(239,68,68,0.4); border: 3px solid rgba(239,68,68,0.7);'
+                : 'background: rgba(56,189,248,0.3); border: 3px solid rgba(56,189,248,0.7);'">
+        <span class="text-3xl" x-text="voiceRecording ? '⏸' : '🎙️'"></span>
+      </button>
+      <div class="text-xs text-gray-300" x-text="voiceRecording ? '錄音中… 撳多次停止' : '撳一下開始錄音 (最長 60 秒)'"></div>
+      <div class="text-[10px] text-gray-500" x-show="voiceRecordingTime > 0">
+        <span x-text="`${voiceRecordingTime}s`"></span>
+      </div>
+      <input type="file" accept="audio/*" capture="microphone" x-ref="voiceFileInput" @change="onVoiceFileSelected($event)" class="hidden">
+      <button @click="$refs.voiceFileInput.click()"
+              :disabled="voiceTranscribing"
+              class="text-[10px] text-sky-300 underline disabled:opacity-50">
+        或選擇 audio 檔
+      </button>
+    </div>
+
+    <!-- Transcribing indicator -->
+    <div x-show="voiceTranscribing" class="text-center text-sm text-sky-300 py-2">
+      🤖 gpt-4o-transcribe 處理緊…
+    </div>
+
+    <!-- Error -->
+    <div x-show="voiceError" class="text-center text-xs text-red-300 py-2" x-text="voiceError"></div>
+
+    <!-- Transcript result + commit button -->
+    <template x-if="voiceTranscript && !voiceTranscribing">
+      <div class="mt-3 rounded-lg p-3" style="background: rgba(0,0,0,0.4); border: 1px solid rgba(56,189,248,0.4);">
+        <div class="text-[10px] text-sky-300 mb-1.5">📝 Transcript:</div>
+        <textarea x-model="voiceTranscript"
+                  class="w-full rounded bg-black/40 px-2 py-1.5 text-xs text-white"
+                  rows="3" maxlength="2000"></textarea>
+        <div class="flex gap-2 mt-2">
+          <button @click="voiceTranscriptToFoodEntry()"
+                  :disabled="!voiceTranscript.trim()"
+                  class="flex-1 rounded-lg py-2 text-xs font-bold active:scale-95 disabled:opacity-50"
+                  style="background: linear-gradient(135deg, rgba(56,189,248,0.4), rgba(56,189,248,0.2)); border: 1.5px solid rgba(56,189,248,0.55);">
+            🍽️ 用呢段文字落 food log
+          </button>
+          <button @click="voiceTranscript = null; voiceRecording = false; voiceRecordingTime = 0;"
+                  class="rounded-lg bg-white/10 px-3 py-2 text-xs text-gray-300 active:scale-95">
+            取消
+          </button>
+        </div>
+      </div>
+    </template>
+  </div>
+</div>
 
 </body>
 </html>
