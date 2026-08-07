@@ -363,7 +363,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "2.7.32"
+__version__ = "2.7.49"
 
 
 def _safe_read_json(path, default=None):
@@ -6064,13 +6064,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="flex items-center justify-between gap-2">
       <h1 @click="onBrandTap()" class="text-3xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
       <div class="flex items-center gap-3">
-        <!-- v2.7.26: paired today + yesterday widget (Jim OOB 2026-08-04 09:55 HKT
-             "show both yesterday and today, today larger").
-             v2.7.40: tap-to-refresh from Withings (Jim OOB 2026-08-06 "tap shoes
-             triggers refresh"). 3-state visual feedback:
-             - idle:  static 👟
-             - refreshing: 👟 spinning (animate-spin)
-             - after: pulse-glow on the number for 1.2s -->
+        <!-- v2.7.49: PTT mic button at top header next to Gymbro logo
+             (Jim OOB 2026-08-07 12:30 HKT 'put this button at the top top next
+             to Gymbro. just one large mic button to trigger'). Single global
+             PTT entry — removes the in-food-log pill. -->
+        <button @click="openVoiceInput()"
+                :disabled="scanUploading"
+                :class="voiceInputMode ? 'opacity-100 ring-2 ring-sky-300' : 'active:scale-95'"
+                class="flex items-center justify-center w-11 h-11 rounded-full transition-all disabled:opacity-50"
+                style="background: linear-gradient(135deg, rgba(56,189,248,0.45), rgba(56,189,248,0.20)); border: 1.5px solid rgba(56,189,248,0.85); box-shadow: 0 0 18px -2px rgba(56,189,248,0.55); -webkit-tap-highlight-color: transparent;"
+                title="按住即開廣東話錄音">
+          <span class="text-2xl leading-none">🎙️</span>
+        </button>
+        <!-- v2.7.49: Step widget numerator/denominator (Jim OOB 2026-08-07
+             'make the denominator of the step count. today step count as
+             numerator'). Today large / yesterday small inline. -->
         <div @click="refreshSteps()"
              :class="stepsRefreshing ? 'opacity-90' : 'active:opacity-70'"
              class="flex items-stretch gap-1.5 rounded-2xl px-2.5 py-1.5 cursor-pointer select-none transition-opacity"
@@ -6079,13 +6087,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="flex flex-col items-center justify-center leading-none">
             <span class="text-base" :class="stepsRefreshing ? 'animate-spin inline-block' : ''">👟</span>
           </div>
-          <!-- TODAY (large, amber) -->
+          <!-- Numerator: TODAY (large, amber/green/red by threshold) -->
           <div class="flex flex-col items-center justify-center leading-none border-r border-white/20 pr-2">
             <span class="text-lg font-black tabular-nums"
                   :class="stepsRefreshing ? 'text-sky-300 animate-pulse' : (stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'))"
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
           </div>
-          <!-- YESTERDAY (small, gray) -->
+          <!-- Denominator: YESTERDAY (small, gray) -->
           <div class="flex flex-col items-center justify-center leading-none" x-show="stepsYesterday !== null">
             <span class="text-sm font-bold tabular-nums text-gray-400"
                   x-text="stepsYesterday !== null ? stepsYesterday.toLocaleString() : '—'"></span>
@@ -6358,47 +6366,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </button>
 
-      <!-- v2.7.45: 2-up chip row (photo stream + text) - each ~48px -->
-      <div class="grid grid-cols-2 gap-2 mb-2">
-        <!-- iPhone photo stream picker -->
+      <!-- v2.7.49: 2-up chip row (photo stream only) - ⌨️ keyboard icon removed
+           (Jim OOB 2026-08-07 12:35 HKT 'the keyboard icon placeholder is
+           useless. if there is no impact, just left it empty and not occupying
+           any space'). PTT mic moved to top header (Gymbro logo旁) as single
+           global trigger. -->
+      <div class="grid grid-cols-1 gap-2 mb-2">
+        <!-- iPhone photo stream picker (full-width now) -->
         <button @click="$refs.scanPhotosInputEl.click()"
                 :disabled="scanUploading || scanPhotosQueue.length > 0"
-                class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                class="rounded-xl py-2.5 px-3 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                 style="background: rgba(255,255,255,0.05); border: 1px solid rgba(16,185,129,0.3);">
-          <div class="flex flex-col items-center gap-0.5">
+          <div class="flex items-center justify-center gap-2">
             <div class="text-xl">📷</div>
-            <div class="text-[11px] font-bold text-emerald-300">相簿多選</div>
-          </div>
-        </button>
-
-        <!-- v2.7.22: Text-direct food input -->
-        <button @click="openScanTextInput()"
-                class="rounded-xl py-2.5 px-2 transition-all active:scale-95"
-                style="background: rgba(168,85,247,0.10); border: 1px solid rgba(168,85,247,0.4);">
-          <div class="flex flex-col items-center gap-0.5">
-            <div class="text-xl">⌨️</div>
-            <div class="text-[11px] font-bold text-purple-300">打文字</div>
+            <div class="text-[12px] font-bold text-emerald-300">相簿多選</div>
           </div>
         </button>
       </div>
-
-      <!-- v2.7.48 (Jim OOB 2026-08-07 11:00 HKT 'make the ptt button larger and
-           visible. not easy to fat finger'): PTT voice button is now a
-           separate full-width pill below the chip row — biggest, most
-           visible, with mic glyph + label + subtitle so it can't be confused
-           with the other secondary actions. -->
-      <button @click="openVoiceInput()"
-              class="w-full rounded-2xl py-4 px-4 mb-2 transition-all active:scale-[0.97]"
-              style="background: linear-gradient(135deg, rgba(56,189,248,0.32), rgba(56,189,248,0.12)); border: 2px solid rgba(56,189,248,0.7); box-shadow: 0 0 0 1px rgba(56,189,248,0.2), 0 0 24px -4px rgba(56,189,248,0.4);">
-        <div class="flex items-center justify-center gap-3">
-          <div class="text-3xl">🎙️</div>
-          <div class="text-left">
-            <div class="text-base font-black text-sky-100 leading-tight">按住講嘢</div>
-            <div class="text-[10px] text-sky-300/80 leading-tight">廣東話直入 food log · gpt-4o-transcribe</div>
-          </div>
-          <div class="ml-auto text-sky-400 text-2xl">›</div>
-        </div>
-      </button>
 
       <!-- v2.7.45: Voice input panel (audio → transcript → food entry) -->
       <div x-show="voiceInputMode" x-cloak class="mb-4 rounded-2xl p-4"
