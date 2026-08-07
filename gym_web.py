@@ -7575,6 +7575,14 @@ function gymApp() {
     scheduleMonthOtherCount: 0,
     scheduleRangeLabel: '',
     scheduleHasAny: false,
+    // v3.2.5: schedule view toggle — 'week' strip OR 'month' calendar.
+    // Default = 'month' (Jim OOB 2026-08-07 18:40 HKT 'Week view is not an
+    // option' / 18:35 HKT 'monthly calendar view also an option' — the
+    // user wants the month to be the primary view, with the week strip
+    // staying as a quick overview above it. No toggle needed.)
+    scheduleView: 'month',
+    // v3.2.5: month calendar popover — tap a day to see full details.
+    scheduleSelectedDay: null,
     // v3.1.0: legacy tab aliases. Old 6 tabs (set/workout/history/scan/end/cheer)
     // are aliased to new 4 (food/gym/cheer/schedule). getActiveTab() is used
     // by old sections that still check tab === 'set' / 'workout' / etc.
@@ -8631,6 +8639,19 @@ function gymApp() {
       this.tab = 'set';
       try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e) { window.scrollTo(0, 0); }
       this.flash('返到 SET 主頁');
+    },
+
+    // v3.2.5: schedule day popover — open / close
+    // (Jim OOB 2026-08-07 18:40 HKT 'need to put the info on the
+    // calendar beautifully'). Tap a day to see full activity list.
+    openDayPopover(day) {
+      try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
+      if (!day || !day.activities || day.activities.length === 0) return;
+      this.scheduleSelectedDay = day;
+      try { this.haptic && this.haptic('light'); } catch(e) { /* noop */ }
+    },
+    closeDayPopover() {
+      this.scheduleSelectedDay = null;
     },
 
     // v3.2.4: gym focus mode — toggles body class + state + scrolls to top
@@ -9758,7 +9779,7 @@ setTimeout(checkLandscapeFood, 500);
      - Top: this week (Mon-Sun) as a 7-day strip with sport icons.
      - Bottom: monthly calendar grid (6 weeks back) with color-coded
      day cells (gym = green, walking = sky, etc.) and is_today ring. -->
-<section x-show="isTabVisible('schedule')"
+<section x-show="isTabVisible('history')"
          x-cloak
          class="px-3 pb-32 pt-3"
          x-init="loadSchedule()">
@@ -9781,7 +9802,9 @@ setTimeout(checkLandscapeFood, 500);
 
   <div x-show="!scheduleLoading && scheduleHasAny">
 
-    <!-- ============ WEEK STRIP (Mon-Sun) ============ -->
+    <!-- v3.2.5: month calendar popover — tap a day for full activity details. -->
+
+    <!-- ============ WEEK STRIP (Mon-Sun, always shown as quick overview) ============ -->
     <div class="mb-5">
       <div class="flex items-center justify-between mb-2">
         <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
@@ -9793,9 +9816,10 @@ setTimeout(checkLandscapeFood, 500);
           <span x-text="scheduleWeekTotalCount" class="font-bold text-gray-300"></span> 全部
         </div>
       </div>
-      <div class="grid grid-cols-7 gap-1.5">
+      <div class="flex flex-wrap gap-1.5 justify-center">
         <template x-for="day in scheduleWeek" :key="day.date">
-          <div class="flex flex-col items-center rounded-xl p-2 transition-all"
+          <div x-show="day.count > 0 || day.is_today"
+               class="flex flex-col items-center rounded-xl p-2 transition-all w-[calc((100%-1.5rem*6)/7)] min-w-[44px]"
                :class="day.is_today
                           ? 'bg-emerald-500/15 ring-1 ring-emerald-400/40'
                           : (day.count > 0 ? 'bg-white/[0.04]' : 'bg-transparent')">
@@ -9817,7 +9841,7 @@ setTimeout(checkLandscapeFood, 500);
       </div>
     </div>
 
-    <!-- ============ MONTHLY CALENDAR (42 days back) ============ -->
+    <!-- ============ MONTHLY CALENDAR (42 days back, primary view) ============ -->
     <div>
       <div class="flex items-center justify-between mb-2">
         <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
@@ -9838,20 +9862,30 @@ setTimeout(checkLandscapeFood, 500);
       <!-- Calendar grid: align first day to its weekday slot -->
       <div class="grid grid-cols-7 gap-1">
         <template x-for="day in scheduleMonthAligned" :key="day.date">
+          <!-- v3.2.5: empty days (count=0, not today, not padding) now render
+               as a truly blank cell — no background, no day number, no ring.
+               Padding cells keep `invisible` so they reserve their grid slot
+               for column alignment. (Jim OOB 2026-08-07 18:25 HKT 'no need
+               to show date without activities')
+               Active days are clickable — open popover with full activity
+               details (Jim OOB 2026-08-07 18:40 HKT 'need to put the info
+               on the calendar beautifully'). -->
           <div class="aspect-square rounded-lg p-1 flex flex-col items-center justify-start transition-all"
                :class="day.empty
                           ? 'invisible'
-                          : (day.is_today
-                              ? 'bg-emerald-500/20 ring-1 ring-emerald-400/50'
-                              : (day.has_gym
-                                  ? 'bg-emerald-500/10 ring-1 ring-emerald-500/30'
-                                  : (day.count > 0
-                                      ? 'bg-sky-500/10 ring-1 ring-sky-500/25'
-                                      : 'bg-white/[0.025]')))">
-            <div class="text-[10px] tabular-nums font-bold"
-                 :class="day.is_today ? 'text-emerald-300' : (day.has_gym ? 'text-emerald-300' : 'text-gray-300')"
+                          : (day.count === 0 && !day.is_today
+                              ? 'bg-transparent'
+                              : (day.is_today
+                                  ? 'bg-emerald-500/25 ring-2 ring-emerald-300/70 shadow-lg shadow-emerald-500/20'
+                                  : (day.has_gym
+                                      ? 'bg-emerald-500/12 ring-1 ring-emerald-500/40 active:scale-95 cursor-pointer'
+                                      : 'bg-sky-500/12 ring-1 ring-sky-500/30 active:scale-95 cursor-pointer')))"
+               @click="day.activities && day.activities.length > 0 ? openDayPopover(day) : null">
+            <div class="text-[10px] tabular-nums font-black"
+                 :class="day.count === 0 && !day.is_today ? 'text-transparent' : (day.is_today ? 'text-emerald-200' : (day.has_gym ? 'text-emerald-200' : 'text-sky-200'))"
                  x-text="day.day_num"></div>
-            <div class="mt-0.5 flex flex-wrap justify-center gap-0.5 text-[10px] leading-none">
+            <div class="mt-0.5 flex flex-wrap justify-center gap-0.5 text-[11px] leading-none"
+                 x-show="day.activities && day.activities.length > 0">
               <template x-for="(act, idx) in (day.activities || []).slice(0, 3)" :key="idx">
                 <span x-text="act.icon"></span>
               </template>
@@ -9873,6 +9907,68 @@ setTimeout(checkLandscapeFood, 500);
         <div class="flex items-center gap-1">
           <span class="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-500/40 ring-1 ring-emerald-300/60"></span>
           <span>今日</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- v3.2.5: Day detail popover (Jim OOB 2026-08-07 18:40 HKT 'need to
+         put the info on the calendar beautifully'). Tap a day in the
+         calendar to see full activity list with sport + strain + time. -->
+    <div x-show="scheduleSelectedDay"
+         x-transition.opacity
+         class="fixed inset-0 z-50 flex items-end justify-center bg-black/70 backdrop-blur-sm"
+         @click.self="scheduleSelectedDay = null"
+         @keydown.escape.window="scheduleSelectedDay = null">
+      <div class="w-full max-w-md rounded-t-3xl bg-gradient-to-b from-zinc-900 to-black border-t border-white/10 p-5 pb-8 max-h-[70dvh] overflow-y-auto"
+           x-show="scheduleSelectedDay"
+           x-transition.duration.200ms>
+        <div class="flex items-center justify-between mb-3">
+          <div>
+            <div class="text-[10px] uppercase tracking-[0.2em] text-gray-500" x-text="scheduleSelectedDay?.weekday_label || ''"></div>
+            <div class="text-2xl font-black tracking-tighter" x-text="scheduleSelectedDay?.date || ''"></div>
+          </div>
+          <button @click="scheduleSelectedDay = null"
+                  class="flex h-9 w-9 items-center justify-center rounded-full bg-white/[0.06] active:scale-95"
+                  data-testid="day-popover-close">
+            <span class="text-lg">✕</span>
+          </button>
+        </div>
+        <!-- Day summary stats -->
+        <div class="grid grid-cols-3 gap-2 mb-4">
+          <div class="rounded-xl bg-white/[0.04] p-2.5 text-center">
+            <div class="text-[9px] uppercase tracking-wider text-gray-500">活動</div>
+            <div class="text-xl font-black text-emerald-300" x-text="scheduleSelectedDay?.count || 0"></div>
+          </div>
+          <div class="rounded-xl bg-white/[0.04] p-2.5 text-center">
+            <div class="text-[9px] uppercase tracking-wider text-gray-500">總 strain</div>
+            <div class="text-xl font-black text-amber-300" x-text="scheduleSelectedDay?.total_strain || 0"></div>
+          </div>
+          <div class="rounded-xl bg-white/[0.04] p-2.5 text-center">
+            <div class="text-[9px] uppercase tracking-wider text-gray-500">Gym</div>
+            <div class="text-xl font-black" :class="scheduleSelectedDay?.has_gym ? 'text-emerald-300' : 'text-gray-600'" x-text="scheduleSelectedDay?.has_gym ? '✓' : '—'"></div>
+          </div>
+        </div>
+        <!-- Activity list -->
+        <div class="space-y-2">
+          <template x-for="(act, idx) in (scheduleSelectedDay?.activities || [])" :key="idx">
+            <div class="flex items-center gap-3 rounded-xl bg-white/[0.04] p-3 border border-white/[0.06]">
+              <div class="text-3xl leading-none" x-text="act.icon"></div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-black" x-text="act.label"></div>
+                <div class="text-[10px] text-gray-500 mt-0.5 tabular-nums">
+                  <span x-text="(act.start || '').slice(0, 10)"></span>
+                  <span class="mx-1">·</span>
+                  <span x-text="(act.start || '').slice(11, 16)"></span>
+                  <span class="mx-1">→</span>
+                  <span x-text="(act.end || '').slice(11, 16)"></span>
+                </div>
+              </div>
+              <div class="text-right">
+                <div class="text-base font-black tabular-nums" :class="act.strain >= 14 ? 'text-rose-300' : (act.strain >= 10 ? 'text-amber-300' : 'text-sky-300')" x-text="(act.strain ?? 0).toFixed(1)"></div>
+                <div class="text-[9px] uppercase tracking-wider text-gray-500">strain</div>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
     </div>
@@ -9921,7 +10017,9 @@ SERVICE_WORKER = """
 // v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
 // v3.2.3: RPE slider with color zones (1-10) replacing number input.
 // v3.2.4: gym focus mode fix — toggleGymFocus() syncs Alpine state + scrolls to top.
-const CACHE = 'gym-web-v96';
+// v3.2.5: schedule tab hides days without activities (week strip + month grid).
+// v3.2.5b: month calendar default + tap-day popover with full activity details.
+const CACHE = 'gym-web-v98';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10002,7 +10100,9 @@ const CACHE = 'gym-web-v96';
 // v3.2.2: slim header (compact step number + HH:MM clock + MM-DD date).
 // v3.2.3: RPE slider with color zones (1-10) replacing number input.
 // v3.2.4: gym focus mode fix — toggleGymFocus() syncs Alpine state + scrolls to top.
-const CACHE = 'gym-web-v96';
+// v3.2.5: schedule tab hides days without activities (week strip + month grid).
+// v3.2.5b: month calendar default + tap-day popover with full activity details.
+const CACHE = 'gym-web-v98';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
