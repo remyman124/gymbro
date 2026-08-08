@@ -7648,10 +7648,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="text-lg font-bold text-white whitespace-nowrap flex-1 min-w-0 overflow-x-auto"
                      style="scrollbar-width: none; -ms-overflow-style: none;"
                      x-text="scan.name || scan.vision_short || '—'"></div>
-                <!-- v3.2.0: coach grade badge moved to image overlay (top-right).
-                     The inline badge below the title was duplicating the
-                     visual signal. Now the image overlay is the only place
-                     the grade shows, keeping the title row clean. -->
+                <!-- v3.2.7.8: inline grade badge for entries WITHOUT image (text-only
+                     or image-back-failed). Image-backed entries already get the
+                     bigger top-right overlay on the image. (Jim OOB 2026-08-08
+                     19:35 HKT 'For those without image, pls also show the rating') -->
+                <template x-if="!scan.image_url && scan.coach_comment?.grade && scan.coach_comment.grade !== '—'">
+                  <div class="text-base font-black px-2 py-0.5 rounded-lg shadow-lg ring-1 ring-white/20 flex-shrink-0"
+                       :class="{
+                         'bg-emerald-500/90 text-white': ['A+','A'].includes(scan.coach_comment.grade),
+                         'bg-lime-500/85 text-black': scan.coach_comment.grade === 'B',
+                         'bg-yellow-500/85 text-black': scan.coach_comment.grade === 'C',
+                         'bg-orange-500/90 text-white': scan.coach_comment.grade === 'D',
+                         'bg-red-500/90 text-white': scan.coach_comment.grade === 'F',
+                       }"
+                       :title="`Coach grade: ${scan.coach_comment.grade}`"
+                       x-text="scan.coach_comment.grade"></div>
+                </template>
                 <!-- v2.7.39: rename button (opens inline popover) -->
                 <button @click="openRenamePopover(scan)"
                         class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
@@ -10596,7 +10608,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v107';
+const CACHE = 'gym-web-v108';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10684,7 +10696,7 @@ const CACHE = 'gym-web-v107';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v107';
+const CACHE = 'gym-web-v108';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
