@@ -2685,11 +2685,18 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     'No regex. Use ai' + 'Use minimax too'). Primary path: MiniMax M3
     via api.minimax.io. Fallback: APiyi gpt-4o-mini. Last resort: regex.
 
-    Returns 2-6 char SPECIFIC Cantonese dish name, e.g.:
+    v3.2.7.6 (Jim OOB 2026-08-08 10:30 HKT 'should recognise as 雞蛋、麵包'):
+    Generic meal labels ('早餐', '午餐', '晚餐', 'afternoon tea') are NOT
+    acceptable — must extract the actual dishes in the meal (e.g. 煎蛋、
+    烤麵包). When vision says only '簡單嘅早餐' / '簡單嘅晚餐' etc.,
+    look deeper for actual food items (蛋類/麵包/粉麵/飯/粥/餐肉).
+
+    Returns 2-12 char SPECIFIC Cantonese dish name, e.g.:
       '相顯示咗一塊千層蛋糕' → '千層蛋糕'
       '可見海南雞飯配青瓜' → '海南雞飯'
       '一杯黑咖啡' → '黑咖啡'
       '一碗白飯同青菜' → '白飯'
+      '相顯示咗一個簡單嘅早餐' → '煎蛋、烤麵包' (NOT '早餐')
     """
     if not vision_desc and not pplx_desc:
         return ""
@@ -2699,14 +2706,22 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
 
     prompt = (
         "你係香港人，識粵語。以下係食物描述。"
-        "淨係俾我 2-6 個中文字嘅 SPECIFIC 菜名，唔好加任何描述、量詞、前綴、餐廳名。"
-        "例如：'千層蛋糕'（唔好寫'相顯示咗一塊千層蛋糕'），"
+        "淨係俾我 2-8 個中文字嘅 SPECIFIC 菜名，唔好加任何描述、量詞、前綴、餐廳名。"
+        "重要規則："
+        "(1) 唔可以用 generic 餐名 ('早餐'、'午餐'、'晚餐'、'下午茶') 當菜名；"
+        "    一定要抽實際嘅食物 (例如：煎蛋、烤麵包、粥、飯)。"
+        "(2) 如果只見到 '簡單嘅早餐' / '簡單嘅晚餐' / '簡單嘅一餐' 等 generic 字眼，"
+        "    就要從描述中揾實際嘅主體食物 (蛋類/麵包/粉麵/飯/粥/餐肉)。"
+        "(3) 多過一樣食物可以用 '、' 分隔 (例如：'煎蛋、烤麵包')。"
+        "\\n\\n例子："
+        "'千層蛋糕'（唔好寫'相顯示咗一塊千層蛋糕'），"
         "'海南雞飯'（唔好寫'可見海南雞飯配青瓜'），"
         "'黑咖啡'（唔好寫'一杯黑咖啡'），"
         "'凍檸茶'（唔好寫'一杯凍檸茶'），"
         "'沙律雞'（唔好寫'一份沙律雞胸'），"
-        "'白飯'（唔好寫'一碗白飯同青菜'）。"
-        "\n\n描述：\n" + combined + "\n\n菜名："
+        "'白飯'（唔好寫'一碗白飯同青菜'），"
+        "'煎蛋、烤麵包'（唔好寫'簡單嘅早餐'，generic 餐名唔接受）。"
+        "\\n\\n描述：\\n" + combined + "\\n\\n菜名："
     )
 
     # Try MiniMax first
@@ -2771,7 +2786,13 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = ""
     # v3.2.7.4: try AI first
     ai_result = _extract_dish_name_ai(vision_desc, pplx_desc)
     if ai_result and 2 <= len(ai_result) <= 12:
-        return ai_result
+        # v3.2.7.6: reject generic meal labels from AI too — fall through to
+        # better extraction (Jim OOB 2026-08-08 10:30 HKT 'should recognise
+        # as 雞蛋、麵包' — vision said '簡單嘅早餐', AI returned '早餐',
+        # but should be '煎蛋、烤麵包' from re-asking).
+        generic_labels = {"早餐", "午餐", "晚餐", "午飯", "晚飯", "下午茶", "宵夜", "tea", "brunch", "dinner", "lunch", "breakfast"}
+        if ai_result not in generic_labels:
+            return ai_result
 
     combined = vision_desc + "\n" + pplx_desc
     # Pattern 1: numbered dish "1. **激安二人餐**"
@@ -10537,7 +10558,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v105';
+const CACHE = 'gym-web-v106';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10625,7 +10646,7 @@ const CACHE = 'gym-web-v105';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v105';
+const CACHE = 'gym-web-v106';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
