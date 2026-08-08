@@ -2680,16 +2680,99 @@ def _parse_nutrition_block(text: str) -> dict:
 
 
 
-def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> str:
-    """v2.7.32: Extract first concrete dish name from vision + pplx descriptions.
-    NOT raw vision_desc[:120] — that bleeds multi-line prose into the food name field.
-    Recipes:
-      1. Numbered markdown "1. **激安二人餐**"
-      2. 菜式：xxx / 菜名：xxx
-      3. vision_desc first non-empty sentence
-      4. fallback chain + meal_type ("Xx 套餐")
-      5. fallback string (truncated to 30 chars)
+def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
+    """v3.2.7.4: AI-based dish name extraction (Jim OOB 2026-08-08 10:35 HKT
+    'No regex. Use ai' + 'Use minimax too'). Primary path: MiniMax M3
+    via api.minimax.io. Fallback: APiyi gpt-4o-mini. Last resort: regex.
+
+    Returns 2-6 char SPECIFIC Cantonese dish name, e.g.:
+      '相顯示咗一塊千層蛋糕' → '千層蛋糕'
+      '可見海南雞飯配青瓜' → '海南雞飯'
+      '一杯黑咖啡' → '黑咖啡'
+      '一碗白飯同青菜' → '白飯'
     """
+    if not vision_desc and not pplx_desc:
+        return ""
+    combined = ((vision_desc or "") + "\n" + (pplx_desc or "")).strip()[:600]
+    if not combined:
+        return ""
+
+    prompt = (
+        "你係香港人，識粵語。以下係食物描述。"
+        "淨係俾我 2-6 個中文字嘅 SPECIFIC 菜名，唔好加任何描述、量詞、前綴、餐廳名。"
+        "例如：'千層蛋糕'（唔好寫'相顯示咗一塊千層蛋糕'），"
+        "'海南雞飯'（唔好寫'可見海南雞飯配青瓜'），"
+        "'黑咖啡'（唔好寫'一杯黑咖啡'），"
+        "'凍檸茶'（唔好寫'一杯凍檸茶'），"
+        "'沙律雞'（唔好寫'一份沙律雞胸'），"
+        "'白飯'（唔好寫'一碗白飯同青菜'）。"
+        "\n\n描述：\n" + combined + "\n\n菜名："
+    )
+
+    # Try MiniMax first
+    try:
+        import urllib.request, json as _json
+        api_key = _minimax_api_key()
+        if api_key:
+            payload = {
+                "model": "MiniMax-Text-01",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 20,
+                "temperature": 0.1,
+            }
+            req = urllib.request.Request(
+                "https://api.minimax.io/v1/chat/completions",
+                data=_json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "".join(["Bearer ", api_key]),
+                },
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            dish = (data["choices"][0]["message"]["content"] or "").strip()
+            dish = dish.strip("「」『』\"'` \n\r\t")
+            if 2 <= len(dish) <= 12:
+                return dish
+    except Exception:
+        pass
+
+    # Fallback: APiyi gpt-4o-mini
+    try:
+        from openai import OpenAI
+        api_key = _apiyi_api_key()
+        if api_key:
+            client = OpenAI(api_key=api_key, base_url="https://api.apiyi.com/v1")
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20,
+                temperature=0.1,
+            )
+            dish = (resp.choices[0].message.content or "").strip()
+            dish = dish.strip("「」『』\"'` \n\r\t")
+            if 2 <= len(dish) <= 12:
+                return dish
+    except Exception:
+        pass
+
+    return ""
+
+
+def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = "") -> str:
+    """v2.7.32: Extract first concrete dish name from vision + pplx descriptions.
+
+    v3.2.7.4: AI-first (MiniMax → APiyi → regex fallback). No more pure regex.
+    Returns 2-6 char SPECIFIC Cantonese dish name. Examples:
+      '相顯示咗一塊千層蛋糕' → '千層蛋糕'
+      '可見海南雞飯配青瓜' → '海南雞飯'
+      '一杯黑咖啡' → '黑咖啡'
+    """
+    # v3.2.7.4: try AI first
+    ai_result = _extract_dish_name_ai(vision_desc, pplx_desc)
+    if ai_result and 2 <= len(ai_result) <= 12:
+        return ai_result
+
     combined = vision_desc + "\n" + pplx_desc
     # Pattern 1: numbered dish "1. **激安二人餐**"
     m = re.search(r"\d+\.\s*\*\*([^*\n]{2,30})\*\*", combined)
@@ -2723,7 +2806,8 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
         return s
     dish_suffixes = ("飯", "麵", "粥", "餅", "糕", "包", "卷", "雞", "牛", "豬", "魚", "蝦",
                     "菜", "湯", "茶", "咖啡", "酒", "水", "奶", "糖", "蛋", "豆", "瓜",
-                    "梨", "桃", "莓", "果", "條", "片", "粒", "碗", "碟", "盤", "杯", "盒")
+                    "梨", "桃", "莓", "果", "條", "片", "粒", "碗", "碟", "盤", "杯", "盒",
+                    "撻", "批", "酥", "圈", "條", "堡", "飯", "餐", "便當")
     bad_nouns = ("透明", "塑料", "餐廳", "場景", "容器",
                  "白色", "黑色", "綠色", "紅色", "黃色", "棕色")
     containers = ("盒入面裝住嘅", "盒裝住嘅", "盒裝住", "入面裝住嘅",
@@ -2731,7 +2815,10 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
     articles = ("咗一個透明嘅", "咗一個", "咗一塊", "咗一",
                 "一個透明嘅", "一個透明", "一個", "一",
                 "透明嘅", "透明塑料", "透明", "塑料",
-                "嘅", "咁")
+                "嘅", "咁", "簡單嘅", "簡單",
+                "一杯", "一份", "一塊", "一碟", "一條", "一隻", "一盒", "一碗", "一盤")
+    meal_kinds = ("早餐", "早午餐", "午餐", "午飯", "下午茶", "晚餐", "晚飯",
+                  "消夜", "宵夜", "茶餐", "快餐", "便當", "餐")
     for line in vision_desc.split("\n"):
         line = line.strip()
         if not line:
@@ -2753,12 +2840,62 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str, fallback: str = "") -> 
             if line.startswith(c):
                 line = line[len(c):].lstrip(" ，,。、")
                 break
-        # v3.2.7b: try a few candidate lengths (2, 3, 4, 5, 6 chars)
-        for L in (6, 5, 4, 3, 2):
-            if len(line) >= L:
-                cand = line[:L]
-                if cand not in bad_nouns and any(cand.endswith(suf) for suf in dish_suffixes):
-                    return cand
+    # v3.2.7.4: SPECIFIC dish name extraction (Jim OOB 2026-08-08 10:35 HKT
+    # 'Don't be generic. Be specific'). Strategy:
+    #   1. Strip leading "相顯示/圖顯示/可見到/見到..." prefixes
+    #   2. Strip leading measure words (一杯/一份/一塊/一碟/一條/一隻/一個)
+    #   3. Cut at first stop word (配/同/和/1盒/1個/配湯/配菜/...)
+    #   4. Try longest 2-6 char candidate that ENDS with a dish suffix
+    #   5. Specific dessert suffix override (撻/批/酥/圈 beats 蛋/餅)
+    #   6. Fallback to meal_kind (早餐/午餐/...)
+    measure_words = ("杯", "塊", "條", "隻", "份", "碗", "碟", "盒", "個", "盤", "包")
+    measure_prefixes = ("一杯", "一份", "一塊", "一碟", "一條", "一隻", "一個", "一盒", "一碗", "一盤")
+    stop_words = ("配", "同", "和", "及", "加", "加埋", "埋", "再", "仲有", "同埋",
+                  "1盒", "1個", "1份", "1杯", "1碗", "1碟", "1條", "1塊", "1隻",
+                  "2盒", "2個", "1 盒", "1 個", "1 份", "1 杯", "1 碗")
+    # Specific dessert suffixes — prefer these over generic 蛋/餅
+    dessert_suffixes = ("撻", "批", "酥", "圈", "捲", "卷", "派", "塔")
+    # Cleaned: strip measure_prefixes, then stop words
+    cleaned = line
+    # Iteratively strip leading measure prefixes (杯/塊/條 etc)
+    for _ in range(3):
+        prev = cleaned
+        for mp in measure_prefixes:
+            if cleaned.startswith(mp):
+                cleaned = cleaned[len(mp):]
+                break
+        if cleaned == prev:
+            break
+    # If still starts with bare measure word (after 咗一 → 杯), strip it
+    if cleaned and cleaned[0] in measure_words and len(cleaned) > 1:
+        # Only strip if next char is not also a measure word (avoid breaking 套餐)
+        if cleaned[1] not in measure_words:
+            cleaned = cleaned[1:]
+    for sw in stop_words:
+        if sw in cleaned:
+            cleaned = cleaned.split(sw)[0]
+    # First pass: try dessert suffix (most specific)
+    for L in range(6, 1, -1):
+        if len(cleaned) >= L:
+            cand = cleaned[:L]
+            if cand in bad_nouns:
+                continue
+            if cand[-1] in dessert_suffixes:
+                return cand
+    # Second pass: any dish suffix
+    for L in range(6, 1, -1):
+        if len(cleaned) >= L:
+            cand = cleaned[:L]
+            if cand in bad_nouns:
+                continue
+            if cand[0] in measure_words and L > 2:
+                continue
+            if cand[-1] in dish_suffixes:
+                return cand
+    # v3.2.7.4: meal_kind fallback — handles "相顯示咗一個簡單嘅早餐"
+    for mk in meal_kinds:
+        if mk in line:
+            return mk
         # Final fallback: cut at first Chinese comma / period / colon
         cut = re.search(r"[，。；：]", line)
         if cut:
@@ -4135,7 +4272,14 @@ def api_scan_preview():
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": _extract_dish_name(vision_desc, pplx_desc),
-            "rating": _compute_rating(vision_desc, merged_nutrition),
+            "coach_comment": _coach_comment(
+                _extract_dish_name(vision_desc, pplx_desc),
+                preview_field_entries["calories"],
+                preview_field_entries["protein"],
+                preview_field_entries.get("carbs", 0),
+                preview_field_entries.get("fat", 0),
+                restaurant_guess,
+            ),
             "restaurant_chain": restaurant_guess,
             "calories": preview_field_entries["calories"],
             "protein": preview_field_entries["protein"],
@@ -4229,7 +4373,14 @@ def api_scan_preview_from_path():
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": _extract_dish_name(vision_desc, pplx_desc),
-            "rating": _compute_rating(vision_desc, merged_nutrition),
+            "coach_comment": _coach_comment(
+                _extract_dish_name(vision_desc, pplx_desc),
+                preview_field_entries["calories"],
+                preview_field_entries["protein"],
+                preview_field_entries.get("carbs", 0),
+                preview_field_entries.get("fat", 0),
+                restaurant_guess,
+            ),
             "restaurant_chain": restaurant_guess,
             "calories": jim_kcal,
             "protein": jim_p,
@@ -4717,6 +4868,18 @@ def api_scan_commit():
     entry["confidence"] = "Jim-confirmed preview"
     entry["sheet_synced"] = False
     entry["user_correction"] = None
+    # v3.2.7.3: single A-F grade via keyword+macro (replaces star rating)
+    entry_name = entry.get("name") or entry.get("meal_name") or "食物"
+    entry_kcal = entry.get("calories", entry.get("kcal", 0)) or 0
+    entry_p = entry.get("protein", entry.get("protein_g", 0)) or 0
+    entry_c = entry.get("carbs", entry.get("carbs_g", 0)) or 0
+    entry_f = entry.get("fat", entry.get("fat_g", 0)) or 0
+    entry_rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
+    if entry_name and entry_kcal > 0:
+        entry["coach_comment"] = _coach_comment(entry_name, entry_kcal, entry_p, entry_c, entry_f, entry_rest)
+    # v3.2.7.3: legacy `rating` field (1-5 star) removed — single source of truth is coach_comment.grade
+    if "rating" in entry:
+        del entry["rating"]
     # v2.7.19: persist user hints (each round-trip = one hint in the list)
     # Dedupe + cap to 20 entries to avoid bloat
     cleaned_hints = []
@@ -5194,7 +5357,15 @@ def api_scan_preview_text():
     # If still empty or the generic "食物" fallback, try the user input directly
     if not suggested_name or suggested_name.strip() == "食物":
         suggested_name = _extract_dish_name(text_desc, "", fallback=text_desc[:60])
-    rating_now = _compute_rating(apiyi_text_desc, parsed if isinstance(parsed, dict) else None)
+    # v3.2.7.3: single A-F grade via _coach_comment (replaces old 1-5 star rating)
+    coach_cc = _coach_comment(
+        suggested_name,
+        field_entries.get("calories", 0) or 0,
+        field_entries.get("protein", 0) or 0,
+        field_entries.get("carbs", 0) or 0,
+        field_entries.get("fat", 0) or 0,
+        restaurant_guess,
+    )
 
     preview = {
         "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_txt",
@@ -5211,7 +5382,7 @@ def api_scan_preview_text():
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
             "name": suggested_name,
-            "rating": rating_now,
+            "coach_comment": coach_cc,
             "restaurant_chain": restaurant_guess,
             "cooking_method": (parsed.get("cooking_method", "") if isinstance(parsed, dict) else ""),
             "calories": field_entries["calories"],
@@ -10366,7 +10537,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v103';
+const CACHE = 'gym-web-v104';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10454,7 +10625,7 @@ const CACHE = 'gym-web-v103';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v103';
+const CACHE = 'gym-web-v104';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
