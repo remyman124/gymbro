@@ -3652,16 +3652,32 @@ def api_scan_food():
     # 7. Append to scan_log.json (with image path) for /api/scan_recent
     scan_log = _load_scan_log()
     scan_index = len(scan_log)
+    # v3.2.7.7: persist all 12 nutrition fields (kcal/P/C/F + 8 micros) so
+    # /api/scan_recent and frontend food cards show full nutrient profile
+    # (Jim OOB 2026-08-08 10:55 HKT 'pipeline do not capture other nutrient
+    # info' — root cause: scan_log write dict was missing micros, even
+    # though nutrition_log.json had them).
     scan_log.append({
         "scan_index": scan_index,
         "timestamp_iso": entry["timestamp_iso"],
         "name": entry["name"],
         "calories": entry["calories"],
         "protein": entry["protein"],
+        "carbs": entry.get("carbs", 0),
+        "fat": entry.get("fat", 0),
+        "fiber": entry.get("fiber", 0),
+        "sugar": entry.get("sugar", 0),
+        "sodium": entry.get("sodium", 0),
+        "sat_fat": entry.get("sat_fat", 0),
+        "trans_fat": entry.get("trans_fat", 0),
+        "vit_c": entry.get("vit_c", 0),
+        "iron": entry.get("iron", 0),
+        "calcium": entry.get("calcium", 0),
         "shared": entry["is_shared_meal"],
         "image_path": str(img_path),
         "image_url": f"/scan_img/{img_filename}",
         "restaurant_chain": entry["restaurant_chain"],
+        "coach_comment": entry.get("coach_comment", {}),
         "vision_short": vision_desc[:120],
     })
     _save_scan_log(scan_log)
@@ -4986,10 +5002,21 @@ def api_scan_commit():
             "rating": entry.get("rating", 3),
             "calories": entry.get("calories", 0),
             "protein": entry.get("protein", 0),
+            "carbs": entry.get("carbs", 0),
+            "fat": entry.get("fat", 0),
+            "fiber": entry.get("fiber", 0),
+            "sugar": entry.get("sugar", 0),
+            "sodium": entry.get("sodium", 0),
+            "sat_fat": entry.get("sat_fat", 0),
+            "trans_fat": entry.get("trans_fat", 0),
+            "vit_c": entry.get("vit_c", 0),
+            "iron": entry.get("iron", 0),
+            "calcium": entry.get("calcium", 0),
             "shared": entry.get("is_shared_meal", False),
             "image_path": str(final_path),
             "image_url": image_url,
             "restaurant_chain": entry.get("restaurant_chain", ""),
+            "coach_comment": entry.get("coach_comment", {}),
             "vision_short": (entry.get("vision_raw_desc") or entry.get("vision_desc") or "")[:120],
             "user_corrections": [user_correction] if user_correction else [],
         })
@@ -5003,10 +5030,21 @@ def api_scan_commit():
             "rating": entry.get("rating", 3),
             "calories": entry.get("calories", 0),
             "protein": entry.get("protein", 0),
+            "carbs": entry.get("carbs", 0),
+            "fat": entry.get("fat", 0),
+            "fiber": entry.get("fiber", 0),
+            "sugar": entry.get("sugar", 0),
+            "sodium": entry.get("sodium", 0),
+            "sat_fat": entry.get("sat_fat", 0),
+            "trans_fat": entry.get("trans_fat", 0),
+            "vit_c": entry.get("vit_c", 0),
+            "iron": entry.get("iron", 0),
+            "calcium": entry.get("calcium", 0),
             "shared": entry.get("is_shared_meal", False),
             "image_path": "",
             "image_url": "",
             "restaurant_chain": entry.get("restaurant_chain", ""),
+            "coach_comment": entry.get("coach_comment", {}),
             "vision_short": (entry.get("vision_raw_desc") or entry.get("name", ""))[:120],
             "user_corrections": [user_correction] if user_correction else [],
             "is_text_only": True,
@@ -10558,7 +10596,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v106';
+const CACHE = 'gym-web-v107';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10646,7 +10684,7 @@ const CACHE = 'gym-web-v106';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v106';
+const CACHE = 'gym-web-v107';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
