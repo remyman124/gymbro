@@ -2467,7 +2467,7 @@ def _minimax_vision(img_b64: str, prompt: str) -> str:
     if not api_key:
         return "（MiniMax 金鑰未設定）"
     payload = {
-        "model": "MiniMax-Text-01",
+        "model": "MiniMax-M3-highspeed",
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
@@ -2583,18 +2583,16 @@ def _pplx_enrich(dish_desc: str) -> str:
 
 
 def _apiyi_nutrition_enrich(dish_desc: str) -> str:
-    """Call APiyi gpt-4o-mini for 2nd-opinion food nutrition enrichment.
+    """v3.2.7.12: 12-field nutrition enrichment via MiniMax M3 (Jim OOB
+    2026-08-08 20:55 HKT 'Use more minimax m3 ... Don't use gpt except
+    food recognition dual scanning'). MiniMax is the canonical LLM —
+    single source of truth for nutrition estimates + coach comments.
 
-    APiyi = OpenAI-compatible proxy. Confirmed live 2026-07-27 08:35 HKT.
-    Jim OOB 2026-07-25 17:12 HKT: 'Not openrouter using apiyi' — ChatGPT
-    gpt-4o-mini is the 2nd-opinion source for 12-field schema. Returns
-    text (or empty on failure) — caller parses via _parse_nutrition_block
-    then median-merges with pplx.
-
-    NOTE: requires APIYI_API_KEY in /home/work/.hermes/.env or env var.
-    Returns "" if key missing → pipeline silently falls back to pplx-only.
+    v3.2.7.6+: MiniMax M3 via api.minimax.io. Returns text (or empty on
+    failure) — caller parses via _parse_nutrition_block then median-merges
+    with pplx.
     """
-    api_key = _apiyi_api_key()
+    api_key = _minimax_api_key()
     if not api_key:
         return ""  # graceful fallback — single-source pplx only
     fields_desc = ", ".join(
@@ -2615,23 +2613,22 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
         f"(KFC, McDonald's, Starbucks). Otherwise use typical HK portion."
     )
     payload = {
-        "model": "gpt-4o-mini",
+        "model": "MiniMax-M3-highspeed",
         "messages": [
             {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": 400,
         "temperature": 0.1,
-        "response_format": {"type": "json_object"},
     }
     try:
         req = urllib.request.Request(
-            "https://api.apiyi.com/v1/chat/completions",
+            "https://api.minimax.io/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
+                "Authorization": "".join(["Bearer ", api_key]),
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
@@ -2641,12 +2638,11 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
 
 
 def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
-    """v3.2.7.9: Multi-dish nutrition enrichment (Jim OOB 2026-08-08 20:05 HKT
-    'is this possible to scan one photo with different food to generate
-    multiple entry of food log'). Returns JSON object with 'dishes' key —
-    one 12-field object per detected dish. gpt-4o-mini requires
-    response_format=json_object, so we wrap array in {dishes: [...]}.
-    Caller unwraps to get the array.
+    """v3.2.7.12: Multi-dish 12-field nutrition enrichment via MiniMax
+    M3-highspeed (Jim OOB 2026-08-08 20:55 HKT 'Use more minimax m3
+    high speed ... Don't use gpt except food recognition dual scanning').
+    Returns JSON object with 'dishes' key — one 12-field object per
+    detected dish.
 
     Schema returned:
       {"dishes": [
@@ -2655,7 +2651,7 @@ def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
         {"name": "例湯",     "calories": 80,  "protein": 3,  ...}
       ]}
     """
-    api_key = _apiyi_api_key()
+    api_key = _minimax_api_key()
     if not api_key:
         return '{"dishes": []}'
     fields_desc = ", ".join(
@@ -2678,23 +2674,22 @@ def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
         f"Otherwise typical HK portion. If only ONE dish, return 1-element array."
     )
     payload = {
-        "model": "gpt-4o-mini",
+        "model": "MiniMax-M3-highspeed",
         "messages": [
             {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": 1500,
         "temperature": 0.1,
-        "response_format": {"type": "json_object"},
     }
     try:
         req = urllib.request.Request(
-            "https://api.apiyi.com/v1/chat/completions",
+            "https://api.minimax.io/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
+                "Authorization": "".join(["Bearer ", api_key]),
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
@@ -2793,7 +2788,7 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
         api_key = _minimax_api_key()
         if api_key:
             payload = {
-                "model": "MiniMax-Text-01",
+                "model": "MiniMax-M3-highspeed",
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 20,
                 "temperature": 0.1,
@@ -2815,25 +2810,11 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     except Exception:
         pass
 
-    # Fallback: APiyi gpt-4o-mini
-    try:
-        from openai import OpenAI
-        api_key = _apiyi_api_key()
-        if api_key:
-            client = OpenAI(api_key=api_key, base_url="https://api.apiyi.com/v1")
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=20,
-                temperature=0.1,
-            )
-            dish = (resp.choices[0].message.content or "").strip()
-            dish = dish.strip("「」『』\"'` \n\r\t")
-            if 2 <= len(dish) <= 12:
-                return dish
-    except Exception:
-        pass
-
+    # v3.2.7.12: Dish-name extraction is NOT food recognition, so use
+    # MiniMax M3-highspeed as fallback (per Jim OOB 2026-08-08 20:55 HKT
+    # 'Don't use gpt except food recognition dual scanning'). The primary
+    # MiniMax call above already tried via the same helper.
+    # If both fail, regex fallback below handles it.
     return ""
 
 
@@ -3285,23 +3266,38 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         suggestions.append("加一隻蛋 / 雞胸 / 豆腐提升蛋白比例")
     if carb_pct > 65 and calories > 400:
         suggestions.append("配菜加多啲菜，飯量減 1/3")
-    # Call MiniMax M3 for richer 1-line coach comment + extra suggestions
+    # v3.2.7.11: comprehensive coach comment via MiniMax M3 (Jim OOB
+    # 2026-08-08 20:35 HKT 'comment on the food can be much more
+    # comprehensive'). 4-section structured response: overall health +
+    # macro breakdown + micronutrient status + next-meal suggestion.
     api_comment = None
+    macro_breakdown = ""
+    micronutrient_status = ""
+    next_meal_suggestion = ""
     try:
         prompt = (
-            f"你係香港私人健身教練，操繁體中文廣東話。一句講晒，最多 50 字。\n"
+            f"你係香港私人健身教練，操繁體中文廣東話。分析以下食物。\n"
             f"食物：{dish_name}\n"
             f"餐廳：{restaurant or '無'}\n"
-            f"營養：{calories:.0f} kcal · 蛋白 {protein:.0f}g · 碳 {carbs:.0f}g · 脂 {fat:.0f}g\n"
+            f"份量：{calories:.0f} kcal · 蛋白 {protein:.0f}g · 碳 {carbs:.0f}g · 脂 {fat:.0f}g\n"
             f"用戶目標：{user_context or '減脂 + 增肌'}\n\n"
-            f"格式：先講「好/普通/差」一句，再比 1 個具體改善建議。例：「脂肪佔 65% 太高，建議下次走皮走醬。」\n"
-            f"唔好講廢話，直接 point。"
+            f"請用以下 4 段 (每段 1 句，最多 30 字)：\n"
+            f"1) 【整體】一句講整體好/普通/差。\n"
+            f"2) 【巨量營養】P/C/F 比例點評 (e.g. 蛋白佔 X% 偏低 / 脂肪 Y% 偏高)。\n"
+            f"3) 【微量營養】鈣/鐵/維 C/鈉 嘅攝取有咩特別。\n"
+            f"4) 【下餐】具體下次食咩 balance (e.g. 下餐加菜減飯 / 配雞胸 / 走醬)。\n\n"
+            f"範例：\n"
+            f"【整體】蛋白優質，脂肪稍多。\n"
+            f"【巨量營養】蛋白佔 38% 出色，脂 42% 略高。\n"
+            f"【微量營養】鐵 3.5mg 不錯，鈉 1200mg 偏上限。\n"
+            f"【下餐】下餐配灼菜一碗平衡鈉。\n\n"
+            f"唔好講廢話，4 段都要具體。"
         )
         payload = {
-            "model": "MiniMax-Text-01",
+            "model": "MiniMax-M3-highspeed",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 120,
-            "temperature": 0.3,
+            "max_tokens": 350,
+            "temperature": 0.4,
         }
         req = urllib.request.Request(
             "https://api.minimax.io/v1/chat/completions",
@@ -3313,15 +3309,46 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         )
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
-        api_comment = data["choices"][0]["message"]["content"].strip()
+        full = data["choices"][0]["message"]["content"].strip()
+        # Parse the 4 sections from AI response
+        import re
+        sec1 = re.search(r"【整體】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
+        sec2 = re.search(r"【巨量營養】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
+        sec3 = re.search(r"【微量營養】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
+        sec4 = re.search(r"【下餐】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
+        if sec1:
+            api_comment = sec1.group(1).strip()
+            if sec2:
+                macro_breakdown = sec2.group(1).strip()
+            if sec3:
+                micronutrient_status = sec3.group(1).strip()
+            if sec4:
+                next_meal_suggestion = sec4.group(1).strip()
     except Exception:
         api_comment = None
-    final_comment = api_comment or pre_comment
+
+    # Build the visible `comment` field — combine all sections into a 4-line string
+    if api_comment:
+        comment_lines = [f"【整體】{api_comment}"]
+        if macro_breakdown:
+            comment_lines.append(f"【巨量】{macro_breakdown}")
+        if micronutrient_status:
+            comment_lines.append(f"【微量】{micronutrient_status}")
+        if next_meal_suggestion:
+            comment_lines.append(f"【下餐】{next_meal_suggestion}")
+        final_comment = "\n".join(comment_lines)
+    else:
+        # Fallback to the original static template
+        final_comment = pre_comment
+
     return {
         "grade": final_grade,
         "comment": final_comment,
         "suggestions": suggestions[:2],  # max 2
         "rationale": f"蛋白 {protein_pct:.0f}% · 碳 {carb_pct:.0f}% · 脂 {fat_pct:.0f}%",
+        "macro_breakdown": macro_breakdown or pre_comment,
+        "micronutrient_status": micronutrient_status,
+        "next_meal_suggestion": next_meal_suggestion or (suggestions[0] if suggestions else ""),
     }
 
 
@@ -5787,7 +5814,7 @@ def _generate_coach_tips(session_data: dict) -> dict:
         api_key = _minimax_api_key()
         if api_key:
             payload = {
-                "model": "MiniMax-Text-01",
+                "model": "MiniMax-M3-highspeed",
                 "messages": [{"role": "user", "content": mm_prompt}],
                 "max_tokens": 1500,
                 "temperature": 0.4,
@@ -7994,9 +8021,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span x-show="(scan.user_corrections || []).length > 0" class="text-gray-400" x-text="`✏ ${(scan.user_corrections || []).length}`"></span>
               </div>
               <div class="text-[10px] text-gray-500 mt-0.5" x-text="scan.time_label || formatScanTime(scan.timestamp_iso)"></div>
-              <!-- v2.7.37: coach comment (one-liner) -->
+              <!-- v2.7.37 + v3.2.7.11: comprehensive coach comment (4-section) -->
               <template x-if="scan.coach_comment?.comment">
-                <div class="mt-1.5 text-[11px] text-emerald-200/80 leading-snug"
+                <div class="mt-1.5 text-[11px] text-emerald-200/80 leading-snug whitespace-pre-line"
                      x-text="`🧑‍🏫 ${scan.coach_comment.comment}`"></div>
               </template>
             </div>
@@ -10812,7 +10839,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v109';
+const CACHE = 'gym-web-v111';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10900,7 +10927,7 @@ const CACHE = 'gym-web-v109';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v109';
+const CACHE = 'gym-web-v111';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
