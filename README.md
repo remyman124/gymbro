@@ -109,3 +109,54 @@ For everything else, fork it.
 ## 📄 License
 
 MIT © Jim — see [LICENSE](LICENSE).
+
+---
+
+## v3.x feature additions (since these docs were last updated)
+
+gymbro has grown well beyond the workout-only logger described above. The
+single ~650-line `gym_web.py` mentioned in the old docs is now **~7,300 lines**
+(the HTML template was extracted to `templates/index.html`) across two entry
+points plus a package:
+
+- `gym_web.py` — Flask web app (~50 routes) — workout logging + PWA shell
+- `gymbro_mcp_server.py` — MCP server (stdio, for the Alonso agent)
+- `workout_formatter.py` — Whoop-AI-friendly text rendering
+- `gym_web/` package — gradual modular refactor (in progress)
+- `templates/index.html` — extracted PWA shell (~3,800 lines)
+
+### Added capabilities (v2.1 → v3.2.7)
+
+- 🍽️ **Food scan** — PWA camera upload → MiniMax vision → Pplx/APiyi nutrition enrichment → Google Sheet mirror
+- 🤖 **AI coach comments** — Traditional Chinese, 4-section, A–F grade per scan
+- 📊 **Whoop + Withings overlays** — recovery %, steps, body composition
+- 📅 **Schedule tab** — Whoop activities on a monthly calendar
+- 🎙️ **8-section cheer pipeline** — text + voice (edge-tts) + image (MiniMax)
+- 🔌 **MCP server** — `get_latest_cheer`, `get_today_workout`, `trigger_cheer_pipeline`
+- 🔁 **Retro migrations** in `scripts/migrations/` — one-shot data fixes
+
+### Project layout (current)
+
+```
+gymbro/
+├── gym_web.py                  # Flask app (monolith, ~7.3k lines)
+├── gymbro_mcp_server.py        # MCP server (stdio)
+├── workout_formatter.py        # Text rendering
+├── gym_web/                    # Gradual refactor package (in progress)
+│   ├── core.py                 # Shared constants + helpers
+│   ├── whoop.py                # Whoop cache reader
+│   └── withings.py             # Withings cache reader
+├── templates/
+│   └── index.html              # PWA shell (extracted from gym_web.py)
+├── scripts/
+│   ├── gymbro_daily_image.py   # Daily motivation image cron
+│   └── migrations/             # One-shot data migrations
+├── tests/                      # Pytest suite
+├── docs/
+│   ├── setup.md
+│   ├── architecture.md
+│   └── v2.1-food-scan-design.md
+├── requirements.txt            # Flask + mcp + requests + python-dotenv
+├── requirements-dev.txt        # + pytest
+└── .github/workflows/python-ci.yml
+```

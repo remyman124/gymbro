@@ -24,7 +24,23 @@ jobs:
       - name: Compile-check scripts/gymbro_daily_image.py
         run: python -m py_compile scripts/gymbro_daily_image.py
 
+      - name: Compile-check gym_web/ package
+        run: python -m py_compile gym_web/__init__.py gym_web/core.py gym_web/whoop.py gym_web/withings.py
+
+      - name: Compile-check gymbro_mcp_server.py
+        run: python -m py_compile gymbro_mcp_server.py
+
       - name: Install Flask + import-check gym_web
         run: |
           pip install -r requirements.txt
           python -c "import gym_web; print('gym_web imports OK')"
+
+      - name: Install Flask + import-check gymbro_mcp_server
+        run: |
+          pip install -r requirements.txt
+          python -c "import gymbro_mcp_server; print('gymbro_mcp_server imports OK')"
+
+      - name: Install dev deps + run tests
+        run: |
+          pip install -r requirements-dev.txt
+          pytest -q

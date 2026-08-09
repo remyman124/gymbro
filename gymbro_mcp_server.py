@@ -33,7 +33,12 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+from gym_web.core import safe_read_json as _safe_read_json
+
+load_dotenv("/home/work/.hermes/.env")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 HOME = Path("/home/work")
@@ -43,18 +48,6 @@ WITHINGS_CACHE = HOME / ".withings_latest_cache.json"
 JIM_CONTEXT = HOME / ".jim_context.json"
 NUTRITION_LOG = Path("/home/work/.hermes/nutrition_log.json")
 CHEER_ARTIFACTS = Path("/home/work/.hermes/cheer_artifacts")
-
-
-def _safe_read_json(path: Path, default=None):
-    if default is None:
-        default = {}
-    try:
-        if path.exists():
-            with open(path) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
 
 
 def _atomic_write_json(path: Path, data) -> bool:
@@ -306,9 +299,8 @@ def search_history(days: int = 7) -> str:
 
 # Google Calendar OAuth
 GTOKEN_FILE = HOME / ".hermes" / "google_token.json"
-ENV_FILE = HOME / ".hermes" / ".env"
 NUTRITION_LOG_PATH = HOME / ".hermes" / "nutrition_log.json"
-SCAN_LOG_PATH = Path("/home/work/projects/gymbro/data/food_scan_log.json")
+SCAN_LOG_PATH = HOME / ".hermes" / "food_scan_log.json"
 GYM_WEB_URL = "http://127.0.0.1:4280"
 
 
@@ -328,22 +320,6 @@ def _google_access_token() -> str | None:
             return json.loads(r.read())["access_token"]
     except Exception:
         return None
-
-
-def _get_env(key: str) -> str | None:
-    if not ENV_FILE.exists():
-        return None
-    try:
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            if k.strip() == key:
-                return v.strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return None
 
 
 @mcp.tool()
