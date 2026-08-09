@@ -4610,6 +4610,44 @@ def api_scan_preview():
         scan_log.append(log_row)
     _save_scan_log(scan_log)
 
+    # v3.2.7.15: do NOT auto-commit when vision failed and name is empty/
+    # generic. Return preview shape with a flag instead so frontend can
+    # surface "no food detected" without polluting food log + sheet.
+    has_meaningful = bool(entries_list) and any(
+        e.get("name", "").strip() and not str(e.get("name","")).startswith("（")
+        and e.get("calories", 0) > 0
+        for e in entries_list
+    )
+    if not has_meaningful:
+        return jsonify({
+            "ok": True,
+            "auto_committed": False,
+            "needs_user_input": True,
+            "image_path": str(final_path),
+            "image_url": image_url,
+            "vision_desc": vision_desc,
+            "vision_short": vision_desc[:300],
+            "is_multi_entry": False,
+            "entries": entries_list,
+            "committed": [],
+            "multi_entry": False,
+            "preview": {
+                "image_path": str(final_path),
+                "image_url": image_url,
+                "vision_short": vision_desc[:300] or "冇食物辨認到，請手動輸入菜名。",
+                "vision_desc": vision_desc,
+                "suggested_entry": {
+                    "name": "",
+                    "calories": 0,
+                    "protein": 0,
+                    "carbs": 0,
+                    "fat": 0,
+                    "restaurant_chain": "",
+                    "is_shared_meal": False,
+                },
+            },
+        })
+
     return jsonify({
         "ok": True,
         "auto_committed": True,
@@ -4621,6 +4659,15 @@ def api_scan_preview():
         "entries": entries_list,
         "committed": committed,
         "multi_entry": len(committed) > 1,
+        # v3.2.7.15: preview wrapper for multi-photo queue
+        # (onScanPhotosPicked reads data.preview.suggested_entry)
+        "preview": {
+            "image_path": str(final_path),
+            "image_url": image_url,
+            "vision_short": vision_desc[:300],
+            "vision_desc": vision_desc,
+            "suggested_entry": entries_list[0] if entries_list else {},
+        },
     })
 
 
@@ -7946,7 +7993,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <div class="flex items-center gap-2 mb-1.5">
                 <div class="text-lg font-bold text-white whitespace-nowrap flex-1 min-w-0 overflow-x-auto"
                      style="scrollbar-width: none; -ms-overflow-style: none;"
-                     x-text="scan.name || scan.vision_short || '—'"></div>
+                     x-text="displayName(scan)"></div>
                 <!-- v3.2.7.8: inline grade badge for entries WITHOUT image (text-only
                      or image-back-failed). Image-backed entries already get the
                      bigger top-right overlay on the image. (Jim OOB 2026-08-08
@@ -8415,6 +8462,30 @@ function gymApp() {
     getActiveTab() {
       const alias = { 'food': 'scan', 'gym': 'workout', 'schedule': 'history', 'cheer': 'cheer' };
       return alias[this.tab] || this.tab;
+    },
+    // v3.2.7.15: fallback display name when scan.name is empty or generic
+    // (e.g. "（MiniMax vision 失敗", "第一道菜", "主菜"). Prefer a
+    // 12-char slice of vision_short, otherwise "—".
+    displayName(scan) {
+      if (!scan) return '—';
+      const name = (scan.name || '').trim();
+      const genericPrefixes = ['（', 'MiniMax', 'APiyi', 'ChatGPT', '抱歉'];
+      const genericWords = ['第一道菜', '主菜', '副菜', '前菜', '甜品', '湯品', '飲品',
+                            '餐', '食物', '料理', '菜式', '餐點', '早餐', '午餐', '晚餐',
+                            '午飯', '晚飯', '下午茶', '宵夜'];
+      // AI apology/uncertainty phrases (Jim OOB 2026-08-09 18:35 HKT
+      // 'imported food title is so wrong. should just show the food name')
+      const aiRefusal = ['無法', '我無法', '不能', '抱歉', '未能', '唔能夠', '係一張'];
+      if (name && !genericPrefixes.some(p => name.startsWith(p)) && !genericWords.includes(name)
+          && !aiRefusal.some(r => name.includes(r))) {
+        return name;
+      }
+      const short = (scan.vision_short || '').trim();
+      if (short && short.length > 2 && !genericPrefixes.some(p => short.startsWith(p))
+          && !aiRefusal.some(r => short.startsWith(r))) {
+        return short.slice(0, 16);
+      }
+      return '—';
     },
     isTabVisible(legacyName) {
       // v3.1.0: 4-tab nav aliases. Each new tab name maps to one or more
@@ -10907,7 +10978,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v115';
+const CACHE = 'gym-web-v116';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10995,7 +11066,7 @@ const CACHE = 'gym-web-v115';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v115';
+const CACHE = 'gym-web-v116';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
