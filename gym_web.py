@@ -2475,7 +2475,10 @@ def _minimax_vision(img_b64: str, prompt: str) -> str:
     result = _apiyi_vision_gpt4o(img_b64, prompt)
     if result:
         return result
-    return "（Vision 服務暫時不可用）"
+    # Return empty so _extract_dish_name falls through to fallback; do NOT
+    # return "（Vision 服務暫時不可用）" — that string is a generic label
+    # and would itself become the dish name (Jim OOB 2026-08-09 16:48 HKT).
+    return ""
 
 
 def _apiyi_vision_analyze(img_b64: str, prompt: str) -> str:
@@ -2864,7 +2867,8 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = ""
         # better extraction (Jim OOB 2026-08-08 10:30 HKT 'should recognise
         # as 雞蛋、麵包' — vision said '簡單嘅早餐', AI returned '早餐',
         # but should be '煎蛋、烤麵包' from re-asking).
-        generic_labels = {"早餐", "午餐", "晚餐", "午飯", "晚飯", "下午茶", "宵夜", "tea", "brunch", "dinner", "lunch", "breakfast"}
+        generic_labels = {"早餐", "午餐", "晚餐", "午飯", "晚飯", "下午茶", "宵夜", "tea", "brunch", "dinner", "lunch", "breakfast",
+                         "第一道菜", "主菜", "副菜", "前菜", "甜品", "湯品", "飲品", "餐", "食物", "料理", "菜式", "餐點"}
         if ai_result not in generic_labels:
             return ai_result
 
@@ -2913,7 +2917,7 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = ""
                 "嘅", "咁", "簡單嘅", "簡單",
                 "一杯", "一份", "一塊", "一碟", "一條", "一隻", "一盒", "一碗", "一盤")
     meal_kinds = ("早餐", "早午餐", "午餐", "午飯", "下午茶", "晚餐", "晚飯",
-                  "消夜", "宵夜", "茶餐", "快餐", "便當", "餐")
+                  "消夜", "宵夜", "茶餐", "快餐", "便當", "餐", "第一道菜", "主菜", "副菜", "前菜", "甜品", "湯品", "飲品", "料理", "菜式", "餐點")
     for line in vision_desc.split("\n"):
         line = line.strip()
         if not line:
@@ -3674,6 +3678,12 @@ def api_scan_food():
 
     # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
     apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    # v3.2.7.14: detect gpt-4o-mini safety-filter refusal (e.g. "抱歉，我無法...")
+    # and treat as empty so it does NOT pollute vision_desc (Jim OOB
+    # 2026-08-09 16:48 HKT 'I took a screenshot not food, but scan got
+    # committed as 抱歉 / 第一道菜').
+    if apiyi_vision_desc and ("抱歉" in apiyi_vision_desc[:30] and "無法" in apiyi_vision_desc[:50] and len(apiyi_vision_desc) < 80):
+        apiyi_vision_desc = ""
     if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
         # 2-vision median-merge: take whichever is longer (more dish detail)
         if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
@@ -4375,6 +4385,12 @@ def api_scan_preview():
 
     # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
     apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    # v3.2.7.14: detect gpt-4o-mini safety-filter refusal (e.g. "抱歉，我無法...")
+    # and treat as empty so it does NOT pollute vision_desc (Jim OOB
+    # 2026-08-09 16:48 HKT 'I took a screenshot not food, but scan got
+    # committed as 抱歉 / 第一道菜').
+    if apiyi_vision_desc and ("抱歉" in apiyi_vision_desc[:30] and "無法" in apiyi_vision_desc[:50] and len(apiyi_vision_desc) < 80):
+        apiyi_vision_desc = ""
     if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
         # 2-vision median-merge: take whichever is longer (more dish detail)
         if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
@@ -4636,6 +4652,12 @@ def api_scan_preview_from_path():
 
     # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
     apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    # v3.2.7.14: detect gpt-4o-mini safety-filter refusal (e.g. "抱歉，我無法...")
+    # and treat as empty so it does NOT pollute vision_desc (Jim OOB
+    # 2026-08-09 16:48 HKT 'I took a screenshot not food, but scan got
+    # committed as 抱歉 / 第一道菜').
+    if apiyi_vision_desc and ("抱歉" in apiyi_vision_desc[:30] and "無法" in apiyi_vision_desc[:50] and len(apiyi_vision_desc) < 80):
+        apiyi_vision_desc = ""
     if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
         # 2-vision median-merge: take whichever is longer (more dish detail)
         if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
@@ -10885,7 +10907,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v113';
+const CACHE = 'gym-web-v115';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10973,7 +10995,7 @@ const CACHE = 'gym-web-v113';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v113';
+const CACHE = 'gym-web-v115';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
