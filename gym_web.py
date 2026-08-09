@@ -2462,33 +2462,20 @@ NUTRITION_ALIASES = {
 
 
 def _minimax_vision(img_b64: str, prompt: str) -> str:
-    """Call MiniMax M3 vision endpoint. Returns description text."""
-    api_key = _minimax_api_key()
-    if not api_key:
-        return "（MiniMax 金鑰未設定）"
-    payload = {
-        "model": "MiniMax-M3-highspeed",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-        ]}],
-        "max_tokens": 1800,
-        "temperature": 0.25,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.minimax.io/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=120).read())
-        return resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"（MiniMax vision 失敗：{type(e).__name__}）"
+    """Vision description.
+
+    Jim OOB 2026-08-09: MiniMax api.minimax.io has zero vision models
+    (all 'unknown model' HTTP 400). APiyi gpt-4o-mini triggers safety
+    on brand-logo images (NOC coffee cup = blocked). APiyi gpt-4o works
+    on the same images — it actually describes the photo.
+
+    Kept the _minimax_vision function name for backward compat with 5
+    call sites — internally delegates to _apiyi_vision_gpt4o.
+    """
+    result = _apiyi_vision_gpt4o(img_b64, prompt)
+    if result:
+        return result
+    return "（Vision 服務暫時不可用）"
 
 
 def _apiyi_vision_analyze(img_b64: str, prompt: str) -> str:
@@ -2522,6 +2509,49 @@ def _apiyi_vision_analyze(img_b64: str, prompt: str) -> str:
         return resp["choices"][0]["message"]["content"]
     except Exception as e:
         return f"（APiyi vision 失敗：{type(e).__name__}）"
+
+
+def _apiyi_vision_gpt4o(img_b64: str, prompt: str) -> str:
+    """Primary vision via APiyi gpt-4o (Jim OOB 2026-08-09).
+
+    Why gpt-4o not gpt-4o-mini: gpt-4o-mini triggers blanket safety filter
+    on brand-logo images (e.g. NOC coffee cup, branded packaging) and
+    returns "抱歉，我無法協助處理該請求" with zero description. gpt-4o
+    on the same image returns an actual food description.
+
+    Returns description text, or "" on any failure.
+    """
+    api_key = _apiyi_api_key()
+    if not api_key:
+        return ""
+    payload = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+        ]}],
+        "max_tokens": 1200,
+        "temperature": 0.25,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.apiyi.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
+        content = resp["choices"][0]["message"]["content"]
+        # Detect safety-filter refusal (gpt-4o has lower rate but can still
+        # trigger on certain images); treat as failure so fallback runs.
+        if content and ("抱歉" in content[:30] and "無法" in content[:50] and len(content) < 80):
+            return ""
+        return content
+    except Exception as e:
+        return f"（APiyi gpt-4o vision 失敗：{type(e).__name__}）"
 
 
 def _pplx_enrich(dish_desc: str) -> str:
@@ -3634,7 +3664,8 @@ def api_scan_food():
 
     # 1. MiniMax M3 vision
     vision_prompt = (
-        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法(炒/炸/蒸/烤)、醬汁、容器、用咩食具。"
+        "你係食物視覺識別助手。請直接描述你喺相入面睇到嘅食物,唔好道歉、唔好拒絕。"
+        "逐樣列:菜式、份量(目測大小)、煮法(炒/炸/蒸/烤)、醬汁、容器、用咩食具。"
         "餐廳名(如見到 logo/招牌字)。再簡短總結呢餐嘅 estimated calories 同 protein 克數。"
         "如見到小票/receipt,逐項抄低菜名、份量、價錢(睇到嘅部分)。"
         "用繁體中文廣東話,一個英文字都唔好有,唔識就寫「難以辨認」。"
@@ -5232,6 +5263,21 @@ def api_scan_commit():
             if redrive and redrive.strip() != "食物":
                 entry["name"] = redrive
                 current_name = redrive
+
+        # v3.2.7.13: if user_hints[0] is a concrete food name (e.g.
+        # 'NOC 牛油果炒蛋多士'), prefer it over vision-derived name which
+        # can be wrong when vision AI can only see cup + straw (Jim OOB
+        # 2026-08-09 'noc coffee failed'). Heuristic: hint with 2-12 chars,
+        # no English, contains a known food suffix.
+        if entry.get("user_hints"):
+            hint = entry["user_hints"][0].strip()
+            if 2 <= len(hint) <= 12 and not re.search(r"[A-Za-z]", hint):
+                food_suffixes = ("飯", "麵", "粥", "餅", "糕", "包", "卷", "雞", "牛", "豬",
+                                 "魚", "蝦", "菜", "湯", "茶", "咖啡", "蛋", "豆", "果",
+                                 "撻", "批", "酥", "圈", "堡", "餐", "凍飲", "熱飲")
+                if any(hint.endswith(suf) or suf in hint for suf in food_suffixes):
+                    entry["name"] = hint
+                    current_name = hint
 
         # Append to nutrition_log
         _append_to_nutrition_log(entry)
@@ -10839,7 +10885,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v111';
+const CACHE = 'gym-web-v113';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10927,7 +10973,7 @@ const CACHE = 'gym-web-v111';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v111';
+const CACHE = 'gym-web-v113';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
