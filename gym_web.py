@@ -2640,6 +2640,69 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
         return f"（APiyi enrichment 失敗：{type(e).__name__}）"
 
 
+def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
+    """v3.2.7.9: Multi-dish nutrition enrichment (Jim OOB 2026-08-08 20:05 HKT
+    'is this possible to scan one photo with different food to generate
+    multiple entry of food log'). Returns JSON object with 'dishes' key —
+    one 12-field object per detected dish. gpt-4o-mini requires
+    response_format=json_object, so we wrap array in {dishes: [...]}.
+    Caller unwraps to get the array.
+
+    Schema returned:
+      {"dishes": [
+        {"name": "海南雞飯", "calories": 600, "protein": 30, ...},
+        {"name": "白菜",     "calories": 50,  "protein": 2,  ...},
+        {"name": "例湯",     "calories": 80,  "protein": 3,  ...}
+      ]}
+    """
+    api_key = _apiyi_api_key()
+    if not api_key:
+        return '{"dishes": []}'
+    fields_desc = ", ".join(
+        f"{f} ({NUTRITION_UNITS[f]})" for f in NUTRITION_FIELDS
+    )
+    prompt = (
+        f"呢張食物相/描述可能包含多過一樣食物。請你逐樣 dish 分開 estimate nutrition。\n\n"
+        f"描述：\n「{dish_desc}」\n\n"
+        f"Reply with ONLY a JSON object (no markdown, no commentary).\n"
+        f"Schema — wrap dishes array under 'dishes' key, one object per dish, "
+        f"all 12 fields required, use 0 if unknown:\n"
+        f'{{"dishes": [\n'
+        f'  {{"name": "菜名1", "calories": 0, "protein": 0, "carbs": 0, "fat": 0, '
+        f'"fiber": 0, "sugar": 0, "sodium": 0, "sat_fat": 0, "trans_fat": 0, '
+        f'"vit_c": 0, "iron": 0, "calcium": 0}},\n'
+        f'  {{"name": "菜名2", "calories": 0, "protein": 0, ...}}\n'
+        f']}}\n\n'
+        f"Units: {fields_desc}. Sodium in mg; vit_c/iron/calcium in mg; rest in g except calories (kcal).\n"
+        f"Be conservative — chain-specific numbers only if well-known. "
+        f"Otherwise typical HK portion. If only ONE dish, return 1-element array."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.apiyi.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        return resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        return '{"dishes": []}'
+
+
 def _parse_nutrition_block(text: str) -> dict:
     """Parse a nutrition block (Chinese or English) into the 12-field schema.
 
@@ -4295,16 +4358,66 @@ def api_scan_preview():
         v = info.get("value", 0) or 0
         preview_field_entries[f] = round(v * jim_ratio, 1) if shared else v
 
-    preview = {
-        "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
-        "image_path": str(img_path),
-        "image_url": f"/scan_img/{img_filename}",
-        "vision_desc": vision_desc,
-        "vision_short": vision_desc[:300],
-        "pplx_short": pplx_desc[:500],
-        "apiyi_enrichment": apiyi_desc[:300] if apiyi_desc else "",
-        "nutrition_merged": merged_nutrition,
-        "suggested_entry": {
+    # 3b. v3.2.7.9: Multi-dish detection — call APiyi multi estimator
+    # (Jim OOB 2026-08-08 20:05 HKT 'scan one photo with different food to
+    # generate multiple entry'). Returns array of {name, 12-field...} objects.
+    multi_desc = vision_desc + "\n\n" + pplx_desc
+    multi_json = _apiyi_nutrition_enrich_multi(multi_desc)
+    multi_dishes = []
+    try:
+        parsed = json.loads(multi_json)
+        if isinstance(parsed, dict) and "dishes" in parsed:
+            multi_dishes = parsed["dishes"]
+        elif isinstance(parsed, list):
+            multi_dishes = parsed
+    except Exception:
+        multi_dishes = []
+
+    # Build per-dish entries (apply jim_ratio to each if shared)
+    entries_list = []
+    for d in multi_dishes:
+        if not isinstance(d, dict):
+            continue
+        d_name = d.get("name") or _extract_dish_name(d.get("name", ""), vision_desc)
+        if not d_name:
+            continue
+        e_macros = {}
+        for f in NUTRITION_FIELDS:
+            v = d.get(f, 0) or 0
+            e_macros[f] = round(float(v) * jim_ratio, 1) if shared else round(float(v), 1)
+        e_entry = {
+            "date": today_iso(),
+            "time": now_hkt_dt.strftime("%H:%M"),
+            "meal_type": "scan",
+            "name": d_name,
+            "coach_comment": _coach_comment(
+                d_name, e_macros["calories"], e_macros["protein"],
+                e_macros.get("carbs", 0), e_macros.get("fat", 0), restaurant_guess
+            ),
+            "restaurant_chain": restaurant_guess,
+            "calories": e_macros["calories"],
+            "protein": e_macros["protein"],
+            "carbs": e_macros.get("carbs", 0),
+            "fat": e_macros.get("fat", 0),
+            "fiber": e_macros.get("fiber", 0),
+            "sugar": e_macros.get("sugar", 0),
+            "sodium": e_macros.get("sodium", 0),
+            "sat_fat": e_macros.get("sat_fat", 0),
+            "trans_fat": e_macros.get("trans_fat", 0),
+            "vit_c": e_macros.get("vit_c", 0),
+            "iron": e_macros.get("iron", 0),
+            "calcium": e_macros.get("calcium", 0),
+            "is_shared_meal": shared,
+            "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
+            "raw_kcal_estimate": e_macros["calories"],
+            "raw_p_estimate": e_macros["protein"],
+        }
+        entries_list.append(e_entry)
+
+    # Fallback: if multi-dish returned empty or 0 elements, use the original
+    # single-entry path (so backward compat preserved for 1-dish scans).
+    if not entries_list:
+        entries_list = [{
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
@@ -4334,11 +4447,107 @@ def api_scan_preview():
             "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
             "raw_kcal_estimate": raw_kcal,
             "raw_p_estimate": raw_p,
-        },
-        "ready_to_commit": True,
-    }
+        }]
 
-    return jsonify({"ok": True, "preview": preview})
+    # v3.2.7.10: AUTO-COMMIT — no more confirm step. Scan → log immediately.
+    # (Jim OOB 2026-08-08 20:15 HKT 'I think no need confirmation after
+    # scanning. Do it right away. if I see problem, I can edit it delete
+    # later on.') Frontend just shows the image + entries; if anything's
+    # wrong, user taps ✏️ edit or 🗑️ delete on the food card.
+    now_iso_str = now_iso()
+    final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    final_path = SCAN_CACHE_DIR / final_name
+    try:
+        img_path.rename(final_path)
+        image_url = f"/scan_img/{final_name}"
+    except Exception:
+        final_path = img_path
+        image_url = f"/scan_img/{img_path.name}"
+
+    committed = []
+    for e_idx, entry in enumerate(entries_list):
+        entry["timestamp_iso"] = now_iso_str
+        entry["source"] = "v3.2.7.10-scan_autocommit (minimax-m3 + pplx-sonar-pro + apiyi-multi)"
+        entry["models_used"] = ["minimax-m3", "pplx-sonar-pro", "apiyi-gpt-4o-mini-multi"]
+        entry["image_saved_to"] = str(final_path)
+        entry["confidence"] = "auto-commit preview"
+        entry["sheet_synced"] = False
+        entry["user_correction"] = None
+        entry["vision_raw_desc"] = vision_desc
+        entry["vision_short"] = vision_desc[:300]
+        entry["pplx_short"] = pplx_desc[:500]
+        entry["apiyi_enrichment"] = apiyi_desc[:300] if apiyi_desc else ""
+        entry["user_hints"] = []
+
+        # v3.2.7: enforce dish-name extraction on every commit
+        current_name = (entry.get("name") or "").strip()
+        if (not current_name
+            or current_name.startswith("img_")
+            or current_name.endswith(".jpg")
+            or current_name == "食物"
+            or current_name.startswith("相顯示")
+            or current_name.startswith("圖顯示")
+            or current_name.startswith("呢張")
+            or len(current_name) > 60):
+            redrive = _extract_dish_name(vision_desc, pplx_desc, fallback=current_name or "")
+            if redrive and redrive.strip() != "食物":
+                entry["name"] = redrive
+                current_name = redrive
+
+        _append_to_nutrition_log(entry)
+        sheet_result = _append_to_sheet_nutrition(entry)
+        committed.append({
+            "name": entry.get("name", "?"),
+            "calories": entry.get("calories", 0),
+            "protein": entry.get("protein", 0),
+            "grade": (entry.get("coach_comment") or {}).get("grade", "—"),
+            "sheet_row": sheet_result.get("range", ""),
+            "sheet_ok": sheet_result.get("ok", False),
+        })
+
+    # Append scan_log rows
+    scan_log = _load_scan_log()
+    for entry in entries_list:
+        log_row = {
+            "scan_index": len(scan_log),
+            "timestamp_iso": now_iso_str,
+            "name": entry.get("name", "scan"),
+            "calories": entry.get("calories", 0),
+            "protein": entry.get("protein", 0),
+            "carbs": entry.get("carbs", 0),
+            "fat": entry.get("fat", 0),
+            "fiber": entry.get("fiber", 0),
+            "sugar": entry.get("sugar", 0),
+            "sodium": entry.get("sodium", 0),
+            "sat_fat": entry.get("sat_fat", 0),
+            "trans_fat": entry.get("trans_fat", 0),
+            "vit_c": entry.get("vit_c", 0),
+            "iron": entry.get("iron", 0),
+            "calcium": entry.get("calcium", 0),
+            "shared": entry.get("is_shared_meal", False),
+            "image_path": str(final_path),
+            "image_url": image_url,
+            "restaurant_chain": entry.get("restaurant_chain", ""),
+            "coach_comment": entry.get("coach_comment", {}),
+            "vision_short": vision_desc[:120],
+            "user_corrections": [],
+            "multi_entry_id": f"me_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_{len(entries_list)}dishes",
+        }
+        scan_log.append(log_row)
+    _save_scan_log(scan_log)
+
+    return jsonify({
+        "ok": True,
+        "auto_committed": True,
+        "image_path": str(final_path),
+        "image_url": image_url,
+        "vision_desc": vision_desc,
+        "vision_short": vision_desc[:300],
+        "is_multi_entry": len(entries_list) > 1,
+        "entries": entries_list,
+        "committed": committed,
+        "multi_entry": len(committed) > 1,
+    })
 
 
 @app.route("/api/scan_preview_from_path", methods=["POST"])
@@ -4864,6 +5073,11 @@ def api_scan_commit():
     Receives the (possibly edited) suggested_entry + image_path from
     /api/scan_preview or /api/scan_preview_text.
 
+    v3.2.7.9: Multi-entry support (Jim OOB 2026-08-08 20:05 HKT 'scan one
+    photo with different food to generate multiple entry'). Accepts
+    `entries: [...]` (1-N items) and commits them all sharing the same
+    image. Falls back to legacy `entry: {...}` for backward compat.
+
     Text-only path (Jim OOB 2026-08-02 02:50 HKT):
         image_path = "" → text-only entry. NO file rename, no scan_log
         append image, sheet row has image_url field empty / sheet
@@ -4874,16 +5088,25 @@ def api_scan_commit():
     If user_corrections are submitted (correction_form), they're appended permanently.
     """
     data = request.get_json(silent=True) or {}
-    entry = data.get("entry", {})
     image_path = data.get("image_path", "")
     user_correction = data.get("user_correction")  # optional dict
     # v2.7.19: list of hint strings Jim typed during scan → re-estimate cycle
     user_hints_in = data.get("user_hints", []) or []
 
-    if not entry:
-        return jsonify({"ok": False, "error": "missing entry"}), 400
+    # v3.2.7.9: accept either `entries: [...]` (new multi-entry) or
+    # `entry: {...}` (legacy single-entry) for backward compat
+    entries_in = data.get("entries")
+    if entries_in is None:
+        single = data.get("entry", {})
+        if not single:
+            return jsonify({"ok": False, "error": "missing entry/entries"}), 400
+        entries_in = [single]
+    if not isinstance(entries_in, list) or not entries_in:
+        return jsonify({"ok": False, "error": "entries must be non-empty list"}), 400
+    # Cap to 10 to prevent abuse
+    entries_in = entries_in[:10]
 
-    # v2.7.22 (text-only path): image_path may be empty (text-direct input).
+    # Validate image (shared across all entries)
     if image_path:
         img_path = Path(image_path)
         if not img_path.exists():
@@ -4891,92 +5114,12 @@ def api_scan_commit():
     else:
         img_path = None  # text-only entry, no image
 
+    # Per-entry commit. All entries share same image + timestamp + scan_log row.
     now_iso_str = now_iso()
-    entry["timestamp_iso"] = now_iso_str
-    if img_path is not None:
-        entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
-        entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
-        entry["image_saved_to"] = str(img_path)
-    else:
-        # v2.7.22 text-direct path
-        entry["source"] = "v2.7.22-scan_text_direct (apiyi-gpt-4o-mini, no image)"
-        entry["models_used"] = ["apiyi-gpt-4o-mini"]
-        entry["image_saved_to"] = ""
-    entry["confidence"] = "Jim-confirmed preview"
-    entry["sheet_synced"] = False
-    entry["user_correction"] = None
-    # v3.2.7.3: single A-F grade via keyword+macro (replaces star rating)
-    entry_name = entry.get("name") or entry.get("meal_name") or "食物"
-    entry_kcal = entry.get("calories", entry.get("kcal", 0)) or 0
-    entry_p = entry.get("protein", entry.get("protein_g", 0)) or 0
-    entry_c = entry.get("carbs", entry.get("carbs_g", 0)) or 0
-    entry_f = entry.get("fat", entry.get("fat_g", 0)) or 0
-    entry_rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
-    if entry_name and entry_kcal > 0:
-        entry["coach_comment"] = _coach_comment(entry_name, entry_kcal, entry_p, entry_c, entry_f, entry_rest)
-    # v3.2.7.3: legacy `rating` field (1-5 star) removed — single source of truth is coach_comment.grade
-    if "rating" in entry:
-        del entry["rating"]
-    # v2.7.19: persist user hints (each round-trip = one hint in the list)
-    # Dedupe + cap to 20 entries to avoid bloat
-    cleaned_hints = []
-    seen = set()
-    for h in user_hints_in:
-        if not isinstance(h, str):
-            continue
-        h = h.strip()
-        if not h or h in seen:
-            continue
-        seen.add(h)
-        cleaned_hints.append(h[:500])
-        if len(cleaned_hints) >= 20:
-            break
-    entry["user_hints"] = cleaned_hints
-
-    # Append to nutrition log
-    _append_to_nutrition_log(entry)
-    sheet_result = _append_to_sheet_nutrition(entry)
-
-    # v2.7.22 (text-only path): when no image, skip file rename + scan_log.
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
-    # v3.2.7: enforce dish-name extraction + rating on every commit
-    # (Jim OOB 2026-08-07 23:50 HKT 'the food title is not shown on
-    # the list view. Moreover, it does not have rating').
-    # If name is a hash / path / generic, re-derive via _extract_dish_name.
-    current_name = (entry.get("name") or "").strip()
-    if (not current_name
-        or current_name.startswith("img_")
-        or current_name.endswith(".jpg")
-        or current_name == "食物"
-        or current_name.startswith("相顯示")
-        or current_name.startswith("圖顯示")
-        or current_name.startswith("呢張")
-        or len(current_name) > 60):
-        vision_hint = (entry.get("vision_raw_desc")
-                       or entry.get("vision_desc")
-                       or entry.get("source_text")
-                       or entry.get("vision_short")
-                       or "")
-        pplx_hint = (entry.get("pplx_short")
-                     or entry.get("apiyi_enrichment")
-                     or "")
-        redrive = _extract_dish_name(vision_hint, pplx_hint, fallback=current_name or "")
-        if redrive and redrive.strip() != "食物":
-            entry["name"] = redrive
-            current_name = redrive
-    # Compute / override rating from available description + macros
-    if "rating" not in entry or not isinstance(entry.get("rating"), int):
-        macro_dict = {k: entry.get(k) for k in
-                      ("calories", "protein", "carbs", "fat",
-                       "fiber", "sugar", "sodium", "sat_fat",
-                       "trans_fat", "vit_c", "iron", "calcium")
-                      if isinstance(entry.get(k), (int, float))}
-        entry["rating"] = _compute_rating(
-            entry.get("vision_raw_desc") or entry.get("vision_desc") or "",
-            macro_dict,
-        )
+
+    # Pre-compute image rename (one-time, shared)
     if img_path is not None:
-        # Rename preview_*.jpg → scan_*.jpg
         final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
         final_path = SCAN_CACHE_DIR / final_name
         try:
@@ -4986,20 +5129,104 @@ def api_scan_commit():
             final_path = img_path
             image_url = f"/scan_img/{img_path.name}"
     else:
-        # Text-only entry — no image, no scan_log image row
         final_path = ""
         image_url = ""
 
-    # Append to scan_log (only image-backed entries; text-only goes to nutrition_log
-    # alone + scan_recent filter hides them by default)
+    # Common vision hints for dish-name re-derivation
+    vision_hint_global = data.get("vision_desc", "") or data.get("vision_short", "") or ""
+    pplx_hint_global = data.get("pplx_short", "") or ""
+
+    committed = []
+    for e_idx, entry in enumerate(entries_in):
+        if not isinstance(entry, dict):
+            continue
+        # Per-entry user_correction (or shared one)
+        e_user_correction = entry.get("user_correction") or (user_correction if e_idx == 0 else None)
+        # Per-entry user_hints (entry-level first, then top-level)
+        e_user_hints = entry.get("user_hints") or user_hints_in
+        # Per-entry meal_type / time
+        entry["timestamp_iso"] = now_iso_str
+        if img_path is not None:
+            entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
+            entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
+            entry["image_saved_to"] = str(final_path)
+        else:
+            entry["source"] = "v2.7.22-scan_text_direct (apiyi-gpt-4o-mini, no image)"
+            entry["models_used"] = ["apiyi-gpt-4o-mini"]
+            entry["image_saved_to"] = ""
+        entry["confidence"] = "Jim-confirmed preview"
+        entry["sheet_synced"] = False
+        entry["user_correction"] = None
+        # v3.2.7.3: single A-F grade via keyword+macro (replaces star rating)
+        entry_name = entry.get("name") or entry.get("meal_name") or "食物"
+        entry_kcal = entry.get("calories", entry.get("kcal", 0)) or 0
+        entry_p = entry.get("protein", entry.get("protein_g", 0)) or 0
+        entry_c = entry.get("carbs", entry.get("carbs_g", 0)) or 0
+        entry_f = entry.get("fat", entry.get("fat_g", 0)) or 0
+        entry_rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
+        if entry_name and entry_kcal > 0:
+            entry["coach_comment"] = _coach_comment(entry_name, entry_kcal, entry_p, entry_c, entry_f, entry_rest)
+        # v3.2.7.3: legacy `rating` field (1-5 star) removed
+        if "rating" in entry:
+            del entry["rating"]
+        # v2.7.19: persist user hints (each round-trip = one hint in the list)
+        cleaned_hints = []
+        seen = set()
+        for h in e_user_hints:
+            if not isinstance(h, str):
+                continue
+            h = h.strip()
+            if not h or h in seen:
+                continue
+            seen.add(h)
+            cleaned_hints.append(h[:500])
+            if len(cleaned_hints) >= 20:
+                break
+        entry["user_hints"] = cleaned_hints
+        # v3.2.7: enforce dish-name extraction on every commit
+        current_name = (entry.get("name") or "").strip()
+        if (not current_name
+            or current_name.startswith("img_")
+            or current_name.endswith(".jpg")
+            or current_name == "食物"
+            or current_name.startswith("相顯示")
+            or current_name.startswith("圖顯示")
+            or current_name.startswith("呢張")
+            or len(current_name) > 60):
+            vision_hint = (entry.get("vision_raw_desc")
+                           or entry.get("vision_desc")
+                           or vision_hint_global
+                           or "")
+            pplx_hint = (entry.get("pplx_short")
+                         or entry.get("apiyi_enrichment")
+                         or pplx_hint_global
+                         or "")
+            redrive = _extract_dish_name(vision_hint, pplx_hint, fallback=current_name or "")
+            if redrive and redrive.strip() != "食物":
+                entry["name"] = redrive
+                current_name = redrive
+
+        # Append to nutrition_log
+        _append_to_nutrition_log(entry)
+        sheet_result = _append_to_sheet_nutrition(entry)
+        committed.append({
+            "name": entry.get("name", "?"),
+            "calories": entry.get("calories", 0),
+            "protein": entry.get("protein", 0),
+            "grade": (entry.get("coach_comment") or {}).get("grade", "—"),
+            "sheet_row": sheet_result.get("range", ""),
+            "sheet_ok": sheet_result.get("ok", False),
+        })
+
+    # Append scan_log rows (one per entry if image-backed, one per entry otherwise)
     scan_log = _load_scan_log()
-    scan_index = len(scan_log)
-    if img_path is not None:
-        scan_log.append({
+    sheet_first_row = committed[0].get("sheet_row", "") if committed else ""
+    for e_idx, entry in enumerate([e for e in entries_in if isinstance(e, dict)]):
+        scan_index = len(scan_log)
+        log_row = {
             "scan_index": scan_index,
             "timestamp_iso": now_iso_str,
             "name": entry.get("name", "scan"),
-            "rating": entry.get("rating", 3),
             "calories": entry.get("calories", 0),
             "protein": entry.get("protein", 0),
             "carbs": entry.get("carbs", 0),
@@ -5013,50 +5240,27 @@ def api_scan_commit():
             "iron": entry.get("iron", 0),
             "calcium": entry.get("calcium", 0),
             "shared": entry.get("is_shared_meal", False),
-            "image_path": str(final_path),
+            "image_path": str(final_path) if img_path is not None else "",
             "image_url": image_url,
             "restaurant_chain": entry.get("restaurant_chain", ""),
             "coach_comment": entry.get("coach_comment", {}),
-            "vision_short": (entry.get("vision_raw_desc") or entry.get("vision_desc") or "")[:120],
-            "user_corrections": [user_correction] if user_correction else [],
-        })
-        _save_scan_log(scan_log)
-    else:
-        # Text-only: tag scan_log entry as text-direct so /scan_recent can show it
-        scan_log.append({
-            "scan_index": scan_index,
-            "timestamp_iso": now_iso_str,
-            "name": entry.get("name", "text"),
-            "rating": entry.get("rating", 3),
-            "calories": entry.get("calories", 0),
-            "protein": entry.get("protein", 0),
-            "carbs": entry.get("carbs", 0),
-            "fat": entry.get("fat", 0),
-            "fiber": entry.get("fiber", 0),
-            "sugar": entry.get("sugar", 0),
-            "sodium": entry.get("sodium", 0),
-            "sat_fat": entry.get("sat_fat", 0),
-            "trans_fat": entry.get("trans_fat", 0),
-            "vit_c": entry.get("vit_c", 0),
-            "iron": entry.get("iron", 0),
-            "calcium": entry.get("calcium", 0),
-            "shared": entry.get("is_shared_meal", False),
-            "image_path": "",
-            "image_url": "",
-            "restaurant_chain": entry.get("restaurant_chain", ""),
-            "coach_comment": entry.get("coach_comment", {}),
-            "vision_short": (entry.get("vision_raw_desc") or entry.get("name", ""))[:120],
-            "user_corrections": [user_correction] if user_correction else [],
-            "is_text_only": True,
-        })
-        _save_scan_log(scan_log)
+            "vision_short": (entry.get("vision_raw_desc") or entry.get("vision_desc") or vision_hint_global or "")[:120],
+            "user_corrections": [],
+        }
+        if img_path is None:
+            log_row["is_text_only"] = True
+        # v3.2.7.9: link sibling entries from same photo via multi_entry_id
+        log_row["multi_entry_id"] = f"me_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_{len(entries_in)}dishes"
+        scan_log.append(log_row)
+    _save_scan_log(scan_log)
 
     return jsonify({
         "ok": True,
-        "scan_index": scan_index,
-        "entry": entry,
-        "sheet_synced": sheet_result.get("ok", False),
-        "sheet_range": sheet_result.get("range", ""),
+        "scan_index": scan_log[-len(committed)] if committed else None,
+        "committed": committed,
+        "multi_entry": len(committed) > 1,
+        "sheet_synced": all(c.get("sheet_ok") for c in committed) if committed else False,
+        "sheet_range": committed[0].get("sheet_row", "") if committed else "",
         "is_text_only": img_path is None,
     })
 
@@ -10608,7 +10812,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v108';
+const CACHE = 'gym-web-v109';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -10696,7 +10900,7 @@ const CACHE = 'gym-web-v108';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v108';
+const CACHE = 'gym-web-v109';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
