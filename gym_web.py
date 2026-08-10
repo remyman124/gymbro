@@ -710,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.23"
+__version__ = "3.2.7.24"
 
 
 def _recovery_pct():
@@ -6075,6 +6075,7 @@ def api_coach_tips():
 import threading
 import shutil
 import subprocess as _sp
+import sys
 import time
 import uuid
 
@@ -6108,7 +6109,12 @@ def _save_cheer_log(log: list) -> None:
 
 # Whoop cache (read live if <2h, else use cache)
 WHOOP_CACHE_PATH = Path("/home/work/.whoop_data_latest.json")
-WHOOP_PULL_SCRIPT = Path("/home/work/.hermes/skills/fitness/whoop-pull-activities/scripts/whoop_pull.py")
+# v3.2.7.23: the legacy whoop_pull.py under skills/fitness/whoop-pull-activities/
+# DOES NOT exist on disk (verified 2026-08-06 09:00 HKT — Pitfall III.8 in
+# fitness/whoop SKILL.md documents the missing-script workaround). Point the
+# auto-refresh path at the working tools/whoop_nutrition.py --sync script
+# instead, which paginates all 4 endpoints + writes the same cache shape.
+WHOOP_PULL_SCRIPT = Path("/home/work/tools/whoop_nutrition.py")
 WITHINGS_PULL_SCRIPT = Path("/home/work/.hermes/skills/withings/withings.py")  # Jim OOB 2026-07-24: cheer pulls Withings on every fire
 
 EN_TO_ZH_VOICE = {
@@ -6293,9 +6299,9 @@ def _run_whoop_pull_cached(force: bool = False) -> dict:
                 return data
         except Exception:
             pass
-    # Run whoop_pull.py (always when forced)
+    # Run whoop_nutrition.py --sync (always when forced)
     try:
-        result = _sp.run([sys.executable, str(WHOOP_PULL_SCRIPT)],
+        result = _sp.run([sys.executable, str(WHOOP_PULL_SCRIPT), "--sync"],
                           capture_output=True, text=True, timeout=180)
         if result.returncode == 0 and WHOOP_CACHE_PATH.exists():
             return json.loads(WHOOP_CACHE_PATH.read_text())
