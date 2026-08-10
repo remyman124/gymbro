@@ -484,6 +484,20 @@
           <span x-text="gymFocusMode ? 'Focus ON' : 'Focus'"></span>
         </button>
       </div>
+      <!-- v3.2.7.20: delete session — wipes today's local + Sheet entry
+           so the user can start over. Only shown when there's something
+           to delete. Two-step confirm (window.confirm + a short lockout
+           to prevent double-tap). -->
+      <div x-show="sessionGrouped.length > 0" class="mt-6 flex justify-center">
+        <button @click="deleteSession()"
+                :disabled="deletingSession"
+                :class="deletingSession ? 'opacity-50 cursor-wait' : 'active:scale-95'"
+                class="flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-black transition-all"
+                style="background: linear-gradient(135deg, rgba(244,63,94,0.4), rgba(244,63,94,0.15)); border: 1.5px solid rgba(244,63,94,0.7); color: rgb(252,165,165);"
+                title="刪除今日 session — 寫得返轉頭㗎">
+          <span>🗑</span><span x-text="deletingSession ? '刪除緊…' : 'Delete Session'"></span>
+        </button>
+      </div>
     </section>
 
     <!-- v3.2.7: legacy HISTORY TAB removed (Jim OOB 2026-08-07 23:40 HKT
@@ -1465,6 +1479,8 @@ function gymApp() {
     intensity: 'warm-up',
     session: { exercises: [] },
     saving: false,
+    // v3.2.7.20: gate for the delete-session button (prevents double-tap)
+    deletingSession: false,
     toast: '',
     // v3.2.8: pull-to-refresh state. pullDistance tracks how far the user
     // has dragged down from the top of <main>; pullRefreshing shows the
@@ -2269,6 +2285,59 @@ function gymApp() {
       this.saving = false;
     },
 
+    // v3.2.7.20: wipe today's session from local WORKOUT_LOG + Google
+    // Sheet so the user can start over. Two-step confirm (window.confirm)
+    // + a short lockout to prevent double-tap. After delete, clears the
+    // in-memory session and refreshes the state.
+    async deleteSession() {
+      if (this.deletingSession) return;
+      if (!this.sessionGrouped.length) {
+        this.flash('冇 set 可以刪');
+        return;
+      }
+      const n = this.session.exercises.length;
+      const ok = window.confirm(
+        `刪除今日 ${n} 個 set？\n\n本地 + Google Sheet 都會一齊刪，寫得返轉頭㗎。`
+      );
+      if (!ok) return;
+      this.deletingSession = true;
+      this.haptic([100, 50, 100]);
+      try {
+        const today = this.sessionDateStr || new Date().toISOString().slice(0, 10);
+        const res = await fetch('/api/delete_session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date: today, safe: false }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          this.flash('刪除失敗：' + (data.error || res.status));
+          this.deletingSession = false;
+          return;
+        }
+        // Clear in-memory session so the pyramid + delete button disappear.
+        this.session = { exercises: [] };
+        // Reload state to make sure server + UI agree.
+        try {
+          const r = await fetch('/api/state');
+          const fresh = await r.json();
+          this.session = fresh.session;
+        } catch (e) { /* keep local clear */ }
+        // v3.2.7.20: also invalidate any Sheet mirror so the next cheer
+        // pipeline doesn't read the deleted session.
+        try { await fetch('/api/sync_sheet', { method: 'POST' }); } catch (e) {}
+        const summary = data.sheet_deleted_rows
+          ? `已刪 ${n} 個 set (Sheet: ${data.sheet_deleted_rows} 行)`
+          : `已刪 ${n} 個 set`;
+        this.flash(summary);
+        this.haptic([60]);
+      } catch (e) {
+        this.flash('刪除失敗：' + e.message);
+      } finally {
+        this.deletingSession = false;
+      }
+    },
+
     // v3.1.0: PT share — copy gym result formatted for PT message.
     // Jim OOB 2026-08-07 14:50 HKT 'i use to copy the gym result to my PT
     // after the gym session and manually update whoop pasting into whoop ai'.
@@ -2445,9 +2514,15 @@ function gymApp() {
       }
     },
 
-    // v3.2.7.19: previous-month navigation. No future navigation.
+    // v3.2.7.20: month navigation. Next is disabled when at current
+    // month (offset >= 0) so the user can't go into the future.
     async schedulePrevMonth() {
       this.scheduleMonthOffset -= 1;
+      await this.loadSchedule();
+    },
+    async scheduleNextMonth() {
+      if (this.scheduleMonthOffset >= 0) return;
+      this.scheduleMonthOffset += 1;
       await this.loadSchedule();
     },
 
@@ -3743,7 +3818,7 @@ setTimeout(checkLandscapeFood, 500);
 <section x-show="isTabVisible('history')"
          x-cloak
          class="fixed left-0 right-0 flex flex-col px-3 pt-2 z-10"
-         style="top: 51px; bottom: 47px;"
+         style="top: calc(51px + env(safe-area-inset-top)); bottom: calc(47px + env(safe-area-inset-bottom));"
          x-init="loadSchedule()">
 
   <!-- Empty state — if no activities in the past 42 days AND this week,
@@ -3770,16 +3845,21 @@ setTimeout(checkLandscapeFood, 500);
          is the single source of truth — tap any day to see full
          activity details in the popover below. -->
 
-    <!-- v3.2.7.19: month navigation bar. ← 上一個月 + month label.
-         No next-month button (Jim OOB 2026-08-10 'no need to navigate
-         future month'). Compact 28px row at the top. -->
+    <!-- v3.2.7.20: month navigation bar. ← 上一個月 + month label +
+         下一個月 →. Next button is enabled for past months (so the user
+         can step back to current). Compact 28px row at the top. -->
     <div class="flex items-center justify-between px-1 mb-1 h-7">
       <button @click="schedulePrevMonth()"
               class="text-xs text-emerald-300 hover:text-emerald-200 active:scale-95 transition flex items-center gap-0.5 px-1.5 py-0.5 rounded">
         <span>←</span><span>上一個月</span>
       </button>
       <div class="text-xs font-bold text-gray-300" x-text="scheduleViewLabel"></div>
-      <div class="w-16"></div><!-- spacer to keep label centered (matches prev btn width) -->
+      <button @click="scheduleNextMonth()"
+              :disabled="scheduleMonthOffset >= 0"
+              :class="scheduleMonthOffset >= 0 ? 'opacity-30 cursor-not-allowed' : 'text-emerald-300 hover:text-emerald-200 active:scale-95'"
+              class="text-xs transition flex items-center gap-0.5 px-1.5 py-0.5 rounded">
+        <span>下一個月</span><span>→</span>
+      </button>
     </div>
 
     <!-- ============ MONTHLY CALENDAR (current month, enriched) ============ -->
