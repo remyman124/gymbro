@@ -3709,8 +3709,8 @@ setTimeout(checkLandscapeFood, 500);
      day cells (gym = green, walking = sky, etc.) and is_today ring. -->
 <section x-show="isTabVisible('history')"
          x-cloak
-         class="flex flex-col px-3 pt-3"
-         style="height: calc(100dvh - 3.5rem);"
+         class="fixed left-0 right-0 flex flex-col px-3 pt-2 z-10"
+         style="top: 51px; bottom: 47px;"
          x-init="loadSchedule()">
 
   <!-- Empty state — if no activities in the past 42 days AND this week,
@@ -3741,22 +3741,19 @@ setTimeout(checkLandscapeFood, 500);
     <!-- v3.2.7: cells now show gym volume + sets + recovery %, enriched
          via /api/whoop_activities_calendar. (Jim OOB 2026-08-07 23:40 HKT
          'beatify the month view with enriched data'.) -->
-    <div>
-      <div class="flex items-center justify-between mb-2">
-        <div class="text-[10px] uppercase tracking-[0.2em] text-gray-400">
-          月曆 <span class="text-gray-300" x-text="scheduleRangeLabel"></span>
-        </div>
-        <div class="text-[10px] text-gray-500 flex items-center gap-1.5">
-          <span class="font-bold text-emerald-400">🏋️<span x-text="scheduleMonthGymCount"></span></span>
-          <span class="text-gray-600">·</span>
-          <span class="font-bold text-sky-400" x-text="scheduleMonthOtherCount"></span><span>其他</span>
-          <template x-if="scheduleTotalVolume != null">
-            <span class="ml-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-bold tabular-nums" x-text="formatVolume(scheduleTotalVolume) + 'kg'"></span>
-          </template>
-        </div>
-      </div>
-      <!-- Weekday header row (Sunday styled red, week starts Sunday — v3.2.8) -->
-      <div class="grid grid-cols-7 gap-1 mb-1">
+    <div class="flex flex-1 flex-col min-h-0">
+      <!-- v3.2.9: stripped the title row (月曆 + stats), legend, and
+           weekday header above the grid to remove ALL blank space at
+           the top. The grid now starts immediately below the page
+           header. The weekday header is overlaid on top of the grid's
+           first row (sticky) so it stays visible without taking
+           vertical space. (Jim OOB 2026-08-10 'don't want space at the
+           top and at the bottom'.) -->
+
+      <!-- v3.2.9: compact weekday header overlaid on the first row of
+           the grid, sticky-positioned so it stays visible while
+           scrolling. -->
+      <div class="grid grid-cols-7 gap-1 sticky top-0 z-10 bg-black/60 backdrop-blur-sm py-0.5">
         <template x-for="wd in ['日','一','二','三','四','五','六']" :key="wd">
           <div class="text-center text-[10px] font-bold"
                :class="wd === '日' ? 'text-rose-400' : 'text-gray-500'"
@@ -3764,43 +3761,18 @@ setTimeout(checkLandscapeFood, 500);
         </template>
       </div>
 
-      <!-- v3.2.9: compact inline legend (moved from below the grid so it
-           doesn't get hidden behind the bottom nav when the calendar
-           fills the viewport). Cells are already color-coded by
-           activity/recovery, so this is intentionally minimal. -->
-      <div class="flex items-center justify-center gap-2 text-[9px] text-gray-500 mb-1.5">
-        <span class="flex items-center gap-1">
-          <span class="inline-block h-2 w-2 rounded-sm bg-emerald-500/30 ring-1 ring-emerald-500/40"></span>
-          <span>Gym</span>
-        </span>
-        <span class="flex items-center gap-1">
-          <span class="inline-block h-2 w-2 rounded-sm bg-sky-500/20 ring-1 ring-sky-500/30"></span>
-          <span>其他</span>
-        </span>
-        <span class="flex items-center gap-1">
-          <span class="inline-block h-2 w-2 rounded-sm bg-emerald-500/40 ring-2 ring-emerald-300/60"></span>
-          <span>今日</span>
-        </span>
-        <span class="flex items-center gap-1">
-          <span class="px-1 rounded-sm bg-emerald-500/30 text-emerald-200 font-black">≥66%</span>
-          <span>高</span>
-        </span>
-        <span class="flex items-center gap-1">
-          <span class="px-1 rounded-sm bg-rose-500/30 text-rose-200 font-black">≤33%</span>
-          <span>低</span>
-        </span>
-      </div>
       <!-- Calendar grid: align first day to its weekday slot.
            v3.2.8: stretches to fill remaining viewport height via CSS grid
            so cells are tall enough to comfortably render volume + sets +
            recovery chips (was cramped at aspect-square on iPhone).
            v3.2.9: removed the max-height cap — it was leaving blank space
            at the bottom of the screen. Now flex-1 on the grid wrapper
-           stretches to fill the section's flex-col layout. Jim OOB
-           2026-08-10 'for calendar view, it should be taller to fill up
-           entire mobile screen' — bumped minmax from 50px → 90px so cells
-           grow to use the full viewport and the blank space below the
-           legend disappears. -->
+           stretches to fill the section's flex-col layout.
+           v3.2.9: title row + legend removed so the grid fills the
+           entire viewport (Jim OOB 2026-08-10 'don't want space at the
+           top and at the bottom'). The schedule section is now fixed-
+           positioned to fill the area between the page header and the
+           bottom nav, so the grid naturally stretches to the bottom. -->
       <div class="grid grid-cols-7 gap-1 flex-1 min-h-0"
            style="grid-auto-rows: minmax(80px, 1fr);">
         <template x-for="day in scheduleMonthAligned" :key="day.date">
