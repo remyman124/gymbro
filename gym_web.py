@@ -676,7 +676,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.15"
+__version__ = "3.2.7.17"
 
 
 def _recovery_pct():
@@ -2743,6 +2743,95 @@ def _parse_nutrition_block(text: str) -> dict:
 
 
 
+# v3.2.7.17: AI-based narration classifier. Jim OOB 2026-08-10
+# 'don't use rule. please use ai to obtain'. The MiniMax M3 model
+# classifies the candidate dish name as either a real dish ('DISH')
+# or narration prose leaked from the vision description ('NARRATION').
+# Used by the post-AI guard in _extract_dish_name_ai AND by the
+# commit-path has_meaningful check.
+_NARRATION_CACHE: dict[str, bool] = {}
+_NARRATION_CACHE_MAX = 256
+
+
+def _ai_check_narration(name: str) -> bool:
+    """Return True if `name` is model narration prose, not a dish.
+
+    Uses MiniMax M3-highspeed for a quick yes/no classification. On
+    API failure, defaults to True (treat as narration) so the commit
+    path refuses to auto-commit. Better to ask the user than to save
+    garbage. Caches results to avoid repeated API calls for the same
+    name within a session.
+    """
+    if not name:
+        return False
+    if name in _NARRATION_CACHE:
+        return _NARRATION_CACHE[name]
+    if len(_NARRATION_CACHE) >= _NARRATION_CACHE_MAX:
+        _NARRATION_CACHE.clear()
+
+    api_key = _minimax_api_key()
+    if not api_key:
+        # No API key → fail closed: assume narration so we don't auto-commit
+        _NARRATION_CACHE[name] = True
+        return True
+
+    payload = {
+        "model": "MiniMax-M3-highspeed",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You classify whether a candidate string is a dish name "
+                    "or model narration prose. Reply with ONLY one word: "
+                    "'DISH' or 'NARRATION'."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Candidate: 「{name}」\n\n"
+                    "Is this a concrete dish/food name (e.g. 蘇打水、漢堡包、"
+                    "海南雞飯), or is it vision-model narration prose (e.g. "
+                    "這張相顯示一支蘇打水樽、品牌為可口可樂、可見到一塊蛋糕)?\n"
+                    "Reply ONLY 'DISH' or 'NARRATION'."
+                ),
+            },
+        ],
+        "max_tokens": 10,
+        "temperature": 0,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "".join(["Bearer ", api_key]),
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=8).read())
+        reply = (resp["choices"][0]["message"]["content"] or "").strip().upper()
+        is_narration = "NARRATION" in reply and "DISH" not in reply
+        _NARRATION_CACHE[name] = is_narration
+        return is_narration
+    except Exception:
+        # Fail closed: if the AI can't decide, refuse to auto-commit.
+        _NARRATION_CACHE[name] = True
+        return True
+
+
+def _name_has_narration(name: str) -> bool:
+    """True if `name` looks like model narration rather than a dish.
+
+    Thin wrapper around the AI classifier. Empty/None names are NOT
+    narration (handled by the empty-name check elsewhere).
+    """
+    if not name:
+        return False
+    return _ai_check_narration(name)
+
+
 def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     """v3.2.7.4: AI-based dish name extraction (Jim OOB 2026-08-08 10:35 HKT
     'No regex. Use ai' + 'Use minimax too'). Primary path: MiniMax M3
@@ -2776,6 +2865,10 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
         "(2) 如果只見到 '簡單嘅早餐' / '簡單嘅晚餐' / '簡單嘅一餐' 等 generic 字眼，"
         "    就要從描述中揾實際嘅主體食物 (蛋類/麵包/粉麵/飯/粥/餐肉)。"
         "(3) 多過一樣食物可以用 '、' 分隔 (例如：'煎蛋、烤麵包')。"
+        "(4) 絕對唔可以寫 '相顯示...'、'呢張相...'、'圖中可見...' 等等敘述性句式，"
+        "    唔可以寫 '品牌為...'、'牌子係...' 等品牌描述，"
+        "    唔可以寫 '一支XXX樽'、'一個XXX盒' 等容器+量詞組合。"
+        "    例如：'這張相顯示一支蘇打水樽，品牌為' -> 直接寫 '蘇打水'。"
         "\\n\\n例子："
         "'千層蛋糕'（唔好寫'相顯示咗一塊千層蛋糕'），"
         "'海南雞飯'（唔好寫'可見海南雞飯配青瓜'），"
@@ -2810,7 +2903,15 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
                 data = _json.loads(r.read())
             dish = (data["choices"][0]["message"]["content"] or "").strip()
             dish = dish.strip("「」『』\"'` \n\r\t")
-            if 2 <= len(dish) <= 12:
+            # v3.2.7.17: post-AI narration guard. If the model still leaks
+            # narration ("這張相顯示..." / "品牌為..." / "一支XXX樽") despite
+            # the prompt, fall through to the regex extractor instead of
+            # saving the narration as the dish name. (Jim OOB 2026-08-10
+            # 'Don't make this 這張相顯示一支蘇打水樽，品牌為'.)
+            if dish and _name_has_narration(dish):
+                # Bail out of AI path — let regex fallback handle it
+                pass
+            elif 2 <= len(dish) <= 12:
                 return dish
     except Exception:
         pass
@@ -2864,11 +2965,13 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = ""
     # v3.2.7: more connectives — APiyi gpt-4o-mini often starts with
     # "相顯示...", "圖片可見...", "睇到..." etc. (Jim OOB 2026-08-07 23:50
     # HKT 'food title not shown, just shows 相顯示xxx').
-    skip_prefixes = ("呢張", "觀察", "呢個", "呢份", "我見到", "呢碟", "呢碗", "呢個餐",
+    skip_prefixes = ("呢張", "這張", "此張", "該張",
+                    "觀察", "呢個", "呢份", "我見到", "呢碟", "呢碗", "呢個餐",
                     "首先", "再來", "另外", "最後", "然後", "接著", "至於",
-                    "從圖", "從相", "圖中", "相中", "照片中",
-                    "相顯示", "圖顯示", "圖中可見", "相中可見",
-                    "可見到", "睇到", "見到一", "睇到一", "可以見到", "可以睇到")
+                    "從圖", "從相", "圖中", "相中", "照片中", "圖片入面", "相片入面",
+                    "相顯示", "這張相顯示", "圖顯示", "圖中可見", "相中可見",
+                    "可見到", "睇到", "見到一", "睇到一", "可以見到", "可以睇到",
+                    "呢張相")
     def _strip_prefix(s: str) -> str:
         for p in skip_prefixes:
             if s.startswith(p):
@@ -2897,10 +3000,19 @@ def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = ""
         line = _strip_prefix(line)
         if not line or len(line) < 2:
             continue
-        # v3.2.7b: multi-pass strip articles + containers (Cantonese
-        # can stack connectors: 相顯示咗一個透明嘅食物盒)
-        for _ in range(3):
+        # v3.2.7b: multi-pass strip narration + articles + containers
+        # (Cantonese can stack connectors: 這張相顯示咗一個透明嘅食物盒)
+        # v3.2.7.17: include skip_prefixes in the multi-pass loop so a
+        # sentence like "呢張相顯示一支蘇打水樽" gets stripped to "蘇打水"
+        # instead of just "相顯示一支蘇打水樽".
+        for _ in range(5):
             prev = line
+            # Strip narration prefixes (longest first so 這張相顯示 beats 這張)
+            for p in sorted(skip_prefixes, key=len, reverse=True):
+                if line.startswith(p):
+                    line = line[len(p):].lstrip(" ，,。、")
+                    break
+            # Strip articles
             for art in articles:
                 if line.startswith(art):
                     line = line[len(art):].lstrip(" ，,。、")
@@ -4534,6 +4646,7 @@ def api_scan_preview():
             or current_name.startswith("相顯示")
             or current_name.startswith("圖顯示")
             or current_name.startswith("呢張")
+            or _name_has_narration(current_name)
             or len(current_name) > 60):
             redrive = _extract_dish_name(vision_desc, pplx_desc, fallback=current_name or "")
             if redrive and redrive.strip() != "食物":
@@ -4585,8 +4698,14 @@ def api_scan_preview():
     # v3.2.7.15: do NOT auto-commit when vision failed and name is empty/
     # generic. Return preview shape with a flag instead so frontend can
     # surface "no food detected" without polluting food log + sheet.
+    # v3.2.7.17: also reject named entries whose name still contains
+    # narration prose (e.g. "這張相顯示一支蘇打水樽，品牌為"). If any
+    # entry has narration in its name, do NOT auto-commit — let the user
+    # see the preview and edit. (Jim OOB 2026-08-10)
     has_meaningful = bool(entries_list) and any(
-        e.get("name", "").strip() and not str(e.get("name","")).startswith("（")
+        e.get("name", "").strip()
+        and not str(e.get("name","")).startswith("（")
+        and not _name_has_narration(e.get("name", ""))
         and e.get("calories", 0) > 0
         for e in entries_list
     )
