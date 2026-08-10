@@ -676,7 +676,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.17"
+__version__ = "3.2.7.19"
 
 
 def _recovery_pct():
@@ -4702,6 +4702,20 @@ def api_scan_preview():
     # narration prose (e.g. "這張相顯示一支蘇打水樽，品牌為"). If any
     # entry has narration in its name, do NOT auto-commit — let the user
     # see the preview and edit. (Jim OOB 2026-08-10)
+    # v3.2.7.19: ALSO check name against the regex fallback so the
+    # extracted name surfaces even when the AI classifier flagged it.
+    # Previously, when narration was detected, the preview returned
+    # empty suggested_entry — which made the frontend show "菜名: —"
+    # with empty calories (Jim OOB 2026-08-10 'one picture without image
+    # and one image without image'). Now we always return the best
+    # extracted entry in the preview; has_meaningful only gates
+    # auto-commit.
+    narration_block = bool(entries_list) and any(
+        e.get("name", "").strip()
+        and (_name_has_narration(e.get("name", ""))
+             or str(e.get("name","")).startswith("（"))
+        for e in entries_list
+    )
     has_meaningful = bool(entries_list) and any(
         e.get("name", "").strip()
         and not str(e.get("name","")).startswith("（")
@@ -4710,10 +4724,27 @@ def api_scan_preview():
         for e in entries_list
     )
     if not has_meaningful:
+        # Jim OOB 2026-08-10: still show the best extracted entry so the
+        # frontend can display the AI's guess (with a warning) rather
+        # than a blank placeholder. If entries_list is empty (vision
+        # completely failed), fall back to the empty placeholder.
+        preview_suggested = entries_list[0] if entries_list else {
+            "name": "",
+            "calories": 0,
+            "protein": 0,
+            "carbs": 0,
+            "fat": 0,
+            "restaurant_chain": "",
+            "is_shared_meal": False,
+        }
         return jsonify({
             "ok": True,
             "auto_committed": False,
             "needs_user_input": True,
+            "needs_user_input_reason": (
+                "narration_detected" if narration_block
+                else "vision_failed_or_generic"
+            ),
             "image_path": str(final_path),
             "image_url": image_url,
             "vision_desc": vision_desc,
@@ -4727,15 +4758,7 @@ def api_scan_preview():
                 "image_url": image_url,
                 "vision_short": vision_desc[:300] or "冇食物辨認到，請手動輸入菜名。",
                 "vision_desc": vision_desc,
-                "suggested_entry": {
-                    "name": "",
-                    "calories": 0,
-                    "protein": 0,
-                    "carbs": 0,
-                    "fat": 0,
-                    "restaurant_chain": "",
-                    "is_shared_meal": False,
-                },
+                "suggested_entry": preview_suggested,
             },
         })
 

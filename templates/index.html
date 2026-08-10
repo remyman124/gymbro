@@ -653,6 +653,17 @@
           <!-- Body: image + suggested entry — only visible when ready/committed/failed -->
           <template x-if="item.preview">
             <div class="p-3">
+              <!-- v3.2.7.19: warning banner when AI returned a narration
+                   name (or vision failed). Jim OOB 2026-08-10 'one picture
+                   without image and one image without image' — previously
+                   the preview was empty in this case, now we surface the
+                   AI's best guess with a clear warning. -->
+              <template x-if="item.preview.needs_user_input">
+                <div class="mb-2 rounded-lg bg-amber-500/15 border border-amber-400/40 px-2 py-1.5 text-[10px] text-amber-200">
+                  <span class="font-bold">⚠️ AI 唔肯定 — 請檢查菜名</span>
+                  <span class="text-amber-300/80" x-text="item.preview.needs_user_input_reason === 'narration_detected' ? '（可能係 AI 描述，不係菜名）' : '（AI 提取唔到，請手動輸入）'"></span>
+                </div>
+              </template>
               <div class="flex gap-3">
                 <img :src="item.preview.image_url" class="w-24 h-24 object-cover rounded-xl bg-black/40 border border-white/10">
                 <div class="flex-1 min-w-0">
@@ -2828,6 +2839,12 @@ function gymApp() {
             queueItem.error = data.error || 'preview failed';
           } else {
             queueItem.preview = data.preview;
+            // v3.2.7.19: surface needs_user_input + reason so the
+            // preview card can show a warning when the AI is unsure
+            // (narration in name, or vision failed). Jim OOB 2026-08-10
+            // 'one picture without image and one image without image'.
+            queueItem.preview.needs_user_input = !!data.needs_user_input;
+            queueItem.preview.needs_user_input_reason = data.needs_user_input_reason || "";
             queueItem.previewCorrectForm = {
               name: data.preview.suggested_entry.name || '',
               restaurant_chain: data.preview.suggested_entry.restaurant_chain || '',
