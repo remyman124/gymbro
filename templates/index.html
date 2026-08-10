@@ -2945,7 +2945,20 @@ function gymApp() {
               fat: data.preview.suggested_entry.fat || null,
               note: '',
             };
-            queueItem.status = 'ready';
+            // v3.2.7.21: when scan_preview already auto-committed (the
+            // server wrote the entry to nutrition_log + scan_log before
+            // returning), mark the queue item as 'committed' so the
+            // confirm button is disabled. Otherwise Jim's tap on
+            // '✓ 確認 log' would call scan_commit AGAIN and create a
+            // duplicate row. (Jim OOB 2026-08-10 'one photo generates
+            // two broken records' — the 23:30 海南雞 was a duplicate of
+            // the 23:29 auto-commit 16s earlier.)
+            if (data.auto_committed) {
+              queueItem.status = 'committed';
+              queueItem.auto_committed = true;
+            } else {
+              queueItem.status = 'ready';
+            }
           }
         } catch (e) {
           queueItem.status = 'failed';
@@ -2954,9 +2967,23 @@ function gymApp() {
         this.scanPhotosQueueDone = i + 1;
         this.scanPhotosQueue = [...this.scanPhotosQueue];  // trigger reactivity
       }
-      this.flash(this.scanPhotosQueue.length === this.scanPhotosQueueDone
-        ? `✓ 全部 ${this.scanPhotosQueueDone} 張 AI 睇完，可以逐張確認`
-        : `⚠️ ${this.scanPhotosQueueDone}/${this.scanPhotosQueue.length} 完成，睇下有冇失敗`);
+      // v3.2.7.21: summarise per-photo outcomes so Jim knows which ones
+      // were auto-committed (no need to tap confirm) vs which need
+      // explicit confirmation. Prevents the 'one photo → two records'
+      // duplicate bug where the auto-commit row was followed by a
+      // manual confirm on the same photo.
+      const ac = this.scanPhotosQueue.filter(q => q.status === 'committed' && q.auto_committed).length;
+      const need = this.scanPhotosQueue.filter(q => q.status === 'ready').length;
+      const fail = this.scanPhotosQueue.filter(q => q.status === 'failed').length;
+      if (ac > 0 && need === 0 && fail === 0) {
+        this.flash(`✓ ${ac} 張已自動寫入 log + Sheet`);
+      } else if (ac > 0 && need > 0) {
+        this.flash(`✓ ${ac} 張自動寫入 · 仲有 ${need} 張等你確認`);
+      } else if (this.scanPhotosQueue.length === this.scanPhotosQueueDone) {
+        this.flash(`✓ 全部 ${this.scanPhotosQueueDone} 張 AI 睇完，可以逐張確認`);
+      } else {
+        this.flash(`⚠️ ${this.scanPhotosQueueDone}/${this.scanPhotosQueue.length} 完成，睇下有冇失敗`);
+      }
       event.target.value = '';  // reset picker so same files can be re-picked later
     },
 
