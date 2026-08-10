@@ -255,14 +255,15 @@ def test_scan_preview_surfaces_extracted_entry_when_narration(monkeypatch, clien
     assert r.status_code == 200, r.data
     d = r.get_json()
     assert d["ok"] is True
-    assert d["auto_committed"] is False
-    assert d["needs_user_input"] is True
-    assert d["needs_user_input_reason"] == "narration_detected"
-    # The preview MUST contain the actual extracted entry (not empty)
-    # so the user can see what the AI thought and edit it.
-    preview = d["preview"]
-    assert preview["suggested_entry"]["name"] == "這張相顯示一支蘇打水樽"
-    assert preview["image_url"]  # not empty
+    assert d["auto_committed"] is True
+    # needs_user_input flag was removed in v3.2.7.23 — the gate no
+    # longer exists, so the field shouldn't appear in the response.
+    assert "needs_user_input" not in d
+    # Entry was actually committed (committed list non-empty). The
+    # narration-stripping in _extract_dish_name (test mocks it
+    # differently here, but production strips aggressively via
+    # skip_prefixes — lines 3042-3055 in gym_web.py).
+    assert len(d["committed"]) >= 1
 
 
 def test_scan_preview_extracts_empty_when_vision_fully_fails(monkeypatch, client, gym_web_module):
@@ -289,9 +290,11 @@ def test_scan_preview_extracts_empty_when_vision_fully_fails(monkeypatch, client
     assert r.status_code == 200
     d = r.get_json()
     assert d["ok"] is True
-    assert d["needs_user_input"] is True
-    # Empty vision → empty suggested_entry (fallback path)
-    assert d["preview"]["suggested_entry"]["name"] == ""
+    assert d["auto_committed"] is True
+    assert "needs_user_input" not in d
+    # Entry was committed even though vision failed — the extractor
+    # returns its fallback ("食物" per Pattern 5 in _extract_dish_name).
+    assert len(d["committed"]) >= 1
 
 
 # ── health overlays (Whoop / Withings) ───────────────────────────────────

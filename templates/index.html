@@ -625,7 +625,7 @@
         <div class="flex items-center gap-2">
           <span>📷 處理中相簿：</span>
           <span class="font-bold text-blue-100" x-text="`${scanPhotosQueueDone}/${scanPhotosQueue.length} 完成`"></span>
-          <span class="text-blue-300/80" x-text="scanPhotosQueueDone === scanPhotosQueue.length ? '（全部 AI 分析完，可以逐張確認）' : '（AI 睇緊下一張…）'"></span>
+          <span class="text-blue-300/80" x-text="scanPhotosQueueDone === scanPhotosQueue.length ? '（全部已直接寫入 log）' : '（AI 睇緊下一張…）'"></span>
         </div>
       </div>
 
@@ -633,7 +633,6 @@
       <template x-for="(item, idx) in scanPhotosQueue" :key="item.client_index">
         <div class="mb-3 rounded-2xl border-2"
              :class="{
-               'border-yellow-400/40 bg-yellow-500/10': item.status === 'ready',
                'border-emerald-400/40 bg-emerald-500/10': item.status === 'committed',
                'border-white/10 bg-white/5 opacity-50': item.status === 'skipped',
                'border-red-400/40 bg-red-500/10': item.status === 'failed',
@@ -646,7 +645,6 @@
             </div>
             <span class="text-[10px] font-bold px-2 py-0.5 rounded-full"
                   :class="{
-                    'bg-yellow-400 text-black': item.status === 'ready',
                     'bg-emerald-400 text-black': item.status === 'committed',
                     'bg-white/20 text-white/60': item.status === 'skipped',
                     'bg-red-400 text-white': item.status === 'failed',
@@ -656,7 +654,6 @@
                   x-text="{
                     pending: '排隊',
                     processing: 'AI 睇緊',
-                    ready: '待確認',
                     committed: '已 log',
                     skipped: '跳過',
                     failed: '失敗'
@@ -664,61 +661,37 @@
             </span>
           </div>
 
-          <!-- Body: image + suggested entry — only visible when ready/committed/failed -->
+          <!-- Body: image + suggested entry — only visible when committed/failed -->
           <template x-if="item.preview">
             <div class="p-3">
-              <!-- v3.2.7.19: warning banner when AI returned a narration
-                   name (or vision failed). Jim OOB 2026-08-10 'one picture
-                   without image and one image without image' — previously
-                   the preview was empty in this case, now we surface the
-                   AI's best guess with a clear warning. -->
-              <template x-if="item.preview.needs_user_input">
-                <div class="mb-2 rounded-lg bg-amber-500/15 border border-amber-400/40 px-2 py-1.5 text-[10px] text-amber-200">
-                  <span class="font-bold">⚠️ AI 唔肯定 — 請檢查菜名</span>
-                  <span class="text-amber-300/80" x-text="item.preview.needs_user_input_reason === 'narration_detected' ? '（可能係 AI 描述，不係菜名）' : '（AI 提取唔到，請手動輸入）'"></span>
-                </div>
-              </template>
               <div class="flex gap-3">
                 <img :src="item.preview.image_url" class="w-24 h-24 object-cover rounded-xl bg-black/40 border border-white/10">
                 <div class="flex-1 min-w-0">
                   <div class="text-[11px] text-white mb-1 line-clamp-3" x-text="item.preview.vision_short || ''"></div>
                   <div class="flex items-baseline gap-2 text-xs text-gray-300">
-                    <span><span class="text-emerald-300 font-bold" x-text="item.previewCorrectForm.calories ?? item.preview.suggested_entry.calories"></span> kcal</span>
-                    <span><span class="text-emerald-300 font-bold" x-text="item.previewCorrectForm.protein ?? item.preview.suggested_entry.protein"></span> P</span>
+                    <span><span class="text-emerald-300 font-bold" x-text="item.preview.suggested_entry.calories || 0"></span> kcal</span>
+                    <span><span class="text-emerald-300 font-bold" x-text="item.preview.suggested_entry.protein || 0"></span> P</span>
                     <template x-if="item.preview.suggested_entry.is_shared_meal">
                       <span class="text-yellow-300 font-bold">👥 60/40</span>
                     </template>
                   </div>
-                  <div class="text-[10px] text-gray-500 mt-1 truncate" x-text="`菜名: ${item.previewCorrectForm.name || item.preview.suggested_entry.name || '—'}`"></div>
+                  <div class="text-[10px] text-gray-500 mt-1 truncate" x-text="`菜名: ${item.preview.suggested_entry.name || '—'}`"></div>
                 </div>
               </div>
 
-              <!-- Edit section (collapsible) — Jim can override before commit -->
-              <details class="mt-2" :open="item.edit_mode">
-                <summary class="text-[10px] text-emerald-300 cursor-pointer" @click="item.edit_mode = !item.edit_mode">✏️ 改呢張嘅資料</summary>
-                <div class="grid grid-cols-2 gap-2 text-xs mt-2">
-                  <input type="text" placeholder="菜名" x-model="item.previewCorrectForm.name" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
-                  <input type="text" placeholder="餐廳" x-model="item.previewCorrectForm.restaurant_chain" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
-                  <input type="number" placeholder="kcal" x-model.number="item.previewCorrectForm.calories" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
-                  <input type="number" placeholder="P" x-model.number="item.previewCorrectForm.protein" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
-                  <input type="number" placeholder="C" x-model.number="item.previewCorrectForm.carbs" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
-                  <input type="number" placeholder="F" x-model.number="item.previewCorrectForm.fat" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
-                </div>
-                <textarea x-model="item.previewCorrectForm.note" placeholder="備註（永久保留）" class="mt-2 w-full rounded-lg bg-black/40 px-2 py-1.5 text-[11px] text-white border border-white/15" rows="2"></textarea>
-              </details>
-
-              <!-- Action buttons: ✓ confirm / skip / re-pick -->
+              <!-- v3.2.7.23: no confirm button — server auto-commits
+                   every photo. Only the skip button remains so Jim can
+                   dismiss the card. To edit the logged entry, use the
+                   ✏️ button on the food log row below. -->
               <div class="mt-3 grid grid-cols-2 gap-2">
                 <button @click="skipQueueItem(idx)"
-                        :disabled="item.status === 'committed' || item.status === 'skipped'"
+                        :disabled="item.status === 'skipped'"
                         class="rounded-lg bg-white/10 px-3 py-2 text-[11px] font-bold text-white/80 active:scale-95 disabled:opacity-30">
-                  跳過
+                  <span x-text="item.status === 'skipped' ? '已跳過' : '收埋呢張'"></span>
                 </button>
-                <button @click="commitQueueItem(idx)"
-                        :disabled="item.status === 'committed' || item.status === 'skipped' || item.status === 'failed' || item.status === 'pending' || item.status === 'processing'"
-                        class="rounded-lg bg-emerald-500 px-3 py-2 text-[11px] font-bold text-black active:scale-95 disabled:opacity-30">
-                  <span x-text="item.status === 'committed' ? '✓ 已 log' : '✓ 確認 log 呢張'"></span>
-                </button>
+                <div class="rounded-lg bg-emerald-500/30 border border-emerald-400/40 px-3 py-2 text-[11px] font-bold text-emerald-100 text-center">
+                  ✓ 已寫入 log
+                </div>
               </div>
               <div class="mt-2 text-[10px] text-yellow-300" x-show="item.preview.suggested_entry.is_shared_meal">
                 已自動 60/40 share ← 你食 60% · 小寶 40%
@@ -2862,7 +2835,13 @@ function gymApp() {
           if (this.scanProgress < 85) this.scanProgress += 5;
         }, 400);
 
-        // v2.2 F2: use PREVIEW endpoint (not auto-commit). Jim confirms manually.
+        // v3.2.7.23: scan_preview ALWAYS auto-commits (Jim OOB 2026-08-10
+        // 'we dont need to preview for my confirmation. just log it right
+        // away'). We don't populate previewEntry/commitPreview any more —
+        // doing so would risk a double-write when Jim taps 確認 again on
+        // the preview card. Just refresh the recent-scans feed so the new
+        // entry shows up immediately. If Jim wants to edit, he uses the
+        // ✏️ button on the food log row.
         const r = await fetch('/api/scan_preview', { method: 'POST', body: formData });
         clearInterval(progressTimer);
         this.scanProgress = 100;
@@ -2872,20 +2851,13 @@ function gymApp() {
           this.scanUploading = false;
           return;
         }
-        // Populate preview entry + start in edit mode after auto-fill
-        this.previewEntry = data.preview;
-        this.previewCorrectForm = {
-          name: data.preview.suggested_entry.name || '',
-          restaurant_chain: data.preview.suggested_entry.restaurant_chain || '',
-          calories: data.preview.suggested_entry.calories || null,
-          protein: data.preview.suggested_entry.protein || null,
-          carbs: data.preview.suggested_entry.carbs || null,
-          fat: data.preview.suggested_entry.fat || null,
-          note: '',
-        };
-        this.previewEditing = true;
-        this.tab = 'scan';
-        this.flash('Preview 就緒 ✓ 撳「確認」先 log');
+        const committedNames = (data.committed || [])
+          .map(c => c.name)
+          .filter(Boolean)
+          .slice(0, 3)
+          .join(' · ');
+        this.flash(`✓ 已寫入：${committedNames || data.entries?.[0]?.name || '食物'}`);
+        await this.loadRecentScans();
       } catch(e) {
         this.flash('Error：' + e.message);
       } finally {
@@ -2896,20 +2868,23 @@ function gymApp() {
     },
 
     // v2.3: iPhone photo stream multi-select picker (independent of server cache).
-    // Picks N photos from iOS Photos app → sequentially fetches preview for each → renders queue
-    // in UI below scan tab. Each queue item shows preview card with ✓ / skip / open-edit actions.
+    // v3.2.7.23: server now ALWAYS auto-commits (Jim OOB 2026-08-10
+    // 'we dont need to preview for my confirmation. just log it right
+    // away'), so the queue card no longer has a confirm button — every
+    // photo gets written to nutrition_log + sheet + scan_log the moment
+    // AI finishes. Cards are still shown briefly for transparency so Jim
+    // can see what was logged; if anything's wrong he can ✏️ edit / 🗑️
+    // delete on the food card after-the-fact.
     async onScanPhotosPicked(event) {
       const files = Array.from(event.target.files || []);
       if (files.length === 0) return;
-      this.flash(`你揀咗 ${files.length} 張相，AI 逐張睇緊…`);
+      this.flash(`你揀咗 ${files.length} 張相，AI 逐張睇緊同寫入 log…`);
       this.scanPhotosQueue = files.map((f, i) => ({
         client_index: i,
         filename: f.name || `image_${i+1}.jpg`,
         file_size_kb: Math.round(f.size / 1024),
-        status: 'pending',  // pending | processing | ready | committed | skipped | failed
+        status: 'pending',  // pending | processing | committed | skipped | failed
         preview: null,
-        edit_mode: false,
-        previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
         error: null,
       }));
       this.scanPhotosQueueDone = 0;
@@ -2927,38 +2902,14 @@ function gymApp() {
           const data = await r.json();
           if (!data.ok) {
             queueItem.status = 'failed';
-            queueItem.error = data.error || 'preview failed';
+            queueItem.error = data.error || 'scan failed';
           } else {
             queueItem.preview = data.preview;
-            // v3.2.7.19: surface needs_user_input + reason so the
-            // preview card can show a warning when the AI is unsure
-            // (narration in name, or vision failed). Jim OOB 2026-08-10
-            // 'one picture without image and one image without image'.
-            queueItem.preview.needs_user_input = !!data.needs_user_input;
-            queueItem.preview.needs_user_input_reason = data.needs_user_input_reason || "";
-            queueItem.previewCorrectForm = {
-              name: data.preview.suggested_entry.name || '',
-              restaurant_chain: data.preview.suggested_entry.restaurant_chain || '',
-              calories: data.preview.suggested_entry.calories || null,
-              protein: data.preview.suggested_entry.protein || null,
-              carbs: data.preview.suggested_entry.carbs || null,
-              fat: data.preview.suggested_entry.fat || null,
-              note: '',
-            };
-            // v3.2.7.21: when scan_preview already auto-committed (the
-            // server wrote the entry to nutrition_log + scan_log before
-            // returning), mark the queue item as 'committed' so the
-            // confirm button is disabled. Otherwise Jim's tap on
-            // '✓ 確認 log' would call scan_commit AGAIN and create a
-            // duplicate row. (Jim OOB 2026-08-10 'one photo generates
-            // two broken records' — the 23:30 海南雞 was a duplicate of
-            // the 23:29 auto-commit 16s earlier.)
-            if (data.auto_committed) {
-              queueItem.status = 'committed';
-              queueItem.auto_committed = true;
-            } else {
-              queueItem.status = 'ready';
-            }
+            // v3.2.7.23: server always auto-commits, so the queue item
+            // goes straight to 'committed'. No 'ready' state anymore —
+            // the confirm button is gone from the queue card UI.
+            queueItem.status = 'committed';
+            queueItem.auto_committed = true;
           }
         } catch (e) {
           queueItem.status = 'failed';
@@ -2967,75 +2918,27 @@ function gymApp() {
         this.scanPhotosQueueDone = i + 1;
         this.scanPhotosQueue = [...this.scanPhotosQueue];  // trigger reactivity
       }
-      // v3.2.7.21: summarise per-photo outcomes so Jim knows which ones
-      // were auto-committed (no need to tap confirm) vs which need
-      // explicit confirmation. Prevents the 'one photo → two records'
-      // duplicate bug where the auto-commit row was followed by a
-      // manual confirm on the same photo.
-      const ac = this.scanPhotosQueue.filter(q => q.status === 'committed' && q.auto_committed).length;
-      const need = this.scanPhotosQueue.filter(q => q.status === 'ready').length;
+      // v3.2.7.23: summarise per-photo outcomes. With always-auto-commit,
+      // every successful scan is committed; only failures need attention.
+      const ok = this.scanPhotosQueue.filter(q => q.status === 'committed').length;
       const fail = this.scanPhotosQueue.filter(q => q.status === 'failed').length;
-      if (ac > 0 && need === 0 && fail === 0) {
-        this.flash(`✓ ${ac} 張已自動寫入 log + Sheet`);
-      } else if (ac > 0 && need > 0) {
-        this.flash(`✓ ${ac} 張自動寫入 · 仲有 ${need} 張等你確認`);
-      } else if (this.scanPhotosQueue.length === this.scanPhotosQueueDone) {
-        this.flash(`✓ 全部 ${this.scanPhotosQueueDone} 張 AI 睇完，可以逐張確認`);
+      if (fail === 0) {
+        this.flash(`✓ 全部 ${ok} 張已直接寫入 log + Sheet`);
+      } else if (ok > 0) {
+        this.flash(`✓ ${ok} 張寫入 · ⚠️ ${fail} 張失敗，睇下點解`);
       } else {
-        this.flash(`⚠️ ${this.scanPhotosQueueDone}/${this.scanPhotosQueue.length} 完成，睇下有冇失敗`);
+        this.flash(`⚠️ ${fail} 張全部失敗`);
       }
+      // Refresh food log so the new entries appear immediately on the
+      // scan tab (Jim OOB 2026-08-10 'just log it right away' — wants
+      // to see the row in the timeline without tab-switching).
+      await this.loadRecentScans();
       event.target.value = '';  // reset picker so same files can be re-picked later
     },
 
-    // v2.3: commit one queue item (called per queue card's ✓ confirm button)
-    async commitQueueItem(idx) {
-      const item = this.scanPhotosQueue[idx];
-      if (!item || item.status !== 'ready' || !item.preview) {
-        this.flash('呢張未 ready 唔可以 log');
-        return;
-      }
-      try {
-        const baseEntry = item.preview.suggested_entry;
-        const form = item.previewCorrectForm;
-        const finalEntry = {
-          ...baseEntry,
-          name: form.name || baseEntry.name,
-          restaurant_chain: form.restaurant_chain || baseEntry.restaurant_chain,
-          calories: form.calories ?? baseEntry.calories,
-          protein: form.protein ?? baseEntry.protein,
-          carbs: form.carbs ?? baseEntry.carbs,
-          fat: form.fat ?? baseEntry.fat,
-        };
-        const r = await fetch('/api/scan_commit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            entry: finalEntry,
-            image_path: item.preview.image_path,
-            user_correction: form.note ? form : null,
-          }),
-        });
-        const data = await r.json();
-        if (data.ok) {
-          item.status = 'committed';
-          this.flash(`✓ 張 ${idx+1} (${item.filename.slice(0,12)}) 寫入 log + Sheet`);
-          // v2.7.42: align with commitScanText + commitPreview — refresh recent scans
-          // so the food log card shows grade + coach_comment immediately
-          await this.loadRecentScans();
-        } else {
-          item.status = 'failed';
-          item.error = data.error || 'commit failed';
-          this.flash('Log 失敗：' + item.error);
-        }
-      } catch (e) {
-        item.status = 'failed';
-        item.error = e.message;
-        this.flash('Error：' + e.message);
-      }
-      this.scanPhotosQueue = [...this.scanPhotosQueue];
-    },
-
-    // v2.3: skip one queue item (mark skipped, don't commit)
+    // v2.3: skip one queue item (mark skipped — purely UI; entry already
+    // logged by scan_preview's auto-commit). Jim uses this to dismiss a
+    // queue card without affecting the underlying food log entry.
     skipQueueItem(idx) {
       const item = this.scanPhotosQueue[idx];
       if (!item) return;

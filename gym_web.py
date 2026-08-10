@@ -710,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.22"
+__version__ = "3.2.7.23"
 
 
 def _recovery_pct():
@@ -4729,73 +4729,15 @@ def api_scan_preview():
         scan_log.append(log_row)
     _save_scan_log(scan_log)
 
-    # v3.2.7.15: do NOT auto-commit when vision failed and name is empty/
-    # generic. Return preview shape with a flag instead so frontend can
-    # surface "no food detected" without polluting food log + sheet.
-    # v3.2.7.17: also reject named entries whose name still contains
-    # narration prose (e.g. "這張相顯示一支蘇打水樽，品牌為"). If any
-    # entry has narration in its name, do NOT auto-commit — let the user
-    # see the preview and edit. (Jim OOB 2026-08-10)
-    # v3.2.7.19: ALSO check name against the regex fallback so the
-    # extracted name surfaces even when the AI classifier flagged it.
-    # Previously, when narration was detected, the preview returned
-    # empty suggested_entry — which made the frontend show "菜名: —"
-    # with empty calories (Jim OOB 2026-08-10 'one picture without image
-    # and one image without image'). Now we always return the best
-    # extracted entry in the preview; has_meaningful only gates
-    # auto-commit.
-    narration_block = bool(entries_list) and any(
-        e.get("name", "").strip()
-        and (_name_has_narration(e.get("name", ""))
-             or str(e.get("name","")).startswith("（"))
-        for e in entries_list
-    )
-    has_meaningful = bool(entries_list) and any(
-        e.get("name", "").strip()
-        and not str(e.get("name","")).startswith("（")
-        and not _name_has_narration(e.get("name", ""))
-        and e.get("calories", 0) > 0
-        for e in entries_list
-    )
-    if not has_meaningful:
-        # Jim OOB 2026-08-10: still show the best extracted entry so the
-        # frontend can display the AI's guess (with a warning) rather
-        # than a blank placeholder. If entries_list is empty (vision
-        # completely failed), fall back to the empty placeholder.
-        preview_suggested = entries_list[0] if entries_list else {
-            "name": "",
-            "calories": 0,
-            "protein": 0,
-            "carbs": 0,
-            "fat": 0,
-            "restaurant_chain": "",
-            "is_shared_meal": False,
-        }
-        return jsonify({
-            "ok": True,
-            "auto_committed": False,
-            "needs_user_input": True,
-            "needs_user_input_reason": (
-                "narration_detected" if narration_block
-                else "vision_failed_or_generic"
-            ),
-            "image_path": str(final_path),
-            "image_url": image_url,
-            "vision_desc": vision_desc,
-            "vision_short": vision_desc[:300],
-            "is_multi_entry": False,
-            "entries": entries_list,
-            "committed": [],
-            "multi_entry": False,
-            "preview": {
-                "image_path": str(final_path),
-                "image_url": image_url,
-                "vision_short": vision_desc[:300] or "冇食物辨認到，請手動輸入菜名。",
-                "vision_desc": vision_desc,
-                "suggested_entry": preview_suggested,
-            },
-        })
-
+    # v3.2.7.23: ALWAYS auto-commit (Jim OOB 2026-08-10 'we dont need to
+    # preview for my confirmation. just log it right away'). Previously
+    # this endpoint refused to commit when the extracted name still
+    # contained narration text (e.g. "這張相顯示一支蘇打水樽"), instead
+    # returning auto_committed=False + needs_user_input=True so the
+    # frontend could surface a warning. Now we trust the dish-name
+    # extractor (lines 4674-4688 above) to do its best job and write
+    # the entry unconditionally. If Jim sees a wrong name, he can
+    # use ✏️ edit / 🗑️ delete on the food card after-the-fact.
     return jsonify({
         "ok": True,
         "auto_committed": True,
