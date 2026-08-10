@@ -21,7 +21,7 @@ NUTRITION_SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
 NUTRITION_TAB_NAME = "Nutrition"
 
 # v3.x version — keep in sync with __version__ in gym_web.py
-VERSION = "3.2.7.19"
+VERSION = "3.2.7.20"
 GIT_COMMIT = "pre-release"  # updated on tag
 
 

@@ -1360,6 +1360,10 @@ function gymApp() {
     scheduleTotalSets: 0,
     scheduleRangeLabel: '',
     scheduleHasAny: false,
+    // v3.2.7.19: monthly navigation — 0 = current month, -1 = previous,
+    // -2 = two months back, etc. No future navigation.
+    scheduleMonthOffset: 0,
+    scheduleViewLabel: '',
     // v3.2.5: month calendar popover — tap a day to see full details.
     scheduleSelectedDay: null,
     // v3.1.0: legacy tab aliases. Old 6 tabs (set/workout/history/scan/end/cheer)
@@ -2394,19 +2398,25 @@ function gymApp() {
     async loadSchedule() {
       this.scheduleLoading = true;
       try {
-        const monthRes = await fetch('/api/whoop_activities_calendar?days=42').then(r => r.json());
+        // v3.2.7.19: month view. Compute target YYYY-MM from offset.
+        // offset=0 → current month; offset=-1 → previous month; etc.
+        const now = new Date();
+        const target = new Date(now.getFullYear(), now.getMonth() + this.scheduleMonthOffset, 1);
+        const monthStr = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}`;
+        const monthRes = await fetch(`/api/whoop_activities_calendar?month=${monthStr}`).then(r => r.json());
         this.scheduleMonth = monthRes.days || [];
         this.scheduleMonthGymCount = monthRes.gym_count || 0;
         this.scheduleMonthOtherCount = monthRes.other_count || 0;
         this.scheduleTotalVolume = monthRes.total_volume_kg || 0;
         this.scheduleTotalSets = monthRes.total_sets || 0;
+        this.scheduleViewLabel = monthRes.view_label || monthStr;
         const rs = monthRes.range_start || '';
         const re = monthRes.range_end || '';
         this.scheduleRangeLabel = rs && re
           ? `${rs.slice(5)} – ${re.slice(5)}`
           : '';
         // Build aligned grid: prepend invisible filler cells so day 1 of
-        // range lands in its correct weekday column.
+        // the month lands in its correct weekday column.
         const aligned = [];
         if (this.scheduleMonth.length > 0) {
           const firstDow = this.scheduleMonth[0].weekday || 0;  // 0=Mon, 6=Sun (Python)
@@ -2433,6 +2443,12 @@ function gymApp() {
       } finally {
         this.scheduleLoading = false;
       }
+    },
+
+    // v3.2.7.19: previous-month navigation. No future navigation.
+    async schedulePrevMonth() {
+      this.scheduleMonthOffset -= 1;
+      await this.loadSchedule();
     },
 
     async loadRecentScans() {
@@ -3742,7 +3758,7 @@ setTimeout(checkLandscapeFood, 500);
   <div x-show="!scheduleLoading && !scheduleHasAny"
        class="text-center py-16 px-4">
     <div class="text-4xl mb-3">📅</div>
-    <div class="text-base text-gray-300 mb-1">呢 6 週冇活動紀錄</div>
+    <div class="text-base text-gray-300 mb-1" x-text="scheduleMonthOffset === 0 ? '呢個月冇活動紀錄' : '呢個月冇活動紀錄'"></div>
     <div class="text-xs text-gray-500">做 gym 或者出街行下, 紀錄會即刻出現</div>
   </div>
 
@@ -3750,11 +3766,23 @@ setTimeout(checkLandscapeFood, 500);
 
     <!-- v3.2.6: monthly calendar ONLY. The week strip + list view were
          removed (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar
-         view. Remove its list view and weekly view'). The 42-day grid
+         view. Remove its list view and weekly view'). The monthly grid
          is the single source of truth — tap any day to see full
          activity details in the popover below. -->
 
-    <!-- ============ MONTHLY CALENDAR (42 days back, enriched) ============ -->
+    <!-- v3.2.7.19: month navigation bar. ← 上一個月 + month label.
+         No next-month button (Jim OOB 2026-08-10 'no need to navigate
+         future month'). Compact 28px row at the top. -->
+    <div class="flex items-center justify-between px-1 mb-1 h-7">
+      <button @click="schedulePrevMonth()"
+              class="text-xs text-emerald-300 hover:text-emerald-200 active:scale-95 transition flex items-center gap-0.5 px-1.5 py-0.5 rounded">
+        <span>←</span><span>上一個月</span>
+      </button>
+      <div class="text-xs font-bold text-gray-300" x-text="scheduleViewLabel"></div>
+      <div class="w-16"></div><!-- spacer to keep label centered (matches prev btn width) -->
+    </div>
+
+    <!-- ============ MONTHLY CALENDAR (current month, enriched) ============ -->
     <!-- v3.2.7: cells now show gym volume + sets + recovery %, enriched
          via /api/whoop_activities_calendar. (Jim OOB 2026-08-07 23:40 HKT
          'beatify the month view with enriched data'.) -->
@@ -3790,8 +3818,8 @@ setTimeout(checkLandscapeFood, 500);
            top and at the bottom'). The schedule section is now fixed-
            positioned to fill the area between the page header and the
            bottom nav, so the grid naturally stretches to the bottom. -->
-      <div class="grid grid-cols-7 gap-1 flex-1 min-h-0"
-           style="grid-auto-rows: minmax(80px, 1fr);">
+      <div class="grid grid-cols-7 gap-1 flex-1 min-h-0 content-start"
+           style="grid-auto-rows: minmax(50px, 1fr);">
         <template x-for="day in scheduleMonthAligned" :key="day.date">
           <!-- v3.2.7: enriched cell layout — 3 visual states:
                (1) gym day  → bg-emerald + day-num + volume + sets + recovery chip
@@ -3799,10 +3827,12 @@ setTimeout(checkLandscapeFood, 500);
                (3) rest     → bg-transparent + day-num + recovery chip (if data)
                Empty days + non-today are blank. Today always gets a ring.
                (Jim OOB 2026-08-07 23:40 HKT 'beatify the month view with
-               enriched data'.) -->
+               enriched data'.)
+               v3.2.7.19: aspect-square so cells stay square (Jim OOB
+               2026-08-10 'calendar is now too tall'). -->
           <div class="rounded-lg p-0.5 flex flex-col items-stretch justify-start transition-all overflow-hidden"
                :class="dayCellClass(day)"
-               :style="day.empty ? 'height: 4px;' : ''"
+               :style="day.empty ? 'height: 4px; aspect-ratio: auto;' : 'aspect-ratio: 1 / 1;'"
                @click="day.activities && day.activities.length > 0 ? openDayPopover(day) : (day.recovery_pct != null ? openDayPopover(day) : null)">
             <!-- v3.2.8: single coherent layout rhythm for all cells.
                  Day-num top-left, recovery chip top-right.

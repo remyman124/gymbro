@@ -15,7 +15,7 @@ import re
 import secrets
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from datetime import datetime as _dt
 from pathlib import Path
 
@@ -314,17 +314,47 @@ def _schedule_enrichment():
 def api_whoop_activities_calendar():
     """v3.2.0/v3.2.7: monthly calendar for schedule tab — enriched.
 
-    Returns activities grouped by date for the past N days (default 42),
-    enriched with workout-log volume/sets/exercises + Whoop recovery
-    (HRV + recovery %) + Whoop sleep performance %.
+    Returns activities grouped by date, enriched with workout-log
+    volume/sets/exercises + Whoop recovery (HRV + recovery %) + Whoop
+    sleep performance %.
+
+    Two modes:
+    - `?month=YYYY-MM` (preferred): return all days of that month.
+    - `?days=N` (legacy): return the past N days (default 42, max 90).
     """
-    try:
-        days_n = int(request.args.get("days", 42))
-    except (TypeError, ValueError):
-        days_n = 42
-    days_n = max(7, min(days_n, 90))
     today = datetime.now(HKT).date()
-    start_date = today - timedelta(days=days_n - 1)
+    month_arg = (request.args.get("month") or "").strip()
+
+    if month_arg:
+        # v3.2.7.19: monthly view. Return all days in that calendar month.
+        try:
+            year_s, month_s = month_arg.split("-", 1)
+            year_i = int(year_s)
+            month_i = int(month_s)
+            if month_i < 1 or month_i > 12:
+                raise ValueError
+        except (ValueError, AttributeError):
+            year_i, month_i = today.year, today.month
+        # First day of month → first day of next month (exclusive)
+        start_date = date(year_i, month_i, 1)
+        if month_i == 12:
+            end_date_excl = date(year_i + 1, 1, 1)
+        else:
+            end_date_excl = date(year_i, month_i + 1, 1)
+        days_n = (end_date_excl - start_date).days
+        is_current_month = (year_i == today.year and month_i == today.month)
+        view_label = f"{year_i}年{month_i}月"
+    else:
+        # Legacy: past N days rolling
+        try:
+            days_n = int(request.args.get("days", 42))
+        except (TypeError, ValueError):
+            days_n = 42
+        days_n = max(7, min(days_n, 90))
+        start_date = today - timedelta(days=days_n - 1)
+        is_current_month = True
+        view_label = ""
+
     activities = _whoop_activities_normalized()
     by_date = {}
     for a in activities:
@@ -371,10 +401,14 @@ def api_whoop_activities_calendar():
             "sleep_pct": ed.get("sleep_pct"),
             "is_today": iso == today.isoformat(),
         })
+    end_date = start_date + timedelta(days=days_n - 1)
     return jsonify({
         "days": days,
         "range_start": start_date.isoformat(),
-        "range_end": today.isoformat(),
+        "range_end": end_date.isoformat(),
+        "view_month": month_arg or "",
+        "view_label": view_label,
+        "is_current_month": is_current_month,
         "total_activities": len(activities),
         "gym_count": gym_count,
         "other_count": other_count,
@@ -676,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.19"
+__version__ = "3.2.7.20"
 
 
 def _recovery_pct():
