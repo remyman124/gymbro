@@ -56,12 +56,12 @@ def test_api_scan_recent_returns_hainanji():
 
 
 def test_sw_cache_bumped():
-    """v3.2.7.28 fix — the SW cache must be v117 so iPhone PWA evicts stale data."""
+    """v3.2.7.32 fix — the SW cache must be v121 so iPhone PWA evicts stale data."""
     resp = urllib.request.urlopen("http://localhost:7000/sw.js", timeout=10)
     sw = resp.read().decode()
-    assert "gym-web-v119" in sw, "SW cache is not v117 — bump CACHE in gym_web.py"
+    assert "gym-web-v121" in sw, "SW cache is not v121 — bump CACHE in gym_web.py"
     assert "gym-web-v116" not in sw, "stale v116 still referenced in SW"
-    print("  ✓ SW cache: v117 (old v116 evicted)")
+    print("  ✓ SW cache: v117 (old v120 evicted)")
 
 
 def test_frontend_grouping_keeps_hainanji():

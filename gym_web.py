@@ -710,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.31"
+__version__ = "3.2.7.32"
 
 
 def _recovery_pct():
@@ -2652,7 +2652,7 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
         f"(KFC, McDonald's, Starbucks). Otherwise use typical HK portion."
     )
     payload = {
-        "model": "MiniMax-M3-highspeed",
+        "model": "MiniMax-M3",
         "messages": [
             {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
             {"role": "user", "content": prompt},
@@ -2713,7 +2713,7 @@ def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
         f"Otherwise typical HK portion. If only ONE dish, return 1-element array."
     )
     payload = {
-        "model": "MiniMax-M3-highspeed",
+        "model": "MiniMax-M3",
         "messages": [
             {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
             {"role": "user", "content": prompt},
@@ -2810,7 +2810,7 @@ def _ai_check_narration(name: str) -> bool:
         return True
 
     payload = {
-        "model": "MiniMax-M3-highspeed",
+        "model": "MiniMax-M3",
         "messages": [
             {
                 "role": "system",
@@ -2869,49 +2869,75 @@ def _name_has_narration(name: str) -> bool:
 def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     """v3.2.7.4: AI-based dish name extraction (Jim OOB 2026-08-08 10:35 HKT
     'No regex. Use ai' + 'Use minimax too'). Primary path: MiniMax M3
-    via api.minimax.io. Fallback: APiyi gpt-4o-mini. Last resort: regex.
+    via api.minimax.io. Returns 2-12 char SPECIFIC Cantonese dish name.
 
-    v3.2.7.6 (Jim OOB 2026-08-08 10:30 HKT 'should recognise as 雞蛋、麵包'):
-    Generic meal labels ('早餐', '午餐', '晚餐', 'afternoon tea') are NOT
-    acceptable — must extract the actual dishes in the meal (e.g. 煎蛋、
-    烤麵包). When vision says only '簡單嘅早餐' / '簡單嘅晚餐' etc.,
-    look deeper for actual food items (蛋類/麵包/粉麵/飯/粥/餐肉).
+    v3.2.7.6: Generic meal labels ('早餐', '午餐', '晚餐', 'afternoon tea')
+    are NOT acceptable — must extract the actual dishes in the meal.
 
-    Returns 2-12 char SPECIFIC Cantonese dish name, e.g.:
-      '相顯示咗一塊千層蛋糕' → '千層蛋糕'
-      '可見海南雞飯配青瓜' → '海南雞飯'
-      '一杯黑咖啡' → '黑咖啡'
-      '一碗白飯同青菜' → '白飯'
-      '相顯示咗一個簡單嘅早餐' → '煎蛋、烤麵包' (NOT '早餐')
+    v3.2.7.32: Vision now returns plaintext, but older entries in
+    scan_log still contain markdown like '**詳細描述：** \\n 1. **菜式：**'
+    — strip those headers out before sending to the dish-name AI, and
+    reject AI responses that are themselves label words (菜式, 菜名, 主菜,
+    etc.). Jim OOB 2026-08-11 'why today recognized food as 菜式 as food
+    name!!!! are you using AI to find the food???? don't use rule/regex'
+    — extraction is AI-only now (no regex cascade).
     """
     if not vision_desc and not pplx_desc:
         return ""
-    combined = ((vision_desc or "") + "\n" + (pplx_desc or "")).strip()[:600]
+    combined = ((vision_desc or "") + "\n" + (pplx_desc or "")).strip()
     if not combined:
         return ""
 
+    # v3.2.7.32: pre-process to remove markdown section headers that older
+    # vision outputs used to embed (e.g. "詳細描述：" / "菜式：" / "份量：").
+    # Strip `**...：**` headings and bare `xxx：` token-only lines so the
+    # AI never sees the structural labels as candidate dish names.
+    cleaned_lines = []
+    for line in combined.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        # 1. Strip leading list markers ('1. ', '2. ') and bullets
+        # ('- ', '• ', '· ') so '1. **菜式：**' reduces to '**菜式：**'
+        # BEFORE the label-regex check below.
+        s = re.sub(r"^\d+\.\s*", "", s)
+        s = re.sub(r"^[-•·]\s*", "", s).strip()
+        if not s:
+            continue
+        # 2. Drop lines that are just a section header / label:
+        # `**詳細描述：**` (bold wrapper), `菜式：` (plain label + colon).
+        if re.match(r"^\*\*?[^*:\n]{1,8}：\*\*?\s*$|^\*\*?[^*:\n]{1,8}:\*\*?\s*$|^[^*:\n]{1,8}[：:]\s*$", s):
+            continue
+        cleaned_lines.append(s)
+    cleaned = "\n".join(l for l in cleaned_lines if l).strip()[:800]
+
+    if not cleaned:
+        return ""
+
     prompt = (
-        "你係香港人，識粵語。以下係食物描述。"
-        "淨係俾我 2-8 個中文字嘅 SPECIFIC 菜名，唔好加任何描述、量詞、前綴、餐廳名。"
-        "重要規則："
-        "(1) 唔可以用 generic 餐名 ('早餐'、'午餐'、'晚餐'、'下午茶') 當菜名；"
-        "    一定要抽實際嘅食物 (例如：煎蛋、烤麵包、粥、飯)。"
-        "(2) 如果只見到 '簡單嘅早餐' / '簡單嘅晚餐' / '簡單嘅一餐' 等 generic 字眼，"
-        "    就要從描述中揾實際嘅主體食物 (蛋類/麵包/粉麵/飯/粥/餐肉)。"
-        "(3) 多過一樣食物可以用 '、' 分隔 (例如：'煎蛋、烤麵包')。"
-        "(4) 絕對唔可以寫 '相顯示...'、'呢張相...'、'圖中可見...' 等等敘述性句式，"
-        "    唔可以寫 '品牌為...'、'牌子係...' 等品牌描述，"
-        "    唔可以寫 '一支XXX樽'、'一個XXX盒' 等容器+量詞組合。"
-        "    例如：'這張相顯示一支蘇打水樽，品牌為' -> 直接寫 '蘇打水'。"
-        "\\n\\n例子："
+        "你係香港人，識粵語。以下係食物描述（可能由舊模型產生仍帶markdown/標題）。"
+        "淨係俾我 2-8 個中文字嘅 SPECIFIC 菜名，唔好加任何描述、量詞、前綴、餐廳名。\n"
+        "絕對唔可以做嘅事：\n"
+        "(A) 唔可以回任何 section 標題、label 類字眼 — 例如 '菜式'、'菜名'、"
+        "'主菜'、'副菜'、'前菜'、'甜品'、'湯品'、'飲品'、'煮法'、'份量'、"
+        "'詳細描述'、'菜單'、'餐牌'、'品牌'、'餐廳'。"
+        "如果描述入面得 section header 冇實際菜名，回 '未識別'。\n"
+        "(B) 唔可以用 generic 餐名 ('早餐'、'午餐'、'晚餐'、'下午茶') 當菜名；"
+        "一定要抽實際嘅食物 (例如：煎蛋、烤麵包、粥、飯、雞胸、青瓜、檸檬茶)。\n"
+        "(C) 多過一樣食物可以用 '、' 分隔 (例如：'煎蛋、烤麵包')。\n"
+        "(D) 唔好寫 '相顯示...'、'呢張相...'、'圖中可見...' 等等敘述性句式，"
+        "唔好寫 '品牌為...'、'牌子係...' 等品牌描述，"
+        "唔好寫 '一支XXX樽'、'一個XXX盒' 等容器+量詞組合。\n\n"
+        "例子："
         "'千層蛋糕'（唔好寫'相顯示咗一塊千層蛋糕'），"
         "'海南雞飯'（唔好寫'可見海南雞飯配青瓜'），"
         "'黑咖啡'（唔好寫'一杯黑咖啡'），"
         "'凍檸茶'（唔好寫'一杯凍檸茶'），"
-        "'沙律雞'（唔好寫'一份沙律雞胸'），"
-        "'白飯'（唔好寫'一碗白飯同青菜'），"
-        "'煎蛋、烤麵包'（唔好寫'簡單嘅早餐'，generic 餐名唔接受）。"
-        "\\n\\n描述：\\n" + combined + "\\n\\n菜名："
+        "'雞胸肉'（唔好寫'菜式：'或'主菜：'），"
+        "'蘇打水'（唔好寫'一支蘇打水樽'），"
+        "'煎蛋、烤麵包'（唔好寫'簡單嘅早餐'，generic 餐名唔接受），"
+        "'馬黛茶'（唔好寫'- 馬黛茶（未見到有沖水...）。'）。\n\n"
+        "描述：\n" + cleaned + "\n\n菜名："
     )
 
     # Try MiniMax first
@@ -2920,9 +2946,15 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
         api_key = _minimax_api_key()
         if api_key:
             payload = {
-                "model": "MiniMax-M3-highspeed",
+                "model": "MiniMax-M3",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 20,
+                # v3.2.7.32: MiniMax M3 emits a ` 進思考...進思考` block
+                # before the final answer. max_tokens=30 was clipping the
+                # answer (e.g. returned just the think block) so the
+                # extractor got nothing. 500 fits a typical think (~300-450
+                # tokens) + the 2-12 char dish name (≤12 tokens). Calls
+                # take ~3-7s.
+                "max_tokens": 1500,
                 "temperature": 0.1,
             }
             req = urllib.request.Request(
@@ -2933,199 +2965,136 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
                     "Authorization": "".join(["Bearer ", api_key]),
                 },
             )
-            with urllib.request.urlopen(req, timeout=8) as r:
-                data = _json.loads(r.read())
-            dish = (data["choices"][0]["message"]["content"] or "").strip()
-            dish = dish.strip("「」『』\"'` \n\r\t")
-            # v3.2.7.17: post-AI narration guard. If the model still leaks
-            # narration ("這張相顯示..." / "品牌為..." / "一支XXX樽") despite
-            # the prompt, fall through to the regex extractor instead of
-            # saving the narration as the dish name. (Jim OOB 2026-08-10
-            # 'Don't make this 這張相顯示一支蘇打水樽，品牌為'.)
-            if dish and _name_has_narration(dish):
-                # Bail out of AI path — let regex fallback handle it
-                pass
-            elif 2 <= len(dish) <= 12:
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = _json.loads(r.read())
+                dish = (data["choices"][0]["message"]["content"] or "").strip()
+            except Exception:
+                dish = ""
+            # v3.2.7.32: strip the M3 `` reasoning block if present so
+            # downstream guards see only the final answer.
+            dish = re.sub(r"^\s*<think.*?</think>\s*", "", dish, flags=re.DOTALL)
+            dish = dish.strip()
+            dish = dish.strip("「」『』\"'` \n\r\t。.,，")
+            # v3.2.7.32: post-AI label guard. Strip any leading bullet /
+            # dash / section label that the model occasionally copies
+            # through (e.g. "- 馬黛茶..." → "馬黛茶"; "菜式：" → "").
+            dish = re.sub(r"^[-•·\s]+", "", dish)
+            dish = dish.strip("：:，,。. ")
+            # v3.2.7.32: reject label/header words returned as the dish
+            label_words = {
+                "菜式", "菜名", "主菜", "副菜", "前菜", "甜品", "湯品",
+                "飲品", "煮法", "份量", "份量大小", "份量（目測）",
+                "詳細描述", "菜單", "餐牌", "品牌", "餐廳", "套餐",
+                "菜式：", "菜名：", "未識別", "未能識別",
+            }
+            # v3.2.7.32: safety net — if M3 emitted a `進思考` block but
+            # never closed (max_tokens cut off mid-think), discard the
+            # partial think instead of saving narration as the dish.
+            if "進思考" in dish:
+                return ""
+            if dish in label_words or not dish or len(dish) > 16:
+                return ""
+            # v3.2.7.17: narration guard (相顯示... / 一支XXX樽...). If
+            # it leaks, ask once more with a stricter prompt — and on
+            # second failure, return empty (caller will surface to user
+            # instead of saving narration as dish name).
+            if _name_has_narration(dish):
+                retry_payload = {
+                    "model": "MiniMax-M3",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"以下係你之前回嘅菜名，但係敘述性句子唔係菜名：'{dish}'。\n"
+                                f"原始描述：{cleaned[:400]}\n\n"
+                                "只回 2-8 個中文字嘅 SPECIFIC 菜名，例如 '海南雞飯'、"
+                                "'蘇打水'、'煎蛋'。唔好再寫敘述。"
+                            ),
+                        }
+                    ],
+                    "max_tokens": 1500,
+                    "temperature": 0,
+                }
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        "https://api.minimax.io/v1/chat/completions",
+                        data=_json.dumps(retry_payload).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": "".join(["Bearer ", api_key]),
+                        },
+                    ),
+                    timeout=8,
+                ) as r2:
+                    data2 = _json.loads(r2.read())
+                dish2 = (data2["choices"][0]["message"]["content"] or "").strip()
+                dish2 = dish2.strip("「」『』\"'` \n\r\t。.,，")
+                dish2 = re.sub(r"^[-•·\s]+", "", dish2).strip("：:，,。. ")
+                if (not dish2 or dish2 in label_words or len(dish2) > 16
+                        or _name_has_narration(dish2)):
+                    return ""
+                return dish2
+            if 2 <= len(dish) <= 16:
                 return dish
     except Exception:
         pass
 
-    # v3.2.7.12: Dish-name extraction is NOT food recognition, so use
-    # MiniMax M3-highspeed as fallback (per Jim OOB 2026-08-08 20:55 HKT
-    # 'Don't use gpt except food recognition dual scanning'). The primary
-    # MiniMax call above already tried via the same helper.
-    # If both fail, regex fallback below handles it.
+    # v3.2.7.32: no regex fallback (per Jim OOB 2026-08-11 'don't use
+    # rule/regex'). If the AI can't decide, return empty so the caller
+    # surfaces the issue rather than silently saving a garbage name.
     return ""
 
 
 def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = "") -> str:
-    """v2.7.32: Extract first concrete dish name from vision + pplx descriptions.
+    """v3.2.7.32: AI-only dish-name extraction. No regex cascade.
 
-    v3.2.7.4: AI-first (MiniMax → APiyi → regex fallback). No more pure regex.
-    Returns 2-6 char SPECIFIC Cantonese dish name. Examples:
+    Jim OOB 2026-08-11 'are you using AI to find the food?? don't use
+    rule/regex' — extract is now strictly AI. If the AI can't decide,
+    fall back to the caller-supplied hint (e.g. user typed the name in
+    the confirm box), or the marker '未識別菜式' so the frontend can
+    prompt the user to name it.
+
+    Returns a 2-12 char SPECIFIC Cantonese dish name, e.g.:
       '相顯示咗一塊千層蛋糕' → '千層蛋糕'
       '可見海南雞飯配青瓜' → '海南雞飯'
       '一杯黑咖啡' → '黑咖啡'
     """
-    # v3.2.7.4: try AI first
+    # v3.2.7.32: AI only — no regex extraction. The previous regex
+    # cascade below (lines 3033-3191 in v3.2.7.32; now removed) included
+    # `菜式[：:]\s*xxx` patterns that returned nonsense labels like
+    # '菜式' when vision output used markdown headers. Jim OOB
+    # 2026-08-11 'don't use rule/regex'. The base prompt in
+    # _extract_dish_name_ai also rejects label/header words and retries
+    # once on narration.
     ai_result = _extract_dish_name_ai(vision_desc, pplx_desc)
-    if ai_result and 2 <= len(ai_result) <= 12:
-        # v3.2.7.6: reject generic meal labels from AI too — fall through to
-        # better extraction (Jim OOB 2026-08-08 10:30 HKT 'should recognise
-        # as 雞蛋、麵包' — vision said '簡單嘅早餐', AI returned '早餐',
-        # but should be '煎蛋、烤麵包' from re-asking).
-        generic_labels = {"早餐", "午餐", "晚餐", "午飯", "晚飯", "下午茶", "宵夜", "tea", "brunch", "dinner", "lunch", "breakfast",
-                         "第一道菜", "主菜", "副菜", "前菜", "甜品", "湯品", "飲品", "餐", "食物", "料理", "菜式", "餐點"}
+    # v3.2.7.32: bumped from 12 to 16 chars — multi-component dishes
+    # (e.g. '雞胸肉、青瓜、紅蘿蔔絲' = 15) are valid Cantonese names;
+    # the 12-char cap was rejecting them.
+    if ai_result and 2 <= len(ai_result) <= 16:
+        # v3.2.7.32: extended generic-label guard — covers all label-word
+        # sets that used to leak through regex OR AI (主菜/菜名/未識別).
+        generic_labels = {
+            "早餐", "午餐", "晚餐", "午飯", "晚飯", "下午茶",
+            "宵夜", "tea", "brunch", "dinner", "lunch",
+            "breakfast", "第一道菜", "主菜", "副菜", "前菜",
+            "甜品", "湯品", "飲品", "餐", "食物", "料理",
+            "菜式", "菜名", "菜式：", "菜名：", "套餐",
+            "未識別", "未識別菜式", "餐點",
+        }
         if ai_result not in generic_labels:
             return ai_result
 
-    combined = vision_desc + "\n" + pplx_desc
-    # Pattern 1: numbered dish "1. **激安二人餐**"
-    m = re.search(r"\d+\.\s*\*\*([^*\n]{2,30})\*\*", combined)
-    if m:
-        return m.group(1).strip()
-    # Pattern 2: 菜式：xxx / 菜名：xxx
-    m = re.search(r"菜式[：:]\s*([^\n.]{2,30})", combined)
-    if m:
-        return m.group(1).strip()
-    # Pattern 3: first non-empty sentence of vision (skip lines starting with 觀察/呢張)
-    # v2.7.53: also skip common Chinese sentence-initial adverbs/connectives
-    # (首先/再來/另外/最後/然後/接著/至於) that often appear in prose
-    # descriptions before the actual dish name. Without this filter, the
-    # extractor returned just "首先" for many image-only entries
-    # (Jim OOB 2026-08-07 14:15 HKT 'the recognized food name is showing
-    # 首先 only'). We strip the connective prefix AND keep searching the
-    # remaining meaningful content on the same line.
-    # v3.2.7: more connectives — APiyi gpt-4o-mini often starts with
-    # "相顯示...", "圖片可見...", "睇到..." etc. (Jim OOB 2026-08-07 23:50
-    # HKT 'food title not shown, just shows 相顯示xxx').
-    skip_prefixes = ("呢張", "這張", "此張", "該張",
-                    "觀察", "呢個", "呢份", "我見到", "呢碟", "呢碗", "呢個餐",
-                    "首先", "再來", "另外", "最後", "然後", "接著", "至於",
-                    "從圖", "從相", "圖中", "相中", "照片中", "圖片入面", "相片入面",
-                    "相顯示", "這張相顯示", "圖顯示", "圖中可見", "相中可見",
-                    "可見到", "睇到", "見到一", "睇到一", "可以見到", "可以睇到",
-                    "呢張相")
-    def _strip_prefix(s: str) -> str:
-        for p in skip_prefixes:
-            if s.startswith(p):
-                rest = s[len(p):].lstrip(" ，,。、")
-                return rest
-        return s
-    dish_suffixes = ("飯", "麵", "粥", "餅", "糕", "包", "卷", "雞", "牛", "豬", "魚", "蝦",
-                    "菜", "湯", "茶", "咖啡", "酒", "水", "奶", "糖", "蛋", "豆", "瓜",
-                    "梨", "桃", "莓", "果", "條", "片", "粒", "碗", "碟", "盤", "杯", "盒",
-                    "撻", "批", "酥", "圈", "條", "堡", "飯", "餐", "便當")
-    bad_nouns = ("透明", "塑料", "餐廳", "場景", "容器",
-                 "白色", "黑色", "綠色", "紅色", "黃色", "棕色")
-    containers = ("盒入面裝住嘅", "盒裝住嘅", "盒裝住", "入面裝住嘅",
-                  "入面裝住", "碗", "碟", "盒", "個", "裝住嘅", "裝住")
-    articles = ("咗一個透明嘅", "咗一個", "咗一塊", "咗一",
-                "一個透明嘅", "一個透明", "一個", "一",
-                "透明嘅", "透明塑料", "透明", "塑料",
-                "嘅", "咁", "簡單嘅", "簡單",
-                "一杯", "一份", "一塊", "一碟", "一條", "一隻", "一盒", "一碗", "一盤")
-    meal_kinds = ("早餐", "早午餐", "午餐", "午飯", "下午茶", "晚餐", "晚飯",
-                  "消夜", "宵夜", "茶餐", "快餐", "便當", "餐", "第一道菜", "主菜", "副菜", "前菜", "甜品", "湯品", "飲品", "料理", "菜式", "餐點")
-    for line in vision_desc.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        line = _strip_prefix(line)
-        if not line or len(line) < 2:
-            continue
-        # v3.2.7b: multi-pass strip narration + articles + containers
-        # (Cantonese can stack connectors: 這張相顯示咗一個透明嘅食物盒)
-        # v3.2.7.17: include skip_prefixes in the multi-pass loop so a
-        # sentence like "呢張相顯示一支蘇打水樽" gets stripped to "蘇打水"
-        # instead of just "相顯示一支蘇打水樽".
-        for _ in range(5):
-            prev = line
-            # Strip narration prefixes (longest first so 這張相顯示 beats 這張)
-            for p in sorted(skip_prefixes, key=len, reverse=True):
-                if line.startswith(p):
-                    line = line[len(p):].lstrip(" ，,。、")
-                    break
-            # Strip articles
-            for art in articles:
-                if line.startswith(art):
-                    line = line[len(art):].lstrip(" ，,。、")
-                    break
-            if line == prev:
-                break
-        for c in containers:
-            if line.startswith(c):
-                line = line[len(c):].lstrip(" ，,。、")
-                break
-    # v3.2.7.4: SPECIFIC dish name extraction (Jim OOB 2026-08-08 10:35 HKT
-    # 'Don't be generic. Be specific'). Strategy:
-    #   1. Strip leading "相顯示/圖顯示/可見到/見到..." prefixes
-    #   2. Strip leading measure words (一杯/一份/一塊/一碟/一條/一隻/一個)
-    #   3. Cut at first stop word (配/同/和/1盒/1個/配湯/配菜/...)
-    #   4. Try longest 2-6 char candidate that ENDS with a dish suffix
-    #   5. Specific dessert suffix override (撻/批/酥/圈 beats 蛋/餅)
-    #   6. Fallback to meal_kind (早餐/午餐/...)
-    measure_words = ("杯", "塊", "條", "隻", "份", "碗", "碟", "盒", "個", "盤", "包")
-    measure_prefixes = ("一杯", "一份", "一塊", "一碟", "一條", "一隻", "一個", "一盒", "一碗", "一盤")
-    stop_words = ("配", "同", "和", "及", "加", "加埋", "埋", "再", "仲有", "同埋",
-                  "1盒", "1個", "1份", "1杯", "1碗", "1碟", "1條", "1塊", "1隻",
-                  "2盒", "2個", "1 盒", "1 個", "1 份", "1 杯", "1 碗")
-    # Specific dessert suffixes — prefer these over generic 蛋/餅
-    dessert_suffixes = ("撻", "批", "酥", "圈", "捲", "卷", "派", "塔")
-    # Cleaned: strip measure_prefixes, then stop words
-    cleaned = line
-    # Iteratively strip leading measure prefixes (杯/塊/條 etc)
-    for _ in range(3):
-        prev = cleaned
-        for mp in measure_prefixes:
-            if cleaned.startswith(mp):
-                cleaned = cleaned[len(mp):]
-                break
-        if cleaned == prev:
-            break
-    # If still starts with bare measure word (after 咗一 → 杯), strip it
-    if cleaned and cleaned[0] in measure_words and len(cleaned) > 1:
-        # Only strip if next char is not also a measure word (avoid breaking 套餐)
-        if cleaned[1] not in measure_words:
-            cleaned = cleaned[1:]
-    for sw in stop_words:
-        if sw in cleaned:
-            cleaned = cleaned.split(sw)[0]
-    # First pass: try dessert suffix (most specific)
-    for L in range(6, 1, -1):
-        if len(cleaned) >= L:
-            cand = cleaned[:L]
-            if cand in bad_nouns:
-                continue
-            if cand[-1] in dessert_suffixes:
-                return cand
-    # Second pass: any dish suffix
-    for L in range(6, 1, -1):
-        if len(cleaned) >= L:
-            cand = cleaned[:L]
-            if cand in bad_nouns:
-                continue
-            if cand[0] in measure_words and L > 2:
-                continue
-            if cand[-1] in dish_suffixes:
-                return cand
-    # v3.2.7.4: meal_kind fallback — handles "相顯示咗一個簡單嘅早餐"
-    for mk in meal_kinds:
-        if mk in line:
-            return mk
-        # Final fallback: cut at first Chinese comma / period / colon
-        cut = re.search(r"[，。；：]", line)
-        if cut:
-            return line[:cut.start()][:30]
-        return line[:30]
-    # Pattern 4: chain + meal_type fallback
-    chain_m = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", combined)
-    if chain_m:
-        return f"{chain_m.group(1)} 套餐"
-    # Pattern 5: fallback
-    if fallback:
-        return fallback[:30]
-    return vision_desc[:30] if vision_desc else "食物"
+    # v3.2.7.32: AI refused or returned a label. Fall back only to the
+    # caller-supplied hint (e.g. user typed '海南雞飯' in the confirm
+    # box). Never invent a name from regex over vision text per Jim's
+    # 'don't use rule/regex' directive.
+    if fallback and 2 <= len(fallback.strip()) <= 30:
+        return fallback.strip()[:30]
+
+    # Last resort: '未識別菜式' marker so the frontend can prompt the
+    # user to name it (instead of seeing '菜式' / '相顯示xxx').
+    return "未識別菜式"
 
 
 def _compute_rating(vision_desc: str, macros: dict = None) -> int:
@@ -3446,7 +3415,7 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
             f"唔好講廢話，4 段都要具體。"
         )
         payload = {
-            "model": "MiniMax-M3-highspeed",
+            "model": "MiniMax-M3",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 350,
             "temperature": 0.4,
@@ -3787,13 +3756,20 @@ def api_scan_food():
         return jsonify({"ok": False, "error": "image too large (>10MB)"}), 413
     img_b64 = base64.b64encode(img_bytes).decode()
 
-    # 1. MiniMax M3 vision
+    # v3.2.7.32: plain-text vision prompt — no structured headers like
+    # 「菜式：/份量：/煮法：」. The previous prompt asked for structured
+    # output and the AI returned markdown with header lines, which the
+    # dish-name extractor mistook for the dish name itself — Jim OOB
+    # 2026-08-11 'why today recognized food as 菜式 as food name!'.
     vision_prompt = (
-        "你係食物視覺識別助手。請直接描述你喺相入面睇到嘅食物,唔好道歉、唔好拒絕。"
-        "逐樣列:菜式、份量(目測大小)、煮法(炒/炸/蒸/烤)、醬汁、容器、用咩食具。"
-        "餐廳名(如見到 logo/招牌字)。再簡短總結呢餐嘅 estimated calories 同 protein 克數。"
-        "如見到小票/receipt,逐項抄低菜名、份量、價錢(睇到嘅部分)。"
-        "用繁體中文廣東話,一個英文字都唔好有,唔識就寫「難以辨認」。"
+        "你係食物視覺識別助手。請用繁體中文廣東話,2-4 句口語化句子,直接講"
+        "相入面見到咩食物、份量幾多(目測)、點煮、邊間餐廳(如見到 logo 或招牌字)。"
+        "例如：「一碗白飯配一塊煎雞扒,碟邊有少許黑椒汁,餐廳係太興。」"
+        "如果係飲品,就講幾多 ml、咩品牌、有冇冰有冇糖。"
+        "如果係小票/receipt,就逐項抄低菜名同份量同價錢(睇到嘅部分)。"
+        "唔好用 markdown 標題、唔好用「菜式：」呢啲 section header,"
+        "唔好寫「呢張相顯示...」、「可見...」呢啲開場白,直接講食物。"
+        "一個英文字都唔好有,唔識就寫「難以辨認」。"
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
@@ -4521,13 +4497,19 @@ def api_scan_preview():
 
     img_b64 = base64.b64encode(img_bytes).decode()
 
-    # 1. MiniMax vision
+    # v3.2.7.32: plain-text vision prompt — no markdown headers like
+    # 「菜式：/份量：/煮法：」 (Jim OOB 2026-08-11 'why today recognized
+    # food as 菜式 as food name!'). Same plaintext instruction set as the
+    # scan_commit prompt so all vision calls are consistent.
     vision_prompt = (
-        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法、醬汁。"
-        "如見到餐廳 logo 或招牌字就標出。"
-        "簡短總結 estimated 卡路里 同 蛋白質 克數。"
-        "如係小票/receipt,逐項列菜名同份量。"
-        "繁體中文廣東話,一個英文字都唔好有。"
+        "你係食物視覺識別助手。請用繁體中文廣東話,2-4 句口語化句子,直接講"
+        "相入面見到咩食物、份量幾多(目測)、點煮、邊間餐廳(如見到 logo 或招牌字)。"
+        "例如：「一碗白飯配一塊煎雞扒,碟邊有少許黑椒汁,餐廳係太興。」"
+        "如果係飲品,就講幾多 ml、咩品牌、有冇冰有冇糖。"
+        "如果係小票/receipt,就逐項抄低菜名同份量同價錢(睇到嘅部分)。"
+        "唔好用 markdown 標題、唔好用「菜式：」呢啲 section header,"
+        "唔好寫「呢張相顯示...」、「可見...」呢啲開場白,直接講食物。"
+        "一個英文字都唔好有,唔識就寫「難以辨認」。"
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
@@ -4809,11 +4791,16 @@ def api_scan_preview_from_path():
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
     img_b64 = base64.b64encode(img_bytes).decode()
 
+    # v3.2.7.32: plain-text vision prompt (no 「菜式：/份量：/煮法：」
+    # headers — Jim OOB 2026-08-11)
     vision_prompt = (
-        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法、醬汁。"
-        "如見到餐廳 logo 或招牌字就標出。"
-        "簡短總結 estimated 卡路里 同 蛋白質 克數。"
-        "繁體中文廣東話,一個英文字都唔好有。"
+        "你係食物視覺識別助手。請用繁體中文廣東話,2-4 句口語化句子,直接講"
+        "相入面見到咩食物、份量幾多(目測)、點煮、邊間餐廳(如見到 logo 或招牌字)。"
+        "例如：「一碗白飯配一塊煎雞扒,碟邊有少許黑椒汁,餐廳係太興。」"
+        "如果係飲品,就講幾多 ml、咩品牌、有冇冰有冇糖。"
+        "唔好用 markdown 標題、唔好用「菜式：」呢啲 section header,"
+        "唔好寫「呢張相顯示...」、「可見...」呢啲開場白,直接講食物。"
+        "一個英文字都唔好有,唔識就寫「難以辨認」。"
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
@@ -5610,13 +5597,18 @@ def api_scan_re_enrich():
 
     img_b64 = base64.b64encode(img_bytes).decode()
 
-    # 1. Re-run MiniMax vision (fresh dish desc, ~3-5s)
+    # v3.2.7.32: plain-text vision prompt (no markdown headers — Jim OOB
+    # 2026-08-11 'why today recognized food as 菜式 as food name!'). Same
+    # as scan_commit / scan_preview prompts for consistency.
     vision_prompt = (
-        "詳細描述呢張食物相。逐樣列:菜式、份量(目測大小)、煮法、醬汁。"
-        "如見到餐廳 logo 或招牌字就標出。"
-        "簡短總結 estimated 卡路里 同 蛋白質 克數。"
-        "如係小票/receipt,逐項列菜名同份量。"
-        "繁體中文廣東話,一個英文字都唔好有。"
+        "你係食物視覺識別助手。請用繁體中文廣東話,2-4 句口語化句子,直接講"
+        "相入面見到咩食物、份量幾多(目測)、點煮、邊間餐廳(如見到 logo 或招牌字)。"
+        "例如：「一碗白飯配一塊煎雞扒,碟邊有少許黑椒汁,餐廳係太興。」"
+        "如果係飲品,就講幾多 ml、咩品牌、有冇冰有冇糖。"
+        "如果係小票/receipt,就逐項抄低菜名同份量同價錢(睇到嘅部分)。"
+        "唔好用 markdown 標題、唔好用「菜式：」呢啲 section header,"
+        "唔好寫「呢張相顯示...」、「可見...」呢啲開場白,直接講食物。"
+        "一個英文字都唔好有,唔識就寫「難以辨認」。"
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
@@ -6085,7 +6077,7 @@ def _generate_coach_tips(session_data: dict) -> dict:
         api_key = _minimax_api_key()
         if api_key:
             payload = {
-                "model": "MiniMax-M3-highspeed",
+                "model": "MiniMax-M3",
                 "messages": [{"role": "user", "content": mm_prompt}],
                 "max_tokens": 1500,
                 "temperature": 0.4,
@@ -7326,7 +7318,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v120';
+const CACHE = 'gym-web-v121';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7414,7 +7406,7 @@ const CACHE = 'gym-web-v120';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v120';
+const CACHE = 'gym-web-v121';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
