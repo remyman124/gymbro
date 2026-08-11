@@ -1351,6 +1351,17 @@ function gymApp() {
     // -2 = two months back, etc. No future navigation.
     scheduleMonthOffset: 0,
     scheduleViewLabel: '',
+    // v3.2.7.25: pull-to-refresh state (Jim OOB 2026-08-11 'calendar
+    // view does not support pull to refresh'). `schedulePullDistance`
+    // tracks how far the user has dragged down from the top; once it
+    // exceeds PULL_THRESHOLD_PX on release, we fire a fresh Whoop pull
+    // via /api/whoop_refresh and reload the calendar.
+    schedulePullDistance: 0,
+    schedulePullActive: false,         // true while user is dragging down
+    scheduleRefreshing: false,         // true while /api/whoop_refresh in flight
+    schedulePullTouchStartY: 0,        // captured on touchstart
+    schedulePullTouchCurrentY: 0,      // captured on touchmove
+    schedulePullLastRefreshAt: null,   // ISO string of last successful refresh
     // v3.2.5: month calendar popover — tap a day to see full details.
     scheduleSelectedDay: null,
     // v3.1.0: legacy tab aliases. Old 6 tabs (set/workout/history/scan/end/cheer)
@@ -2497,6 +2508,85 @@ function gymApp() {
       if (this.scheduleMonthOffset >= 0) return;
       this.scheduleMonthOffset += 1;
       await this.loadSchedule();
+    },
+
+    // v3.2.7.25: pull-to-refresh handlers (Jim OOB 2026-08-11 'calendar
+    // view does not support pull to refresh'). Touch-driven: when the
+    // user pulls the calendar down past 80px from the top, fire
+    // /api/whoop_refresh (forces a fresh Whoop pull) then reload the
+    // calendar. Visual indicator follows the finger during the drag.
+    schedulePullStart(e) {
+      if (this.scheduleRefreshing) return;
+      // Only listen when at the top of the scroll area. The schedule
+      // section is fixed-position with no internal scroll (grid fits
+      // viewport), so we accept any pull — but guard against pull
+      // during active pull or during refresh.
+      const t = e.touches && e.touches[0];
+      if (!t) return;
+      this.schedulePullTouchStartY = t.clientY;
+      this.schedulePullTouchCurrentY = t.clientY;
+      this.schedulePullActive = true;
+    },
+    schedulePullMove(e) {
+      if (!this.schedulePullActive || this.scheduleRefreshing) return;
+      const t = e.touches && e.touches[0];
+      if (!t) return;
+      this.schedulePullTouchCurrentY = t.clientY;
+      const dy = t.clientY - this.schedulePullTouchStartY;
+      if (dy <= 0) {
+        this.schedulePullDistance = 0;
+        return;
+      }
+      // Rubber-band: first 80px = full drag, beyond that ease out.
+      const MAX_PX = 140;
+      const dist = dy > MAX_PX
+        ? MAX_PX + (dy - MAX_PX) * 0.35
+        : dy;
+      this.schedulePullDistance = dist;
+      // Prevent native scroll while we're tracking the pull — without
+      // this, iOS Safari fights the gesture.
+      e.preventDefault();
+    },
+    schedulePullEnd() {
+      if (!this.schedulePullActive) return;
+      this.schedulePullActive = false;
+      const PULL_THRESHOLD_PX = 80;
+      if (this.schedulePullDistance >= PULL_THRESHOLD_PX && !this.scheduleRefreshing) {
+        this.scheduleDoRefresh();
+      } else {
+        // Snap back — let CSS transition handle the animation.
+        this.schedulePullDistance = 0;
+      }
+    },
+    async scheduleDoRefresh() {
+      if (this.scheduleRefreshing) return;
+      this.scheduleRefreshing = true;
+      // Keep the indicator visible at a fixed "refreshing" height while
+      // the network call is in flight.
+      this.schedulePullDistance = 70;
+      const startedAt = Date.now();
+      try {
+        const r = await fetch('/api/whoop_refresh', { method: 'POST' });
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || 'refresh failed');
+        this.schedulePullLastRefreshAt = data.synced_at;
+        // Reload the schedule so the freshly-pulled data shows up.
+        await this.loadSchedule();
+        // Hold the indicator visible for at least 600ms so the user
+        // sees the success state even on a fast network.
+        const elapsed = Date.now() - startedAt;
+        if (elapsed < 600) {
+          await new Promise(res => setTimeout(res, 600 - elapsed));
+        }
+        const ac = data.cycle_count || 0;
+        const rec = data.recovery_count || 0;
+        this.flash(`✓ Whoop 重新 pull 完 — ${ac} cycles · ${rec} recovery`);
+      } catch (e) {
+        this.flash('Whoop 刷新失敗：' + (e.message || e));
+      } finally {
+        this.scheduleRefreshing = false;
+        this.schedulePullDistance = 0;
+      }
     },
 
     async loadRecentScans() {
@@ -3747,9 +3837,32 @@ setTimeout(checkLandscapeFood, 500);
      day cells (gym = green, walking = sky, etc.) and is_today ring. -->
 <section x-show="isTabVisible('history')"
          x-cloak
-         class="fixed left-0 right-0 flex flex-col px-3 pt-2 z-10"
-         style="top: calc(51px + env(safe-area-inset-top)); bottom: calc(47px + env(safe-area-inset-bottom));"
-         x-init="loadSchedule()">
+         class="fixed left-0 right-0 flex flex-col px-3 pt-2 z-10 overflow-hidden"
+         style="top: calc(51px + env(safe-area-inset-top)); bottom: calc(47px + env(safe-area-inset-bottom)); touch-action: pan-y;"
+         x-init="loadSchedule()"
+         @touchstart.passive="schedulePullStart($event)"
+         @touchmove="schedulePullMove($event)"
+         @touchend="schedulePullEnd()"
+         @touchcancel="schedulePullEnd()">
+
+  <!-- v3.2.7.25: pull-to-refresh indicator. Sits above the calendar grid
+       and slides down with the user's finger. Shows "下拉刷新" while
+       pulling, "鬆手刷新" past threshold, then a spinner + "刷新緊..."
+       while the Whoop pull is in flight. -->
+  <div class="w-full flex items-center justify-center text-xs text-emerald-300 select-none transition-all"
+       :style="`height: ${schedulePullDistance}px; opacity: ${Math.min(1, schedulePullDistance / 40)};`">
+    <template x-if="scheduleRefreshing">
+      <div class="flex items-center gap-2">
+        <span class="inline-block animate-spin text-base">⟳</span>
+        <span>Whoop 重新 pull 中…</span>
+      </div>
+    </template>
+    <template x-if="!scheduleRefreshing">
+      <div class="flex items-center gap-2">
+        <span x-text="schedulePullDistance >= 80 ? '↓ 鬆手刷新' : '↓ 下拉刷新'"></span>
+      </div>
+    </template>
+  </div>
 
   <!-- Empty state — if no activities in the past 42 days AND this week,
        the section is hidden entirely (handled by parent x-show on the

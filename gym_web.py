@@ -710,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.24"
+__version__ = "3.2.7.25"
 
 
 def _recovery_pct():
@@ -3990,6 +3990,33 @@ def api_scan_recent():
             # therefore knows this is a text entry.
             entry["is_text_only"] = True
     return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
+
+
+# v3.2.7.25: Force-refresh Whoop cache (Jim OOB 2026-08-11 'calendar view
+# does not support pull to refresh'). Calls _run_whoop_pull_cached(force=True)
+# which spawns `whoop_nutrition.py --sync` to pull all 4 endpoints (cycles /
+# recovery / sleep / workouts) and overwrite the cache file. Returns the
+# updated cycle + recovery counts so the frontend can confirm freshness.
+# Designed for the schedule tab's pull-to-refresh UX — typically 5-15s.
+@app.route("/api/whoop_refresh", methods=["POST", "GET"])
+def api_whoop_refresh():
+    try:
+        data = _run_whoop_pull_cached(force=True)
+        cycles = len(data.get("cycles") or [])
+        recovery = len(data.get("recovery") or [])
+        sleep = len(data.get("sleep") or [])
+        workouts = len(data.get("workouts") or [])
+        synced_at = data.get("synced_at") or now_iso()
+        return jsonify({
+            "ok": True,
+            "synced_at": synced_at,
+            "cycle_count": cycles,
+            "recovery_count": recovery,
+            "sleep_count": sleep,
+            "workout_count": workouts,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # v2.7.18: Withings steps endpoints (Jim OOB 2026-07-29)
