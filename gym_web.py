@@ -710,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.29"
+__version__ = "3.2.7.30"
 
 
 def _recovery_pct():
@@ -5375,6 +5375,42 @@ def api_scan_commit():
         except Exception:
             final_path = img_path
             image_url = f"/scan_img/{img_path.name}"
+
+    # v3.2.7.30: dedup by image md5 — reject duplicate scans of the same
+    # photo within 30 minutes. Fixes 'user taps confirm twice on a vision
+    # failure' → two entries pointing at the same image with junk names.
+    if img_path is not None and final_path and Path(final_path).exists():
+        try:
+            import hashlib
+            new_hash = hashlib.md5(Path(final_path).read_bytes()).hexdigest()
+            scan_log_pre = _load_scan_log()
+            for prev in scan_log_pre:
+                prev_img = prev.get("image_path") or ""
+                if not prev_img or not Path(prev_img).exists():
+                    continue
+                prev_hash = hashlib.md5(Path(prev_img).read_bytes()).hexdigest()
+                if prev_hash != new_hash:
+                    continue
+                # Same image. If within 30 min, treat as duplicate.
+                from datetime import datetime as _dt
+                prev_ts = prev.get("timestamp_iso", "")
+                try:
+                    prev_dt = _dt.fromisoformat(prev_ts)
+                    now_dt = _dt.fromisoformat(now_iso_str)
+                    age_min = abs((now_dt - prev_dt).total_seconds()) / 60
+                except Exception:
+                    age_min = 999
+                if age_min <= 30:
+                    return jsonify({
+                        "ok": False,
+                        "error": "duplicate_scan",
+                        "message": (f"呢張相喺 {age_min:.0f} 分鐘前已經 scan 過 "
+                                    f"({prev.get('name')!r}). 唔會重複記錄。"),
+                        "existing_scan_index": prev.get("scan_index"),
+                        "existing_name": prev.get("name"),
+                    }), 409
+        except Exception:
+            pass  # dedup is best-effort; never block a real commit
     else:
         final_path = ""
         image_url = ""
@@ -7290,7 +7326,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v118';
+const CACHE = 'gym-web-v119';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7378,7 +7414,7 @@ const CACHE = 'gym-web-v118';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v118';
+const CACHE = 'gym-web-v119';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what

@@ -30,17 +30,16 @@ def run():
         txt = page.evaluate("document.body.innerText")
 
         assert "海南雞" in txt, "海南雞 NOT in rendered DOM (regression: scan_index key collision)"
-        # Both entries should appear: 21:17 350 kcal AND 23:43 750 kcal
+        # Should appear: 21:17 海南雞飯 (the 23:43 dup was removed by retro_v7)
         hainan_count = txt.count("海南雞飯")
-        assert hainan_count >= 2, (
-            f"expected >=2 海南雞飯 entries rendered, got {hainan_count}"
+        assert hainan_count >= 1, (
+            f"expected >=1 海南雞飯 entries rendered, got {hainan_count}"
         )
         print(f"✓ 海南雞飯 rendered {hainan_count}× in food log DOM")
 
-        # Sanity check: 21:17 and 23:43 entries both visible
-        for ts in ("21:17", "23:43"):
-            assert ts in txt, f"timestamp {ts} missing from food log"
-        print("✓ both 21:17 and 23:43 entries visible")
+        # Sanity check: 21:17 entry visible
+        assert "21:17" in txt, "21:17 timestamp missing from food log"
+        print("✓ 21:17 海南雞飯 entry visible")
 
         browser.close()
 
