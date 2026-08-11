@@ -832,15 +832,16 @@
       <!-- Group scans by date — render one section per day -->
       <template x-for="group in recentScansGrouped" :key="group.date">
         <div class="mb-5">
-          <!-- Date header: date + count + day total kcal -->
+          <!-- Date header: date + count + day total kcal + day total protein (Jim OOB 2026-08-11) -->
           <div class="flex items-baseline justify-between mb-2 px-1">
             <div class="flex items-baseline gap-2">
               <div class="text-base font-black text-emerald-300" x-text="group.date_label"></div>
               <div class="text-[11px] text-gray-500 font-semibold" x-text="group.weekday"></div>
               <div class="text-[10px] text-gray-500" x-text="`· ${group.count} 項`"></div>
             </div>
-            <div class="text-[11px] text-gray-400">
-              <span class="text-white font-bold" x-text="group.total_kcal"></span> kcal
+            <div class="text-[11px] text-gray-400 flex items-baseline gap-2.5">
+              <span><span class="text-white font-bold tabular-nums" x-text="group.total_kcal"></span><span class="text-gray-400"> kcal</span></span>
+              <span><span class="text-purple-300 font-bold tabular-nums" x-text="group.total_protein"></span><span class="text-gray-400">g P</span></span>
             </div>
           </div>
 
@@ -1873,11 +1874,12 @@ function gymApp() {
           else label = `${String(m).padStart(2,'0')}/${String(d).padStart(2,'0')}`;
           groups[date] = {
             date, date_label: label, weekday,
-            count: 0, total_kcal: 0, items: [],
+            count: 0, total_kcal: 0, total_protein: 0, items: [],
           };
         }
         groups[date].count += 1;
         groups[date].total_kcal += (s.calories || 0);
+        groups[date].total_protein += (s.protein || 0);
         // Add HH:MM time_label inline (avoid formatScanTime round-trip)
         const time = ts.slice(11, 16);  // 'HH:MM'
         groups[date].items.push({ ...s, time_label: time });
@@ -1887,6 +1889,7 @@ function gymApp() {
       for (const g of Object.values(groups)) {
         g.items.sort((a, b) => (b.timestamp_iso || '').localeCompare(a.timestamp_iso || ''));
         g.total_kcal = Math.round(g.total_kcal);
+        g.total_protein = Math.round(g.total_protein);
       }
       // Return as array sorted by date DESC (newest first)
       return Object.values(groups).sort((a, b) => b.date.localeCompare(a.date));
