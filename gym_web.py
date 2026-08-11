@@ -7076,10 +7076,11 @@ def _background_cheer_job(job_id: str, fire_type: str):
         # 4. Image
         context = f"{fire_type}_{int(time.time())}"
         image_path = _generate_cheer_image(context)
-        with CHEER_JOBS_LOCK:
-            CHEER_JOBS[job_id].update({"step": "done", "step_at": now_iso(), "image_path": image_path})
 
-        # 5. Cache to cheer_artifacts
+        # 5. Cache to cheer_artifacts — moved BEFORE the CHEER_JOBS.update
+        # so we can reference artifact_dir/text_path in the done payload
+        # (UnboundLocalError on earlier line 7082 because artifact_dir was
+        # declared below the update — 2026-08-11 22:17 HKT cheer failure).
         today_iso_str = today_iso()
         artifact_dir = CHEER_ARTIFACT_DIR / f"cheer_{today_iso_str}_{context}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -7088,6 +7089,25 @@ def _background_cheer_job(job_id: str, fire_type: str):
             shutil.copy2(voice_path, artifact_dir / "cheer_voice.mp3")
         if image_path:
             shutil.copy2(image_path, artifact_dir / "cheer_motivation.png")
+
+        # v3.2.7.37: surface full artifact metadata in CHEER_JOBS so
+        # /api/cheer/status returns text_chars / voice_path / image_path /
+        # ok=True / status='done' / text inline (was all-null before,
+        # frontpage showed "0 字" looking like cheer silently failed).
+        with CHEER_JOBS_LOCK:
+            CHEER_JOBS[job_id].update({
+                "step": "done", "step_at": now_iso(),
+                "image_path": image_path,
+                "text_chars": len(text),
+                "has_voice": bool(voice_path),
+                "has_image": bool(image_path),
+                "text_path": str(artifact_dir / "cheer_text.txt"),
+                "voice_path": voice_path,
+                "text": text,
+                "ok": True,
+                "status": "done",
+                "finished_at": now_iso(),
+            })
 
         # 6. Append to cheer_log
         log = _load_cheer_log()
@@ -7262,6 +7282,12 @@ def api_cheer_status():
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),
             "text": job.get("text", ""),
+            "text_chars": job.get("text_chars", 0),
+            "has_voice": job.get("has_voice", False),
+            "has_image": job.get("has_image", False),
+            "text_path": job.get("text_path"),
+            "voice_path": job.get("voice_path"),
+            "image_path": job.get("image_path"),
             "voice_url": voice_url,
             "image_url": image_url,
             "metrics": job.get("metrics", {}),
@@ -7329,7 +7355,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v123';
+const CACHE = 'gym-web-v126';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7417,7 +7443,7 @@ const CACHE = 'gym-web-v123';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v123';
+const CACHE = 'gym-web-v126';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
