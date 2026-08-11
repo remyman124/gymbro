@@ -710,7 +710,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.25"
+__version__ = "3.2.7.26"
 
 
 def _recovery_pct():
@@ -3600,15 +3600,18 @@ def _load_today_nutrition() -> dict:
             continue
         m_date = m.get("date") or ""
         if not m_date:
-            # try parse timestamp
-            ts = m.get("timestamp") or m.get("logged_at")
-            if ts and isinstance(ts, str) and today in ts:
-                m_date = today
+            # v3.2.7.26: scan auto-commit writes timestamp_iso only (no date/time),
+            # so entries like 2026-08-10 21:17 海南雞飯 were invisible here.
+            ts = (m.get("timestamp_iso") or m.get("timestamp")
+                  or m.get("logged_at") or "")
+            if isinstance(ts, str) and len(ts) >= 10:
+                m_date = ts[:10]
         if m_date != today:
             continue
         today_meals.append(m)
     # Sort by time
-    today_meals.sort(key=lambda m: m.get("time") or m.get("timestamp") or "")
+    today_meals.sort(key=lambda m: (m.get("time") or m.get("timestamp_iso")
+                                    or m.get("timestamp") or ""))
     out["meals"] = today_meals
     out["meal_count"] = len(today_meals)
     for m in today_meals:
