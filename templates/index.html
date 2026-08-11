@@ -846,7 +846,11 @@
 
           <!-- Per-day entries — vertical layout, full-width title (Jim OOB 2026-08-07
                "Food title display is very bad. Pls give more space to display. No wrap") -->
-          <template x-for="scan in group.items" :key="scan.scan_index">
+          <!-- v3.2.7.29: key on ts + image basename (scan_index has 11 dupes in
+               scan_log from data-integrity rot; Alpine dedupes by key so the
+               "earlier" entry of each pair silently vanished from the food
+               log — Jim OOB 2026-08-11 'i saw it quickly then disappeared'). -->
+          <template x-for="scan in group.items" :key="(scan.timestamp_iso || '') + '|' + (scan.image_url || scan.image_path || '')">
             <div class="rounded-2xl bg-white/[0.04] backdrop-blur border border-white/10 p-3 mb-2">
               <!-- Row 1: full-width image on top (max 200px, 16:9 ratio) — only if
                    image exists. v2.7.53 (Jim OOB 2026-08-07 14:15 HKT 'for those
