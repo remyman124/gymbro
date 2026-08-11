@@ -3630,7 +3630,21 @@ def _get_today_nutrition_for_cheer() -> str:
         kcal_part = f" (~{int(float(kcal))} kcal)" if kcal is not None and str(kcal) != "" else ""
         lines.append(f"  - {t} {mt}：{mn}{chain_part}{kcal_part}")
     t = data["totals"]
-    lines.append(f"- 今日累計: ~{int(t['kcal'])} kcal / P {int(t['P'])}g / C {int(t['C'])}g / F {int(t['F'])}g")
+    p_g = int(t["P"])
+    # v3.2.7.38: show protein delta vs Jim's PT-set target (120g/day,
+    # Jim OOB 2026-08-11 13:00 HKT). pplx can reference this in the
+    # cheer §「飲食」section so Jim hears "P 食咗 X 克，PT 個 120 仲差 Y"
+    # instead of just raw totals.
+    p_target = 120
+    p_delta = p_g - p_target
+    if p_delta >= 0:
+        p_status = f"+{p_delta}g 已達標（PT 目標 {p_target}g）"
+    else:
+        p_status = f"仲差 {-p_delta}g 至 PT 目標 {p_target}g"
+    lines.append(
+        f"- 今日累計: ~{int(t['kcal'])} kcal / P {p_g}g / C {int(t['C'])}g / F {int(t['F'])}g"
+    )
+    lines.append(f"- 蛋白質對住 PT 目標：{p_status}")
     if data["last_meal_ts"]:
         try:
             from datetime import datetime as _dt
@@ -6286,6 +6300,16 @@ def _voice_zh_replace(s: str) -> str:
     for k in keys:
         # No \b anchors — Chinese text has no inter-word boundaries
         s = re.sub(re.escape(k), EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
+    # v3.2.7.38: strip markdown asterisks (**bold** / *italic*) before TTS.
+    # pplx sonar-pro often wraps metric numbers like **52%** or **weightlifting**
+    # in markdown — Edge-TTS WanLung reads each * as the literal Chinese word
+    # "星號", producing the robotic "星號52%星號" artefact Jim OOB 2026-08-11
+    # 22:30 HKT. Strip them cleanly here so voice only reads the number/word.
+    s = re.sub(r"\*\*+", "", s)
+    s = re.sub(r"(?<!\*)\*(?!\*)", "", s)
+    # Also strip orphan citation refs like [1][3] — Edge-TTS reads "一三" or
+    # "中括號一" awkwardly. Replace with nothing so the prose flows naturally.
+    s = re.sub(r"\[\d+\]", "", s)
     return s
 
 def _voice_audit_en(s: str) -> list:
@@ -6831,9 +6855,15 @@ def _synthesize_cheer_voice(text: str) -> str:
         for marker, bridge in pause_bridges:
             voice_text = voice_text.replace(marker, bridge)
         # Replace double-newlines (paragraph breaks from cheer text) with "。 "
-        voice_text = voice_text.replace("\n\n", "。 ")
-        # Replace single newlines with comma+pause (avoid hard pause in TTS)
-        voice_text = voice_text.replace("\n", "，")
+        # v3.2.7.38: wrap in SSML <break> tags so WanLung actually pauses
+        # instead of reading the period as "。" (sentence-end) and rushing
+        # on. SSML <break> is the natural breath pause Edge-TTS honours.
+        # Also avoid the "comma flood" — consecutive 4-5 commas in a row
+        # make WanLung recite like a list. Use single sentence-end period
+        # + break tag instead.
+        voice_text = voice_text.replace("\n\n", "。<break time='450ms'/>")
+        # Single newline → comma + small break (instead of just comma)
+        voice_text = voice_text.replace("\n", "，<break time='250ms'/>")
         # Strip section markers if any still present
         for marker, _ in pause_bridges:
             voice_text = voice_text.replace(marker, "")
@@ -6859,14 +6889,20 @@ def _synthesize_cheer_voice(text: str) -> str:
             import re as _re
             voice_text = _re.sub(r"([A-Za-z]+)", lambda m: _zh_inline(m.group(0)), voice_text)
 
-        # Step 2: Edge-TTS WanLung +0% (longer timeout for full-detail scripts).
-        # Edge-TTS WanLung has empirically shown 1m30s-2m runtime for 800-1500 字
+        # Step 2: Edge-TTS WanLung +5% (slightly brisker than default 0%, sounds less
+        # monotone). Edge-TTS WanLung has shown 1m30s-2m runtime for 800-1500 字
         # scripts. Use 240s (4 min) timeout to be safe. Jim OOB 2026-07-23 voice
         # detail direction — sacrifice latency for completeness.
+        #
+        # v3.2.7.38: wrap in SSML <speak> so the <break time='450ms'/> tags
+        # actually take effect. Without SSML wrapping, edge-tts treats the
+        # tags as literal text and reads "左括號 break time 等於..." which
+        # is exactly the robotic artefact Jim OOB 2026-08-11 22:30 HKT.
+        ssml_text = f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-HK'>{voice_text}</speak>"
         tmp_ogg = f"/tmp/cheer_voice_{int(time.time())}.ogg"
         result = _sp.run([
             "edge-tts", "--voice", "zh-HK-WanLungNeural",
-            "--rate", "+0%", "--text", voice_text,
+            "--rate", "+5%", "--text", ssml_text,
             "--write-media", tmp_ogg,
         ], capture_output=True, text=True, timeout=240)
         if result.returncode != 0:
@@ -7094,11 +7130,15 @@ def _background_cheer_job(job_id: str, fire_type: str):
         # /api/cheer/status returns text_chars / voice_path / image_path /
         # ok=True / status='done' / text inline (was all-null before,
         # frontpage showed "0 字" looking like cheer silently failed).
+        # v3.2.7.38: strip markdown asterisks/citations for frontpage render.
+        # Re-use _voice_zh_replace which already handles **bold** / [n] citations.
+        clean_text = _voice_zh_replace(text)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({
                 "step": "done", "step_at": now_iso(),
                 "image_path": image_path,
                 "text_chars": len(text),
+                "clean_text": clean_text,
                 "has_voice": bool(voice_path),
                 "has_image": bool(image_path),
                 "text_path": str(artifact_dir / "cheer_text.txt"),
@@ -7283,6 +7323,12 @@ def api_cheer_status():
             "finished_at": job.get("finished_at"),
             "text": job.get("text", ""),
             "text_chars": job.get("text_chars", 0),
+            # v3.2.7.38: clean_text is the markdown-stripped version (no **, no
+            # [n] citations) for frontpage render. Cheer text from pplx often
+            # wraps metrics in **markdown bold**; frontpage shows raw text but
+            # the * glyphs visually clutter the body. clean_text is what TTS
+            # actually reads.
+            "clean_text": job.get("clean_text", ""),
             "has_voice": job.get("has_voice", False),
             "has_image": job.get("has_image", False),
             "text_path": job.get("text_path"),
@@ -7355,7 +7401,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v126';
+const CACHE = 'gym-web-v128';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7443,7 +7489,7 @@ const CACHE = 'gym-web-v126';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v126';
+const CACHE = 'gym-web-v128';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
