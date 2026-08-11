@@ -873,7 +873,10 @@
                        and reads naturally with the iOS PWA full-bleed grid.
                        v3.2.7.3: single rating scheme only (A+/A/B/C/D/F), bigger
                        font (text-2xl), thicker ring + drop shadow for legibility. -->
-                  <template x-if="scan.coach_comment?.grade && scan.coach_comment.grade !== '—'">
+                  <!-- v3.2.7.36: always render grade badge (was 'grade !== "—"'
+                       which skipped entries; now _coach_comment() never returns
+                       '—', every logged scan gets A+/A/B/C/D/F render). -->
+                  <template x-if="scan.coach_comment?.grade">
                     <div class="absolute top-2 right-2 text-2xl font-black px-3 py-1.5 rounded-xl shadow-2xl shadow-black/70 backdrop-blur-md ring-2 ring-white/20"
                          :class="{
                            'bg-emerald-500/90 text-white': ['A+','A'].includes(scan.coach_comment.grade),
@@ -896,7 +899,8 @@
                      or image-back-failed). Image-backed entries already get the
                      bigger top-right overlay on the image. (Jim OOB 2026-08-08
                      19:35 HKT 'For those without image, pls also show the rating') -->
-                <template x-if="!scan.image_url && scan.coach_comment?.grade && scan.coach_comment.grade !== '—'">
+                <!-- v3.2.7.36: always render grade badge -->
+                <template x-if="!scan.image_url && scan.coach_comment?.grade">
                   <div class="text-base font-black px-2 py-0.5 rounded-lg shadow-lg ring-1 ring-white/20 flex-shrink-0"
                        :class="{
                          'bg-emerald-500/90 text-white': ['A+','A'].includes(scan.coach_comment.grade),

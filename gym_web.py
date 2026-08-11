@@ -3280,10 +3280,19 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
       - D:  偏heavy (cake/dessert/cream/fried rice/焗飯)
       - F:  極heavy (deep-fried/BBQ/buffet/sugary drink/processed meat)
     """
-    if not dish_name or calories <= 0:
-        return {"grade": "—", "comment": "資料不足", "suggestions": [], "rationale": "calories = 0, 冇資料可以評"}
+    # Jim OOB 2026-08-11 'not every food has a rating. Pls fix it':
+    # Even when calories=0 (early scan / data sync) or dish_name empty, we
+    # still render a usable grade from whatever macros we DO have. The
+    # '—' placeholder caused rating gaps in PWA (Jim's gymbro dashboard
+    # showed missing badges). Now we degrade gracefully:
+    #   - dish_name empty + no macros → return 'C' with note "菜名未知"
+    #   - calories=0 but macros present → use macros to compute (only need
+    #     P/C/F fat_pct; calories derived from 4P+4C+9F)
+    #   - everything missing → still 'C' as neutral default
+    if not dish_name:
+        dish_name = "(未命名菜式)"
 
-    combined = (dish_name or "").lower()
+    combined = dish_name.lower()
 
     # ----- Step 1: keyword tier pre-grade -----
     tier_a_plus = [
@@ -7320,7 +7329,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v122';
+const CACHE = 'gym-web-v123';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7408,7 +7417,7 @@ const CACHE = 'gym-web-v122';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v122';
+const CACHE = 'gym-web-v123';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
