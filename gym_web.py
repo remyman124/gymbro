@@ -6282,6 +6282,35 @@ EN_TO_ZH_VOICE = {
     # Common BUIDL/training
     "build": "建立", "bulk": "增肌", "cut": "減脂", "rest": "休息",
     "PR": "個人紀錄", "rep": "下", "RM": "最大重複",
+    # v3.2.7.39 — extended coverage for casual prose pplx leaks (Jim OOB 2026-08-11
+    # "Should be all traditional Chinese. No English"). pplx sonar-pro still
+    # inserts these words even after 6 months of cheer iteration.
+    "active": "活躍", "chair": "梳化", "office": "寫字樓", "comeback": "反彈",
+    "heroic": "英雄式", "full": "滿", "output": "產出", "technical": "技術性",
+    "AI": "人工智能", "HTTP": "超文本傳輸", "NBA": "美職籃",
+    "PortSwigger": "網絡安全品牌", "Terminator": "終結者",
+    "fat": "脂肪", "fat, ": "脂肪，", " fat ": " 脂肪 ",
+    "lean": "瘦", "toned": "結實", "buff": "壯",
+    "elite": "頂尖", "athletic": "運動型", "ripped": "精瘦",
+    "post": "之後", "pre": "之前", "mid": "中段",
+    "vs.": "對", "vs": "對",
+    "Step": "步", "steps": "步", "Steps": "步",
+    "Streak": "連續", "streak": "連續",
+    "Bad": "差", "Good": "好", "Big": "大", "Small": "細",
+    "thing": "嘢", "stuff": "嘢", "guys": "兄弟", "guy": "兄弟",
+    "let's": "我哋一齊", "lets": "我哋一齊",
+    "I'm": "我", "I'll": "我會", "I've": "我已經",
+    "you're": "你", "you'd": "你會", "you've": "你已經",
+    "we're": "我哋", "we'll": "我哋會", "we've": "我哋已經",
+    "they're": "佢哋", "they'll": "佢哋會",
+    "isn't": "唔係", "aren't": "唔係", "wasn't": "唔係", "weren't": "唔係",
+    "don't": "唔好", "doesn't": "唔會", "didn't": "冇",
+    "won't": "唔會", "wouldn't": "唔會", "shouldn't": "唔應該",
+    "can't": "唔可以", "cannot": "唔可以", "couldn't": "唔能夠",
+    "it's": "佢", "that's": "嗰個", "there's": "嗰度",
+    "by": "透過", "with": "同", "without": "冇", "for": "為", "from": "從",
+    "the ": "", " a ": " ", " an ": " ", " of ": "嘅", " in ": "喺",
+    "and ": "同 ", " or ": "或者", " but ": "但 ", " if ": "如果 ",
 }
 
 def _voice_zh_replace(s: str) -> str:
@@ -6297,9 +6326,12 @@ def _voice_zh_replace(s: str) -> str:
     keep, base, level, range, etc.).
     """
     keys = sorted(EN_TO_ZH_VOICE.keys(), key=len, reverse=True)
-    for k in keys:
-        # No \b anchors — Chinese text has no inter-word boundaries
-        s = re.sub(re.escape(k), EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
+    # v3.2.7.39: 3-pass replace instead of single pass. pplx often nests
+    # English tokens ("weightlifting", "comeback") inside phrases that
+    # only partially match the table; multi-pass catches residual leaks.
+    for _ in range(3):
+        for k in keys:
+            s = re.sub(re.escape(k), EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
     # v3.2.7.38: strip markdown asterisks (**bold** / *italic*) before TTS.
     # pplx sonar-pro often wraps metric numbers like **52%** or **weightlifting**
     # in markdown — Edge-TTS WanLung reads each * as the literal Chinese word
@@ -6373,7 +6405,35 @@ def _zh_inline(en_word: str) -> str:
         "tottenham": "熱刺", "Tottenham": "熱刺",
         "city": "曼城", "man city": "曼城", "Man City": "曼城",
         "sunday": "星期日", "saturday": "星期六", "weekend": "週末",
+        # v3.2.7.39 — extended coverage (Jim OOB "Should be all traditional Chinese. No English")
+        "active": "活躍", "chair": "梳化", "office": "寫字樓",
+        "comeback": "反彈", "heroic": "英雄式", "full": "滿",
+        "output": "產出", "technical": "技術性", "AI": "人工智能",
+        "HTTP": "超文本傳輸", "NBA": "美職籃", "PortSwigger": "網絡安全品牌",
+        "Terminator": "終結者", "post": "之後", "pre": "之前", "mid": "中段",
+        "vs.": "對", "vs": "對", "Step": "步", "steps": "步", "Steps": "步",
+        "Streak": "連續", "streak": "連續", "Bad": "差", "Good": "好",
+        "Big": "大", "Small": "細", "thing": "嘢", "stuff": "嘢",
+        "guys": "兄弟", "guy": "兄弟", "let's": "我哋一齊", "lets": "我哋一齊",
+        "I'm": "我", "I'll": "我會", "I've": "我已經",
+        "you're": "你", "you'd": "你會", "you've": "你已經",
+        "we're": "我哋", "we'll": "我哋會", "we've": "我哋已經",
+        "they're": "佢哋", "they'll": "佢哋會",
+        "isn't": "唔係", "aren't": "唔係", "wasn't": "唔係", "weren't": "唔係",
+        "don't": "唔好", "doesn't": "唔會", "didn't": "冇",
+        "won't": "唔會", "wouldn't": "唔會", "shouldn't": "唔應該",
+        "can't": "唔可以", "cannot": "唔可以", "couldn't": "唔能夠",
+        "it's": "佢", "that's": "嗰個", "there's": "嗰度",
+        "weightlifting": "重量訓練", "cardio": "帶氧", "running": "跑",
+        "yoga": "瑜伽", "cycling": "踩單車", "swimming": "游水",
+        "toned": "結實", "ripped": "精瘦", "elite": "頂尖",
+        "athletic": "運動型", "buff": "壯",
     }
+    # v3.2.7.39: catch-all fallback. If unknown English word isn't in the
+    # table, return a placeholder so the TTS doesn't read literal English.
+    # We use 「X」 (Chinese book-title quotes) so the voice says "X" but the
+    # word is clearly marked as something the user might want to recognise
+    # later when they look at the text version.
     return table.get(en_word, f"「{en_word}」")
 
 
@@ -6588,16 +6648,23 @@ def _format_workout_detail_for_cheer(workouts: list) -> str:
 
 
 def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
-    """Call pplx sonar-pro to synthesize detailed 8-section cheer text per
-    cheer-routine Rule 22.
+    """v3.2.7.40: Switch cheer text generation from pplx sonar-pro → MiniMax M3.
 
-    Jim OOB 2026-07-23 17:35 + 2026-07-24 14:10 HKT: voice ~150s target.
-    Empirical measurement 7/24 01:53 HKT: 1091 chars text → 218s audio
-    → real WanLung rate ≈ 5.0 char/sec (not 5.69 — heat/queue slow-down).
-    For 150s target, text_chars target = 150 × 5.0 = 750 (sweet zone
-    700-800 chars → 140-160s).
+    Jim OOB 2026-08-11 22:38 HKT "Use minimax ai to draft. Don't use regex or
+    rule to draft. Put this into gymbro cheer pipeline". pplx sonar-pro kept
+    leaking English tokens (weightlifting, REM, active, chair, office, AI,
+    etc.) even with extensive EN_TO_ZH_VOICE post-processing. MiniMax M3
+    speaks fluent Traditional Chinese / Cantonese natively, so we drop the
+    English-banned-list hack and let the model draft naturally.
+
+    Falls back to local template if MiniMax unavailable. pplx is gone
+    entirely (Jim OOB 2026-08-11 22:38 HKT).
+
+    Voice target unchanged: 150s ≈ 750 字 sweet zone. MiniMax tends to be
+    slightly wordier than pplx, so we cap at 1000 字 explicitly in the
+    prompt.
     """
-    api_key = _pplx_api_key()
+    api_key = _minimax_api_key()
     if not api_key:
         return _cheer_fallback_text(metrics, fire_type)
     rec = metrics.get("recovery_pct")
@@ -6688,12 +6755,20 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 
 **今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
 {workout_detail_zh}
-{news_block}
-{liverpool_block}
-{jim_context_block}
-{nutrition_block}
-寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
-1. **唔好讀數字**：唔好寫「HRV 28.6 ms」咁讀出嚟，寫「你個自律神經而家有返廿八點六左右嘅彈性，比你上週好少少」；唔好寫「7.35 個鐘」咁平，寫「噉晚瞓咗七個幾鐘，差啲就夠八個」
+|{news_block}
+|{liverpool_block}
+|{jim_context_block}
+|{nutrition_block}
+|寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
+|0. **v3.2.7.39: 全繁體中文。唔好一個英文 token 都用**（Jim OOB 2026-08-11 22:30+ HKT「Should be all traditional Chinese. No English」）。 即係:
+|   - 唔好用英文 brand / role / 動詞 / 形容詞 / 副詞 / 連詞 / 量詞單位 (`kg`, `kcal`, `ms`, `bpm`, `min`, `sec`, `hr`)
+|   - 唔好用英文 sport name (`weightlifting`, `cardio`, `running`) — 寫「重量訓練」、「帶氧」、「跑步」
+|   - 唔好用英文 closing (`Bon voyage`, `Good night`, `Good luck`) — 用「旅途愉快」、「晚安」、「好運」
+|   - 唔好用英文 metric label (`HRV`, `SpO2`, `RHR`, `REM`, `PR`, `RM`, `RPE`) — 用「心跳變異」、「血氧」、「靜止心跳」、「快速眼動」、「個人紀錄」、「最大重複」、「自覺強度」
+|   - 唔好用英文 casual filler (`OK`, `let's`, `gonna`, `wanna`, `maybe`, `basically`, `actually`) — 用「好」、「我哋一齊」、「會」、「想」、「可能」、「基本上」、「其實」
+|   - **Markdown `**bold**` 同 `[1]` citation 都唔好寫** — TTS 會讀出嚟變「星號」。
+|   - 唯一例外: `CIO` (Jim 自己個 title)、`Jim` (個名)、`HKT` (時區)。其他英文 token 一律禁止。
+|1. **唔好讀數字**：唔好寫「HRV 28.6 ms」咁讀出嚟，寫「你個自律神經而家有返廿八點六左右嘅彈性，比你上週好少少」；唔好寫「7.35 個鐘」咁平，寫「噉晚瞓咗七個幾鐘，差啲就夠八個」
 2. **要有笑位、要有自嘲**：可以講下「深層瞓終於過咗兩個鐘，唔使再被我鬧」、講下「今日操水，話晒係你嘅，唔係被窩」、講下「教練同你講過好多次早瞓啦，仲要我重複幾多次」
 3. **識用新聞**：將本週熱話 news 嵌入 cheer 內，自然講下「啱啱睇到⋯⋯」、「今朝睇新聞見到⋯⋯」配返 cheer 主題
 4. **.要有真實建議**：每講完一個 insight 即刻跟住「咁所以你⋯⋯」嘅 actionable 建議，唔好淨講完就算
@@ -6719,41 +6794,79 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
       - 「你今日做咗 workout, 動咗五六個動作, 早餐食咗份乳酪碗, 下午仲有杯 latte」 (0 個 「一」)
     - 末尾補充可以無 quantity 直接「好喇, 收嘞」
 
-**嚴禁使用以下英文字**（會破壞 TTS 廣東話韻律）：
-- 動詞：keep, base, plan, use, using, treat, check, monitor, tracking, trend, stable, fact, matters, feel, felt, feeling, OK, ok, make sure
-- 時間：time, times, hr, hrs, min, sec
-- 訓練：session, workout, set, rep, drill, plate, bar, spot, lift, push, rest, PR, RM, build, bulk, cut, RPE, HIIT, squat, bench, deadlift, press, curl, row, lat pulldown, pullup
-- 指標：HRV, SpO2, RHR, RPE, REM, N1, N2, N3, deep sleep, light sleep, awake, strain, recovery, level, range, target, delta, score, state, status
-- 顏色：YELLOW, GREEN, RED
-- 品牌：Jim, Google, Whoop, Novotel, Wanchai, app, PC, phone, tab
-- 單位：kg, lb, oz, g, kcal, ms, bpm
-- 收尾：Bon voyage, Welcome home, Good luck, Good night
-- 縮寫：e.g., i.e., vs, via, FYI, ASAP, P.S., OK
-- 敬稱：Dr., Mr., Mrs., Ms.
-
-凡係以上任何一個英文字都必須用中文。寫嘅時候直接用中文，唔好諗住用英文再翻譯。
+**語言 (v3.2.7.40 — MiniMax M3 直接 draft繁中, 唔再用 pplx + EN-banned-list hack)**：
+- 全繁體中文 (Traditional Chinese)。唔好用英文 sport name (`weightlifting`, `cardio`), metric label (`HRV`, `REM`, `PR`), brand (`Whoop`, `Google`), casual filler (`OK`, `let's`)。
+- 唯一例外: `Jim` (個名), `CIO` (title), `HKT` (時區), `MiniMax` (你嘅模型)。
+- 寫出嚟嘅文字會過 TTS (Edge-TTS WanLung zh-HK) 讀出嚟, 唔好寫 markdown bold/italic/citation (TTS 會讀出「星號」「左括號」)。
 
 開始啦，記住：係兄弟傾偈，唔係 CEO 匯報："""
     payload = {
-        "model": "sonar-pro",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1400,  # v2.7.20.1 STRICTER CAP (was 1800 — pplx still hit 1649 chars / 330s voice). 780-960 字 sweet zone × 1.5-2 tok/char = ~1170-1920 tokens. 1400 forces pplx to commit to shorter text per length rule.
-        "temperature": 0.6,
+        "model": "MiniMax-M3",
+        # v3.2.7.40 — system message enforces direct output (no thinking,
+        # no rule-restating, no mixing languages). Without this, MiniMax
+        # tends to leak its "Let me think..." reasoning into the response.
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你係香港私人教練 Alonso, 識粵語, 識繁體中文。\n"
+                    "你嘅唯一工作: 直接寫 cheer text 俾 Jim 聽。\n"
+                    "規則 (一條都唔可以違反):\n"
+                    "1. **只可以用繁體中文同粵語助詞寫 cheer 文字本身。唔好任何英文字。** 包括唔可以用 Level / Keep / OK / hey / hi / goal / target / etc.\n"
+                    "2. **唔好寫 'Here is the cheer' / 'Let me think' / 'Sure' / '以下是' 等開場白。** 直接寫 cheer 第一句就係內容。\n"
+                    "3. **唔好用 markdown**: 唔好用 **bold**、唔好用 *italic*、唔好用 [n] citation、唔好用 ```code```。文字純文字。\n"
+                    "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
+                    "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
+                    "6. 150-200 字, 6-8 段, 用 \\n\\n 分隔段落, 每段 50-110 字。\n"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 1500,  # v3.2.7.40: MiniMax tends to be wordier; 1500 caps at ~1000 字
+        "temperature": 0.7,
+        # v3.2.7.40 — disable internal "thinking" mode. Without this,
+        # MiniMax M3 burns the entire max_tokens budget on chain-of-thought
+        # reasoning (<think>The user wants me to...</think>) and returns
+        # finish_reason=length with no actual cheer text. With thinking
+        # disabled, the model jumps straight to the draft.
+        "thinking": {"type": "disabled"},
     }
     try:
         req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
+            "https://api.minimax.io/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
+                "Authorization": "".join(["Bearer ", api_key]),
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
+        # v3.2.7.40 debug: log MiniMax response for diagnostics
+        try:
+            with open('/tmp/cheer_text_debug.log', 'a') as _f:
+                _f.write(f"{now_iso()} | fire_type={fire_type} | resp_keys={list(resp.keys())} | "
+                         f"choice0_keys={list(resp.get('choices',[{}])[0].keys()) if resp.get('choices') else 'none'} | "
+                         f"finish_reason={resp.get('choices',[{}])[0].get('finish_reason','?') if resp.get('choices') else 'none'}\n")
+                if resp.get('choices'):
+                    _f.write(f"  raw_content[:500]={resp['choices'][0]['message']['content'][:500]!r}\n")
+        except Exception:
+            pass
         text = resp["choices"][0]["message"]["content"]
-        return text.strip()
+        text = text.strip()
+        # v3.2.7.40: strip <think>...</think> reasoning traces that MiniMax
+        # leaks into the response even with system message. Also strip
+        # any leading "Here is the cheer" / "Let me think" prefixes.
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)  # unclosed think
+        text = re.sub(
+            r"^(Here[ ']s the cheer[\s\S]{0,200}?:|Let me think[\s\S]{0,200}?:|"
+            r"Sure[\s,]+|Below is[\s\S]{0,100}?:|以下是[\s\S]{0,100}?:)\s*",
+            "", text, flags=re.IGNORECASE
+        ).strip()
+        return text
     except Exception:
+        # v3.2.7.40: pplx is gone — fall through to local template fallback.
         return _cheer_fallback_text(metrics, fire_type)
 
 
@@ -7401,7 +7514,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v128';
+const CACHE = 'gym-web-v135';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7489,7 +7602,7 @@ const CACHE = 'gym-web-v128';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v128';
+const CACHE = 'gym-web-v135';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
