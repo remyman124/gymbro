@@ -6313,6 +6313,86 @@ EN_TO_ZH_VOICE = {
     "and ": "同 ", " or ": "或者", " but ": "但 ", " if ": "如果 ",
 }
 
+def _humanize_for_voice(s: str) -> str:
+    """v3.2.7.41: HARD guardrail — make cheer text human-friendly for voice.
+
+    Jim OOB 2026-08-12 01:15 HKT 「the cheer voice is so mechanical. So many
+    non-narrative words at the beginning. I don't continue listen it. Pls fix.
+    Place a minimax ai guardrail at gymbro to make sure the voice summary is
+    human friendly to read」.
+
+    4 layers of post-processing to guarantee natural Cantonese voice output:
+
+    (1) URL strip — MiniMax occasionally echoes source URLs (e.g.「資料來源
+    https://news.example.com/abc」). Edge-TTS WanLung reads each char as
+    「H-T-T-P-S 冒號 斜線 斜線 news 點 example 點 com」 — instantly robotic.
+    Strip ALL URLs (http/https/ftp/www/d.uguu.se/h.uguu.se + alipays/aliyuncs
+    signed-OSS patterns). Replace with 「資料來源省略」 neutral phrase so
+    WanLung reads a clean 「資料來源省略」.
+
+    (2) Metadata strip — pplx/MiniMax sometimes leak prompt-trace fragments
+    like 「Here is the cheer:」 / 「Below is...」 / 「以下是 cheer 內容:」 /
+    「Let me draft...」. Edge-TTS reads 「Here is the cheer」 as robotic
+    English opener. Strip aggressively.
+
+    (3) Line-by-line opener audit — if the first sentence contains English
+    words OR starts with markdown noise, drop it and start from sentence 2.
+    Jim OOB specifically called out 「so many non-narrative words at the
+    beginning」 — first 10 seconds of voice must be Chinese-only.
+
+    (4) URL/email/handle residual audit (final guard). If anything URL-shaped
+    survives all 3 layers, wrap in 「⋯⋯」 ellipse so WanLung at least reads
+    a graceful 「⋯⋯」 instead of gibberish.
+
+    Returns cleaned string with all 4 layers applied.
+    """
+    # Layer 1: URL strip (4 patterns: http(s)://, www., subdomain.uguu.se,
+    # aliyuncs OSS signed URLs, bare domain.tld patterns)
+    url_patterns = [
+        r"https?://[^\s\)\]\}，。！？]+",         # http(s)://... until whitespace/punct
+        r"www\.[^\s\)\]\}，。！？]+",            # www.domain...
+        r"[a-zA-Z0-9\-]+\.(uguu\.se|aliyuncs\.com|googleusercontent\.com|googleapis\.com)[^\s\)\]\}，。！？]*",
+        r"\b[a-zA-Z0-9\-]+\.(com|net|org|io|hk|cn|uk)(/[^\s\)\]\}，。！？]*)?",  # bare domain.tld
+    ]
+    for pat in url_patterns:
+        s = re.sub(pat, "資料來源省略", s)
+    # Layer 2: metadata strip (English/中文 meta-openers that leak into text)
+    meta_openers = [
+        r"^(Here'?s the cheer[\s\S]{0,150}?:)\s*",
+        r"^(Let me think[\s\S]{0,150}?:)\s*",
+        r"^(Sure[\s,]+|Below is[\s\S]{0,80}?:)\s*",
+        r"^(以下是[\s\S]{0,80}?:|以下為[\s\S]{0,80}?:|下面係[\s\S]{0,80}?:)\s*",
+        r"^(Here'?s a[\s\S]{0,80}?:)\s*",
+        r"^(OK[\s,]+|Okay[\s,]+)\s*",
+        r"^(Acknowledged[\s,]+|Noted[\s,]+)\s*",
+        r"^(我會[\s\S]{0,60}?寫[\s\S]{0,60}?:)\s*",
+        r"^(現在[\s\S]{0,30}?開始[\s\S]{0,30}?:)\s*",
+    ]
+    for pat in meta_openers:
+        s = re.sub(pat, "", s, flags=re.IGNORECASE | re.MULTILINE)
+    # Layer 3: opener audit — if first 80 chars contain English word, drop
+    # the first sentence entirely and start from sentence 2. Cantonese voice
+    # must open with Chinese words, no English/numbers/markdown at all.
+    sentences = re.split(r"(?<=[。！？\n])", s, maxsplit=3)
+    if sentences and len(sentences[0]) < 200:
+        first = sentences[0]
+        # Strip leading whitespace
+        first = first.strip()
+        # If first sentence has English letter or markdown noise OR URL-shaped,
+        # drop it and concat the rest.
+        if re.search(r"[A-Za-z]|[\*#\[\]\(\)\{\}]|https?://", first):
+            s = "".join(sentences[1:]).lstrip()
+    # Layer 4: residual audit. If anything URL-shaped survives (some bare
+    # domain.tld might miss Layer 1), wrap in 「⋯⋯」 so WanLung reads a clean
+    # ellipse.
+    s = re.sub(r"\b[a-zA-Z0-9\-\.]+\.(com|net|org|io|hk)/[^\s]*", "⋯⋯", s)
+    # Remove any remaining triple-asterisk noise (Layer 1 of _voice_zh_replace
+    # already handles ** but extra paranoia here)
+    s = re.sub(r"\*\*+", "", s)
+    s = re.sub(r"(?<!\*)\*(?!\*)", "", s)
+    return s.strip()
+
+
 def _voice_zh_replace(s: str) -> str:
     """Pre-flight EN→ZH auto-replace for voice script (Rule 26 + Rule 37).
 
@@ -6324,6 +6404,9 @@ def _voice_zh_replace(s: str) -> str:
     Also added an extended 'natural Chinese filler' replacement table for common
     leaked English tokens that pplx sonar-pro often uses (state, use, treat,
     keep, base, level, range, etc.).
+
+    v3.2.7.41 — caller should run `_humanize_for_voice()` BEFORE this function
+    to strip URL/metadata/openers (cleaner layered approach).
     """
     keys = sorted(EN_TO_ZH_VOICE.keys(), key=len, reverse=True)
     # v3.2.7.39: 3-pass replace instead of single pass. pplx often nests
@@ -6941,13 +7024,23 @@ def _synthesize_cheer_voice(text: str) -> str:
     Returns file path or '' on failure.
     """
     try:
+        # Step 0: humanize guardrail (v3.2.7.41 — Jim OOB 2026-08-12 01:15 HKT
+        # 「voice is so mechanical, so many non-narrative words at the
+        # beginning」). Strip URL + metadata + bad openers BEFORE zh-replace
+        # so the TTS never sees gibberish like 「H-T-T-P-S 冒號 斜線」.
+        voice_text = _humanize_for_voice(text)
+        try:
+            with open("/tmp/cheer_voice_debug.log", "a") as _f:
+                _f.write(f"{now_iso()} | text_in={len(text)} chars | after_humanize={len(voice_text)}\n")
+        except Exception:
+            pass
         # Step 1: zh-replace (first pass)
         try:
             with open("/tmp/cheer_voice_debug.log", "a") as _f:
                 _f.write(f"{now_iso()} | text_in={len(text)} chars\n")
         except Exception:
             pass
-        voice_text = _voice_zh_replace(text)
+        voice_text = _voice_zh_replace(voice_text)
         try:
             with open("/tmp/cheer_voice_debug.log", "a") as _f:
                 _f.write(f"{now_iso()} | after_zh_replace={len(voice_text)}\n")
@@ -7514,7 +7607,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v135';
+const CACHE = 'gym-web-v136';
 //   - Per-row Copy button: each history row has its own 📋 button; no more
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
@@ -7602,7 +7695,7 @@ const CACHE = 'gym-web-v135';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v135';
+const CACHE = 'gym-web-v136';
 // not workable. iPhone Withings widget has latest data but gymbro syncing"):
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
