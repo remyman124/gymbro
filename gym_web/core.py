@@ -6,7 +6,9 @@ in gym_web.py still re-implements some of these inline until migrated.
 
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional
 import json
+import urllib.parse
 
 # ---------- Constants ----------
 HKT = timezone(timedelta(hours=8))
@@ -21,7 +23,10 @@ NUTRITION_SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
 NUTRITION_TAB_NAME = "Nutrition"
 
 # v3.x version — keep in sync with __version__ in gym_web.py
-VERSION = "3.2.7.48"
+# v3.3.0: Sheet/Drive-only persistence (no file cache). Memory cache hydrates
+# from Google Sheet on startup; all writes go through the cache → Sheet.
+# food_scan_log.json + scan_cache/ are deprecated.
+VERSION = "3.3.0"
 GIT_COMMIT = "pre-release"  # updated on tag
 
 
@@ -108,3 +113,57 @@ FOOD_HISTORY_LAYOUT = {
     "landscape": "grid-2col",  # 2-column grid for compact timeline
     "switch_breakpoint": "orientation: landscape",  # CSS media query
 }
+
+
+# v3.3.0: Helper for image_proxy lazy backfill. Pulls column K (Drive URL)
+# for a single Sheet row. Returns the URL string or None if the row is
+# empty / not found. Imported lazily by gym_web.image_proxy to avoid
+# pulling the Sheet reader at module-load time.
+def get_row_drive_url(row_index: int) -> Optional[str]:
+    """Fetch Drive Image URL (column K) for a single Sheet row.
+
+    Used by image_proxy._resolve_drive_url when the per-row URL cache misses.
+    Reads `Nutrition!A{row_index}:K{row_index}` from the configured Sheet.
+
+    Args:
+        row_index: 1-based Sheet row (1 = header). Must be >= 1.
+
+    Returns:
+        The URL string from column K, or None if the row is empty / doesn't
+        exist / has no Drive URL.
+    """
+    if row_index < 2:  # row 1 is the header — no Drive URL there
+        return None
+    token_path = Path("/home/work/.hermes/google_token.json")
+    try:
+        tok = json.loads(token_path.read_text())
+        refresh = tok.get("refresh_token")
+        client_id = tok.get("client_id")
+        client_secret = tok.get("client_secret")
+        if not (refresh and client_id and client_secret):
+            return None
+        data = urllib.parse.urlencode({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh,
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        access = json.loads(urllib.request.urlopen(req, timeout=10).read())["access_token"]
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{NUTRITION_SHEET_ID}/values/"
+            f"{NUTRITION_TAB_NAME}!A{row_index}:K{row_index}"
+        )
+        req2 = urllib.request.Request(url, headers={"Authorization": f"Bearer {access}"})
+        body = json.loads(urllib.request.urlopen(req2, timeout=10).read())
+        values = body.get("values") or []
+        if not values:
+            return None
+        cells = values[0]
+        return cells[10].strip() if len(cells) > 10 and cells[10].strip() else None
+    except Exception:
+        return None

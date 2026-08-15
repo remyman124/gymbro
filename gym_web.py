@@ -31,6 +31,8 @@ from workout_formatter import render as _render_text
 from dotenv import load_dotenv
 from gym_web.core import safe_read_json as _safe_read_json
 from gym_web.idempotency import check_and_remember as _idempotency_check
+from gym_web.cache import NutritionCache, NutritionRow, get_cache as _get_nutrition_cache
+from gym_web import image_proxy
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -44,6 +46,18 @@ PORT = 7000
 HOST = "0.0.0.0"
 
 app = Flask(__name__, static_folder="/home/work/.hermes/image_cache", static_url_path="/img")
+# v3.3.0: Drive image proxy + on-demand thumbnail (replaces /scan_img/<file> route).
+app.register_blueprint(image_proxy.bp)
+
+
+# v3.3.0: Hydrate the nutrition cache + start background refresh at app start.
+# First hydration blocks app startup briefly (~3-5s for 500 rows) — acceptable.
+# Background refresh keeps it warm (60s) so concurrent edits (MCP, cheer)
+# converge without manual intervention.
+#
+# Deferred: _hydrate_nutrition_cache is defined later in this file (line ~1614),
+# so calling it at import time raises NameError. Run the hydration right before
+# serving the app (see __main__ block below).
 
 # Static token (Tailscale-only network = trusted)
 SESSION_COOKIE = "gym_web_session"
@@ -718,7 +732,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.48"
+__version__ = "3.3.0"
 
 
 def _recovery_pct():
@@ -1273,15 +1287,52 @@ def api_nutrition_today():
     Used by gym_web PWA nutrition tab + cheer pipeline. iPhone PWA can
     also POST to /api/food_scan (existing) which writes to the same log
     this endpoint reads.
+
+    v3.3.0: reads from in-memory NutritionCache instead of nutrition_log.json.
     """
-    data = _load_today_nutrition()
+    cache = _get_nutrition_cache()
+    if not cache.is_ready():
+        return jsonify({"ok": False, "error": "cache hydrating"}), 503
+    today = today_iso()
+    rows = cache.get_by_date(today)
+    meals = []
+    totals = {"kcal": 0.0, "P": 0.0, "C": 0.0, "F": 0.0}
+    for r in rows:
+        d = r.to_pwa_dict()
+        # Match legacy meal schema so cheer pipeline stays unchanged
+        meals.append({
+            "date": r.date,
+            "time": r.time,
+            "meal_type": r.meal or "scan",
+            "meal_name": r.name,
+            "name": r.name,
+            "dish_name": r.name,
+            "calories": r.kcal,
+            "protein": r.p,
+            "carbs": r.c,
+            "fat": r.f,
+            "restaurant_chain": r.restaurant,
+            "timestamp_iso": (r.dt.isoformat() if r.dt else "") + "+08:00",
+            "drive_image_url": r.drive_image_url,
+        })
+        totals["kcal"] += r.kcal
+        totals["P"] += r.p
+        totals["C"] += r.c
+        totals["F"] += r.f
+    totals = {k: round(v, 1) for k, v in totals.items()}
+    last_meal_ts = None
+    if rows:
+        last = rows[0]  # get_by_date returns time-DESC, newest first
+        if last.dt:
+            last_meal_ts = f"{last.date}T{last.time}:00+08:00"
     return jsonify({
-        "date": today_iso(),
+        "date": today,
         "fetched_at": now_iso(),
-        "meal_count": data["meal_count"],
-        "totals": data["totals"],
-        "last_meal_ts": data["last_meal_ts"],
-        "meals": data["meals"],
+        "meal_count": len(meals),
+        "totals": totals,
+        "last_meal_ts": last_meal_ts,
+        "meals": meals,
+        "cache": cache.stats(),
     })
 
 
@@ -1530,6 +1581,44 @@ def _sheet_read_all():
     with urllib.request.urlopen(req, timeout=15) as resp:
         body = json.loads(resp.read().decode())
     return body.get("values", [])
+
+
+# v3.3.0: Sheet reader for the in-memory NutritionCache. Reads the Nutrition tab
+# (A:K = 11 cols). Returns list of row arrays; first row is the header.
+# Lives in gym_web.py so it can reuse _get_google_access_token(); cache.py
+# stays pure.
+NUTRITION_SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+NUTRITION_SHEET_TAB = "Nutrition"
+
+
+def _sheet_read_nutrition_rows() -> list:
+    """Return all rows from the Nutrition tab (A:K = 11 cols)."""
+    access = _get_google_access_token()
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{NUTRITION_SHEET_ID}/values/"
+        f"{NUTRITION_SHEET_TAB}!A1:K"
+    )
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {access}"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read().decode())
+    return body.get("values", [])
+
+
+def _hydrate_nutrition_cache() -> int:
+    """Pull the Nutrition tab into the in-memory cache. Safe to call repeatedly.
+    Returns rows loaded; 0 if Sheet read failed (cache stays in last-known state).
+    """
+    try:
+        return _get_nutrition_cache().hydrate(_sheet_read_nutrition_rows)
+    except Exception as e:
+        try:
+            with open("/tmp/cache_hydrate_errors.log", "a") as f:
+                f.write(f"{now_iso()} | hydrate | {type(e).__name__}: {e}\n")
+        except Exception:
+            pass
+        return 0
 
 
 def _session_to_sheet_rows(date, session):
@@ -4300,9 +4389,26 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
         # Mark synced locally (Jim OOB 2026-07-29: prevent re-push)
         entry["sheet_synced"] = True
         updated_range = resp.get("updates", {}).get("updatedRange", "?")
+        # v3.3.0: extract the appended row's index so cache.commit() can store it.
+        # `updatedRange` looks like "Nutrition!A2:K2" for a single-row append.
+        appended_row_index = None
+        m = re.search(r"!A(\d+):K(\d+)$", updated_range or "")
+        if m and m.group(1) == m.group(2):
+            try:
+                appended_row_index = int(m.group(1))
+            except (TypeError, ValueError):
+                appended_row_index = None
         # v3.2.7.48: header bootstrap — Drive Image URL now sits at column K
         # (was N before the schema trim that dropped 來源/Image/User Hints).
         # If header K is empty, set it. Idempotent — safe to call every push.
+        # v3.3.0: index the newly-appended row in the in-memory cache so
+        # /api/scan_recent + /api/nutrition/today see it immediately.
+        try:
+            row_cells = [row_data + [""] * (11 - len(row_data))][:11]
+            new_row = NutritionRow.from_sheet_row(appended_row_index, row_cells)
+            _get_nutrition_cache().insert_row(new_row)
+        except Exception:
+            pass  # cache update is best-effort; background refresh will catch up
         try:
             header_check_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!K1"
             req_h = urllib.request.Request(header_check_url, headers={"Authorization": f"Bearer {access}"})
@@ -4320,7 +4426,7 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
                 urllib.request.urlopen(req_b, timeout=10).read()
         except Exception:
             pass  # header bootstrap is best-effort, don't break the main push
-        return {"ok": True, "range": updated_range}
+        return {"ok": True, "range": updated_range, "row_index": appended_row_index}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -4506,53 +4612,43 @@ def api_scan_recent():
     """Return last N successful scans (default 5) for dashboard overlay.
 
     Jim OOB 2026-07-23: 'In scan last 5 photo. Do not show failed upload'.
-    Filter logic: drop scans whose name/vision_short indicates MiniMax vision
-    failure (calories==0 + NameError marker), so the dashboard only shows
-    scans that produced a real food entry.
-    v2.7.33: drop hash-label fallback entries (e.g. '食物 #a1b2c3 (HH:xx)')
-    so the list only shows scans with real dish names.
+    Filter logic: drop scans whose name indicates vision failure, so the
+    dashboard only shows scans that produced a real food entry.
+
+    v3.3.0: reads from in-memory NutritionCache (hydrated from Google Sheet
+    on startup). No food_scan_log.json I/O — that file is gone. coach_comment
+    is computed on demand from the cached name+macros (keyword match, no AI).
     """
     limit = int(request.args.get("limit", 100))
-    scan_log = _load_scan_log()
-    # v2.4: drop failed scans (name/vision_short contain Vision failed marker)
-    def _is_failed_scan(s):
-        n = str(s.get("name", "")).strip() + " " + str(s.get("vision_short", ""))
-        # v2.7.33: drop generic '食物' label + hash fallback '食物 #xxx' + failed markers
+    cache = _get_nutrition_cache()
+    if not cache.is_ready():
+        return jsonify({"ok": False, "error": "cache hydrating"}), 503
+    rows = cache.get_recent(limit=limit * 2)
+
+    def _is_failed(name: str) -> bool:
+        s = (name or "").strip()
         return (
-            n.strip() == "食物"
-            or n.strip().startswith("食物 #")
-            or "失敗" in n
-            or "NameError" in n
-            or "failed" in n.lower()
+            s == "食物"
+            or s.startswith("食物 #")
+            or "失敗" in s
+            or "NameError" in s
+            or "failed" in s.lower()
         )
-    successful = [s for s in scan_log if not _is_failed_scan(s)]
-    # v2.7.42: explicit sort by timestamp_iso DESC (newest first) — was buggy
-    # `successful[-limit:][::-1]` only worked if successful was already in
-    # reverse-chronological order; the file is actually chronological so this
-    # returned the OLDEST N entries. Now we explicitly sort.
-    successful_sorted = sorted(successful, key=lambda s: s.get("timestamp_iso", ""), reverse=True)
-    recent = successful_sorted[:limit]
-    # v2.7.42: inject image_url for each scan so frontend <img :src> can render
-    # the thumbnail. Without this, every card shows the empty-fallback ⌨️/🍽️
-    # icon, which makes the food log look mostly empty.
-    for entry in recent:
-        img_path = entry.get("image_path") or entry.get("image_saved_to") or ""
-        if img_path:
-            # Extract just the filename from the absolute path
-            # e.g. /home/work/.hermes/scan_cache/scan_20260806_233225.jpg
-            #   → /scan_img/scan_20260806_233225.jpg
-            fname = os.path.basename(img_path)
-            entry["image_url"] = f"/scan_img/{fname}"
-            entry["thumbnail_url"] = _thumb_url_for(f"/scan_img/{fname}")
-            entry["is_text_only"] = False
-        else:
-            entry["image_url"] = None
-            entry["thumbnail_url"] = None
-            # v2.7.42: no image_path = text-direct entry by definition in our
-            # codebase. scan_text_direct path always sets image_path=""; user
-            # therefore knows this is a text entry.
-            entry["is_text_only"] = True
-    return jsonify({"scans": recent, "total": len(scan_log), "filtered": len(scan_log) - len(successful)})
+
+    successful = [r for r in rows if not _is_failed(r.name)]
+    recent_rows = successful[:limit]
+    out = []
+    for r in recent_rows:
+        d = r.to_pwa_dict()
+        # Lazy-compute coach_comment (fast keyword match, no AI call)
+        d["coach_comment"] = _coach_comment(r.name, r.kcal, r.p, r.c, r.f, r.restaurant)
+        out.append(d)
+    return jsonify({
+        "scans": out,
+        "total": len(rows),
+        "filtered": len(rows) - len(successful),
+        "cache": cache.stats(),
+    })
 
 
 # v3.2.7.25: Force-refresh Whoop cache (Jim OOB 2026-08-11 'calendar view
@@ -4872,30 +4968,29 @@ def api_scan_rename():
 
 @app.route("/scan_img/<path:filename>", methods=["GET"])
 def serve_scan_image(filename):
-    """Serve scanned food images (for dashboard thumbnail)."""
+    """Legacy: served scanned food images from SCAN_CACHE_DIR.
+
+    v3.3.0: superseded by image_proxy.bp /scan_img/<int:row_index>, which
+    proxies / redirects to Google Drive via the row's Drive URL (no file
+    cache). Kept for backward compat — falls through to 404 once scan_cache/
+    is removed.
+    """
     return send_from_directory(str(SCAN_CACHE_DIR), filename)
 
 
 @app.route("/scan_thumb/<path:filename>", methods=["GET"])
 def serve_scan_thumb(filename):
-    """Serve 480px thumbnail for a scan image. Lazy-generates on miss.
+    """Legacy: 480px thumbnail from SCAN_THUMB_DIR with lazy-gen fallback.
 
-    v3.2.7.46: replaces full-res JPEGs (~1.9MB) with 480px thumbs (~15-30KB)
-    in the food history view. New scans pre-generate the thumb at commit time
-    via _make_thumb(). Historical scans (pre-v3.2.7.46) and cache wipes are
-    handled here — on miss, if the original exists in SCAN_CACHE_DIR,
-    generate the thumb and cache it before serving.
-
-    Filename convention: scan_YYYYMMDD_HHMMSS.thumb.jpg (or
-    preview_*.thumb.jpg for previews). The original scan file is
-    SCAN_CACHE_DIR/<basename_without_.thumb.jpg>.jpg.
+    v3.3.0: superseded by image_proxy.bp /scan_thumb/<int:row_index>, which
+    proxies / 302-redirects to Drive's built-in thumbnail endpoint (=s220-c).
+    Kept for backward compat during transition.
     """
     if not filename.endswith(".thumb.jpg"):
         return jsonify({"ok": False, "error": "invalid thumb filename"}), 400
     thumb_path = SCAN_THUMB_DIR / filename
     if thumb_path.exists():
         return send_from_directory(str(SCAN_THUMB_DIR), filename)
-    # Lazy-generate from original
     orig_basename = filename[:-len(".thumb.jpg")] + ".jpg"
     orig_path = SCAN_CACHE_DIR / orig_basename
     if not orig_path.exists():
@@ -9048,4 +9143,18 @@ if __name__ == "__main__":
     print(f"   Local:   http://127.0.0.1:{PORT}/")
     print(f"   Tailscale: http://100.114.66.125:{PORT}/")
     print(f"   Persist to: {WORKOUT_LOG}\n")
+    # v3.3.0: Hydrate cache now that all helper funcs are defined.
+    # Failure here is non-fatal — /api/scan_recent will return 503
+    # until hydration succeeds, but the server still serves other routes.
+    try:
+        _hydrate_nutrition_cache()
+        _get_nutrition_cache().start_background_refresh(
+            _sheet_read_nutrition_rows, period_s=60
+        )
+    except Exception as _e:
+        try:
+            with open("/tmp/cache_startup_errors.log", "a") as f:
+                f.write(f"{now_iso()} | startup | {type(_e).__name__}: {_e}\n")
+        except Exception:
+            pass
     app.run(host=HOST, port=PORT, debug=False, threaded=True)

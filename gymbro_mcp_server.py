@@ -21,12 +21,16 @@ Storage:
   - /home/work/.withings_latest_cache.json (Withings cache)
   - /home/work/.jim_context.json           (push context, NEW)
   - /home/work/.hermes/cheer_artifacts/    (cheer outputs)
+  - Google Sheet id `1YKjsQ...Oag` tab Nutrition (A:K) — v3.3.0 source of truth
+    for nutrition. MCP server reads it directly via Sheets API (out-of-process,
+    cannot share memory with gym_web.py).
 
 Transport: stdio (launched by Hermes via `python3 gymbro_mcp_server.py`).
 """
 import json
 import os
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,7 +40,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-from gym_web.core import safe_read_json as _safe_read_json
+from gym_web.core import (
+    NUTRITION_SHEET_ID,
+    NUTRITION_TAB_NAME,
+    safe_read_json as _safe_read_json,
+)
 
 load_dotenv("/home/work/.hermes/.env")
 
@@ -46,8 +54,12 @@ WORKOUT_LOG = HOME / ".whoop_workout_log.json"
 WHOOP_CACHE = HOME / ".whoop_data_latest.json"
 WITHINGS_CACHE = HOME / ".withings_latest_cache.json"
 JIM_CONTEXT = HOME / ".jim_context.json"
-NUTRITION_LOG = Path("/home/work/.hermes/nutrition_log.json")
 CHEER_ARTIFACTS = Path("/home/work/.hermes/cheer_artifacts")
+
+# v3.3.0: Sheet is the source of truth for nutrition. No file cache.
+NUTRITION_SHEET_TAB = NUTRITION_TAB_NAME  # "Nutrition"
+NUTRITION_RANGE = f"{NUTRITION_SHEET_TAB}!A1:K1000"  # 11 cols, 1000-row soft cap
+GOOGLE_TOKEN_PATH = HOME / ".hermes" / "google_token.json"
 
 
 def _atomic_write_json(path: Path, data) -> bool:
@@ -69,46 +81,191 @@ def _hkt_today() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
 
 
-def _load_today_nutrition() -> dict:
-    """Read /home/work/.hermes/nutrition_log.json and return today's meals
-    + summary stats. Mirrors gym_web._load_today_nutrition.
+# ── Google OAuth (refresh_token flow) ─────────────────────────────────────────
+def _google_access_token() -> str | None:
+    """Refresh Google OAuth access token using stored refresh_token.
+    Mirrors gym_web._get_google_access_token() pattern (urllib only).
     """
-    out = {"meals": [], "totals": {"kcal": 0.0, "P": 0.0, "C": 0.0, "F": 0.0}, "meal_count": 0, "last_meal_ts": None}
-    if not NUTRITION_LOG.exists():
-        return out
+    if not GOOGLE_TOKEN_PATH.exists():
+        return None
     try:
-        log = json.loads(NUTRITION_LOG.read_text())
+        with GOOGLE_TOKEN_PATH.open() as f:
+            tok = json.load(f)
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            tok.get("token_uri", "https://oauth2.googleapis.com/token"),
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode())
+        return body["access_token"]
     except Exception:
-        return out
-    meals = (log or {}).get("meals") or []
+        return None
+
+
+# ── Sheet-backed nutrition mirror (v3.3.0) ───────────────────────────────────
+# Lightweight in-process mirror of the Nutrition tab. The MCP server is
+# out-of-process vs gym_web.py, so it cannot share the Flask module's
+# NutritionCache — it rebuilds its own on every call. Sheet reads are cheap
+# (~5s for 461 rows), so we refresh on demand rather than spawn a background
+# thread (the MCP server is short-lived per Hermes invocation).
+#
+# Mirror shape: {by_date: {"YYYY-MM-DD": [meal_dict, ...]}, by_row: {row_index: meal_dict}}
+# `meal_dict` is the same shape NutritionRow.to_pwa_dict() returns.
+
+_mirror_lock = threading.Lock()
+_mirror: dict = {"by_date": {}, "by_row": {}, "fetched_at": None}
+
+
+def _coerce_float(v) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sheet_row_to_meal_dict(row_index: int, cells: list[str]) -> dict:
+    """cells = list of 11 strings (A..K). Defensive: missing/short → ""."""
+    cells = (cells + [""] * 11)[:11]
+    date = cells[0].strip()
+    time = cells[1].strip()
+    meal = cells[2].strip()
+    name = cells[3].strip()
+    restaurant = cells[4].strip()
+    kcal = _coerce_float(cells[5])
+    p = _coerce_float(cells[6])
+    c = _coerce_float(cells[7])
+    f = _coerce_float(cells[8])
+    notes = cells[9].strip()
+    drive = cells[10].strip()
+    return {
+        # Identity
+        "entry_id": f"row-{row_index}",
+        "scan_index": row_index,
+        "row_index": row_index,
+        # Core fields
+        "date": date,
+        "time": time,
+        "time_label": time,
+        "timestamp_iso": f"{date}T{time}:00+08:00" if date and time else "",
+        "meal": meal,
+        "meal_type": meal,
+        "name": name,
+        "meal_name": name,
+        "restaurant": restaurant,
+        "restaurant_chain": restaurant,
+        # Macros
+        "calories": kcal,
+        "kcal": kcal,
+        "protein": p,
+        "carbs": c,
+        "fat": f,
+        # 12-field extras — Sheet doesn't store micros, zero defaults
+        "fiber": 0.0, "sugar": 0.0, "sodium": 0.0, "sat_fat": 0.0,
+        "trans_fat": 0.0, "vit_c": 0.0, "iron": 0.0, "calcium": 0.0,
+        # Notes
+        "notes": notes,
+        "note": notes,
+        # Image
+        "image_url": drive,
+        "thumbnail_url": f"{drive}=s220-c" if drive else "",
+        "drive_image_url": drive,
+        "image_path": "",
+        "is_text_only": not bool(drive),
+        # Dropped after file-cache removal — empty defaults keep PWA happy
+        "coach_comment": {},
+        "vision_short": "",
+        "user_corrections": [],
+        "shared": False,
+        "is_shared_meal": False,
+    }
+
+
+def _read_sheet_nutrition_rows() -> list[list[str]]:
+    """Return all rows from the Nutrition tab (A:K = 11 cols). First row = header.
+    Mirrors gym_web._sheet_read_nutrition_rows() at gym_web.py:1599-1611.
+    """
+    access = _google_access_token()
+    if not access:
+        return []
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{NUTRITION_SHEET_ID}/values/"
+        f"{NUTRITION_RANGE}"
+    )
+    req = urllib.request.Request(
+        url, headers={"Authorization": "".join(["Bearer ", access])}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = json.loads(resp.read().decode())
+    return body.get("values", [])
+
+
+def _refresh_mirror() -> dict:
+    """Pull the Sheet and rebuild the in-process mirror. Returns the mirror."""
+    new_mirror = {"by_date": {}, "by_row": {}, "fetched_at": _hkt_now_iso()}
+    try:
+        rows = _read_sheet_nutrition_rows()
+    except Exception:
+        rows = []
+    for offset, cells in enumerate(rows):
+        if offset == 0:
+            continue  # skip header row
+        sheet_row = offset + 1  # 1-based, header = row 1
+        meal = _sheet_row_to_meal_dict(sheet_row, cells)
+        if not meal["date"] and not meal["name"]:
+            continue  # skip blank rows
+        new_mirror["by_row"][sheet_row] = meal
+        new_mirror["by_date"].setdefault(meal["date"], []).append(meal)
+    # Sort each date bucket by time DESC (matches NutritionCache convention)
+    for d in new_mirror["by_date"]:
+        new_mirror["by_date"][d].sort(key=lambda m: m["time"], reverse=True)
+    with _mirror_lock:
+        _mirror.clear()
+        _mirror.update(new_mirror)
+    return _mirror
+
+
+def _get_mirror() -> dict:
+    """Get the mirror, refreshing from the Sheet on every call.
+    Sheet reads are cheap (~5s for 461 rows), so we don't bother caching.
+    """
+    return _refresh_mirror()
+
+
+def _load_today_nutrition() -> dict:
+    """Read today's meals + summary stats from the Nutrition Sheet mirror.
+    v3.3.0: replaces the legacy nutrition_log.json file-cache path.
+    Same return shape as before: {meals, totals, meal_count, last_meal_ts}.
+    """
+    out = {
+        "meals": [],
+        "totals": {"kcal": 0.0, "P": 0.0, "C": 0.0, "F": 0.0},
+        "meal_count": 0,
+        "last_meal_ts": None,
+    }
+    mirror = _get_mirror()
     today = _hkt_today()
-    today_meals = []
-    for m in meals:
-        if not isinstance(m, dict):
-            continue
-        m_date = m.get("date") or ""
-        if not m_date:
-            ts = m.get("timestamp") or m.get("logged_at")
-            if ts and isinstance(ts, str) and today in ts:
-                m_date = today
-        if m_date != today:
-            continue
-        today_meals.append(m)
-    today_meals.sort(key=lambda m: m.get("time") or m.get("timestamp") or "")
+    today_meals = list(mirror["by_date"].get(today, []))
+    today_meals.sort(key=lambda m: m["time"])  # chronological for "last" pick
     out["meals"] = today_meals
     out["meal_count"] = len(today_meals)
     for m in today_meals:
-        try:
-            out["totals"]["kcal"] += float(m.get("calories") or 0)
-            out["totals"]["P"] += float(m.get("protein") or 0)
-            out["totals"]["C"] += float(m.get("carbs") or 0)
-            out["totals"]["F"] += float(m.get("fat") or 0)
-        except (TypeError, ValueError):
-            pass
+        out["totals"]["kcal"] += _coerce_float(m.get("calories"))
+        out["totals"]["P"] += _coerce_float(m.get("protein"))
+        out["totals"]["C"] += _coerce_float(m.get("carbs"))
+        out["totals"]["F"] += _coerce_float(m.get("fat"))
     out["totals"] = {k: round(v, 1) for k, v in out["totals"].items()}
     if today_meals:
         last = today_meals[-1]
-        out["last_meal_ts"] = f"{last.get('date', today)}T{last.get('time', '00:00')}:00+08:00"
+        out["last_meal_ts"] = (
+            f"{last.get('date', today)}T{last.get('time', '00:00')}:00+08:00"
+        )
     return out
 
 
@@ -248,7 +405,12 @@ def push_jim_context(key: str, value: str, tags: str = "") -> str:
 
 @mcp.tool()
 def get_today_nutrition() -> str:
-    """Return today's meals + totals (kcal, P, C, F) from nutrition_log.json.
+    """Return today's meals + totals (kcal, P, C, F) from the Nutrition Sheet.
+
+    v3.3.0: reads directly from the Google Sheet (id `1YKjsQ...Oag` tab
+    Nutrition) via the Sheets API. The MCP server is out-of-process vs
+    gym_web.py so it cannot share the Flask in-memory cache — it builds
+    a lightweight mirror on each call.
 
     Jim OOB 2026-07-25 13:30 HKT: 'monitor my food' — Alonso should be able
     to inspect today's intake directly via MCP, not just rely on cheer
@@ -297,29 +459,7 @@ def search_history(days: int = 7) -> str:
 
 # ── Phase B/C: New tools for full cheer + scheduling orchestration ────────────
 
-# Google Calendar OAuth
-GTOKEN_FILE = HOME / ".hermes" / "google_token.json"
-NUTRITION_LOG_PATH = HOME / ".hermes" / "nutrition_log.json"
-SCAN_LOG_PATH = HOME / ".hermes" / "food_scan_log.json"
 GYM_WEB_URL = "http://127.0.0.1:4280"
-
-
-def _google_access_token() -> str | None:
-    if not GTOKEN_FILE.exists():
-        return None
-    try:
-        tok = json.loads(GTOKEN_FILE.read_text())
-        data = urllib.parse.urlencode({
-            "client_id": tok["client_id"],
-            "client_secret": tok["client_secret"],
-            "refresh_token": tok["refresh_token"],
-            "grant_type": "refresh_token",
-        }).encode()
-        req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())["access_token"]
-    except Exception:
-        return None
 
 
 @mcp.tool()
@@ -392,7 +532,7 @@ def log_meal_text(food_desc: str) -> str:
 
     Phase B: Jim OOB 2026-08-02 'food log should allow direct text input'.
     Posts to gym_web server which calls APiyi gpt-4o-mini for nutrition
-    estimate, then commits to nutrition_log + Google Sheet.
+    estimate, then commits to Google Sheet (v3.3.0 source of truth).
 
     Returns: {ok, meal, totals_after, sheet_row}
     """
