@@ -3393,11 +3393,22 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         "西蘭花", "椰菜花", "蘆筍", "蒸雞", "清蒸", "白灼", "烚菜",
         "希臘乳酪", "茅屋芝士", "豆腐", "枝豆", "海帶", "紫菜湯",
         "燙青菜", "灼菜", "蒸魚", "蒸蛋白", "蛋白奶昔",
+        # Whole-egg forms — clean gym protein (Jim OOB 2026-08-15
+        # "eggs that i scanned is marked as F, this should be a good food
+        # for gym"). Boiled/poached/tea/century/chicken egg are zero-burden
+        # gym food. Use specific phrases — bare "蛋" would mis-match
+        # 蛋糕/蛋撻/蛋卷 which are desserts in tier_d below.
+        "烚雞蛋", "烚蛋", "水煮蛋", "水蛋", "茶葉蛋", "皮蛋", "雞蛋",
+        "蒸水蛋",  # savory steamed egg custard — wholesome, was wrongly in tier_b
     ]
     tier_a = [
         "魚", "蝦", "帶子", "刺身", "壽司", "和牛 (細份)",
-        "牛扒 (細)", "牛柳", "烤雞", "燒雞", "煎魚",
+        "牛扒 (細)", "牛柳", "烤�", "燒雞", "煎魚",
         "蒸蛋", "番茄", "菠菜", "甘藍", "羽衣甘藍", "蘑菇", "茄子", "彩椒",
+        # Cooked-with-oil egg forms (Jim OOB 2026-08-15): fried/scrambled/sunny
+        # side up are still healthy gym protein — cooking oil adds ~20-40 kcal
+        # vs boiled, so tier_a (healthy balanced) not tier_a_plus (zero burden).
+        "煎蛋", "炒蛋", "太陽蛋", "滑蛋", "西炒蛋", "蛋花湯", "滷蛋",
         "燕麥", "乳酪", "酸奶", "香蕉", "蘋果", "藍莓", "奇異果",
         "牛油果", "番薯", "紫薯", "糙米", "藜麥", "扁糧",
         "毛豆", "蝦仁", "海鮮", "貝殼類", "蟹肉 (蒸)", "蜆", "青口",
@@ -3450,8 +3461,8 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
     tier_b = [
         "飯", "粥", "麵", "米粉", "河粉", "瀨粉", "烏冬", "蕎麥麵",
         "饅頭", "餃子", "包子", "雲吞", "燒賣", "腸粉", "蘿蔔糕",
-        "牛肉餅", "蒸肉餅", "肉碎", "蒸排骨", "蒸水蛋", "燉湯",
-        "雞翼", "雞腳", "鳳爪", "豬手", "牛腩", "炆牛腩",
+        "牛肉餅", "蒸肉餅", "肉碎", "蒸排骨", "燉湯",
+        "雞翼", "雞腳", "鳳爪", "豬手", "牛腩", "�牛腩",
         "炒菜", "青菜", "菜心", "芥蘭", "通菜", "豆苗", "白菜",
         "蒸饅頭", "小籠包", "生煎包", "鍋貼", "水餃", "湯圓",
         "油條", "煎餅", "葱油餅",
@@ -3558,8 +3569,13 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
         full = data["choices"][0]["message"]["content"].strip()
-        # Parse the 4 sections from AI response
+        # Strip <think>...</think> blocks leaked from reasoning models
+        # (Jim OOB 2026-08-15: "description of the egg is having a tag
+        # </think>, pls fix"). Without this, the regex below captures the
+        # tag into the user-visible comment field.
         import re
+        full = re.sub(r"<think>.*?</think>", "", full, flags=re.DOTALL).strip()
+        # Parse the 4 sections from AI response
         sec1 = re.search(r"【整體】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
         sec2 = re.search(r"【巨量營養】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
         sec3 = re.search(r"【微量營養】\s*(.+?)(?=\n|【|$)", full, re.DOTALL)
