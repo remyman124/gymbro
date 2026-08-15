@@ -800,7 +800,7 @@
           <span><span class="text-emerald-300 font-bold" x-text="lastScan?.protein || 0"></span> P</span>
           <span x-show="lastScan?.shared" class="text-yellow-300 font-bold">👥 60/40 share</span>
         </div>
-        <div class="text-[10px] text-gray-400 mb-2" x-text="lastScan?.timestamp_iso || ''"></div>
+        <div class="text-[10px] text-gray-400 mb-2" x-text="lastScan?.time_label || formatRelativeTime(lastScan?.timestamp_iso)"></div>
         <!-- Correction form -->
         <details class="mt-2">
           <summary class="text-xs text-emerald-300 cursor-pointer">✏️ 改資料（永遠保留）</summary>
@@ -861,7 +861,10 @@
                    entries just show no image at all — clean, no placeholder. -->
               <template x-if="scan.image_url">
                 <div class="relative w-full mb-2">
-                  <img :src="scan.image_url"
+                  <!-- v3.2.7.46: use 480px thumbnail for fast food history
+                       (was full-res ~1.9MB JPEGs). Tap-to-open still loads
+                       the full image for the detail view. -->
+                  <img :src="scan.thumbnail_url || scan.image_url"
                        class="w-full aspect-[16/9] rounded-xl object-cover bg-black/40 cursor-pointer active:scale-95"
                        style="max-height: 200px;"
                        loading="lazy"
@@ -1162,7 +1165,7 @@
         <div class="mb-4 rounded-2xl bg-gradient-to-br from-purple-900/40 to-pink-900/40 backdrop-blur border border-purple-400/40 p-4">
           <div class="flex items-baseline justify-between mb-2">
             <div class="text-[10px] uppercase tracking-[0.15em] text-purple-300 font-bold">最近 cheer</div>
-            <div class="text-[10px] text-gray-400" x-text="cheerLatest.timestamp_iso || ''"></div>
+            <div class="text-[10px] text-gray-400" x-text="formatRelativeTime(cheerLatest?.timestamp_iso)"></div>
           </div>
           <div class="text-xs text-gray-300 mb-1" x-text="(cheerLatest.fire_type === 'morning' ? '朝早 cheer' : cheerLatest.fire_type === 'evening' ? '夜晚 cheer' : '即場 cheer') + ' · ' + (cheerLatest.fire_id || '')"></div>
           <div class="grid grid-cols-4 gap-1 text-[10px] text-gray-400 mb-3">
@@ -1226,8 +1229,8 @@
           <div class="mt-3 rounded-xl bg-emerald-500/10 border border-emerald-400/30 px-3 py-2 text-xs text-emerald-200">
             <div class="font-bold mb-1">✓ 上一個 cheer 完成 · <span class="text-emerald-100" x-text="cheerLastFire.fire_id || ''"></span></div>
             <div class="text-[10px] text-emerald-300/80">
-              開始 <span x-text="cheerLastFire.started_at"></span>
-              · 完 <span x-text="cheerLastFire.finished_at"></span>
+              開始 <span x-text="formatTimeShort(cheerLastFire.started_at)"></span>
+              · 完 <span x-text="formatTimeShort(cheerLastFire.finished_at)"></span>
               · <span x-text="cheerLastFire.text_chars || 0"></span> 字
               · <span x-show="cheerLastFire.voice_url">語音 ✓</span>
               · <span x-show="cheerLastFire.image_url">圖 ✓</span>
@@ -1254,6 +1257,64 @@
         </template>
       </div>
 
+      <!-- v3.2.7.48: Music v3 generation section -->
+      <div class="rounded-2xl bg-gradient-to-br from-indigo-900/30 to-purple-900/30 backdrop-blur border border-indigo-400/40 p-4 mb-4">
+        <div class="flex items-baseline justify-between mb-2">
+          <div class="text-[10px] uppercase tracking-[0.15em] text-indigo-300 font-bold">🎵 Music v3 音樂生成</div>
+          <div class="text-[10px] text-gray-400" x-text="musicTracks.length ? musicTracks.length + ' 首歌' : '未有歌'"></div>
+        </div>
+        <div class="text-xs text-gray-400 mb-3">MiniMax music-3.0 · 廣東話 · 約 2 分鐘 · 50-110 秒生成時間</div>
+
+        <!-- 3 mood preset buttons -->
+        <div class="grid grid-cols-3 gap-2 mb-3">
+          <template x-for="mood in (musicMoods.length ? musicMoods : [
+            {key: 'gym', label: '💪 Gym 衝刺'},
+            {key: 'chill', label: '🌙 Chill 收機'},
+            {key: 'wind_down', label: '🌃 Wind-down 入眠'}
+          ])" :key="mood.key">
+            <button @click="generateMusic(mood.key)"
+                    :disabled="musicGenerating"
+                    class="rounded-lg py-2 text-xs font-bold active:scale-95 disabled:opacity-50"
+                    style="background:rgba(99,102,241,0.18);box-shadow:inset 0 0 0 1px rgba(99,102,241,0.4);">
+              <span x-text="mood.label"></span>
+            </button>
+          </template>
+        </div>
+
+        <!-- Live progress + error -->
+        <div x-show="musicGenProgress" class="my-2 text-xs" :class="musicGenError ? 'text-red-300' : 'text-indigo-300'" x-text="musicGenProgress"></div>
+        <div x-show="musicGenError" class="my-2 text-[10px] text-red-300" x-text="'錯誤：' + musicGenError"></div>
+
+        <!-- Last generated inline player -->
+        <template x-if="musicActiveTrack">
+          <div class="mt-3 rounded-xl bg-black/40 border border-indigo-400/30 px-3 py-2">
+            <div class="flex items-baseline justify-between mb-1">
+              <div class="text-[10px] text-indigo-200 font-bold" x-text="musicActiveTrack.label || musicActiveTrack.mood"></div>
+              <div class="text-[10px] text-gray-400" x-text="Math.round((musicActiveTrack.duration_sec || 0) / 60 * 10) / 10 + ' 分 · ' + (musicActiveTrack.size_kb ? Math.round(musicActiveTrack.size_kb/1024 * 10) / 10 + 'MB' : '')"></div>
+            </div>
+            <audio :src="musicActiveTrack.url" controls class="w-full" style="height:36px"></audio>
+            <div class="flex gap-2 mt-2">
+              <a :href="musicActiveTrack.url" :download="musicActiveTrack.file" class="text-[10px] bg-emerald-500/20 text-emerald-300 rounded-full px-2 py-0.5">⬇ 下載</a>
+              <button @click="generateMusic(musicActiveTrack.mood)" :disabled="musicGenerating" class="text-[10px] bg-purple-500/20 text-purple-300 rounded-full px-2 py-0.5 active:scale-95">🔄 再整多次</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- Recent tracks list -->
+        <template x-if="musicTracks.length > 1">
+          <div class="mt-3">
+            <div class="text-[10px] text-gray-400 mb-1 font-bold">最近 5 首：</div>
+            <template x-for="(track, idx) in musicTracks.slice(0, 5)" :key="track.file || idx">
+              <div class="flex items-center justify-between py-1.5 border-b border-white/5 last:border-b-0">
+                <button @click="playMusicTrack(track)" class="flex-1 text-left text-xs text-indigo-200 truncate active:scale-95" x-text="track.label || track.mood || track.file"></button>
+                <span class="text-[10px] text-gray-500 ml-2" x-text="Math.round((track.duration_sec || 0) / 60 * 10) / 10 + ' 分'"></span>
+                <a :href="track.url" :download="track.file" class="text-[10px] text-emerald-400 ml-2">⬇</a>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
       <!-- Recent fires (last 3, progressive load — v2.7.31) -->
       <div class="text-[10px] uppercase tracking-[0.15em] text-gray-400 mb-2 font-bold">最近 fires</div>
       <template x-if="cheerRecent.length === 0">
@@ -1271,7 +1332,7 @@
             <div class="flex-1 min-w-0">
               <div class="flex items-baseline gap-2">
                 <div class="text-xs text-white font-bold" x-text="(fire.fire_type === 'morning' ? '🌅 朝早' : fire.fire_type === 'evening' ? '🌙 夜晚' : '⚡ 即場') + ' cheer'"></div>
-                <div class="text-[10px] text-gray-500" x-text="(String(fire.timestamp_iso || '')).slice(0, 16)"></div>
+                <div class="text-[10px] text-gray-500" x-text="formatScanTime(fire.timestamp_iso)"></div>
               </div>
               <div class="flex items-baseline gap-2 text-[11px] text-gray-400 mt-0.5">
                 <span><span class="text-emerald-300 font-bold" x-text="fire.metrics_snapshot?.recovery_pct ?? '-'"></span> 復原%</span>
@@ -1465,6 +1526,49 @@ function gymApp() {
       if (m) return `${m[4]}:${m[5]}`;
       return s.slice(11, 16);
     },
+    // v3.2.7.43: HH:MM only — for cheer fire start/finish (seconds-to-minutes, no date needed)
+    formatTimeShort(iso) {
+      if (!iso) return '';
+      const s = String(iso);
+      const m = s.match(/T(\\d{2}):(\\d{2})/);
+      return m ? `${m[1]}:${m[2]}` : '';
+    },
+    // v3.2.7.43: human-friendly relative time. Jim OOB 2026-08-12
+    // "avoid showing timestamp to me. please use human readable stuff."
+    // Returns: 剛剛 / N 分鐘前 / 今日 HH:MM / 尋日 HH:MM / 星期一 / 8月5日
+    // Compares against HKT (Asia/Hong_Kong) since all timestamps emit with +08:00.
+    formatRelativeTime(iso) {
+      if (!iso) return '';
+      const ts = new Date(iso).getTime();
+      if (!Number.isFinite(ts)) return '';
+      const now = Date.now();
+      const diffMs = now - ts;
+      const diffMin = Math.floor(diffMs / 60000);
+      const diffDay = Math.floor(diffMs / 86400000);
+      if (diffMin < 1) return '剛剛';
+      if (diffMin < 60) return `${diffMin} 分鐘前`;
+      // Same HKT day → "今日 HH:MM"
+      const hktDayFmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Hong_Kong',
+        year: 'numeric', month: '2-digit', day: '2-digit'
+      });
+      const nowHktDay = hktDayFmt.format(new Date(now));
+      const isoHktDay = hktDayFmt.format(new Date(ts));
+      if (isoHktDay === nowHktDay) return `今日 ${this.formatTimeShort(iso)}`;
+      // Yesterday → "尋日 HH:MM"
+      const yesterdayHktDay = hktDayFmt.format(new Date(now - 86400000));
+      if (isoHktDay === yesterdayHktDay) return `尋日 ${this.formatTimeShort(iso)}`;
+      // Within a week → weekday
+      if (diffDay < 7) {
+        return new Intl.DateTimeFormat('zh-HK', {
+          timeZone: 'Asia/Hong_Kong', weekday: 'short'
+        }).format(new Date(ts));
+      }
+      // Older → "8月5日"
+      return new Intl.DateTimeFormat('zh-HK', {
+        timeZone: 'Asia/Hong_Kong', month: 'numeric', day: 'numeric'
+      }).format(new Date(ts));
+    },
     currentExercise: '',
     exerciseInput: '',
     weight: 20,
@@ -1565,6 +1669,14 @@ function gymApp() {
     deletingScanIndex: null,
     deleteSubmitting: false,
     deleteSubmitMsg: '',
+    // v3.2.7.48: Music v3 generation (Jim OOB 2026-08-15 "Try minimax music 3")
+    musicTracks: [],          // recent tracks from /api/music/recent
+    musicMoods: [],           // mood presets [{key, label}, ...]
+    musicGenerating: false,   // button disabled while music-3.0 renders
+    musicGenProgress: '',     // human-readable progress
+    musicGenError: '',        // error message from API
+    musicLastGenerated: null, // last successful track (object)
+    musicActiveTrack: null,   // currently playing track (for inline player)
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
     photostream: [],           // today's images with optional classification
     photostreamClassifying: false,
@@ -2806,6 +2918,8 @@ function gymApp() {
       this.tab = 'cheer';
       this.flash('🔥 Cheer tab');
       this.loadCheerRecent();
+      // v3.2.7.48: also load music recent tracks
+      this.loadMusicRecent();
     },
 
     // v2.5 cheer — load last N cheer fires from server log
@@ -2912,7 +3026,6 @@ function gymApp() {
             voice_gen: '🎙 Edge-TTS 整緊 WanLung 語音…',
             image_gen: '🖼 MiniMax 整緊勵志圖…',
           };
-          // 7/29 Jim OOB: surface 'as of time' so he sees when the data is actually from
           let suffix = '';
           if (data.whoop_pulled_at) suffix += ` · WHOOP ${data.whoop_pulled_at}`;
           if (data.withings_pulled_at) suffix += ` · Withings ${data.withings_pulled_at}`;
@@ -2921,6 +3034,63 @@ function gymApp() {
           this.cheerPct = Math.min(this.cheerPct + 8, 90);
         }
       } catch (e) { /* silent — next poll will retry */ }
+    },
+
+    // v3.2.7.48: Music v3 — load recent tracks + mood presets
+    async loadMusicRecent() {
+      try {
+        const r = await fetch('/api/music/recent?limit=10');
+        const data = await r.json();
+        if (data.tracks) this.musicTracks = data.tracks;
+        if (data.moods) this.musicMoods = data.moods;
+      } catch (e) {
+        console.error('loadMusicRecent failed', e);
+      }
+    },
+
+    // v3.2.7.48: Music v3 — trigger music-3.0 generation
+    // Cost: ~50-110s wall time, ~2:00-2:30 song. Token-cost: 1 music unit.
+    async generateMusic(mood) {
+      if (this.musicGenerating) return;
+      try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
+      this.musicGenerating = true;
+      this.musicGenProgress = `🎵 生成緊「${mood}」音樂… 等 50-110 秒`;
+      this.musicGenError = '';
+      try {
+        const r = await fetch('/api/music/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mood }),
+        });
+        const data = await r.json();
+        if (!data.ok) {
+          this.musicGenError = data.error || '未知錯誤';
+          this.musicGenProgress = '';
+          this.flash('❌ 音樂生成失敗');
+          this.musicGenerating = false;
+          return;
+        }
+        this.musicLastGenerated = data;
+        this.musicActiveTrack = data;
+        const mins = Math.round((data.duration_sec || 0) / 60 * 10) / 10;
+        this.musicGenProgress = `✓ 完成 · ${mins} 分鐘`;
+        this.flash(`🎵 ${data.label || mood} 完成`);
+        // Refresh recent list so newest is on top
+        await this.loadMusicRecent();
+        // Clear progress after 8s (longer than cheer — user wants to hear it)
+        setTimeout(() => { this.musicGenProgress = ''; }, 8000);
+      } catch (e) {
+        this.musicGenError = e.message || String(e);
+        this.musicGenProgress = '';
+        this.flash('Error：' + this.musicGenError);
+      } finally {
+        this.musicGenerating = false;
+      }
+    },
+
+    // v3.2.7.48: Set a track as currently active for inline player
+    playMusicTrack(track) {
+      this.musicActiveTrack = track;
     },
 
     async onScanFile(event) {
@@ -3144,6 +3314,7 @@ function gymApp() {
         // Preserve image_path so commit still works
         newPreview.image_path = newPreview.image_path || this.previewEntry.image_path;
         newPreview.image_url = newPreview.image_url || this.previewEntry.image_url;
+        newPreview.thumbnail_url = newPreview.thumbnail_url || this.previewEntry.thumbnail_url;  // v3.2.7.46
         this.previewEntry = newPreview;
         // Reset previewCorrectForm to reflect new suggested_entry (don't clobber Jim's edits
         // if he's already tweaked fields; only sync if form is empty/default)

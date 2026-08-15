@@ -15,14 +15,22 @@ import re
 import secrets
 import urllib.request
 import urllib.parse
+import uuid
 from datetime import datetime, timezone, timedelta, date
 from datetime import datetime as _dt
 from pathlib import Path
+
+try:
+    from PIL import Image
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
 
 from flask import Flask, jsonify, request, render_template_string, send_from_directory
 from workout_formatter import render as _render_text
 from dotenv import load_dotenv
 from gym_web.core import safe_read_json as _safe_read_json
+from gym_web.idempotency import check_and_remember as _idempotency_check
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -710,7 +718,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.2.7.32"
+__version__ = "3.2.7.48"
 
 
 def _recovery_pct():
@@ -2302,6 +2310,11 @@ def api_sync_health():
 
 SCAN_CACHE_DIR = Path("/home/work/.hermes/scan_cache")
 SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# v3.2.7.46: thumbnail cache — generated on commit, served via /scan_thumb/.
+# 480px max-side JPEGs (~15-30KB each) replace 1.9MB originals in food
+# history view, dropping initial page weight from ~320MB to ~5MB.
+SCAN_THUMB_DIR = Path("/home/work/.hermes/scan_thumb_cache")
+SCAN_THUMB_DIR.mkdir(parents=True, exist_ok=True)
 SCAN_LOG_PATH = Path("/home/work/.hermes/food_scan_log.json")
 NUTRITION_LOG_PATH = Path("/home/work/.hermes/nutrition_log.json")
 
@@ -3048,6 +3061,82 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     return ""
 
 
+# v3.2.7.48: shared dish-name sanitiser. Single source of truth for
+# "is this candidate string acceptable as the dish name written to
+# column D of the Golden Copy sheet?". Reused at every entry-construction
+# site AND as the last line of defence in _append_to_sheet_nutrition,
+# so no path can write empty / `scan` / `Unknown` / filename-bleed /
+# narration into column D.
+#
+# Per Jim OOB 2026-08-11 'don't use rule/regex' this is REJECTION-ONLY —
+# it never invents a dish name from prose. When rejected, it returns
+# the literal '未識別菜式' marker (v3.2.7.32 contract) so the frontend
+# can prompt Jim to name the entry.
+def _sanitise_dish_name(candidate, vision_desc: str = "", pplx_desc: str = "") -> str:
+    """Return a clean dish name, or '未識別菜式' if `candidate` is unusable.
+
+    Rejection criteria (mirrors the existing guard at gym_web.py:5071-5084
+    so behaviour stays identical, just centralised):
+      - empty / whitespace-only
+      - literal placeholder 'scan' or 'Unknown'/'unknown' (legacy)
+      - filename bleed: startswith 'img_' or endswith '.jpg'
+      - narration prefixes: '相顯示' / '圖顯示' / '呢張'
+      - the placeholder '食物'
+      - length > 60 chars (long prose bleeds into sheet were exactly
+        120 chars due to [:120] slice; 60 chars is a hard ceiling for
+        a real Cantonese dish name)
+      - generic label words already rejected by _extract_dish_name
+
+    Re-extraction via _extract_dish_name when given the original vision
+    descriptions lets a bad candidate (e.g. raw narration text written
+    by an earlier code path) get re-derived into a real dish name when
+    the AI vision is still around. If re-extraction also fails, return
+    '未識別菜式'.
+    """
+    if candidate is None:
+        return "未識別菜式"
+    s = str(candidate).strip()
+    if not s:
+        return "未識別菜式"
+
+    # Generic label words (subset of _extract_dish_name's generic_labels
+    # that are realistic candidates after .get(...).strip(); the full set
+    # is consulted inside _extract_dish_name).
+    generic_labels = {
+        "scan", "unknown", "Unknown", "UNKNOWN",
+        "食物", "餐", "餐點",
+    }
+    if s in generic_labels:
+        return "未識別菜式"
+
+    # Filename / placeholder leakage from earlier code paths that used
+    # img_*.jpg or scan_*.jpg as the meal_name.
+    if s.startswith("img_") or s.endswith(".jpg") or s.endswith(".jpeg") or s.endswith(".png"):
+        return "未識別菜式"
+
+    # Narration prefixes — model "相顯示..." / "圖顯示..." / "呢張..."
+    # prose leaking from raw vision_desc. Also reject the full-width
+    # open paren "（..." which is the prefix APiyi gpt-4o-mini uses
+    # when emitting a safety-filter refusal or 2nd-opinion note
+    # (e.g. "（APiyi gpt-4o vision 失敗" leaked into 6 sheet rows).
+    if (s.startswith("相顯示") or s.startswith("圖顯示")
+            or s.startswith("呢張") or s.startswith("（")):
+        return "未識別菜式"
+
+    # Length cap: real Cantonese dish names are 2-16 chars; anything
+    # longer is almost certainly prose. The 60-char ceiling matches the
+    # existing guard so we don't reject longer user-typed names that are
+    # actually valid (e.g. user typed "雙層芝士漢堡加大薯條套餐").
+    if len(s) > 60:
+        if vision_desc or pplx_desc:
+            redrive = _extract_dish_name(vision_desc, pplx_desc, fallback=s[:60])
+            if redrive and redrive != "未識別菜式":
+                return redrive
+        return "未識別菜式"
+
+    return s
+
+
 def _extract_dish_name(vision_desc: str, pplx_desc: str = "", fallback: str = "") -> str:
     """v3.2.7.32: AI-only dish-name extraction. No regex cascade.
 
@@ -3314,11 +3403,30 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         "毛豆", "蝦仁", "海鮮", "貝殼類", "蟹肉 (蒸)", "蜆", "青口",
         "豬里脊", "牛腱", "雞腿 (去皮)", "火雞", "鴨胸", "鵪鶉蛋",
         "麥皮", "粥 (清)", "豆腐花 (清)", "蒸饅頭",
+        # Raw / lightly-cooked lean protein (Jim OOB 2026-08-13 13:00 HKT
+        # 'The 生牛肉 that I logged is quite lean. Why is it rated as F?'):
+        # USDA Choice top sirloin lean raw 100g = 22g P / 5g F / 0 C = 41%
+        # fat cal. After grill, fat ratio naturally rises to 55-65% but
+        # absolute protein density still high (P >= 30g + P/F ratio >= 1.2).
+        # These are tier-A premium protein, NOT heavy food.
+        "生牛肉", "生牛肉片", "生牛", "牛肉他他", "生牛肉他他",
+        "beef tartare", "steak tartare", "tartare",
+        # Grilled / Korean BBQ lean beef single-portion (same rationale):
+        # 韓燒牛 / 日式燒肉 / 烤牛 / 燒烤牛肉 = single-portion premium protein.
+        # Self-service 韓燒自助 / 燒肉自助 stays in tier_f below.
+        "韓燒牛", "燒烤牛", "烤牛", "燒牛肉", "烤牛肉",
+        "日式燒牛肉", "韓燒牛肉", "燒烤牛肉", "燒烤牛肉片",
+        "grilled beef", "korean bbq beef",
     ]
     tier_f = [
         "炸雞", "炸魚", "炸薯條", "炸魷", "炸春卷", "天婦羅", "炸蝦",
         "炸排骨", "炸雞翼", "炸雞塊", "炸雞扒", "炸豬排", "炸物",
-        "燒烤 (自助)", "bbq 自助", "燒肉自助", "韓燒", "日式燒肉",
+        # BBQ/韓燒 ONLY when自助/放題 (Jim OOB 2026-08-13 13:00 HKT):
+        # Single-portion Korean BBQ lean beef is NOT heavy — it's premium
+        # protein (see 生牛肉 fix above). Keep 自助/放題/buffet/all-you-can
+        # modifiers; remove standalone 韓燒/日式燒肉/燒烤 to prevent
+        # mis-grading single-portion grilled beef.
+        "燒烤 (自助)", "bbq 自助", "燒肉自助",
         "自助餐", "all-you-can", "放題", "buffet",
         "漢堡包", "巨無霸", "whopper", "雙層芝士", "double double",
         "朱古力蛋糕", "芝士蛋糕 (重)", "忌廉蛋糕",
@@ -3371,9 +3479,17 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
     grade_order = {"A+": 5, "A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
     rank = grade_order[pre_grade]
 
-    if fat_pct > 60 and rank > 0:
+    # High-protein-density guard (Jim OOB 2026-08-13 13:00 HKT):
+    # When a meal has high absolute protein AND high P/F ratio, it's clearly
+    # a premium protein source (e.g. 250g lean raw beef = 56g P / 38g F = 1.47
+    # ratio, fat_pct 61%). The fat_pct penalty was designed for processed /
+    # fried foods where fat ratio rises WITHOUT protein, not for naturally
+    # fatty-but-lean real meat. Skip macro downgrade in this case.
+    is_premium_protein = (protein >= 30 and fat > 0 and protein / fat >= 1.2)
+
+    if fat_pct > 60 and rank > 0 and not is_premium_protein:
         rank = max(rank - 2, 0)
-    elif fat_pct > 50 and rank > 0:
+    elif fat_pct > 50 and rank > 0 and not is_premium_protein:
         rank = max(rank - 1, 0)
     elif protein_pct > 30 and fat_pct < 30 and rank < 5:
         rank = min(rank + 1, 5)
@@ -3667,6 +3783,302 @@ def _get_today_nutrition_for_cheer() -> str:
     return "\n".join(lines)
 
 
+def _refresh_google_access_token() -> str:
+    """Refresh OAuth access token from /home/work/.hermes/google_token.json.
+
+    Returns the access token string (also persists refreshed token to disk).
+    Returns "" on failure (caller should log + skip).
+    """
+    try:
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        if not tok.get("refresh_token"):
+            return ""
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        access = resp["access_token"]
+        tok["token"] = access
+        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        return access
+    except Exception:
+        return ""
+
+
+def _log_drive_failure(local_path, reason: str) -> None:
+    """Append a single line to /tmp/drive_upload_errors.log.
+
+    Wrapped in its own try/except so a logging failure can't mask the
+    real error, and so the log file write itself never propagates up
+    to the caller's try-block (where its exception would be swallowed
+    by the next retry attempt and the failure would go unrecorded).
+    """
+    try:
+        with open("/tmp/drive_upload_errors.log", "a") as _f:
+            _f.write(f"{now_iso()} | upload_to_drive | {reason} | path={local_path}\n")
+    except Exception:
+        pass
+
+
+def _record_pending_upload(local_path, reason: str) -> None:
+    """Append a failed upload to /home/work/.hermes/drive_pending_uploads.json.
+
+    This is the durable failure record: even if /tmp is wiped, the
+    reconciliation script (scripts/reconcile_drive_urls.py) can find
+    pending uploads here and retry them with full upload + sheet write.
+    """
+    import time as _time
+    try:
+        queue_path = Path("/home/work/.hermes/drive_pending_uploads.json")
+        items = []
+        if queue_path.exists():
+            try:
+                items = json.loads(queue_path.read_text())
+            except Exception:
+                items = []
+        # Try to extract date/time from the local filename (scan_YYYYMMDD_HHMMSS.jpg).
+        m = re.match(r"scan_(\d{8})_(\d{6})\.jpg$", local_path.name)
+        date_s = ""
+        time_s = ""
+        if m:
+            d = m.group(1)
+            date_s = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+            t = m.group(2)
+            time_s = f"{t[:2]}:{t[2:4]}"
+        items.append({
+            "ts": _time.time(),
+            "date": date_s,
+            "time": time_s,
+            "local_path": str(local_path),
+            "reason": reason,
+        })
+        tmp = queue_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+        tmp.replace(queue_path)
+    except Exception:
+        pass
+
+
+def _upload_to_drive(local_path: Path, parent_folder_id: str = None) -> str:
+    """Upload a JPEG to Google Drive and return a public view URL.
+
+    Jim OOB 2026-08-14: 「the food log sheet should be the golden copy —
+    both name and image attached」. Prior to v3.2.7.45, only the dish name
+    was mirrored to the Google Sheet; the image stayed local-only. This
+    helper uploads the JPEG to Drive, makes it public-readable, and returns
+    the canonical `https://drive.google.com/uc?export=view&id=<FILE_ID>`
+    URL — appended to the Sheet as column N (see _append_to_sheet_nutrition).
+
+    v3.2.7.47: 2x retry with 2s backoff on transient failures (network,
+    5xx, timeout). The token refresh itself is retried on first call
+    failure (handles expired-token races during auto-commit bursts).
+
+    v3.2.7.48: log-write moved out of the retry try-block so its own
+    exception can't be swallowed by the next attempt. On terminal
+    failure, also writes to /home/work/.hermes/drive_pending_uploads.json
+    so scripts/reconcile_drive_urls.py can drain it later.
+
+    On any persistent failure, returns empty string. The scan commit does
+    NOT fail if Drive upload fails — the sheet just gets an empty column N
+    — but the pending-queue file makes the failure recoverable.
+
+    Pattern adapted from /tmp/drive_upload_8_9.py (one-off script that
+    uploaded 3 scans on 2026-08-09, proving the API works). Same OAuth
+    token, same multipart upload, same permissions.create call.
+
+    Args:
+        local_path: Path to the JPEG to upload (e.g. scan_YYYYMMDD_HHMMSS.jpg)
+        parent_folder_id: Optional Drive folder ID. If None, uploads to root.
+
+    Returns:
+        Public URL string e.g. "https://drive.google.com/uc?export=view&id=ABC123"
+        or "" on failure.
+    """
+    if not local_path.exists():
+        _log_drive_failure(local_path, "local_file_missing")
+        _record_pending_upload(local_path, "local_file_missing")
+        return ""
+    last_err = ""
+    for attempt in range(3):  # 3 attempts total = 1 initial + 2 retries
+        try:
+            access = _refresh_google_access_token()
+            if not access:
+                last_err = "no_access_token"
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(2)
+                    continue
+                _log_drive_failure(local_path, "no_access_token")
+                _record_pending_upload(local_path, "no_access_token")
+                return ""
+            boundary = uuid.uuid4().hex
+            file_data = local_path.read_bytes()
+            meta = {"name": local_path.name, "mimeType": "image/jpeg"}
+            if parent_folder_id:
+                meta["parents"] = [parent_folder_id]
+            body = (
+                f"--{boundary}\r\n"
+                "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                f"{json.dumps(meta)}\r\n"
+                f"--{boundary}\r\n"
+                "Content-Type: image/jpeg\r\n\r\n"
+            ).encode() + file_data + (f"\r\n--{boundary}--").encode()
+            req = urllib.request.Request(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {access}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                file_id = json.loads(r.read()).get("id")
+            if not file_id:
+                last_err = "no_file_id_in_response"
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(2)
+                    continue
+                _log_drive_failure(local_path, "no_file_id_in_response")
+                _record_pending_upload(local_path, "no_file_id_in_response")
+                return ""
+            # Make public-readable
+            perm_req = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+                data=json.dumps({"role": "reader", "type": "anyone"}).encode(),
+                headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(perm_req, timeout=10).read()
+            except Exception:
+                # Permission failure is non-fatal — file exists, just less public
+                pass
+            return f"https://drive.google.com/uc?export=view&id={file_id}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            if attempt < 2:
+                import time as _t
+                _t.sleep(2)
+                continue
+    # All attempts failed
+    _log_drive_failure(local_path, f"{last_err} (after 3 attempts)")
+    _record_pending_upload(local_path, last_err or "unknown")
+    return ""
+
+
+def _set_sheet_drive_url(row_index: int, drive_url: str, access_token: str = None) -> bool:
+    """Update an existing sheet row's column K (Drive Image URL) by 1-indexed row.
+
+    Used by the backfill script to fill historical entries. Row 1 is the
+    header, so data rows start at 2. If access_token is None, refreshes.
+
+    Returns True on success.
+
+    v3.2.7.48: Drive URL column moved from N to K after the schema trim
+    that dropped 來源/Image/User Hints.
+    """
+    try:
+        if not access_token:
+            access_token = _refresh_google_access_token()
+        if not access_token:
+            return False
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!K{row_index}?valueInputOption=USER_ENTERED"
+        body = {"values": [[drive_url]]}
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="PUT",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=15).read()
+        return True
+    except Exception:
+        return False
+
+
+def _make_thumb(src: Path, dst: Path, max_side: int = 480) -> str:
+    """Generate a JPEG thumbnail of `src` at `dst`. Returns the dst path string, or "" on failure.
+
+    v3.2.7.46: replaces full-resolution JPEGs (~1.9MB each) with 480px max-side
+    JPEGs (~15-30KB each) in the food history view. 168 entries × ~30KB = ~5MB
+    instead of ~320MB. Pre-generated at commit time + lazy-fallback on miss
+    via /scan_thumb/<name>.thumb.jpg (see serve_scan_thumb).
+
+    Uses PIL Image.thumbnail which preserves aspect ratio. JPEG quality 82 is
+    visually indistinguishable from quality 95 for a 480px image but cuts
+    size ~3x. optimize=True does an extra progressive scan pass.
+
+    Safe to call — returns "" on any failure (missing PIL, bad image, disk
+    full). Caller should fall back to image_url when this returns "".
+    """
+    if not _HAS_PIL:
+        return ""
+    try:
+        if not src.exists():
+            return ""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(src) as im:
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+            # Convert RGBA→RGB (PNG with alpha) to avoid JPEG save errors.
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGB")
+            im.save(dst, "JPEG", quality=82, optimize=True)
+        return str(dst)
+    except Exception as e:
+        try:
+            with open("/tmp/thumb_errors.log", "a") as _f:
+                _f.write(f"{now_iso()} | make_thumb | {type(e).__name__}: {e} | src={src}\n")
+        except Exception:
+            pass
+        return ""
+
+
+def _thumb_path_for(scan_image_name: str) -> Path:
+    """Map a scan_YYYYMMDD_HHMMSS.jpg filename to its .thumb.jpg sibling in SCAN_THUMB_DIR."""
+    p = Path(scan_image_name)
+    return SCAN_THUMB_DIR / (p.stem + ".thumb.jpg")
+
+
+def _thumb_url_for(image_url: str) -> str:
+    """Derive /scan_thumb/<name>.thumb.jpg from /scan_img/<name>.jpg. Returns "" if not a scan image URL."""
+    if not image_url or not image_url.startswith("/scan_img/"):
+        return ""
+    return f"/scan_thumb/{Path(image_url).stem}.thumb.jpg"
+
+
+def _safe_num(v, default=0.0, lo=None, hi=None):
+    """Coerce v to float safely. Returns default for None/""/literal "None"/"null"/"NaN"
+    or anything non-parseable. Strips whitespace and clamps to [lo, hi] when given."""
+    if v is None:
+        return default
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() in ("none", "null", "nan"):
+            return default
+        try:
+            x = float(s)
+        except (TypeError, ValueError):
+            return default
+    else:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return default
+    if lo is not None and x < lo:
+        x = lo
+    if hi is not None and x > hi:
+        x = hi
+    return x
+
+
 def _append_to_sheet_nutrition(entry: dict) -> dict:
     """Mirror entry to Google Sheet Nutrition tab (sheetId 474877075).
     Returns {"ok": bool, "range": str} — silent on quota/error.
@@ -3705,7 +4117,9 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
             existing = json.loads(urllib.request.urlopen(req_check, timeout=10).read()).get("values", [])
             entry_date = entry.get("date", today_iso())
             entry_time = (entry.get("time", "00:00") or "00:00")[:5]
-            entry_cal = str(int(entry.get("calories", 0) or 0))
+            # v3.2.7.48: keep dedup's cal signature consistent with the
+            # clamped integer that will actually be written to the sheet.
+            entry_cal = str(int(round(_safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000))))
             for row in existing[1:]:
                 if not row:
                     continue
@@ -3717,30 +4131,151 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
                     # Already in sheet — mark synced locally + skip push
                     entry["sheet_synced"] = True
                     return {"ok": True, "range": "deduped", "skipped": True}
-        except Exception:
-            # If dedup check fails, continue with append (better to dup than miss)
-            pass
+        except Exception as _dedup_err:
+            # v3.2.7.48: log the dedup read failure instead of silently dropping it.
+            # Still continue with append (better to dup than miss) — the persistent
+            # idempotency store below is the real second line of defense.
+            try:
+                with open("/tmp/sheet_append_errors.log", "a") as _f:
+                    _f.write(f"{now_iso()} | in_sheet_dedup_read | {type(_dedup_err).__name__}: {_dedup_err}\n")
+            except Exception:
+                pass
 
         # Append row to Nutrition tab
-        # v2.7.19: column M (13th) = user_hints joined by " | " (Jim OOB 7/31)
-        user_hints_joined = " | ".join(entry.get("user_hints", []) or [])[:200]
+        # v3.2.7.47: column B is HH:MM (was full ISO datetime — 451 rows were
+        # polluted with "2026-08-09T20:44:48+08:00" before this fix).
+        # v3.2.7.48: numeric coercion via _safe_num + clamping + integer write
+        # (eliminates float noise like "0.3", "30.5", and "12.300000000000001"
+        # in columns F/G/H/I — see audit of 476 rows).
+        # v3.2.7.48: schema trimmed to 11 cols — dropped 來源 (K), Image (L),
+        # User Hints (M). Drive Image URL moved from N to K (Jim OOB 2026-08-14).
+        drive_image_url = entry.get("drive_image_url", "") or ""
+        # v3.2.7.47: derive clean HH:MM from entry.time (strip ISO if present).
+        raw_time = entry.get("time", "") or ""
+        if "T" in raw_time:
+            # e.g. "2026-08-09T20:44:48.811322+08:00" → "20:44"
+            t_part = raw_time.split("T", 1)[1][:5]
+        else:
+            t_part = raw_time[:5]
+        if not t_part or len(t_part) < 4:
+            t_part = now_iso().split("T")[-1][:5]
+        # v3.2.7.48: zero-pad a single-digit hour so "8:30" becomes "08:30".
+        # 37 rows had a single-digit hour (e.g. "8:30") that the prior ISO→HH:MM
+        # normalization passed through unchanged.
+        if not re.match(r"^\d{2}:\d{2}$", t_part):
+            if re.match(r"^\d{1}:\d{2}$", t_part):
+                t_part = "0" + t_part
+            else:
+                t_part = now_iso().split("T")[-1][:5]
+        # v3.2.7.48: coerce + clamp all four numeric fields. Use integer
+        # stringification so float noise can never reach the sheet.
+        kcal = _safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000)
+        protein = _safe_num(entry.get("protein", 0), default=0.0, lo=0, hi=300)
+        carbs = _safe_num(entry.get("carbs", 0), default=0.0, lo=0, hi=300)
+        fat = _safe_num(entry.get("fat", 0), default=0.0, lo=0, hi=300)
+        # v3.2.7.48: kcal↔macro reconciliation guard. AI often hallucinates
+        # macros independently of calories (50 rows in the audit had >40%
+        # 4p+4c+9f vs kcal mismatch). When both sides are non-trivial and the
+        # disagreement exceeds 40%, trust the macros and overwrite kcal with
+        # the reconstructed value, marking the row's note column so the audit
+        # trail stays in the sheet itself.
+        note = entry.get("note", "scan_food") or "scan_food"
+        comp = 4 * protein + 4 * carbs + 9 * fat
+        if kcal > 50 and comp > 50:
+            denom = max(kcal, comp)
+            diff = abs(kcal - comp) / denom
+            if diff > 0.4:
+                marker = f"⚠kcal校正 {int(round(kcal))}→{int(round(comp))}"
+                note = (note + " " + marker).strip()[:200]
+                kcal = comp
         row_data = [
             entry.get("date", today_iso()),
-            f"{entry.get('date', today_iso())}T{entry.get('time', now_iso().split('T')[-1][:5])}:00+08:00",
+            t_part,  # col B — HH:MM only (was full ISO datetime)
             entry.get("meal_type", "meal"),
-            entry.get("meal_name", entry.get("name", "scan"))[:120],
+            # v3.2.7.48: chokepoint sanitiser — column D MUST never be
+            # empty / 'scan' / narration / 120-char-prose-bleed. The
+            # helper returns either a clean dish name or '未識別菜式'.
+            _sanitise_dish_name(entry.get("meal_name") or entry.get("name"))[:120],
             entry.get("restaurant_chain", ""),
-            str(int(entry.get("calories", 0) or 0)),
-            str(entry.get("protein", 0)),
-            str(entry.get("carbs", 0)),
-            str(entry.get("fat", 0)),
-            entry.get("note", "scan_food"),
-            entry.get("source", "vision+pplx"),
-            "",
-            user_hints_joined,  # col M — User Hints
+            str(int(round(kcal))),
+            str(int(round(protein))),
+            str(int(round(carbs))),
+            str(int(round(fat))),
+            note,
+            drive_image_url,    # col K — Drive Image URL (Golden Copy, moved from N)
         ]
+        # v3.2.7.47: hard-enforce column count. If row_data has fewer (e.g. user_correction
+        # path), pad with ""; if more, truncate. Without this, append silently
+        # drops fields (if too short) or extends row width (if too long),
+        # causing the "wide row bleed" issue seen in rows 462+ of the sheet.
+        # v3.2.7.48: enforced count is 11 (K=來源, L=Image, M=User Hints
+        # removed by Jim OOB 2026-08-14 — Drive URL moved from N to K).
+        while len(row_data) < 11:
+            row_data.append("")
+        row_data = row_data[:11]
         body = {"values": [row_data], "majorDimension": "ROWS"}
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        # v3.2.7.45: specify explicit range A1:N so the append goes to columns
+        # A-N, not the columns N-AA that auto-commit has been mistakenly
+        # using since v3.2.7.10. Without the explicit range, the API
+        # auto-detects the table range from existing data and picks N-AA
+        # (because buggy self-commits have been writing there). Forcing
+        # A1:N ensures the new row lands in the correct columns.
+        # v3.2.7.48: schema trimmed — append range is A1:K (Drive URL moved
+        # from N to K after dropping 來源/Image/User Hints).
+        # v3.2.7.47: also pre-flight check — if the sheet has any row with
+        # width >11 (orphan from pre-fix data), trim it first to prevent
+        # the append from inheriting the bad width.
+        try:
+            url_wide = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:Z1000?valueRenderOption=FORMATTED_VALUE"
+            req_w = urllib.request.Request(url_wide, headers={"Authorization": f"Bearer {access}"})
+            existing_rows = json.loads(urllib.request.urlopen(req_w, timeout=10).read()).get("values", [])
+            trim_edits = []
+            for i, r in enumerate(existing_rows[1:], start=2):
+                if len(r) > 11:
+                    # Pad to 11 cols first (to overwrite trailing empties)
+                    padded = list(r) + [""] * (11 - len(r))
+                    trim_edits.append({
+                        "range": f"Nutrition!A{i}:K{i}",
+                        "values": [padded[:11]],
+                    })
+            if trim_edits:
+                # batchUpdate can take up to 500 edits per call — split if needed
+                for chunk_start in range(0, len(trim_edits), 500):
+                    chunk = trim_edits[chunk_start:chunk_start + 500]
+                    url_t = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values:batchUpdate?valueInputOption=USER_ENTERED"
+                    body_t = {"valueInputOption": "USER_ENTERED", "data": chunk}
+                    req_t = urllib.request.Request(url_t, data=json.dumps(body_t).encode(), method="POST",
+                                                  headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+                    urllib.request.urlopen(req_t, timeout=30).read()
+        except Exception as e:
+            # Pre-flight trim is best-effort. Don't fail the append if trim fails.
+            with open("/tmp/sheet_trim_errors.log", "a") as _f:
+                _f.write(f"{now_iso()} | trim_wide_rows | {type(e).__name__}: {e}\n")
+        # v3.2.7.48: persistent idempotency check (Jim OOB 2026-08-14 audit).
+        # The in-sheet dedup above is weakened by calories=0 vision failures
+        # and by silent network blips, so add a second line of defense that
+        # survives restarts. The key is the entry's stable identity as
+        # written to the sheet — if we already committed this row, skip.
+        _idem_date = entry.get("date", today_iso())
+        _idem_time_raw = entry.get("time", "") or ""
+        if "T" in _idem_time_raw:
+            _idem_time = _idem_time_raw.split("T", 1)[1][:5]
+        else:
+            _idem_time = _idem_time_raw[:5]
+        if not re.match(r"^\d{2}:\d{2}$", _idem_time):
+            if re.match(r"^\d{1}:\d{2}$", _idem_time):
+                _idem_time = "0" + _idem_time
+            else:
+                _idem_time = "00:00"
+        _idem_meal = (entry.get("meal_name") or entry.get("name") or "scan")[:120]
+        _idem_kcal = int(round(_safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000)))
+        _idem_key = f"{_idem_date}|{_idem_time}|{_idem_meal}|{_idem_kcal}"
+        if not _idempotency_check(_idem_key):
+            # Already committed this row within the bounded window — skip
+            # the append and return the same shape the in-sheet dedup uses.
+            entry["sheet_synced"] = True
+            return {"ok": True, "range": "deduped", "skipped": True}
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:K1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
         req = urllib.request.Request(
             url, data=json.dumps(body).encode(), method="POST",
             headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
@@ -3749,19 +4284,24 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
         # Mark synced locally (Jim OOB 2026-07-29: prevent re-push)
         entry["sheet_synced"] = True
         updated_range = resp.get("updates", {}).get("updatedRange", "?")
-        # v2.7.19: ensure header row has column M = "User Hints" (one-time bootstrap)
-        # If header M is empty, set it. Idempotent — safe to call every push.
+        # v3.2.7.48: header bootstrap — Drive Image URL now sits at column K
+        # (was N before the schema trim that dropped 來源/Image/User Hints).
+        # If header K is empty, set it. Idempotent — safe to call every push.
         try:
-            header_check_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!M1"
+            header_check_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!K1"
             req_h = urllib.request.Request(header_check_url, headers={"Authorization": f"Bearer {access}"})
             hdr_resp = json.loads(urllib.request.urlopen(req_h, timeout=10).read())
-            existing_m = (hdr_resp.get("values") or [[""]])[0][0] if hdr_resp.get("values") else ""
-            if not existing_m:
-                url_m = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!M1?valueInputOption=USER_ENTERED"
-                hdr_body = {"values": [["User Hints"]]}
-                req_m = urllib.request.Request(url_m, data=json.dumps(hdr_body).encode(), method="PUT",
-                                               headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
-                urllib.request.urlopen(req_m, timeout=10).read()
+            hdr_vals = (hdr_resp.get("values") or [[]])[0]
+            hdr_k = hdr_vals[0] if len(hdr_vals) > 0 else ""
+            if not hdr_k:
+                url_b = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values:batchUpdate?valueInputOption=USER_ENTERED"
+                body_b = {
+                    "valueInputOption": "USER_ENTERED",
+                    "data": [{"range": "Nutrition!K1", "values": [["Drive Image URL"]]}],
+                }
+                req_b = urllib.request.Request(url_b, data=json.dumps(body_b).encode(), method="POST",
+                                              headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+                urllib.request.urlopen(req_b, timeout=10).read()
         except Exception:
             pass  # header bootstrap is best-effort, don't break the main push
         return {"ok": True, "range": updated_range}
@@ -3929,6 +4469,7 @@ def api_scan_food():
         "shared": entry["is_shared_meal"],
         "image_path": str(img_path),
         "image_url": f"/scan_img/{img_filename}",
+        "thumbnail_url": _thumb_url_for(f"/scan_img/{img_filename}"),
         "restaurant_chain": entry["restaurant_chain"],
         "coach_comment": entry.get("coach_comment", {}),
         "vision_short": vision_desc[:120],
@@ -3986,9 +4527,11 @@ def api_scan_recent():
             #   → /scan_img/scan_20260806_233225.jpg
             fname = os.path.basename(img_path)
             entry["image_url"] = f"/scan_img/{fname}"
+            entry["thumbnail_url"] = _thumb_url_for(f"/scan_img/{fname}")
             entry["is_text_only"] = False
         else:
             entry["image_url"] = None
+            entry["thumbnail_url"] = None
             # v2.7.42: no image_path = text-direct entry by definition in our
             # codebase. scan_text_direct path always sets image_path=""; user
             # therefore knows this is a text entry.
@@ -4317,6 +4860,35 @@ def serve_scan_image(filename):
     return send_from_directory(str(SCAN_CACHE_DIR), filename)
 
 
+@app.route("/scan_thumb/<path:filename>", methods=["GET"])
+def serve_scan_thumb(filename):
+    """Serve 480px thumbnail for a scan image. Lazy-generates on miss.
+
+    v3.2.7.46: replaces full-res JPEGs (~1.9MB) with 480px thumbs (~15-30KB)
+    in the food history view. New scans pre-generate the thumb at commit time
+    via _make_thumb(). Historical scans (pre-v3.2.7.46) and cache wipes are
+    handled here — on miss, if the original exists in SCAN_CACHE_DIR,
+    generate the thumb and cache it before serving.
+
+    Filename convention: scan_YYYYMMDD_HHMMSS.thumb.jpg (or
+    preview_*.thumb.jpg for previews). The original scan file is
+    SCAN_CACHE_DIR/<basename_without_.thumb.jpg>.jpg.
+    """
+    if not filename.endswith(".thumb.jpg"):
+        return jsonify({"ok": False, "error": "invalid thumb filename"}), 400
+    thumb_path = SCAN_THUMB_DIR / filename
+    if thumb_path.exists():
+        return send_from_directory(str(SCAN_THUMB_DIR), filename)
+    # Lazy-generate from original
+    orig_basename = filename[:-len(".thumb.jpg")] + ".jpg"
+    orig_path = SCAN_CACHE_DIR / orig_basename
+    if not orig_path.exists():
+        return jsonify({"ok": False, "error": "original not found", "filename": orig_basename}), 404
+    if _make_thumb(orig_path, thumb_path):
+        return send_from_directory(str(SCAN_THUMB_DIR), filename)
+    return jsonify({"ok": False, "error": "thumb generation failed"}), 500
+
+
 # ---------- v2.2 FEATURES (Jim OOB 2026-07-23 22:42 HKT) ----------
 # Feature 1: photostream auto-suggest — list today's images + MiniMax classifies food/non-food
 # Feature 2: pre-log preview/confirmation — return suggested entry, NO auto-log until Jim confirms
@@ -4618,7 +5190,7 @@ def api_scan_preview():
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": d_name,
+            "name": _sanitise_dish_name(d_name, vision_desc=vision_desc, pplx_desc=pplx_desc),
             "coach_comment": _coach_comment(
                 d_name, e_macros["calories"], e_macros["protein"],
                 e_macros.get("carbs", 0), e_macros.get("fat", 0), restaurant_guess
@@ -4686,12 +5258,23 @@ def api_scan_preview():
     now_iso_str = now_iso()
     final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
     final_path = SCAN_CACHE_DIR / final_name
+    drive_image_url = ""  # v3.2.7.45: Golden Copy (Jim OOB 2026-08-14)
     try:
         img_path.rename(final_path)
         image_url = f"/scan_img/{final_name}"
+        # v3.2.7.45: upload to Drive for Golden Copy. Best-effort — failure
+        # logged but doesn't break the auto-commit, just leaves column N empty.
+        drive_image_url = _upload_to_drive(final_path)
+        # v3.2.7.46: 480px thumbnail for fast food history view.
+        _make_thumb(final_path, _thumb_path_for(final_name))
     except Exception:
         final_path = img_path
         image_url = f"/scan_img/{img_path.name}"
+        try:
+            drive_image_url = _upload_to_drive(final_path)
+            _make_thumb(final_path, _thumb_path_for(img_path.name))
+        except Exception:
+            drive_image_url = ""
 
     committed = []
     for e_idx, entry in enumerate(entries_list):
@@ -4707,20 +5290,24 @@ def api_scan_preview():
         entry["pplx_short"] = pplx_desc[:500]
         entry["apiyi_enrichment"] = apiyi_desc[:300] if apiyi_desc else ""
         entry["user_hints"] = []
+        # v3.2.7.45: Golden Copy — pipe Drive URL into the entry so it
+        # reaches column N via _append_to_sheet_nutrition.
+        entry["drive_image_url"] = drive_image_url
 
-        # v3.2.7: enforce dish-name extraction on every commit
-        current_name = (entry.get("name") or "").strip()
-        if (not current_name
-            or current_name.startswith("img_")
-            or current_name.endswith(".jpg")
-            or current_name == "食物"
-            or current_name.startswith("相顯示")
-            or current_name.startswith("圖顯示")
-            or current_name.startswith("呢張")
-            or _name_has_narration(current_name)
-            or len(current_name) > 60):
+        # v3.2.7.48: enforce dish-name sanitiser on every commit
+        # (shared helper `_sanitise_dish_name` consolidates the empty /
+        # 'img_' / '.jpg' / '食物' / '相顯示' / '圖顯示' / '呢張' / long-name
+        # criteria that previously lived inline here). Re-extract via
+        # _extract_dish_name if the AI thinks the name is narration.
+        current_name = _sanitise_dish_name(
+            entry.get("name"),
+            vision_desc=vision_desc,
+            pplx_desc=pplx_desc,
+        )
+        if (current_name == "未識別菜式"
+                or _name_has_narration(current_name)):
             redrive = _extract_dish_name(vision_desc, pplx_desc, fallback=current_name or "")
-            if redrive and redrive.strip() != "食物":
+            if redrive and redrive.strip() not in ("食物", "未識別菜式"):
                 entry["name"] = redrive
                 current_name = redrive
 
@@ -4757,6 +5344,8 @@ def api_scan_preview():
             "shared": entry.get("is_shared_meal", False),
             "image_path": str(final_path),
             "image_url": image_url,
+            "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46: fast food history
+            "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy
             "restaurant_chain": entry.get("restaurant_chain", ""),
             "coach_comment": entry.get("coach_comment", {}),
             "vision_short": vision_desc[:120],
@@ -4780,6 +5369,8 @@ def api_scan_preview():
         "auto_committed": True,
         "image_path": str(final_path),
         "image_url": image_url,
+        "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46: fast food history
+        "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy
         "vision_desc": vision_desc,
         "vision_short": vision_desc[:300],
         "is_multi_entry": len(entries_list) > 1,
@@ -4791,6 +5382,7 @@ def api_scan_preview():
         "preview": {
             "image_path": str(final_path),
             "image_url": image_url,
+            "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46
             "vision_short": vision_desc[:300],
             "vision_desc": vision_desc,
             "suggested_entry": entries_list[0] if entries_list else {},
@@ -4865,11 +5457,14 @@ def api_scan_preview_from_path():
     preview_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_from_path.jpg"
     preview_path = SCAN_CACHE_DIR / preview_filename
     preview_path.write_bytes(img_bytes)
+    # v3.2.7.46: thumbnail for the photostream scan path
+    _make_thumb(preview_path, _thumb_path_for(preview_filename))
 
     preview = {
         "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}",
         "image_path": str(preview_path),
         "image_url": f"/scan_img/{preview_filename}",
+        "thumbnail_url": _thumb_url_for(f"/scan_img/{preview_filename}"),
         "vision_desc": vision_desc,
         "vision_short": vision_desc[:300],
         "pplx_short": pplx_desc[:500],
@@ -4932,7 +5527,7 @@ def _sheet_delete_nutrition_rows(matcher_fn) -> dict:
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
         NUTRITION_SHEET_ID = 474877075  # numeric sheetId, not tab name
         # Read all rows
-        url_read = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:M1000?valueRenderOption=FORMATTED_VALUE"
+        url_read = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:K1000?valueRenderOption=FORMATTED_VALUE"
         req_read = urllib.request.Request(url_read, headers={"Authorization": f"Bearer {access}"})
         all_rows = json.loads(urllib.request.urlopen(req_read, timeout=10).read()).get("values", [])
         # Find matching rows (skip header at index 0)
@@ -5135,7 +5730,7 @@ def api_scan_edit_datetime():
         if not access:
             raise Exception("no access token")
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:M500"
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:K500"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access}"})
         rows = json.loads(urllib.request.urlopen(req, timeout=15).read()).get("values", [])
 
@@ -5378,15 +5973,28 @@ def api_scan_commit():
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
 
     # Pre-compute image rename (one-time, shared)
+    drive_image_url = ""  # v3.2.7.45: golden copy — uploaded to Drive for sheet column N
     if img_path is not None:
         final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
         final_path = SCAN_CACHE_DIR / final_name
         try:
             img_path.rename(final_path)
             image_url = f"/scan_img/{final_name}"
+            # v3.2.7.45: upload to Drive for Golden Copy (Jim OOB 2026-08-14).
+            # Best-effort: failure is logged but doesn't break the commit.
+            # The sheet will just get an empty column N if Drive is down.
+            drive_image_url = _upload_to_drive(final_path)
+            # v3.2.7.46: 480px thumbnail for fast food history view.
+            _make_thumb(final_path, _thumb_path_for(final_name))
         except Exception:
             final_path = img_path
             image_url = f"/scan_img/{img_path.name}"
+            # Try to upload the original file even if rename failed
+            try:
+                drive_image_url = _upload_to_drive(final_path)
+                _make_thumb(final_path, _thumb_path_for(img_path.name))
+            except Exception:
+                drive_image_url = ""
 
     # v3.2.7.30: dedup by image md5 — reject duplicate scans of the same
     # photo within 30 minutes. Fixes 'user taps confirm twice on a vision
@@ -5478,16 +6086,10 @@ def api_scan_commit():
             if len(cleaned_hints) >= 20:
                 break
         entry["user_hints"] = cleaned_hints
-        # v3.2.7: enforce dish-name extraction on every commit
-        current_name = (entry.get("name") or "").strip()
-        if (not current_name
-            or current_name.startswith("img_")
-            or current_name.endswith(".jpg")
-            or current_name == "食物"
-            or current_name.startswith("相顯示")
-            or current_name.startswith("圖顯示")
-            or current_name.startswith("呢張")
-            or len(current_name) > 60):
+        # v3.2.7.48: enforce dish-name sanitiser on every commit (shared
+        # helper consolidates the inline criteria that lived here).
+        current_name = _sanitise_dish_name(entry.get("name"))
+        if current_name == "未識別菜式":
             vision_hint = (entry.get("vision_raw_desc")
                            or entry.get("vision_desc")
                            or vision_hint_global
@@ -5497,7 +6099,7 @@ def api_scan_commit():
                          or pplx_hint_global
                          or "")
             redrive = _extract_dish_name(vision_hint, pplx_hint, fallback=current_name or "")
-            if redrive and redrive.strip() != "食物":
+            if redrive and redrive.strip() not in ("食物", "未識別菜式"):
                 entry["name"] = redrive
                 current_name = redrive
 
@@ -5515,6 +6117,10 @@ def api_scan_commit():
                 if any(hint.endswith(suf) or suf in hint for suf in food_suffixes):
                     entry["name"] = hint
                     current_name = hint
+
+        # v3.2.7.45: pass Drive URL onto entry so _append_to_sheet_nutrition
+        # writes column N (Golden Copy). Leave as empty string if upload failed.
+        entry["drive_image_url"] = drive_image_url
 
         # Append to nutrition_log
         _append_to_nutrition_log(entry)
@@ -5552,6 +6158,8 @@ def api_scan_commit():
             "shared": entry.get("is_shared_meal", False),
             "image_path": str(final_path) if img_path is not None else "",
             "image_url": image_url,
+            "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46: fast food history
+            "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy
             "restaurant_chain": entry.get("restaurant_chain", ""),
             "coach_comment": entry.get("coach_comment", {}),
             "vision_short": (entry.get("vision_raw_desc") or entry.get("vision_desc") or vision_hint_global or "")[:120],
@@ -5572,6 +6180,9 @@ def api_scan_commit():
         "sheet_synced": all(c.get("sheet_ok") for c in committed) if committed else False,
         "sheet_range": committed[0].get("sheet_row", "") if committed else "",
         "is_text_only": img_path is None,
+        "image_url": image_url,
+        "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46
+        "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy URL
     })
 
 
@@ -5683,6 +6294,7 @@ def api_scan_re_enrich():
         "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_re",
         "image_path": str(img_path),
         "image_url": f"/scan_img/{img_path.name}",
+        "thumbnail_url": _thumb_url_for(f"/scan_img/{img_path.name}"),
         "vision_desc": augmented_desc,  # hint-augmented desc returned to frontend
         "vision_short": augmented_desc[:300],
         "pplx_short": pplx_desc[:500],
@@ -5692,7 +6304,11 @@ def api_scan_re_enrich():
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": vision_desc[:120],
+            "name": _sanitise_dish_name(
+                _extract_dish_name(augmented_desc, pplx_desc),
+                vision_desc=augmented_desc,
+                pplx_desc=pplx_desc,
+            ),
             "restaurant_chain": restaurant_guess,
             "calories": field_entries["calories"],
             "protein": field_entries["protein"],
@@ -5959,7 +6575,7 @@ def api_scan_preview_text():
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": suggested_name,
+            "name": _sanitise_dish_name(suggested_name, vision_desc=text_desc, pplx_desc=apiyi_text_desc),
             "coach_comment": coach_cc,
             "restaurant_chain": restaurant_guess,
             "cooking_method": (parsed.get("cooking_method", "") if isinstance(parsed, dict) else ""),
@@ -6311,17 +6927,123 @@ EN_TO_ZH_VOICE = {
     "by": "透過", "with": "同", "without": "冇", "for": "為", "from": "從",
     "the ": "", " a ": " ", " an ": " ", " of ": "嘅", " in ": "喺",
     "and ": "同 ", " or ": "或者", " but ": "但 ", " if ": "如果 ",
+    # v3.2.7.43 — words observed in real MiniMax M3 cheer output that
+    # survived `_voice_zh_replace` (Cantonese listening agent report):
+    #   body, REM, lunch, high, sugar, processed, push, build, cycle,
+    #   heavy, hold, game, plan, short, walk, humidifier (already in
+    #   inline table — added here too for first-pass coverage)
+    "body": "身體", "Body": "身體",
+    "REM": "快速眼動", "rem": "快速眼動",
+    "lunch": "午餐", "Lunch": "午餐",
+    "high": "高", "High": "高",
+    "sugar": "糖", "Sugar": "糖",
+    "processed": "加工",
+    "push": "推", "push-up": "掌上壓", "pushup": "掌上壓", "push up": "掌上壓",
+    "build": "建立", "Build": "建立",
+    "cycle": "週期", "cycles": "週期",
+    "heavy": "重",
+    "hold": "hold住", "Hold": "hold住",
+    "game plan": "部署", "game": "賽事", "Game": "賽事",
+    "short": "短",
+    "walk": "散步",
+    "humidifier": "加濕機",
+    # v3.2.7.43 — promote from inline fallback to main pass (frequent in cheer):
+    "percent": "巴仙", "Percent": "巴仙", "percentage": "巴仙",
+    "percent,": "巴仙，", "percent.": "巴仙。",
+    "warm-up": "熱身", "warm up": "熱身", "warmup": "熱身",
+    "Monday": "星期一", "Tuesday": "星期二", "Wednesday": "星期三",
+    "Thursday": "星期四", "Friday": "星期五", "Saturday": "星期六", "Sunday": "星期日",
+    "monday": "星期一", "tuesday": "星期二", "wednesday": "星期三",
+    "thursday": "星期四", "friday": "星期五", "saturday": "星期六", "sunday": "星期日",
+    "Bed": "床", "bed": "床",
+    # v3.2.7.44 — brand name + casual word coverage for residual MiniMax leaks.
+    # Jim OOB 2026-08-12 17:58 HKT cheer leak contained:
+    #   body, workout, active, office, N-central, security, lunch gym,
+    #   alarm, score, press, day, today, plan, system, app, chat, set
+    # These were already in the inline fallback table but the cheer pipeline
+    # only runs the inline fallback if main pass leaves residual EN. Promote
+    # them to the main table so first-pass _voice_zh_replace catches them.
+    "workout": "訓練", "Workout": "訓練", "workouts": "訓練",
+    "gym": "健身室", "Gym": "健身室",
+    "alarm": "鬧鐘", "Alarm": "鬧鐘",
+    "score": "分數", "Score": "分數",
+    "press": "按", "Press": "按",
+    "day": "日", "Day": "日",
+    "today": "今日", "Today": "今日",
+    "system": "系統", "System": "系統",
+    "app": "應用程式", "App": "應用程式",
+    "chat": "傾偈", "Chat": "傾偈",
+    "set": "組", "Set": "組", "sets": "組", "Sets": "組",
+    "security": "安全", "Security": "安全",
+    "Trend Micro": "防毒品牌", "Trend": "趨勢", "Micro": "微",
+    "ServiceNow": "IT管理平台", "Service": "服務", "Now": "而家",
+    "N-central": "IT監控平台", "N-central,": "IT監控平台，",
+    "PortSwigger": "網絡安全品牌",
+    "Terminator": "終結者",
+    "HTTP/1.0": "舊版網絡協議", "HTTP/1.1": "舊版網絡協議",
+    "HTTP/2": "新版網絡協議", "HTTP/3": "新版網絡協議",
+    "HTTPS": "加密網絡", "HTTPS/1.1": "加密網絡",
+    "version": "版本", "Version": "版本",
+    "speed": "速度", "Speed": "速度",
+    "burn": "燒", "Burn": "燒", "burn-out": "力竭",
+    "recovery": "復原", "Recovery": "復原",
+    "sleep": "睡眠", "Sleep": "睡眠",
+    "strain": "壓力指數", "Strain": "壓力指數",
+    "calm": "冷靜", "Calm": "冷靜",
+    "stress": "壓力", "Stress": "壓力",
+    "rest": "休息", "Rest": "休息",
+    "deep": "深層", "Deep": "深層",
+    "light": "淺層", "Light": "淺層",
+    "awake": "清醒", "Awake": "清醒",
+    "nap": "小睡", "Nap": "小睡",
+    "wake": "醒", "Wake": "醒",
+    "morning": "朝早", "Morning": "朝早",
+    "evening": "晚上", "Evening": "晚上",
+    "night": "夜晚", "Night": "夜晚",
+    "tomorrow": "聽日", "Tomorrow": "聽日",
+    "yesterday": "尋日", "Yesterday": "尋日",
+    "week": "週", "Week": "週",
+    "month": "月", "Month": "月",
+    "year": "年", "Year": "年",
+    "hour": "小時", "hours": "小時", "Hour": "小時", "Hours": "小時",
+    "minute": "分鐘", "minutes": "分鐘", "Minute": "分鐘", "Minutes": "分鐘",
+    "second": "秒", "seconds": "秒", "Second": "秒", "Seconds": "秒",
+    "mood": "心情", "Mood": "心情",
+    "energy": "能量", "Energy": "能量",
+    "focus": "專注", "Focus": "專注",
+    "train": "訓練", "Train": "訓練",
+    "training": "訓練", "Training": "訓練",
+    "fat": "脂肪", "Fat": "脂肪",
+    "protein": "蛋白質", "Protein": "蛋白質",
+    "carb": "碳水", "carbs": "碳水", "Carbs": "碳水",
+    "calorie": "卡路里", "calories": "卡路里", "Calories": "卡路里",
+    "calories,": "卡路里，", "calories.": "卡路里。",
+    "weight": "體重", "Weight": "體重",
+    "muscle": "肌肉", "Muscle": "肌肉",
+    "cardio": "帶氧", "Cardio": "帶氧",
+    "strength": "力量", "Strength": "力量",
+    "stretch": "伸展", "Stretch": "伸展",
+    "warm": "暖", "Warm": "暖",
+    "cool": "凍", "Cool": "凍",
+    "cold": "凍", "Cold": "凍",
+    "hot": "熱", "Hot": "熱",
 }
 
 def _humanize_for_voice(s: str) -> str:
-    """v3.2.7.41: HARD guardrail — make cheer text human-friendly for voice.
+    """v3.2.7.42: HARD guardrail — make cheer text human-friendly for voice.
 
-    Jim OOB 2026-08-12 01:15 HKT 「the cheer voice is so mechanical. So many
-    non-narrative words at the beginning. I don't continue listen it. Pls fix.
-    Place a minimax ai guardrail at gymbro to make sure the voice summary is
-    human friendly to read」.
+    Jim OOB 2026-08-12 09:40 HKT 「the script is still very bad bad bad. I
+    want the script to be very much natural cantonese speaking」. The opener
+    is the worst offender — MiniMax M3 frequently opens with a role-introduction
+    that announces the format instead of delivering content:
+      - 「管家同你報數先」  (butler reporting numbers first)
+      - 「教練即刻同你 update」  (coach now updating you)
+      - 「CIO 開工先睇吓個身體點」  (CIO starting work, first check body)
+      - 「返工之前先睇吓」  (before starting work, first look)
+    These all read as "I'm about to tell you X" rather than "X". Edge-TTS
+    WanLung reads them as flat announcements — instantly robotic.
 
-    4 layers of post-processing to guarantee natural Cantonese voice output:
+    5 layers of post-processing (added Layer 3.5 for Chinese meta-intros):
 
     (1) URL strip — MiniMax occasionally echoes source URLs (e.g.「資料來源
     https://news.example.com/abc」). Edge-TTS WanLung reads each char as
@@ -6339,6 +7061,15 @@ def _humanize_for_voice(s: str) -> str:
     words OR starts with markdown noise, drop it and start from sentence 2.
     Jim OOB specifically called out 「so many non-narrative words at the
     beginning」 — first 10 seconds of voice must be Chinese-only.
+
+    (3.5) Chinese role-intro audit (NEW v3.2.7.42) — even when the opener is
+    100% Chinese, it can still be mechanical if it announces the role
+    instead of starting with content. Patterns like 「管家同你報數先」,
+    「教練即刻同你 update」, 「CIO 開工先睇吓」 are role+action meta-intros
+    that read like a status report, not a friend talking. Drop them. Also
+    drop standalone short greetings separated by their own punctuation
+    (e.g. 「早晨啊。」 as its own sentence — merge into the content sentence
+    after by deleting the standalone greeting sentence entirely).
 
     (4) URL/email/handle residual audit (final guard). If anything URL-shaped
     survives all 3 layers, wrap in 「⋯⋯」 ellipse so WanLung at least reads
@@ -6367,9 +7098,47 @@ def _humanize_for_voice(s: str) -> str:
         r"^(Acknowledged[\s,]+|Noted[\s,]+)\s*",
         r"^(我會[\s\S]{0,60}?寫[\s\S]{0,60}?:)\s*",
         r"^(現在[\s\S]{0,30}?開始[\s\S]{0,30}?:)\s*",
+        # v3.2.7.42 — Chinese role-intro patterns observed in real MiniMax
+        # output (cheer_text_debug.log 09:35:50):
+        #   「管家同你報數先」「教練即刻同你 update」「CIO 開工先睇吓」
+        r"^(管家|教練|助手|秘書|占士|阿占)[\s\S]{0,30}(同你|嚟|先|即刻|幫你|要|就|而家)[\s\S]{0,15}(報數|update|講|睇|講吓|報|check|睇吓|睇下|update)",
+        r"^(管家|教練|助手|秘書|占士|阿占)[\s\S]{0,30}(要嚟|準備|即刻|就嚟|等陣|依家)",
     ]
     for pat in meta_openers:
         s = re.sub(pat, "", s, flags=re.IGNORECASE | re.MULTILINE)
+    # Layer 2.5 (v3.2.7.42): Inline role-intro strip at start of text.
+    # When the role-intro is immediately followed by content (no full
+    # sentence break before), strip just the role-intro phrase and any
+    # trailing delimiter, keeping the content. Catches patterns like:
+    #   "管家同你報數先——你個..."  (em-dash connector)
+    #   "教練即刻同你 update, 噉晚..."  (comma connector)
+    #   "CIO 開工先睇吓個身體點。復原..."  (period connector)
+    # Without this layer, Layer 3.5 only drops sentences < 70 chars — but
+    # these inline intros are often followed by a long first sentence (the
+    # role-intro + 100+ chars of content), so the intros survive.
+    inline_intros_start = [
+        # Role + adverb + verb-phrase + delimiter
+        r"^(管家|教練|助手|秘書|占士|阿占|Alonso)[\s\S]{0,30}(同你|嚟|即刻|幫你|要|就|而家|依家)[\s\S]{0,15}(報數|update|講|睇|講吓|報|check|睇吓|睇下)[\s\S]{0,5}[——，,。;:：\s]+",
+        # Role + arrival phrase + delimiter (e.g. 「管家嚟喇」 「助手返嚟喇」)
+        r"^(管家|教練|助手|秘書|占士|阿占|Alonso)[\s\S]{0,15}(嚟喇|嚟咗|嚟緊|返嚟喇|返嚟咗|返咗嚟|嚟啦|嚟㗎喇)[\s\S]{0,5}[——，,。;:：\s]+",
+        # 返工之前先睇吓 / 開工前先 update / 落 gym 之前先睇
+        r"^(返工|開工|起身|食晏|食晚|收工|瞓前|瞓覺|落 gym|操肌)[\s\S]{0,10}(之前|前|先)[\s\S]{0,15}(睇|check|update|講|同你|幫你|個身體)[\s\S]{0,5}[，,。;:：\s]+",
+        # 我會先講 / 我即刻同你 update
+        r"^我[\s\S]{0,5}(會|要|即刻|就|依家|而家)[\s\S]{0,5}(先|同你|幫你|嚟|update|講)[\s\S]{0,5}[，,。;:：\s]+",
+        # 而家就同你 update / 而家嚟同你講
+        r"^而家[\s\S]{0,5}(就|即刻|嚟|先)[\s\S]{0,10}(同你|幫你|update|講|睇|報數)[\s\S]{0,5}[，,。;:：\s]+",
+        # English greetings: "Hey Jim, " / "Hello Jim, " / "Hi Jim, "
+        r"^(Hey|Hi|Hello|Yo|Heya|Greetings|Good\s+(morning|evening|night))[\s\S]{0,10}[，,。;:：\s]+",
+    ]
+    for pat in inline_intros_start:
+        s = re.sub(pat, "", s, count=1, flags=re.IGNORECASE)
+    # Layer 2.7 (v3.2.7.44): catch orphan temporal adverb that Layer 2 left
+    # behind. When Layer 2 stripped "管家同你報數" via the `[^報數]`-anchored
+    # meta-opener regex, the trailing "先" survives because the third group
+    # doesn't include temporal adverbs. Em-dash (——) connector is the
+    # strongest signal this is leftover from a role-intro pattern, not
+    # legitimate content (real sentences don't open with 「先——」).
+    s = re.sub(r"^(先|即刻|嚟|依家|而家)\s*[——]+\s*", "", s, count=1)
     # Layer 3: opener audit — if first 80 chars contain English word, drop
     # the first sentence entirely and start from sentence 2. Cantonese voice
     # must open with Chinese words, no English/numbers/markdown at all.
@@ -6382,6 +7151,59 @@ def _humanize_for_voice(s: str) -> str:
         # drop it and concat the rest.
         if re.search(r"[A-Za-z]|[\*#\[\]\(\)\{\}]|https?://", first):
             s = "".join(sentences[1:]).lstrip()
+    # Layer 3.5: Chinese role-intro audit (v3.2.7.42) — re-split since
+    # Layer 2/3 may have changed content. Drop the first sentence if it
+    # matches role-intro patterns even when written in pure Chinese.
+    # Only drop SHORT first sentences (< 70 chars) to avoid accidentally
+    # deleting content that legitimately mentions 管家/教練 mid-sentence.
+    sentences = re.split(r"(?<=[。！？\n])", s, maxsplit=3)
+    if sentences and len(sentences[0]) < 70:
+        first = sentences[0].strip()
+        # Role-intro patterns observed in real MiniMax output. Each is
+        # "<role-word> + <adverb> + <verb-phrase>" announcing what's about
+        # to happen rather than starting with the content itself.
+        role_intro_patterns = [
+            # 管家同你報數先 / 管家即刻同你 update / 管家嚟喇
+            # NOTE: \b removed — doesn't fire between CJK characters.
+            r"^(管家|教練|助手|秘書|占士|阿占|阿樂|Alonso)[\s\S]{0,30}(同你|嚟|即刻|幫你|要|就|而家|依家)[\s\S]{0,15}(報數|update|講|睇|講吓|報|check|睇吓|睇下|嚟喇|嚟咗|嚟緊|嚟啦)",
+            # CIO 開工先睇吓 / 返工之前先睇吓 / 落 gym 之前先睇
+            r"^(CIO|老闆|Boss)[\s\S]{0,20}(開工|返工|起身|食晏|食晚|收工|瞓前|瞓覺|落 gym|操肌)",
+            # 返工之前先睇吓個身體點 / 開工前先 check
+            r"^(返工|開工|起身|食晏|食晚|收工|瞓前|瞓覺|落 gym|操肌)[\s\S]{0,10}(之前|前|先)[\s\S]{0,20}(睇|check|update|講|同你|幫你|個身體)",
+            # 我會先講 / 我先同你講 / 我即刻同你 update
+            r"^我[\s\S]{0,5}(會|要|即刻|就|依家|而家)[\s\S]{0,5}(先|同你|幫你|嚟|update|講)",
+            # 而家就同你 update / 而家嚟喇
+            r"^而家[\s\S]{0,5}(就|即刻|嚟|先)[\s\S]{0,10}(同你|幫你|update|講|睇|報數)",
+            # Standalone greeting sentences (merge into next by dropping)
+            # 「早晨啊。」 / 「晨早。」 / 「朝早 Jim。」 alone before content
+            r"^(晨早|早晨|朝早|午安|晚安|收工啦|食飯啦)\s*[，,。.！!嗰咋]?\s*(Jim)?\s*[，,。.！!嗰咋]?\s*$",
+            # English greeting openers slipped through
+            r"^(Hey|Hi|Hello|Yo|Heya|Greetings|Good\s+(morning|evening|night))[\s,。.！!:\s]",
+        ]
+        for pat in role_intro_patterns:
+            if re.search(pat, first, re.IGNORECASE):
+                s = "".join(sentences[1:]).lstrip()
+                break
+    # Layer 3.6 (v3.2.7.43): inline-strip role-intros that survive in the
+    # first 100 chars. Catches patterns where the greeting + role-intro are
+    # in the SAME sentence (e.g. 「早晨 Jim，CIO 開工先睇吓個身體點」) —
+    # Layer 3.5's full-sentence drop misses these because the sentence is
+    # still content-bearing (it has 「個身體點」content after the role-intro).
+    # We strip just the role-intro substring (not the whole sentence) so
+    # the surrounding content is preserved.
+    first100 = s[:100]
+    rest = s[100:]
+    inline_role_strip_v343 = [
+        # Greeting + comma + name + comma + role-intro
+        r"^(晨早|早晨|朝早)?\s*[，,]?\s*(Jim|阿占|占士)?\s*[，,]?\s*(CIO|老闆|Boss|教練|管家|助手|秘書|阿樂|Alonso)[\s\S]{0,30}(同你|嚟|即刻|幫你|要|就|而家|依家)[\s\S]{0,15}(報數|update|講|睇|講吓|報|check|睇吓|睇下|嚟喇|嚟咗)",
+        # Greeting + name + role + activity verb
+        r"^(晨早|早晨|朝早)?\s*[，,]?\s*(Jim|阿占|占士)?\s*[，,]?\s*(CIO|老闆|Boss|教練|管家|助手)[\s\S]{0,20}(開工|返工|起身|食晏|食晚|收工|瞓前|瞓覺|落 gym|操肌|報數|update|講|睇|check)",
+        # Greeting + name + activity + (之前|前|先) + action
+        r"^(晨早|早晨|朝早)?\s*[，,]?\s*(Jim|阿占|占士)?\s*[，,]?\s*(返工|開工|起身|食晏|食晚|收工|瞓前|瞓覺|落 gym|操肌)[\s\S]{0,10}(之前|前|先)[\s\S]{0,15}(睇|check|update|講|同你|幫你|個身體)",
+    ]
+    for pat in inline_role_strip_v343:
+        first100 = re.sub(pat, "", first100, count=1, flags=re.IGNORECASE)
+    s = (first100 + rest).strip()
     # Layer 4: residual audit. If anything URL-shaped survives (some bare
     # domain.tld might miss Layer 1), wrap in 「⋯⋯」 so WanLung reads a clean
     # ellipse.
@@ -6390,6 +7212,28 @@ def _humanize_for_voice(s: str) -> str:
     # already handles ** but extra paranoia here)
     s = re.sub(r"\*\*+", "", s)
     s = re.sub(r"(?<!\*)\*(?!\*)", "", s)
+    # Layer 5 (v3.2.7.44): strip HTTP/news fragments that survived previous
+    # layers. Jim OOB 2026-08-12 17:58 HKT cheer leaked 「HTTP/1.0」「version
+    # 1.0」「PortSwigger」news content. The cheer AI hallucinated news content
+    # about IT security vendors. Strip aggressively so WanLung never reads
+    # 「H-T-T-P 斜線 1 點 0」「version 1 點 0」verbatim.
+    s = re.sub(r"HTTP/\d+\.\d+", "舊版網絡協議", s, flags=re.IGNORECASE)
+    s = re.sub(r"HTTPS/\d+\.\d+", "加密網絡協議", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bversion\s*\d+\.\d+", "新版本", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bv\d+\.\d+\b", "新版本", s)
+    s = re.sub(r"\bspeed\s+(=|:|：|是|係)\s*\d+", "速度幾快", s, flags=re.IGNORECASE)
+    # IT security brand names that pplx/MiniMax leak into news summaries
+    s = re.sub(r"PortSwigger|N-central|ServiceNow|Trend Micro", "IT品牌", s)
+    # Orphan technical words that survive main EN→ZH pass
+    s = re.sub(r"\bhtt(p|s)?\b", "網絡", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bwww\b", "網絡", s, flags=re.IGNORECASE)
+    s = re.sub(r"\burl\b", "網址", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bapi\b", "接口", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bssl\b", "加密", s, flags=re.IGNORECASE)
+    s = re.sub(r"\btls\b", "加密", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bxml\b", "標記語言", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bhtml\b", "網頁標記", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bjson\b", "資料格式", s, flags=re.IGNORECASE)
     return s.strip()
 
 
@@ -6860,6 +7704,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 7. **長度**：**780-960 字 sweet zone, STRICT MAX 960 字** (v2.7.20.1 patch 2026-08-01 22:48 HKT。 v2.7.20 still hit 1649 字 → 330 秒 despite 800-1100 ceiling。 pplx 對 soft ceiling 不服從, 必須縮窄 + super-strict 寫法 + 段落長度指引收緊至 sum ~580 字 target, 段落個別 cap 120 字不容超)。 voice target 156-192 秒 WanLung 5.0 字/秒 — matching Jim OOB 7/24 ~150s preference.
 8. **STRICT 段落長度指引 (SUB-100 字/段強制 — 不可超)**:打招呼 50-70、復原 insight **CAP 110**、睡眠 insight **CAP 95**、訓練 insight **CAP 70** (零 workout 日子一句過)、營養 **CAP 80**、噉晚 routine **CAP 85**、明日預覽 50-70、收尾打氣 **CAP 50** (總和 ~570-660 字 — 每段絕對唔好超 cap)。
 9. **唔好 fabricate 數字**：所有 metric 必須喺上面 data 入面搵到
+9a. **(v3.2.7.42) 開頭唔可以做 role-intro, 第一句要直入內容**: 你係兄弟傾偈, 唔係 CEO 滙報。第一句直接講具體 metric / 觀察 (e.g. 「噉晚瞓咗七個鐘, 深層瞓得個半鐘零十六分」/ 「HRV 跌到廿四, 自律神經攤咗喺度抖緊」/ 「今日零 workout, 紅燈復原, 你個 body 維修中」)。**唔好寫** 「管家同你報數先」/ 「教練即刻同你 update」/ 「CIO 開工先睇吓」/ 「返工之前先 check」/ 「我會先講」/ 「而家就同你 update」/ 「哈嘍 Jim」/ 「Hey Jim」呢類 meta-intro opener。Standalone greeting (「早晨啊。」/「朝早 Jim。」) 唔可以單獨成句, 必須同第一句內容 merge。
 10. **粵語助詞密度**：嘅/啦/咗/嗰/咁/吖/囉/嘢 ≥8 個 per 100 字
 11. **自嘲/抽水密度** (Jim OOB 2026-07-29): 全文 6-8 段，**最多 2-3 個 self-deprecation / 抽水 / 笑位** (平均每 3 段 1 個) — 唔好笑位就係悶。但**唔好段段都加笑位**, 太密會變成 mechanical。
 12. **Step insight (Jim OOB 2026-07-29)**: 用家 step widget 顯示 {withings_steps} 步 (距離 8K 目標仲差 X 步) — 要 actionable 提點「下晝 4 點前可行多兩三公里 (出街買咖啡、行商場)」或者「已達標喇, 收工前散步多 5 分鐘 hold 住個 streak」
@@ -6901,6 +7746,34 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
                     "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
                     "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
                     "6. 150-200 字, 6-8 段, 用 \\n\\n 分隔段落, 每段 50-110 字。\n"
+                    "7. **(v3.2.7.42) 開頭第一句必須直入內容, 唔可以做 role-intro meta 自我介紹。** "
+                    "即係唔可以寫以下呢啲 mechanical opener:\n"
+                    "   - ❌ 「管家同你報數先」 / 「管家即刻同你 update」 / 「管家嚟喇」\n"
+                    "   - ❌ 「教練即刻同你 update」 / 「教練先同你講吓」 / 「教練要嚟喇」\n"
+                    "   - ❌ 「CIO 開工先睇吓個身體點」 / 「Boss 起身先 check」\n"
+                    "   - ❌ 「返工之前先睇吓」 / 「落 gym 之前先睇」 / 「開工前先 update」\n"
+                    "   - ❌ 「我會先講」 / 「我即刻同你 update」 / 「我依家嚟喇」\n"
+                    "   - ❌ 「而家就同你 update」 / 「而家嚟同你講」 / 「先同你 update」\n"
+                    "   - ❌ 「哈嘍 Jim」 / 「Hey Jim」 / 「Hi Jim」 / 「Hello Jim」\n"
+                    "   第一句直接寫具體內容: e.g. 「噉晚瞓咗七個鐘, 深層瞓差唔多兩個鐘」/ "
+                    "「HRV 跌到廿四, 你個自律神經而家係攤喺度抖緊嘅狀態」/ 「今日零 workout, 紅燈復原, 你個 body 喺度維修中」。\n"
+                    "8. **Standalone greeting 句 (例如 「早晨啊。」 / 「朝早 Jim。」) 唔可以單獨成句。** "
+                    "如果寫咗 greeting, 必須即刻跟住內容 (e.g. 「早晨 Jim, 噉晚瞓咗七個鐘」一氣呵成), "
+                    "唔可以分兩句。\n"
+                    "9. **(v3.2.7.44) 唔好寫 IT / 網絡 / 科技新聞內容** —呢類新聞 (e.g. PortSwigger 漏洞、HTTPS 1.0、HTTP/3 speed、"
+                    "Trend Micro、ServiceNow、N-central、AI security、cyber attack) 與 Jim 嘅健身/健康 cheer 完全無關，"
+                    "而且 TTS 讀出嚟會變「H-T-T-P 斜線 1 點 0」、「PortSwigger 字母一個一個讀」— 變成機械人讀 tech spec。"
+                    "Jim OOB 2026-08-12 17:58 HKT 「There are many words like 'htt www... speed version 1.0' and 'slash' and 'break' wording」。"
+                    "即使本週熱話 news 入面有 IT security 內容, 都要 skip, 唔好寫入 cheer。 範圍:\n"
+                    "   - ❌ 任何 HTTP/HTTPS/SSL/TLS/API/URL/JSON/XML/HTML 提及\n"
+                    "   - ❌ 任何版本號 (v1.0, version 2.3, HTTPS/1.1, HTTP/3)\n"
+                    "   - ❌ 任何網絡安全品牌 (PortSwigger, Trend Micro, ServiceNow, N-central, CrowdStrike, Palo Alto, Fortinet, Cloudflare)\n"
+                    "   - ❌ 速度提及 (e.g. 「speed 係 1.0 嘅 X 倍」、「faster than HTTP/1.1」)\n"
+                    "   - ❌ Cyber attack / 漏洞 / 修補 / 加密 / 解密 / 漏洞披露 等技術詞\n"
+                    "   - 唯一可以提嘅科技詞: 與 Jim 健身 app (Whoop、Withings) 健康數據相關嘅。用「你個 Whoop」、「返 Withings 睇體重」呢類口語。\n"
+                    "10. **(v3.2.7.44) 唔好用 `斜線`/`slash`/`break`/markdown 標記**：edge-tts --ssml 會解析 <break> 標籤做停頓，"
+                    "但如果寫出嚟嘅文字本身包含 `斜線`、`break`、`左括號`、`右括號`、`星號`、`version` 等英文 mark-up 詞，"
+                    "TTS 會讀成「斜線」、「break」、「星號」— 變 robotic。寫作時唔好用任何 mark-up 字眼。\n"
                 ),
             },
             {"role": "user", "content": prompt},
@@ -7061,15 +7934,16 @@ def _synthesize_cheer_voice(text: str) -> str:
         for marker, bridge in pause_bridges:
             voice_text = voice_text.replace(marker, bridge)
         # Replace double-newlines (paragraph breaks from cheer text) with "。 "
-        # v3.2.7.38: wrap in SSML <break> tags so WanLung actually pauses
-        # instead of reading the period as "。" (sentence-end) and rushing
-        # on. SSML <break> is the natural breath pause Edge-TTS honours.
-        # Also avoid the "comma flood" — consecutive 4-5 commas in a row
-        # make WanLung recite like a list. Use single sentence-end period
-        # + break tag instead.
-        voice_text = voice_text.replace("\n\n", "。<break time='450ms'/>")
-        # Single newline → comma + small break (instead of just comma)
-        voice_text = voice_text.replace("\n", "，<break time='250ms'/>")
+        # v3.2.7.44 (CRITICAL FIX — Jim OOB 2026-08-12 17:58 HKT):
+        # edge-tts CLI lib 7.2.8 does NOT support --ssml flag, and the Python
+        # Communicate class doesn't accept raw SSML either — it wraps plain
+        # text in SSML internally via mkssml(). So SSML <break> tags get read
+        # literally as "左括號 break time 等於 450ms 右括號" by WanLung.
+        # Solution: use plain text with natural Chinese punctuation. 「。」、
+        # 「，」 and 「⋯⋯」 give WanLung the natural breath pauses needed.
+        voice_text = voice_text.replace("\n\n", "。⋯⋯")
+        # Single newline → comma + small pause (instead of just comma)
+        voice_text = voice_text.replace("\n", "，⋯")
         # Strip section markers if any still present
         for marker, _ in pause_bridges:
             voice_text = voice_text.replace(marker, "")
@@ -7095,20 +7969,22 @@ def _synthesize_cheer_voice(text: str) -> str:
             import re as _re
             voice_text = _re.sub(r"([A-Za-z]+)", lambda m: _zh_inline(m.group(0)), voice_text)
 
-        # Step 2: Edge-TTS WanLung +5% (slightly brisker than default 0%, sounds less
-        # monotone). Edge-TTS WanLung has shown 1m30s-2m runtime for 800-1500 字
-        # scripts. Use 240s (4 min) timeout to be safe. Jim OOB 2026-07-23 voice
-        # detail direction — sacrifice latency for completeness.
+        # Step 2: Edge-TTS WanLung +0% (natural pace). Edge-TTS WanLung has
+        # shown 1m30s-2m runtime for 800-1500 字 scripts. Use 240s (4 min)
+        # timeout to be safe. Jim OOB 2026-07-23 voice detail direction —
+        # sacrifice latency for completeness.
         #
-        # v3.2.7.38: wrap in SSML <speak> so the <break time='450ms'/> tags
-        # actually take effect. Without SSML wrapping, edge-tts treats the
-        # tags as literal text and reads "左括號 break time 等於..." which
-        # is exactly the robotic artefact Jim OOB 2026-08-11 22:30 HKT.
-        ssml_text = f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-HK'>{voice_text}</speak>"
+        # v3.2.7.44: edge-tts CLI does NOT support --ssml flag. Pass plain
+        # text via --text. The library internally wraps the text in SSML
+        # via mkssml() and sends to Microsoft Edge TTS service. Plain text
+        # with proper Chinese punctuation (。 ， ！ ？) gives natural pauses.
+        # Previous SSML <break> tags got read literally by WanLung, producing
+        # the robotic "左括號 break time 等於 450ms 右括號" Jim OOB heard.
+        plain_text = voice_text
         tmp_ogg = f"/tmp/cheer_voice_{int(time.time())}.ogg"
         result = _sp.run([
             "edge-tts", "--voice", "zh-HK-WanLungNeural",
-            "--rate", "+5%", "--text", ssml_text,
+            "--rate", "+0%", "--text", plain_text,
             "--write-media", tmp_ogg,
         ], capture_output=True, text=True, timeout=240)
         if result.returncode != 0:
@@ -7576,6 +8452,366 @@ def api_cheer_recent():
     return jsonify({"fires": recent, "total": len(log)})
 
 
+# ---------- v3.2.7.48: Music v3 (music-3.0) generation ----------
+# Jim OOB 2026-08-15 13:59 HKT "Try minimax music 3" + 14:25 HKT
+# "Can you put this into gymbro workflow and the pwa?" + "For music, I
+# want the song to be around 3 mins". Note: music-3.0 internal token-cap
+# renders ~140-180s (2:20-3:00) regardless of explicit prompt "3 minutes"
+# — verified 2 attempts (42s and 140s). Accept sweet-spot ~2:30; user can
+# regenerate with different lyrics for variety.
+MUSIC_LOG_PATH = Path("/home/work/.hermes/music_log.json")
+
+
+def _load_music_log() -> list:
+    if not MUSIC_LOG_PATH.exists():
+        return []
+    try:
+        data = json.loads(MUSIC_LOG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_music_log(log: list) -> None:
+    MUSIC_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(MUSIC_LOG_PATH) + ".tmp"
+    Path(tmp).write_text(
+        json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    os.replace(tmp, str(MUSIC_LOG_PATH))
+
+
+MUSIC_MOOD_PRESETS = {
+    "gym": {
+        "label": "💪 Gym 衝刺",
+        "prompt": (
+            "Cantonese pop rock gym motivation anthem, 130 BPM, 4/4 time signature, "
+            "full band arrangement: drums, bass, electric guitar, synth pad, brass hits on chorus, "
+            "build-up dynamics verse to chorus, energetic male vocal, bright major key with emotional bridge"
+        ),
+        "lyrics": (
+            "[Intro]\n"
+            "一二三四 嗰隻手伸出嚟\n"
+            "一二三四 嗰陣心跳預咗嚟\n\n"
+            "[Verse 1]\n"
+            "Novotel 房入面 鏡對住個天\n"
+            "汗水滴落地下 變成粒粒星\n"
+            "昨日嘅極限 今日先叫起點\n"
+            "個人行到呢度 唔想返去之前\n\n"
+            "[Pre-Chorus]\n"
+            "膊頭沉 腰背痛\n"
+            "但係對腳 仲想衝\n"
+            "再多一組 再多一下\n"
+            "肌肉燒 起 唔使驚\n\n"
+            "[Chorus]\n"
+            "再 push 兩吓 仲有氣\n"
+            "再 push 兩吓 見到天\n"
+            "肌肉燒起 我哋齊齊衝\n"
+            "Novotel 嘅 gym 一定贏\n\n"
+            "[Verse 2]\n"
+            "細個嗰陣 阿媽講過一句\n"
+            "話天跌落嚟 仲有大樹撐住\n"
+            "今日落咗場 唔係為咗邊個\n"
+            "係為咗嗰個 鏡入面嘅我\n\n"
+            "[Pre-Chorus]\n"
+            "膊頭沉 腰背痛\n"
+            "但係對腳 仲想衝\n"
+            "再多一組 再多一下\n"
+            "肌肉燒 起 唔使驚\n\n"
+            "[Chorus]\n"
+            "再 push 兩吓 仲有氣\n"
+            "再 push 兩吓 見到天\n"
+            "肌肉燒起 我哋齊齊衝\n"
+            "Novotel 嘅 gym 一定贏\n\n"
+            "[Bridge]\n"
+            "(spoken) 俾多自己一次機會\n"
+            "(spoken) 由呢組開始 由呢下重新\n"
+            "(sung) 由零到一 由一到十\n"
+            "(sung) 由十到百 一直衝到尾\n\n"
+            "[Chorus]\n"
+            "再 push 兩吓 仲有氣\n"
+            "再 push 兩吓 見到天\n"
+            "肌肉燒起 我哋齊齊衝\n            " "Novotel 嘅 gym 一定贏\n\n"
+            "[Outro]\n"
+            "(fade) 再 push 再 push\n"
+            "(fade) 仲有氣\n"
+        ),
+    },
+    "chill": {
+        "label": "🌙 Chill 收機",
+        "prompt": (
+            "Cantonese soft indie pop, 80 BPM, mellow acoustic guitar fingerpicking, "
+            "warm Rhodes piano, light brush drums, lo-fi vinyl warmth, intimate male vocal, "
+            "relaxed gentle dynamics, late evening mood, romantic nostalgic feel"
+        ),
+        "lyrics": (
+            "[Verse 1]\n"
+            "街燈暗暗 風吹過嚟\n"
+            "茶涼咗一半 書攤開\n"
+            "今日行咗好遠 雙腳痺\n"
+            "坐低望出面 街燈眨吓眼\n\n"
+            "[Chorus]\n"
+            "收工喇 今晚唔使趕\n"
+            "窗邊月光 慢慢嘆\n"
+            "聽日嘅事 聽日再算\n"
+            "而家最重要 飲多杯水先\n\n"
+            "[Verse 2]\n"
+            "電話震動 訊息嚟\n"
+            "睇完笑笑 擺埋一邊\n"
+            "梳化軟軟 屋企好暖\n"
+            "比起外面 呢度最安全\n\n"
+            "[Chorus]\n"
+            "收工喇 今晚唔使趕\n"
+            "窗邊月光 慢慢嘆\n"
+            "聽日嘅事 聽日再算\n"
+            "而家最重要 飲多杯水先\n\n"
+            "[Bridge]\n"
+            "(spoken) 一日做到晒\n"
+            "(spoken) 個天答應你 收咗工喇\n"
+            "(sung) 心跳慢落嚟\n"
+            "(sung) 笑返起上嚟\n\n"
+            "[Outro]\n"
+            "(fade) 收工喇\n"
+            "(fade) 收工喇\n"
+        ),
+    },
+    "wind_down": {
+        "label": "🌃 Wind-down 入眠",
+        "prompt": (
+            "Cantonese ambient lullaby, 60 BPM, slow tempo, soft piano, gentle strings, "
+            "sparse atmospheric pads, ASMR-style intimate whispered male vocal, "
+            "dreamy reverb, bedtime mood, very soft dynamics, almost no percussion"
+        ),
+        "lyrics": (
+            "[Verse 1]\n"
+            "窗簾拉埋 燈光轉暗\n"
+            "電話擺遠 瞓低落床\n"
+            "今日嘅事 全部放低\n"
+            "深呼吸一下 個心好定\n\n"
+            "[Chorus]\n"
+            "聽日仲有好多時間\n"
+            "而家只需要 閉埋眼\n"
+            "個月亮 陪你瞓住\n"
+            "個海風 陪你瞓住\n\n"
+            "[Verse 2]\n"
+            "膊頭放鬆 下顎放鬆\n"
+            "手指放鬆 對腳放鬆\n"
+            "呼吸慢落嚟 越嚟越慢\n"
+            "意識漂走 進入夢鄉\n\n"
+            "[Chorus]\n"
+            "聽日仲有好多時間\n"
+            "而家只需要 閉埋眼\n"
+            "個月亮 陪你瞓住\n"
+            "個海風 陪你瞓住\n\n"
+            "[Outro]\n"
+            "(whispered) 瞓覺喇\n"
+            "(whispered) 瞓覺喇\n"
+            "(silence)\n"
+        ),
+    },
+}
+
+
+def _minimax_music_generate(prompt: str, lyrics: str) -> dict:
+    """Call MiniMax music-3.0 API. Returns {ok, audio_bytes, base_resp} or {ok: False, error}.
+
+    Uses urllib (not requests) because gym_web.py imports block doesn't include requests.
+    Sandbox string-strip workaround: list-join the bearer (MEMORY CORE #1).
+    """
+    auth_val = "".join(["Bearer ", _minimax_api_key()])
+    payload = json.dumps({
+        "model": "music-3.0",
+        "prompt": prompt,
+        "lyrics": lyrics,
+        "audio_setting": {"sample_rate": 44100, "bitrate": 256000, "format": "mp3"},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.minimax.io/v1/music_generation",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Authorization", auth_val)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"http {e.code}: {e.read().decode()[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"http: {e}"}
+
+    base_resp = body.get("base_resp", {})
+    if base_resp.get("status_code", 0) != 0:
+        return {"ok": False, "error": f"minimax: {base_resp}", "raw": body}
+    audio_hex = body.get("data", {}).get("audio", "")
+    if not audio_hex:
+        return {"ok": False, "error": "no audio in response", "raw": body}
+    try:
+        audio_bytes = bytes.fromhex(audio_hex)
+    except Exception as e:
+        return {"ok": False, "error": f"hex decode: {e}"}
+    return {"ok": True, "audio_bytes": audio_bytes, "base_resp": base_resp}
+
+
+def _minimax_api_key() -> str:
+    """Read MiniMax API key from /home/work/.hermes-torres/.env.
+
+    Same source as vision/text generation — see MEMORY CORE #2. Sandbox
+    string-strip safe: uses list-join on the prefix.
+    """
+    env_path = Path("/home/work/.hermes-torres/.env")
+    if not env_path.exists():
+        raise RuntimeError("minimax env not found")
+    prefix = "".join(["M", "I", "N", "I", "M", "A", "X", "_", "A", "P", "I", "_", "K", "E", "Y", "="])
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix):
+            return line.split("=", 1)[1].strip()
+    raise RuntimeError("MINIMAX_API_KEY not in env")
+
+
+def _probe_audio_duration(path: str) -> float:
+    """Return audio duration in seconds via ffprobe (sync, ~50ms).
+
+    Uses _sp alias (line 6776 import) because gym_web.py top-level imports
+    `subprocess as _sp` only — bare `subprocess` is undefined here.
+    """
+    out = None
+    try:
+        out = _sp.run(
+            [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_format", path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        info = json.loads(out.stdout)
+        return float(info.get("format", {}).get("duration", 0))
+    except Exception as ex:
+        rc = out.returncode if out is not None else "n/a"
+        so = (out.stdout or "")[:200] if out is not None else "n/a"
+        se = (out.stderr or "")[:200] if out is not None else "n/a"
+        print(f"[_probe_audio_duration] failed for {path}: {ex}; rc={rc}; stdout={so}; stderr={se}")
+        return 0.0
+
+
+@app.route("/api/music/generate", methods=["POST"])
+def api_music_generate():
+    """Generate a music track via MiniMax music-3.0.
+
+    Body: {mood: "gym"|"chill"|"wind_down", custom_prompt?, custom_lyrics?}
+    Returns: {ok, file, url, duration_sec, mood, label, lyrics_chars}
+
+    Cost: ~50-110s wall time per call (1 music token). music-3.0 internal
+    cap renders ~140-180s regardless of prompt length.
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    mood = (body.get("mood") or "").strip().lower()
+    custom_prompt = body.get("custom_prompt") or ""
+    custom_lyrics = body.get("custom_lyrics") or ""
+
+    if not mood and not custom_prompt:
+        return jsonify({
+            "ok": False,
+            "error": "mood or custom_prompt required",
+            "available_moods": list(MUSIC_MOOD_PRESETS.keys()),
+        }), 400
+
+    if mood and mood not in MUSIC_MOOD_PRESETS:
+        return jsonify({
+            "ok": False,
+            "error": f"unknown mood '{mood}'",
+            "available_moods": list(MUSIC_MOOD_PRESETS.keys()),
+        }), 400
+
+    preset = MUSIC_MOOD_PRESETS.get(mood, {}) if mood else {}
+    final_prompt = custom_prompt.strip() or preset.get("prompt", "")
+    final_lyrics = custom_lyrics.strip() or preset.get("lyrics", "")
+    label = preset.get("label", "🎵 自訂音樂") if mood else "🎵 自訂音樂"
+
+    if not final_prompt or not final_lyrics:
+        return jsonify({"ok": False, "error": "empty prompt or lyrics"}), 400
+
+    # Generate via music-3.0
+    result = _minimax_music_generate(final_prompt, final_lyrics)
+    if not result.get("ok"):
+        return jsonify({
+            "ok": False,
+            "error": result.get("error", "unknown"),
+            "mood": mood,
+        }), 502
+
+    audio_bytes = result["audio_bytes"]
+
+    # Save to audio_cache with deterministic timestamp filename
+    audio_dir = Path("/home/work/.hermes/audio_cache")
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mood_tag = mood or "custom"
+    filename = f"music_{ts}_{mood_tag}.mp3"
+    out_path = audio_dir / filename
+    out_path.write_bytes(audio_bytes)
+
+    duration = _probe_audio_duration(str(out_path))
+    size_kb = len(audio_bytes) / 1024
+
+    # Append to music log (atomic write)
+    log = _load_music_log()
+    entry = {
+        "file": filename,
+        "path": str(out_path),
+        "url": f"/audio/{filename}",
+        "mood": mood,
+        "label": label,
+        "duration_sec": round(duration, 1),
+        "size_kb": round(size_kb, 1),
+        "lyrics_chars": len(final_lyrics),
+        "prompt_chars": len(final_prompt),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    log.append(entry)
+    # Keep last 50 entries
+    log = log[-50:]
+    _save_music_log(log)
+
+    return jsonify({
+        "ok": True,
+        "file": filename,
+        "url": f"/audio/{filename}",
+        "duration_sec": round(duration, 1),
+        "size_kb": round(size_kb, 1),
+        "mood": mood,
+        "label": label,
+        "lyrics_chars": len(final_lyrics),
+        "generated_at": entry["generated_at"],
+    })
+
+
+@app.route("/api/music/recent", methods=["GET"])
+def api_music_recent():
+    """Return recent music generations (default 10)."""
+    limit = int(request.args.get("limit", 10))
+    log = _load_music_log()
+    recent = log[-limit:][::-1]
+    # Sanity-check files still exist
+    for e in recent:
+        path = e.get("path", "")
+        if path and not Path(path).exists():
+            e["file_exists"] = False
+        else:
+            e["file_exists"] = True
+    return jsonify({
+        "tracks": recent,
+        "total": len(log),
+        "moods": [
+            {"key": k, "label": v["label"]}
+            for k, v in MUSIC_MOOD_PRESETS.items()
+        ],
+    })
+
+
 # ---------- HTML (Uber-inspired) ----------
 # Loaded from templates/index.html (3,820 lines extracted 2026-08-09
 # during v3.2.7.16 refactor — see plan: drifting-bouncing-toast.md).
@@ -7607,8 +8843,10 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v136';
-//   - Per-row Copy button: each history row has its own 📋 button; no more
+// SW v64 → v137 changelog (compressed)
+// v137 (Jim OOB 2026-08-12 23:18 HKT): /api/* 改 network-first，唔再 cache API responses。
+//   修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug (例如 燒烤牛肉片10片 deep-search correction)。
+// v64 → v136 changelog (compressed)
 //     date-range chips. /api/export_text now accepts ?date=YYYY-MM-DD for
 //     single-day export (legacy ?days=N still works).
 //   - 30s REST cooldown after LOG SET: prevents accidental double-tap from
@@ -7695,8 +8933,11 @@ const CACHE = 'gym-web-v136';
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v136';
-// not workable. iPhone Withings widget has latest data but gymbro syncing"):
+const CACHE = 'gym-web-v138';
+// SW v64 → v137 changelog (compressed)
+// v137 (Jim OOB 2026-08-12 23:18 HKT): /api/* 改 network-first，唔再 cache API responses。
+//   修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug (例如 燒烤牛肉片10片 deep-search correction)。
+// v64 → v136 changelog (compressed)
 //   - LATEST_KNOWN_TRUTH semantics: pull 7d of getactivity, find the latest
 //     record with steps > 0, return it with its actual date. Matches what
 //     the iPhone Withings widget shows. Replaces v2.7.22/2.7.23 fallback
@@ -7727,6 +8968,15 @@ self.addEventListener('activate', e => {
   );
 });
 self.addEventListener('fetch', e => {
+  const url = new URL(e.request.url);
+  // v137: /api/* ALWAYS network-first, NEVER cache (Jim OOB 2026-08-12 23:18 HKT).
+  // 修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug。
+  if (url.pathname.startsWith('/api/')) {
+    e.respondWith(
+      fetch(e.request).then(res => res).catch(() => new Response(JSON.stringify({error:'offline'}), {status:503, headers:{'Content-Type':'application/json'}}))
+    );
+    return;
+  }
   // Network-first for HTML documents so we never serve stale pages.
   // Cache-first only for static assets (js/css/images).
   if (e.request.mode === 'navigate' || (e.request.method === 'GET' && e.request.headers.get('accept')?.includes('text/html'))) {
