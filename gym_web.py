@@ -3237,8 +3237,12 @@ def _sanitise_dish_name(candidate, vision_desc: str = "", pplx_desc: str = "") -
     # open paren "（..." which is the prefix APiyi gpt-4o-mini uses
     # when emitting a safety-filter refusal or 2nd-opinion note
     # (e.g. "（APiyi gpt-4o vision 失敗" leaked into 6 sheet rows).
+    # v3.3.4: also catch "這張相顯示" / "這張相" — same narration pattern,
+    # just with a demonstrative pronoun that the vision model adds when
+    # the photo is too sparse to identify (e.g. "這張相顯示一支蘇打水樽").
     if (s.startswith("相顯示") or s.startswith("圖顯示")
-            or s.startswith("呢張") or s.startswith("（")):
+            or s.startswith("呢張") or s.startswith("這張")
+            or s.startswith("（")):
         return "未識別菜式"
 
     # Length cap: real Cantonese dish names are 2-16 chars; anything
@@ -4265,6 +4269,15 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
         # v3.2.7.48: schema trimmed to 11 cols — dropped 來源 (K), Image (L),
         # User Hints (M). Drive Image URL moved from N to K (Jim OOB 2026-08-14).
         drive_image_url = entry.get("drive_image_url", "") or ""
+        # v3.3.4: harden column K write. Reject any value that isn't a Drive
+        # URL (Jim OOB 2026-08-15 'I don't accept broken image' — row 455
+        # had K='30', a corrupted int from a wrong lookup that bled here).
+        # PWA skips <img> rendering for empty string, so blanks are fine.
+        if drive_image_url and not re.match(
+            r"^https?://(lh3\.googleusercontent\.com|drive\.google\.com)/",
+            drive_image_url,
+        ):
+            drive_image_url = ""
         # v3.2.7.47: derive clean HH:MM from entry.time (strip ISO if present).
         raw_time = entry.get("time", "") or ""
         if "T" in raw_time:
@@ -5764,6 +5777,14 @@ def _sheet_update_nutrition_row(row_idx: int, entry: dict) -> dict:
         restaurant = (entry.get("restaurant_chain") or entry.get("restaurant") or "")[:80]
         notes = (entry.get("note") or entry.get("notes") or "")[:200]
         drive_image_url = entry.get("drive_image_url", "") or ""
+        # v3.3.4: harden column K write (mirror of the guard in
+        # _append_to_sheet_nutrition). Reject non-URL values so corrupted
+        # ints/labels never reach the Sheet and break PWA image rendering.
+        if drive_image_url and not re.match(
+            r"^https?://(lh3\.googleusercontent\.com|drive\.google\.com)/",
+            drive_image_url,
+        ):
+            drive_image_url = ""
         row_values = [[
             date_v, t_part, entry.get("meal_type", "scan") or "scan", name, restaurant,
             int(round(kcal)), int(round(protein)), int(round(carbs)), int(round(fat)),

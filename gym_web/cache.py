@@ -35,7 +35,13 @@ from .core import NUTRITION_SHEET_ID, NUTRITION_TAB_NAME, now_hkt
 SHEET_ID = NUTRITION_SHEET_ID
 TAB = NUTRITION_TAB_NAME
 RANGE_ALL = f"{TAB}!A1:K1000"  # 11 cols A-K; 1000-row soft cap
-PLACEHOLDER_IMG = "/static/img/placeholder_food.png"  # served by gym_web static/
+# v3.3.4: empty string, not a placeholder URL. The PWA template uses
+# `<template x-if="scan.image_url">` (line 862 of templates/index.html)
+# to skip the <img> element entirely when there's no image — Jim OOB
+# 2026-08-07 14:15 HKT 'for those without image, don't show any image'.
+# Returning a non-existent /static/img/placeholder_food.png was the
+# cause of the "many broken image" report on 2026-08-15.
+PLACEHOLDER_IMG = ""
 DEFAULT_REFRESH_S = 60
 
 # ---------- Sheet column indices (0-based within a row list) ----------
@@ -96,10 +102,14 @@ class NutritionRow:
         drive = cells[COL_IMG].strip()
         if drive:
             # Drive public URL is e.g. 'https://drive.google.com/uc?export=view&id=<FILE_ID>'
-            # iPhone Safari <img> does NOT reliably follow the 303 redirect to
-            # drive.usercontent.google.com/download, so use lh3 thumbnail directly:
-            #   https://lh3.googleusercontent.com/d/<id>=s480   (no redirect, faster)
-            # Extract id once, build canonical lh3 URL for both image + thumb.
+            # v3.3.4: switch back to drive.google direct URLs. The lh3
+            # thumbnail proxy (lh3.googleusercontent.com/d/<id>=s480) returned
+            # 404 for tiny Drive files (e.g. 555-byte stub JPEGs uploaded when
+            # the AI scan produced a placeholder instead of a real photo) —
+            # Google's image CDN rejects non-image files at any size param.
+            # drive.google.com is reliable for everything, even tiny uploads.
+            # Build canonical drive.google URLs for image + thumb (same URL
+            # since Drive doesn't have separate thumbnail caching).
             file_id = ""
             if "id=" in drive:
                 file_id = drive.split("id=", 1)[1].split("&", 1)[0].split("#", 1)[0]
@@ -107,13 +117,15 @@ class NutritionRow:
                 # legacy shape like https://drive.google.com/file/d/<id>/view
                 file_id = drive.split("/d/", 1)[1].split("/", 1)[0]
             if file_id:
-                img_for_pwa = f"https://lh3.googleusercontent.com/d/{file_id}=s480"
-                thumb = f"https://lh3.googleusercontent.com/d/{file_id}=s220"
+                canonical = f"https://drive.google.com/uc?export=view&id={file_id}"
+                img_for_pwa = canonical
+                thumb = canonical
             else:
-                # Couldn't parse — fall back to raw Drive URL (let browser try)
                 img_for_pwa = drive
                 thumb = drive
         else:
+            # v3.3.4: empty (no broken /static/img/placeholder_food.png URL).
+            # Template `<template x-if="scan.image_url">` skips the <img>.
             img_for_pwa = PLACEHOLDER_IMG
             thumb = PLACEHOLDER_IMG
         return cls(

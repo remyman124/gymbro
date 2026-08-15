@@ -251,9 +251,13 @@ def check_photo_proxy(recent_data: dict | None) -> None:
         _record("6. image_url + thumbnail_url contract", False, "no scans")
         return
 
-    # Pick the most recent scan; PWA exposes row_index in the dict.
+    # Pick the most recent scan THAT HAS AN IMAGE (v3.3.4: cleared
+    # K for stub-upload rows leaves entries with empty image_url).
     scans = recent_data["scans"]
-    first = scans[0]
+    first = next(
+        (s for s in scans if s.get("image_url")),
+        scans[0],
+    )
     row_index = first.get("row_index") or first.get("scan_index")
     if row_index is None:
         _record("5. row_index present in scan dict", False, "missing field")

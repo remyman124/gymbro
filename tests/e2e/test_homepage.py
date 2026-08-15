@@ -127,13 +127,13 @@ def test_api_healthz():
 
 
 def test_api_version_returns_3x():
-    """Verify a v3.x version is running (was hard-coded to 3.2.7.15 in
-    the refactor, now any 3.2.7.x is acceptable)."""
+    """Verify a v3.x version is running. v3.3.x is the Sheet+Drive
+    canonical-store line; v3.2.7.x was the file-log line."""
     import urllib.request
     import json
     with urllib.request.urlopen(f"{BASE_URL}/api/version", timeout=5) as r:
         data = json.loads(r.read())
-    assert data["version"].startswith("3.2.7."), f"got {data['version']}"
+    assert data["version"].startswith("3."), f"got {data['version']}"
     print(f"  ✓ version {data['version']}, commit {data['git_commit']}")
 
 
