@@ -139,5 +139,3 @@ def populated_withings_cache(isolated_files):
 # food data no longer lives in JSON files. Tests that depend on prior scan
 # data should seed the in-memory NutritionCache directly via the gym_web
 # module (see tests/api/test_food_log_visibility.py for the rewritten path).
-        ]
-    }))

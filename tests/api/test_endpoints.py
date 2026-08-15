@@ -156,31 +156,47 @@ def test_history_lists_sessions_desc(client, isolated_files):
 
 # ── nutrition / scans ────────────────────────────────────────────────────
 
-def test_nutrition_today_empty(client):
+def test_nutrition_today_empty(client, gym_web_module):
+    """v3.3.2: empty cache hydrates with no rows → 0 meals today."""
+    cache = gym_web_module._get_nutrition_cache()
+    cache.hydrate(lambda: [])  # empty Sheet
     d = client.get("/api/nutrition/today").get_json()
     assert d["meal_count"] == 0
     assert d["meals"] == []
 
 
-def test_nutrition_today_totals(client, isolated_files, gym_web_module):
+def test_nutrition_today_totals(client, gym_web_module):
     today = gym_web_module.today_iso()
-    isolated_files["NUTRITION_LOG_PATH"].write_text(json.dumps({"meals": [
-        {"date": today, "time": "12:00", "name": "白飯",
-         "calories": 117, "protein": 2.4, "carbs": 25.8, "fat": 0},
-        {"date": today, "time": "13:00", "name": "凍咖啡",
-         "calories": 180, "protein": 4, "carbs": 30, "fat": 6},
-    ]}))
+    from gym_web.cache import NutritionRow
+    cache = gym_web_module._get_nutrition_cache()
+    cache.insert_row(NutritionRow.from_sheet_row(
+        1, [today, "12:00", "lunch", "白飯", "", "117",
+            "2.4", "25.8", "0", "", ""]))
+    cache.insert_row(NutritionRow.from_sheet_row(
+        2, [today, "13:00", "lunch", "凍咖啡", "", "180",
+            "4", "30", "6", "", ""]))
     d = client.get("/api/nutrition/today").get_json()
     assert d["meal_count"] == 2
     assert d["totals"]["kcal"] == pytest.approx(297, abs=1)
 
 
-def test_scan_recent_empty(client):
+def test_scan_recent_empty(client, gym_web_module):
+    """v3.3.2: empty cache hydrates with no rows → 200 with empty scans."""
+    cache = gym_web_module._get_nutrition_cache()
+    cache.hydrate(lambda: [])  # empty Sheet → cache hydrated with 0 rows
     r = client.get("/api/scan_recent")
     assert r.status_code == 200
+    d = r.get_json()
+    assert d["scans"] == []
 
 
-def test_scan_recent_filters_failed_scans(client, populated_scan_log):
+def test_scan_recent_filters_failed_scans(client, gym_web_module):
+    """v3.3.2: scan data lives in the in-memory NutritionCache, not JSON."""
+    from gym_web.cache import NutritionRow
+    cache = gym_web_module._get_nutrition_cache()
+    cells = ["2026-08-09", "12:00", "lunch", "白飯", "", "117",
+            "2.4", "25.8", "0", "", ""]
+    cache.insert_row(NutritionRow.from_sheet_row(1, cells))
     r = client.get("/api/scan_recent?limit=10")
     assert r.status_code == 200
     d = r.get_json()
@@ -190,7 +206,16 @@ def test_scan_recent_filters_failed_scans(client, populated_scan_log):
     assert not any(n and n.startswith("食物 #") for n in names)
 
 
-def test_scan_recent_respects_limit(client, populated_scan_log):
+def test_scan_recent_respects_limit(client, gym_web_module):
+    """v3.3.2: seed NutritionCache directly via NutritionRow.from_sheet_row."""
+    from gym_web.cache import NutritionRow
+    cache = gym_web_module._get_nutrition_cache()
+    cache.insert_row(NutritionRow.from_sheet_row(
+        1, ["2026-08-09", "12:00", "lunch", "白飯", "", "117",
+            "2.4", "25.8", "0", "", ""]))
+    cache.insert_row(NutritionRow.from_sheet_row(
+        2, ["2026-08-09", "13:00", "lunch", "凍咖啡", "", "180",
+            "4", "30", "6", "", ""]))
     d = client.get("/api/scan_recent?limit=1").get_json()
     scans = d if isinstance(d, list) else d.get("scans", d.get("recent", []))
     assert len(scans) <= 1
