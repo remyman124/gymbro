@@ -94,10 +94,28 @@ class NutritionRow:
         except ValueError:
             f = 0.0
         drive = cells[COL_IMG].strip()
-        img_for_pwa = drive if drive else PLACEHOLDER_IMG
-        # Drive thumbnail: append =s220-c for inline display. If placeholder,
-        # leave unchanged.
-        thumb = f"{img_for_pwa}=s220-c" if drive else img_for_pwa
+        if drive:
+            # Drive public URL is e.g. 'https://drive.google.com/uc?export=view&id=<FILE_ID>'
+            # iPhone Safari <img> does NOT reliably follow the 303 redirect to
+            # drive.usercontent.google.com/download, so use lh3 thumbnail directly:
+            #   https://lh3.googleusercontent.com/d/<id>=s480   (no redirect, faster)
+            # Extract id once, build canonical lh3 URL for both image + thumb.
+            file_id = ""
+            if "id=" in drive:
+                file_id = drive.split("id=", 1)[1].split("&", 1)[0].split("#", 1)[0]
+            elif "/d/" in drive:
+                # legacy shape like https://drive.google.com/file/d/<id>/view
+                file_id = drive.split("/d/", 1)[1].split("/", 1)[0]
+            if file_id:
+                img_for_pwa = f"https://lh3.googleusercontent.com/d/{file_id}=s480"
+                thumb = f"https://lh3.googleusercontent.com/d/{file_id}=s220"
+            else:
+                # Couldn't parse — fall back to raw Drive URL (let browser try)
+                img_for_pwa = drive
+                thumb = drive
+        else:
+            img_for_pwa = PLACEHOLDER_IMG
+            thumb = PLACEHOLDER_IMG
         return cls(
             row_index=row_index,
             entry_id=f"row-{row_index}",
