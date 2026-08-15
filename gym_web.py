@@ -734,7 +734,7 @@ WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.2"
+__version__ = "3.3.5"
 
 
 def _recovery_pct():
@@ -6095,6 +6095,26 @@ def api_scan_commit():
                 if any(hint.endswith(suf) or suf in hint for suf in food_suffixes):
                     entry["name"] = hint
                     current_name = hint
+
+        # v3.3.4: refuse to commit AI-failed entries (Jim OOB 2026-08-15
+        # 'I don't expect any unrecognized food'). Skip this entry — the
+        # rest of the multi-entry batch can still commit. The caller
+        # (frontend) gets name="未識別菜式" returned for the skipped entry
+        # so it can prompt Jim to name it manually via /api/scan_correct.
+        if current_name == "未識別菜式":
+            committed.append({
+                "name": "未識別菜式",
+                "calories": entry.get("calories", 0),
+                "protein": entry.get("protein", 0),
+                "grade": "—",
+                "skipped_unrecognized": True,
+                "skip_reason": (
+                    "AI 未能識別，請改 entry.name 後再 call /api/scan_correct "
+                    "寫入 Sheet row"
+                ),
+                "entry_ref": entry,
+            })
+            continue
 
         entry["drive_image_url"] = drive_image_url
 

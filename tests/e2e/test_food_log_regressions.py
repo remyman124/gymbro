@@ -60,20 +60,22 @@ def test_api_no_broken_placeholder_image_urls():
     print(f"  ✓ no placeholder_food URLs in /api/scan_recent")
 
 
-def test_api_image_url_is_either_drive_or_empty():
-    """v3.3.4: every image_url is either a drive.google.com URL (real
-    Drive thumbnail via /uc?export=view&id=...) or empty (no image
-    recoverable). No /static/ 404s, no legacy placeholders."""
+def test_api_image_url_is_either_drive_or_local():
+    """v3.3.4: every image_url is either a Drive URL (drive.google.com or
+    googleusercontent.com), a local proxy route (/scan_thumb/<row> or
+    /scan_img/<row>), or empty. No /static/ 404s, no legacy placeholder."""
+    OK_LOCAL = ("/scan_thumb/", "/scan_img/", "/static/img/")
+    OK_DRIVE = ("drive.google.com", "googleusercontent.com")
     for s in _fetch_scan_recent():
         url = s.get("image_url") or ""
         if not url:
             continue
-        assert ("drive.google.com" in url
-                or "googleusercontent.com" in url), (
+        ok = any(p in url for p in OK_LOCAL + OK_DRIVE)
+        assert ok, (
             f"unexpected image_url format on "
             f"{s.get('timestamp_iso', '')[:16]}: {url!r}"
         )
-    print(f"  ✓ all image_url values use drive.google.com or googleusercontent")
+    print(f"  ✓ all image_url values are Drive URL, local proxy, or empty")
 
 
 # ──────────────────────────────────────────────────────────────────

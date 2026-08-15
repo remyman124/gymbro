@@ -151,6 +151,13 @@ class NutritionRow:
         no longer persisted after the file-cache removal (coach_comment,
         vision_short, user_corrections) are returned with empty defaults
         — the template's `<template x-if=...>` guards handle missing data.
+
+        v3.3.4: image_url + thumbnail_url point to LOCAL proxy routes
+        (/scan_img/<row> + /scan_thumb/<row>) instead of drive.google.com
+        direct URLs. Drive was 403-ing ~15% of files when the browser
+        fired many parallel <img> requests (anti-bot rate limit). The
+        local proxy fetches once, caches in-memory LRU, and serves from
+        the same origin — no per-request Drive round-trip.
         """
         ts_iso = self.dt.isoformat() if self.dt else ""
         if self.dt:
@@ -190,9 +197,17 @@ class NutritionRow:
             # Notes
             "notes": self.notes,
             "note": self.notes,                  # alias
-            # Image
-            "image_url": self.image_url_for_pwa,
-            "thumbnail_url": self.thumbnail_url,
+            # v3.3.4: ALL images route through the local /scan_thumb/ proxy.
+            # /scan_img/ would 302-redirect to drive.google.com directly,
+            # which 403's ~15% of files when many parallel <img> requests
+            # hit Drive's anti-bot rate limit. /scan_thumb/ stays in-LRU,
+            # proxies bytes via image_proxy.bp, never redirects, browser
+            # sees only localhost. The /scan_img/ URL is preserved for
+            # the full-resolution tap-to-open modal (still via 302).
+            "image_url": self.image_url_for_pwa if not self.drive_image_url
+                        else f"/scan_thumb/{self.row_index}",
+            "thumbnail_url": self.thumbnail_url if not self.drive_image_url
+                             else f"/scan_thumb/{self.row_index}",
             "drive_image_url": self.drive_image_url,
             "image_path": "",                    # local path no longer used
             "is_text_only": not bool(self.drive_image_url),
