@@ -1,43 +1,17 @@
 """End-to-end test: verify 海南雞 entry is visible in the food log.
 
 Jim OOB 2026-08-11 'still missing the 海南雞飯, please do automated
-testing' — trace the full data chain from scan_log.json → /api/scan_recent
-→ simulated frontend grouping. Fail loudly if anything drops the entry.
+testing' — trace the full data chain from Google Sheet (canonical) →
+in-memory NutritionCache → /api/scan_recent → simulated frontend grouping.
+Fail loudly if anything drops the entry.
 
 Run against the LIVE server at localhost:7000 (so we know the cache
-bump from v3.2.7.28 is actually live).
+hydration from Sheet is actually live).
 """
 import json
 import urllib.request
 
-SCAN_LOG_PATH = "/home/work/.hermes/food_scan_log.json"
-NUTRITION_LOG_PATH = "/home/work/.hermes/nutrition_log.json"
 SCAN_RECENT_URL = "http://localhost:7000/api/scan_recent?limit=100"
-
-
-def test_scan_log_has_hainanji():
-    sl = json.load(open(SCAN_LOG_PATH))
-    matches = [e for e in sl if e.get("name") == "海南雞飯"
-               and (e.get("timestamp_iso") or "").startswith("2026-08-10")]
-    assert len(matches) >= 1, (
-        f"expected >= 1 海南雞飯 entries in scan_log for 2026-08-10, "
-        f"got {len(matches)}: {matches}"
-    )
-    for e in matches:
-        assert e.get("calories", 0) > 0, f"0 kcal on {e.get('timestamp_iso')}"
-        assert e.get("image_path"), f"missing image_path on {e.get('timestamp_iso')}"
-    print(f"  ✓ scan_log: {len(matches)} 海南雞飯 entries yesterday, all with kcal+image")
-
-
-def test_nutrition_log_has_hainanji():
-    nl = json.load(open(NUTRITION_LOG_PATH))
-    meals = nl.get("meals", [])
-    matches = [m for m in meals if m.get("name") == "海南雞飯"
-               and m.get("date") == "2026-08-10"]
-    assert len(matches) >= 1, (
-        f"expected >= 1 海南雞飯 in nutrition_log for 2026-08-10, got {len(matches)}"
-    )
-    print(f"  ✓ nutrition_log: {len(matches)} 海南雞飯 meals on 2026-08-10")
 
 
 def test_api_scan_recent_returns_hainanji():

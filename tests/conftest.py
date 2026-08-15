@@ -51,10 +51,11 @@ def client(app):
 def isolated_files(tmp_path, monkeypatch, gym_web_module):
     """Redirect ALL persistent state to temp files. Never touches production.
 
+    v3.3.2: removed NUTRITION_LOG_PATH + SCAN_LOG_PATH — Sheet + Drive are
+    the canonical store now; no file-level persistence for food data.
+
     The patterns covered:
     - workout_log    → /home/work/.whoop_workout_log.json
-    - nutrition_log  → /home/work/.hermes/nutrition_log.json
-    - scan_log       → /home/work/.hermes/food_scan_log.json
     - whoop_cache    → /home/work/.whoop_data_latest.json
     - withings_cache → /home/work/.withings_latest_cache.json
     - jim_context    → /home/work/.jim_context.json
@@ -62,8 +63,6 @@ def isolated_files(tmp_path, monkeypatch, gym_web_module):
     """
     paths = {
         "WORKOUT_LOG": tmp_path / "workout_log.json",
-        "NUTRITION_LOG_PATH": tmp_path / "nutrition_log.json",
-        "SCAN_LOG_PATH": tmp_path / "food_scan_log.json",
         "WHOOP_CACHE": tmp_path / "whoop_cache.json",
         "WITHINGS_CACHE": tmp_path / "withings_cache.json",
         "JIM_CONTEXT": tmp_path / "jim_context.json",
@@ -71,8 +70,6 @@ def isolated_files(tmp_path, monkeypatch, gym_web_module):
     }
     # Init each file with sane empty defaults
     paths["WORKOUT_LOG"].write_text("{}")
-    paths["NUTRITION_LOG_PATH"].write_text(json.dumps({"meals": []}))
-    paths["SCAN_LOG_PATH"].write_text("[]")
     paths["WHOOP_CACHE"].write_text(json.dumps({"recovery": {"records": []}, "workouts": []}))
     paths["WITHINGS_CACHE"].write_text(json.dumps({"body": {}, "steps": {}}))
     paths["JIM_CONTEXT"].write_text(json.dumps({"entries": {}}))
@@ -138,27 +135,9 @@ def populated_withings_cache(isolated_files):
     }))
 
 
-@pytest.fixture
-def populated_scan_log(isolated_files):
-    """Provide a stub scan log with 2 entries."""
-    isolated_files["SCAN_LOG_PATH"].write_text(json.dumps([
-        {"scan_index": 1, "date": "2026-08-09", "time": "12:00",
-         "name": "白飯", "kcal": 117, "protein": 2.4, "carbs": 25.8, "fat": 0,
-         "user_corrections": []},
-        {"scan_index": 2, "date": "2026-08-09", "time": "13:00",
-         "name": "凍咖啡", "kcal": 180, "protein": 4, "carbs": 30, "fat": 6,
-         "user_corrections": [{"note": "less sugar"}]},
-    ]))
-
-
-@pytest.fixture
-def populated_nutrition_log(isolated_files):
-    """Provide today's nutrition_log with 2 meals."""
-    isolated_files["NUTRITION_LOG"].write_text(json.dumps({
-        "meals": [
-            {"date": "2026-08-09", "time": "12:00", "name": "白飯",
-             "calories": 117, "protein": 2.4, "carbs": 25.8, "fat": 0},
-            {"date": "2026-08-09", "time": "13:00", "name": "凍咖啡",
-             "calories": 180, "protein": 4, "carbs": 30, "fat": 6},
+# v3.3.2: removed populated_scan_log + populated_nutrition_log fixtures —
+# food data no longer lives in JSON files. Tests that depend on prior scan
+# data should seed the in-memory NutritionCache directly via the gym_web
+# module (see tests/api/test_food_log_visibility.py for the rewritten path).
         ]
     }))

@@ -295,6 +295,22 @@ class NutritionCache:
         with self._lock:
             return self.by_row.get(row_index)
 
+    def find_by_signature(self, date: str, time_short: str, calories: int) -> Optional[NutritionRow]:
+        """Find a row by (date, HH:MM, kcal) signature — replaces the legacy
+        food_scan_log.json dedup logic. Returns the first matching row, or None.
+        """
+        target_cal = int(calories or 0)
+        with self._lock:
+            for ri in self.by_date.get(date, []):
+                row = self.by_row.get(ri)
+                if row is None:
+                    continue
+                if row.time[:5] != time_short[:5]:
+                    continue
+                if int(row.kcal) == target_cal:
+                    return row
+        return None
+
     def stats(self) -> dict:
         with self._lock:
             return {

@@ -473,10 +473,9 @@ def api_health():
     checks["google_token"] = google_tok.exists()
     # TG bot
     checks["telegram_bot_configured"] = bool(_os.environ.get("TELEGRAM_BOT_TOKEN")) or _os.path.exists("/home/work/.hermes/.env")
-    # Local logs
-    checks["nutrition_log"] = Path("/home/work/.hermes/nutrition_log.json").exists()
+    # v3.3.2: removed `nutrition_log` + `food_scan_log` checks — the Sheet
+    # is the canonical store now; those JSON files no longer exist.
     checks["workout_log"] = Path("/home/work/.whoop_workout_log.json").exists()
-    checks["food_scan_log"] = Path("/home/work/.hermes/food_scan_log.json").exists()
     # Health overlay API (composite)
     overall = all([
         checks.get("whoop_token"),
@@ -732,9 +731,10 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-# v3.3.1: split _coach_comment into _coach_comment_keyword (no AI) +
-# _coach_comment (with AI). Food history list now O(fast).
-__version__ = "3.3.1"
+# v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
+# scan_thumb_cache from the WRITE path. Sheet + Drive are the only
+# persistent store; cache hydrates from Sheet on boot.
+__version__ = "3.3.2"
 
 
 def _recovery_pct():
@@ -1608,6 +1608,30 @@ def _sheet_read_nutrition_rows() -> list:
     return body.get("values", [])
 
 
+def _sheet_read_nutrition_row(row_index: int) -> list[str]:
+    """Return cells from a single row in the Nutrition tab (A{row}:K{row}).
+    Returns an 11-cell list padded with '' if the row is short. Empty list on error.
+    Used by cache.refresh_one() to patch the cache after a single-row edit/delete.
+    """
+    if row_index < 2:
+        return []
+    try:
+        access = _get_google_access_token()
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{NUTRITION_SHEET_ID}/values/"
+            f"{NUTRITION_SHEET_TAB}!A{row_index}:K{row_index}"
+        )
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {access}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode())
+        cells = (body.get("values") or [[]])[0]
+        return (list(cells) + [""] * 11)[:11]
+    except Exception:
+        return []
+
+
 def _hydrate_nutrition_cache() -> int:
     """Pull the Nutrition tab into the in-memory cache. Safe to call repeatedly.
     Returns rows loaded; 0 if Sheet read failed (cache stays in last-known state).
@@ -2404,10 +2428,13 @@ SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # v3.2.7.46: thumbnail cache — generated on commit, served via /scan_thumb/.
 # 480px max-side JPEGs (~15-30KB each) replace 1.9MB originals in food
 # history view, dropping initial page weight from ~320MB to ~5MB.
+# v3.3.2: SCAN_CACHE_DIR + SCAN_THUMB_DIR remain as ephemeral preview buffer
+# for the multi-photo scan flow. They are no longer the canonical store —
+# Google Drive (lh3 URLs) + Google Sheet are. Reads of /scan_img/<filename>
+# + /scan_thumb/<filename> fall through to 404 once these directories are
+# eventually cleaned.
 SCAN_THUMB_DIR = Path("/home/work/.hermes/scan_thumb_cache")
 SCAN_THUMB_DIR.mkdir(parents=True, exist_ok=True)
-SCAN_LOG_PATH = Path("/home/work/.hermes/food_scan_log.json")
-NUTRITION_LOG_PATH = Path("/home/work/.hermes/nutrition_log.json")
 
 # pplx API key (separate from MiniMax which is in hermes-torres)
 def _pplx_api_key() -> str:
@@ -3768,69 +3795,37 @@ def _detect_shared_meal(dish_desc: str) -> bool:
     return any(indicator.lower() in desc_lower for indicator in shared_indicators)
 
 
-def _save_scan_log(log_list: list) -> None:
-    SCAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SCAN_LOG_PATH.write_text(json.dumps(log_list, ensure_ascii=False, indent=2))
-
-
-def _load_scan_log() -> list:
-    if not SCAN_LOG_PATH.exists():
-        return []
-    try:
-        return json.loads(SCAN_LOG_PATH.read_text())
-    except Exception:
-        return []
-
-
-def _append_to_nutrition_log(entry: dict) -> None:
-    """Append food entry to canonical nutrition_log.json[meals]."""
-    if NUTRITION_LOG_PATH.exists():
-        log = json.loads(NUTRITION_LOG_PATH.read_text())
-    else:
-        log = {"meals": []}
-    if "meals" not in log:
-        log["meals"] = []
-    log["meals"].append(entry)
-    NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
-
-
 def _load_today_nutrition() -> dict:
-    """Read /home/work/.hermes/nutrition_log.json and return today's meals
-    + summary stats. Returns {'meals': [...], 'totals': {kcal, P, C, F}, 'meal_count': N, 'last_meal_ts': ISO}.
-
-    Used by cheer pipeline (Jim OOB 2026-07-25 13:30 HKT: "monitor my food").
+    """v3.3.2: replaced the legacy nutrition_log.json file-cache read with a
+    cache + Sheet query. Same return shape as before so callers don't change.
+    Reads from the in-memory NutritionCache (hydrated from the Sheet on boot).
     """
     out = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0}, "meal_count": 0, "last_meal_ts": None}
-    if not NUTRITION_LOG_PATH.exists():
+    cache = get_cache()
+    if not cache.is_ready():
         return out
-    try:
-        log = json.loads(NUTRITION_LOG_PATH.read_text())
-    except Exception:
-        return out
-    meals = (log or {}).get("meals") or []
     today = today_iso()
-    today_meals = []
+    rows = cache.get_by_date(today)
+    meals = []
+    for r in rows:
+        d = r.to_pwa_dict()
+        meals.append({
+            "date": r.date,
+            "time": r.time,
+            "meal_type": r.meal,
+            "meal_name": r.name,
+            "name": r.name,
+            "calories": r.kcal,
+            "protein": r.p,
+            "carbs": r.c,
+            "fat": r.f,
+            "restaurant_chain": r.restaurant,
+            "timestamp_iso": (r.dt.isoformat() + "+08:00") if r.dt else "",
+        })
+    meals.sort(key=lambda m: m.get("time") or m.get("timestamp_iso") or "")
+    out["meals"] = meals
+    out["meal_count"] = len(meals)
     for m in meals:
-        # entry schema: {date, time, meal_type, meal_name, calories, protein, carbs, fat, ...}
-        if not isinstance(m, dict):
-            continue
-        m_date = m.get("date") or ""
-        if not m_date:
-            # v3.2.7.26: scan auto-commit writes timestamp_iso only (no date/time),
-            # so entries like 2026-08-10 21:17 海南雞飯 were invisible here.
-            ts = (m.get("timestamp_iso") or m.get("timestamp")
-                  or m.get("logged_at") or "")
-            if isinstance(ts, str) and len(ts) >= 10:
-                m_date = ts[:10]
-        if m_date != today:
-            continue
-        today_meals.append(m)
-    # Sort by time
-    today_meals.sort(key=lambda m: (m.get("time") or m.get("timestamp_iso")
-                                    or m.get("timestamp") or ""))
-    out["meals"] = today_meals
-    out["meal_count"] = len(today_meals)
-    for m in today_meals:
         try:
             out["totals"]["kcal"] += float(m.get("calories") or 0)
             out["totals"]["P"] += float(m.get("protein") or 0)
@@ -3839,8 +3834,8 @@ def _load_today_nutrition() -> dict:
         except (TypeError, ValueError):
             pass
     out["totals"] = {k: round(v, 1) for k, v in out["totals"].items()}
-    if today_meals:
-        last = today_meals[-1]
+    if meals:
+        last = meals[-1]
         out["last_meal_ts"] = f"{last.get('date', today)}T{last.get('time', '00:00')}:00+08:00"
     return out
 
@@ -4569,56 +4564,38 @@ def api_scan_food():
         "user_correction": None,  # permanent — never trimmed (Jim OOB 2026-07-23 22:30 HKT "no trimming of data")
     }
 
-    # 5. Save image to scan cache
+    # 5. Save image to scan cache (ephemeral preview buffer only — Drive is
+    # the canonical store. v3.3.2: no longer write to food_scan_log.json.)
     img_filename = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
     img_path = SCAN_CACHE_DIR / img_filename
     img_path.write_bytes(img_bytes)
     entry["image_saved_to"] = str(img_path)
 
-    # 6. Append to local log + Sheet
-    _append_to_nutrition_log(entry)
-    sheet_result = _append_to_sheet_nutrition(entry)
+    # v3.3.2: best-effort Drive upload for Golden Copy. Failure is non-fatal —
+    # the Sheet will get an empty column N.
+    drive_image_url = _upload_to_drive(img_path)
+    entry["drive_image_url"] = drive_image_url
+    _make_thumb(img_path, _thumb_path_for(img_filename))
 
-    # 7. Append to scan_log.json (with image path) for /api/scan_recent
-    scan_log = _load_scan_log()
-    scan_index = len(scan_log)
-    # v3.2.7.7: persist all 12 nutrition fields (kcal/P/C/F + 8 micros) so
-    # /api/scan_recent and frontend food cards show full nutrient profile
-    # (Jim OOB 2026-08-08 10:55 HKT 'pipeline do not capture other nutrient
-    # info' — root cause: scan_log write dict was missing micros, even
-    # though nutrition_log.json had them).
-    scan_log.append({
-        "scan_index": scan_index,
-        "timestamp_iso": entry["timestamp_iso"],
-        "name": entry["name"],
-        "calories": entry["calories"],
-        "protein": entry["protein"],
-        "carbs": entry.get("carbs", 0),
-        "fat": entry.get("fat", 0),
-        "fiber": entry.get("fiber", 0),
-        "sugar": entry.get("sugar", 0),
-        "sodium": entry.get("sodium", 0),
-        "sat_fat": entry.get("sat_fat", 0),
-        "trans_fat": entry.get("trans_fat", 0),
-        "vit_c": entry.get("vit_c", 0),
-        "iron": entry.get("iron", 0),
-        "calcium": entry.get("calcium", 0),
-        "shared": entry["is_shared_meal"],
-        "image_path": str(img_path),
-        "image_url": f"/scan_img/{img_filename}",
-        "thumbnail_url": _thumb_url_for(f"/scan_img/{img_filename}"),
-        "restaurant_chain": entry["restaurant_chain"],
-        "coach_comment": entry.get("coach_comment", {}),
-        "vision_short": vision_desc[:120],
-    })
-    _save_scan_log(scan_log)
+    # 6. Write Sheet → cache refreshes the new row from the Sheet writer.
+    sheet_result = _append_to_sheet_nutrition(entry)
+    if sheet_result.get("ok") and not sheet_result.get("skipped"):
+        try:
+            range_str = sheet_result.get("range", "")
+            new_row_index = int(range_str.split(":")[0].rstrip("ABCDEFGHIJKLM"))
+            get_cache().refresh_one(new_row_index, _sheet_read_nutrition_row)
+        except Exception:
+            pass
 
     return jsonify({
         "ok": True,
         "entry": entry,
-        "scan_index": scan_index,
+        "scan_index": int(sheet_result.get("range", "").split(":")[0].rstrip("ABCDEFGHIJKLM")) if sheet_result.get("range") and not sheet_result.get("skipped") else None,
         "sheet_synced": sheet_result.get("ok", False),
         "sheet_range": sheet_result.get("range", ""),
+        "drive_image_url": drive_image_url,
+        "image_url": f"/scan_img/{img_filename}",
+        "thumbnail_url": _thumb_url_for(f"/scan_img/{img_filename}"),
     })
 
 
@@ -4847,18 +4824,23 @@ def api_withings_steps_7d_avg():
 
 @app.route("/api/scan_correct", methods=["POST"])
 def api_scan_correct():
-    """Receive Jim's correction for a scan. Append user_correction field.
-    NO TRIMMING — corrections are permanent (Jim OOB 2026-07-23 22:30 HKT)."""
+    """Receive Jim's correction for a scan. v3.3.2: scan_index now refers to
+    the Sheet row index (1-based, header = 1). The correction is appended to
+    the cache row's _coach_comment correction list AND persisted to the Sheet
+    row (name + macros + restaurant + note update).
+    """
     data = request.get_json(silent=True) or {}
     scan_index = data.get("scan_index")
     if scan_index is None:
         return jsonify({"ok": False, "error": "no scan_index"}), 400
-
-    scan_log = _load_scan_log()
-    if not isinstance(scan_index, int) or scan_index < 0 or scan_index >= len(scan_log):
+    if not isinstance(scan_index, int) or scan_index < 2:
         return jsonify({"ok": False, "error": "scan_index out of range"}), 404
 
-    # Append correction — never trim
+    cache = get_cache()
+    row = cache.get_by_row(scan_index)
+    if row is None:
+        return jsonify({"ok": False, "error": "scan_index not found in cache"}), 404
+
     correction = {
         "corrected_at": now_iso(),
         "name": data.get("name"),
@@ -4869,21 +4851,32 @@ def api_scan_correct():
         "restaurant_chain": data.get("restaurant_chain"),
         "note": data.get("note", ""),
     }
-    scan_log[scan_index].setdefault("user_corrections", []).append(correction)
-    _save_scan_log(scan_log)
 
-    # Also update nutrition_log.json entry if scan_index matches timestamp
-    if NUTRITION_LOG_PATH.exists():
-        log = json.loads(NUTRITION_LOG_PATH.read_text())
-        meals = log.get("meals", [])
-        ts_iso = scan_log[scan_index].get("timestamp_iso")
-        for m in meals:
-            if m.get("timestamp_iso") == ts_iso and m.get("meal_type") == "scan":
-                m.setdefault("user_corrections", []).append(correction)
-                NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
-                break
+    # v3.3.2: push the correction to the Sheet row. Apply corrections field-
+    # by-field (only overwrite if the correction supplies a non-empty value).
+    corrected_entry = {
+        "date": row.date,
+        "time": row.time,
+        "meal_type": row.meal,
+        "name": correction["name"] if correction["name"] else row.name,
+        "restaurant_chain": (correction["restaurant_chain"]
+                             if correction["restaurant_chain"] else row.restaurant),
+        "calories": correction["calories"] if correction["calories"] is not None else row.kcal,
+        "protein": correction["protein"] if correction["protein"] is not None else row.p,
+        "carbs": correction["carbs"] if correction["carbs"] is not None else row.c,
+        "fat": correction["fat"] if correction["fat"] is not None else row.f,
+        "note": (correction["note"] if correction["note"] else row.notes),
+        "drive_image_url": row.drive_image_url,
+    }
+    sheet_result = _sheet_update_nutrition_row(scan_index, corrected_entry)
+    if not sheet_result.get("ok"):
+        return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
 
-    return jsonify({"ok": True, "scan_index": scan_index, "correction": correction})
+    # Refresh the cache row from Sheet so subsequent reads reflect the fix.
+    cache.refresh_one(scan_index, _sheet_read_nutrition_row)
+
+    return jsonify({"ok": True, "scan_index": scan_index, "correction": correction,
+                    "sheet_updated": sheet_result.get("updated", 0)})
 
 
 # v2.7.39: Rename existing scan + auto re-recognize macros (Jim OOB 2026-08-06
@@ -4893,8 +4886,11 @@ def api_scan_correct():
 #  1. User types new dish name in inline popover
 #  2. Backend overwrites name field (so iPhone display updates immediately)
 #  3. Backend auto-calls _apiyi_nutrition_enrich(new_name) for re-estimate macros
-#  4. Old name + macros saved to user_corrections as audit trail (never trimmed)
+#  4. Old name + macros saved as audit trail (returned to caller; cache holds it)
 #  5. Returns new entry state so frontend can update display
+#
+# v3.3.2: scan_index now refers to the Sheet row. Update goes via
+# _sheet_update_nutrition_row + cache.refresh_one. No more food_scan_log.json.
 @app.route("/api/scan_rename", methods=["POST"])
 def api_scan_rename():
     data = request.get_json(silent=True) or {}
@@ -4904,17 +4900,20 @@ def api_scan_rename():
         return jsonify({"ok": False, "error": "no scan_index"}), 400
     if not new_name:
         return jsonify({"ok": False, "error": "new_name required"}), 400
-    scan_log = _load_scan_log()
-    if not isinstance(scan_index, int) or scan_index < 0 or scan_index >= len(scan_log):
+    if not isinstance(scan_index, int) or scan_index < 2:
         return jsonify({"ok": False, "error": "scan_index out of range"}), 404
-    entry = scan_log[scan_index]
-    old_name = entry.get("name", "")
-    old_kcal = entry.get("calories", 0)
-    old_p = entry.get("protein", 0)
-    old_c = entry.get("carbs", 0)
-    old_f = entry.get("fat", 0)
-    # Build text description for re-estimate (using new name + restaurant if any)
-    restaurant = entry.get("restaurant_chain", "") or ""
+
+    cache = get_cache()
+    row = cache.get_by_row(scan_index)
+    if row is None:
+        return jsonify({"ok": False, "error": "scan_index not found in cache"}), 404
+
+    old_name = row.name
+    old_kcal = row.kcal
+    old_p = row.p
+    old_c = row.c
+    old_f = row.f
+    restaurant = row.restaurant or ""
     re_text = f"{new_name} (餐廳: {restaurant})" if restaurant else new_name
     # Re-estimate macros from text (uses APiyi gpt-4o-mini nutrition enrichment, JSON mode)
     new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
@@ -4927,16 +4926,15 @@ def api_scan_rename():
             new_c = float(parsed.get("carbs", old_c) or old_c)
             new_f = float(parsed.get("fat", old_f) or old_f)
     except Exception as e:
-        # If re-estimate fails, keep old macros + log warning
         print(f"[scan_rename] re-estimate failed: {e}")
-    # Apply share ratio (Jim 60% / 小寶 40% if shared) — same as new scan flow
-    shared = entry.get("is_shared_meal", False) or _detect_shared_meal(re_text)
+    # Apply share ratio (Jim 60% / 小寶 40% if shared)
+    shared = _detect_shared_meal(re_text)
     jim_ratio = 0.60 if shared else 1.00
     jim_kcal = round(new_kcal * jim_ratio)
     jim_p = round(new_p * jim_ratio, 1)
     jim_c = round(new_c * jim_ratio, 1)
     jim_f = round(new_f * jim_ratio, 1)
-    # Append audit trail (NEVER trimmed)
+
     correction = {
         "type": "rename",
         "corrected_at": now_iso(),
@@ -4945,41 +4943,33 @@ def api_scan_rename():
         "from_macros": {"calories": old_kcal, "protein": old_p, "carbs": old_c, "fat": old_f},
         "to_macros": {"calories": jim_kcal, "protein": jim_p, "carbs": jim_c, "fat": jim_f},
     }
-    entry.setdefault("user_corrections", []).append(correction)
-    # Overwrite name + macros fields
-    entry["name"] = new_name[:30]
-    entry["calories"] = jim_kcal
-    entry["protein"] = jim_p
-    entry["protein_g"] = jim_p
-    entry["carbs"] = jim_c
-    entry["carbs_g"] = jim_c
-    entry["fat"] = jim_f
-    entry["fat_g"] = jim_f
-    # v2.7.37: regenerate coach comment for new dish
-    entry["coach_comment"] = _coach_comment(new_name, jim_kcal, jim_p, jim_c, jim_f, restaurant)
-    # Mark for downstream (e.g. Google Sheet resync)
-    entry["_renamed_at"] = now_iso()
-    _save_scan_log(scan_log)
-    # Also update nutrition_log.json entry if scan_index matches timestamp
-    if NUTRITION_LOG_PATH.exists():
-        log = json.loads(NUTRITION_LOG_PATH.read_text())
-        meals = log.get("meals", [])
-        ts_iso = entry.get("timestamp_iso")
-        for m in meals:
-            if m.get("timestamp_iso") == ts_iso and m.get("meal_type") == "scan":
-                m.setdefault("user_corrections", []).append(correction)
-                m["name"] = new_name[:30]
-                m["calories"] = jim_kcal
-                m["protein"] = jim_p
-                m["carbs"] = jim_c
-                m["fat"] = jim_f
-                NUTRITION_LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2))
-                break
+    # Overwrite name + macros fields on the Sheet row
+    sheet_entry = {
+        "date": row.date,
+        "time": row.time,
+        "meal_type": row.meal,
+        "name": new_name[:120],
+        "restaurant_chain": restaurant,
+        "calories": jim_kcal,
+        "protein": jim_p,
+        "carbs": jim_c,
+        "fat": jim_f,
+        "note": (row.notes + (" " + correction["type"] if row.notes else "")).strip()[:200],
+        "drive_image_url": row.drive_image_url,
+    }
+    sheet_result = _sheet_update_nutrition_row(scan_index, sheet_entry)
+    if not sheet_result.get("ok"):
+        return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
+    cache.refresh_one(scan_index, _sheet_read_nutrition_row)
+
+    # Reload row for the response
+    row = cache.get_by_row(scan_index)
     return jsonify({
         "ok": True,
         "scan_index": scan_index,
-        "entry": entry,
+        "entry": row.to_pwa_dict() if row else {},
         "correction": correction,
+        "sheet_updated": sheet_result.get("updated", 0),
     })
 
 
@@ -5168,21 +5158,13 @@ def api_photostream_today():
             if classify_flag:
                 cls = _classify_image_cached(str(fp), mtime_iso)
                 entry["classification"] = cls
-                # Check if already logged by matching the path
-                try:
-                    scan_log = _load_scan_log()
-                    match = next((s for s in scan_log if s.get("image_path") == str(fp)), None)
-                    if match:
-                        entry["already_logged"] = True
-                        entry["scan_index"] = match.get("scan_index")
-                        entry["log_summary"] = {
-                            "name": match.get("name"),
-                            "calories": match.get("calories"),
-                            "protein": match.get("protein"),
-                            "shared": match.get("shared"),
-                        }
-                except Exception:
-                    pass
+                # v3.3.2: scan_log.json is gone — already_logged is best-effort
+                # based on whether any cache row has this local image filename
+                # in its drive_image_url path. Skip the heuristic; treat every
+                # photostream image as "not yet logged" so the PWA surfaces
+                # the scan button. The Sheet-level dedup on /api/scan_commit
+                # catches any actual duplicates.
+                pass
             items.append(entry)
             if len(items) >= limit:
                 break
@@ -5439,8 +5421,15 @@ def api_scan_preview():
                 entry["name"] = redrive
                 current_name = redrive
 
-        _append_to_nutrition_log(entry)
         sheet_result = _append_to_sheet_nutrition(entry)
+        new_row_index = None
+        if sheet_result.get("ok") and not sheet_result.get("skipped"):
+            try:
+                range_str = sheet_result.get("range", "")
+                new_row_index = int(range_str.split(":")[0].rstrip("ABCDEFGHIJKLM"))
+                get_cache().refresh_one(new_row_index, _sheet_read_nutrition_row)
+            except Exception:
+                pass
         committed.append({
             "name": entry.get("name", "?"),
             "calories": entry.get("calories", 0),
@@ -5448,40 +5437,11 @@ def api_scan_preview():
             "grade": (entry.get("coach_comment") or {}).get("grade", "—"),
             "sheet_row": sheet_result.get("range", ""),
             "sheet_ok": sheet_result.get("ok", False),
+            "scan_index": new_row_index,
         })
 
-    # Append scan_log rows
-    scan_log = _load_scan_log()
-    for entry in entries_list:
-        log_row = {
-            "scan_index": len(scan_log),
-            "timestamp_iso": now_iso_str,
-            "name": entry.get("name", "scan"),
-            "calories": entry.get("calories", 0),
-            "protein": entry.get("protein", 0),
-            "carbs": entry.get("carbs", 0),
-            "fat": entry.get("fat", 0),
-            "fiber": entry.get("fiber", 0),
-            "sugar": entry.get("sugar", 0),
-            "sodium": entry.get("sodium", 0),
-            "sat_fat": entry.get("sat_fat", 0),
-            "trans_fat": entry.get("trans_fat", 0),
-            "vit_c": entry.get("vit_c", 0),
-            "iron": entry.get("iron", 0),
-            "calcium": entry.get("calcium", 0),
-            "shared": entry.get("is_shared_meal", False),
-            "image_path": str(final_path),
-            "image_url": image_url,
-            "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46: fast food history
-            "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy
-            "restaurant_chain": entry.get("restaurant_chain", ""),
-            "coach_comment": entry.get("coach_comment", {}),
-            "vision_short": vision_desc[:120],
-            "user_corrections": [],
-            "multi_entry_id": f"me_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_{len(entries_list)}dishes",
-        }
-        scan_log.append(log_row)
-    _save_scan_log(scan_log)
+    # v3.3.2: no more food_scan_log.json / nutrition_log.json writes —
+    # Sheet + cache are the canonical store. Skip the legacy scan_log append.
 
     # v3.2.7.23: ALWAYS auto-commit (Jim OOB 2026-08-10 'we dont need to
     # preview for my confirmation. just log it right away'). Previously
@@ -5755,158 +5715,132 @@ def _sheet_update_nutrition_cells(row_idx: int, updates: list) -> dict:
         return {"ok": False, "updated": 0, "errors": [str(e)]}
 
 
+def _sheet_update_nutrition_row(row_idx: int, entry: dict) -> dict:
+    """Replace ALL 11 columns (A:K) at the given row from `entry`. v3.3.2:
+    full-row update path for api_scan_correct / api_scan_rename. Uses the
+    same token + batchUpdate plumbing as _sheet_update_nutrition_cells but
+    writes the full row in one go. Coerces numerics with _safe_num and
+    rebuilds the HH:MM time so the sheet sees the same shape as a fresh
+    _append_to_sheet_nutrition row. Returns {ok, updated, errors}.
+    """
+    try:
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        if "token" not in tok or not tok.get("refresh_token"):
+            return {"ok": False, "updated": 0, "errors": ["no_token"]}
+        # Refresh access token
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        access = resp["access_token"]
+        tok["token"] = access
+        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        # Build 11-column row from entry — mirror _append_to_sheet_nutrition shape
+        date_v = (entry.get("date") or "").strip()
+        raw_time = (entry.get("time") or "").strip()
+        if "T" in raw_time:
+            t_part = raw_time.split("T", 1)[1][:5]
+        else:
+            t_part = raw_time[:5]
+        if not re.match(r"^\d{2}:\d{2}$", t_part):
+            if re.match(r"^\d{1}:\d{2}$", t_part):
+                t_part = "0" + t_part
+            else:
+                t_part = "00:00"
+        kcal = _safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000)
+        protein = _safe_num(entry.get("protein", 0), default=0.0, lo=0, hi=300)
+        carbs = _safe_num(entry.get("carbs", 0), default=0.0, lo=0, hi=300)
+        fat = _safe_num(entry.get("fat", 0), default=0.0, lo=0, hi=300)
+        name = (entry.get("name") or entry.get("meal_name") or "scan")[:120]
+        restaurant = (entry.get("restaurant_chain") or entry.get("restaurant") or "")[:80]
+        notes = (entry.get("note") or entry.get("notes") or "")[:200]
+        drive_image_url = entry.get("drive_image_url", "") or ""
+        row_values = [[
+            date_v, t_part, entry.get("meal_type", "scan") or "scan", name, restaurant,
+            int(round(kcal)), int(round(protein)), int(round(carbs)), int(round(fat)),
+            notes, drive_image_url,
+        ]]
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": [{
+                "range": f"Nutrition!A{row_idx}:K{row_idx}",
+                "values": row_values,
+            }],
+        }
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values:batchUpdate"
+        req_batch = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+        )
+        result = json.loads(urllib.request.urlopen(req_batch, timeout=15).read())
+        return {
+            "ok": True,
+            "updated": result.get("totalUpdatedCells", 0),
+            "range": f"Nutrition!A{row_idx}:K{row_idx}",
+            "errors": [],
+        }
+    except Exception as e:
+        return {"ok": False, "updated": 0, "errors": [str(e)]}
+
+
 @app.route("/api/scan_edit_datetime", methods=["POST"])
 def api_scan_edit_datetime():
     """Jim OOB 2026-08-07: 'in gymbro, allow me to edit date time of food log'.
 
-    Edits date/time of an existing food scan entry. Cascades across 3 stores:
-      1. food_scan_log.json → update timestamp_iso + date + time fields
-      2. nutrition_log.json → update matching meal (by timestamp_iso + meal_type=scan)
-      3. Google Sheet Nutrition tab → update A (date) + B (time) cells at the matching row
-
-    Body: { scan_index: int, timestamp_iso: str, new_date: "YYYY-MM-DD", new_time: "HH:MM" }
-
-    Returns: { ok, entry, sheet_cells_updated, errors }
+    v3.3.2: scan_index is now the Sheet row index. Single cascade target:
+    update A (date) + B (time) at the row + refresh cache. No JSON files.
     """
     data = request.get_json(silent=True) or {}
-    scan_index_hint = data.get("scan_index")
-    ts_iso_hint = data.get("timestamp_iso")
+    scan_index = data.get("scan_index")
     new_date = (data.get("new_date") or "").strip()
     new_time = (data.get("new_time") or "").strip()
+    if not isinstance(scan_index, int) or scan_index < 2:
+        return jsonify({"ok": False, "error": "scan_index required"}), 400
     if not new_date or not new_time:
         return jsonify({"ok": False, "error": "new_date + new_time required (YYYY-MM-DD + HH:MM)"}), 400
-    # Validate date format
     import re as _re
     if not _re.match(r"^\d{4}-\d{2}-\d{2}$", new_date):
         return jsonify({"ok": False, "error": "new_date 必須係 YYYY-MM-DD 格式"}), 400
     if not _re.match(r"^\d{1,2}:\d{2}$", new_time):
         return jsonify({"ok": False, "error": "new_time 必須係 HH:MM 格式"}), 400
-    # Normalize time to HH:MM
     hh, mm = new_time.split(":")[:2]
     new_time = f"{int(hh):02d}:{int(mm):02d}"
-    # Build new ISO timestamp
-    new_ts_iso = f"{new_date}T{new_time}:00+08:00"
-    old_date = ""
-    old_time = ""
-    old_ts_iso = ""
-    new_time_full = f"{new_date}T{new_time}:00+08:00"  # full ISO for sheet column B
+    new_time_full = f"{new_date}T{new_time}:00+08:00"
 
-    scan_log = _load_scan_log()
-    entry = None
-    # Authoritative match: (timestamp_iso + scan_index fallback)
-    if ts_iso_hint:
-        for i, e in enumerate(scan_log):
-            if e.get("timestamp_iso") == ts_iso_hint:
-                entry = e
-                break
-    if entry is None and isinstance(scan_index_hint, int) and 0 <= scan_index_hint < len(scan_log):
-        entry = scan_log[scan_index_hint]
-    if entry is None:
-        return jsonify({"ok": False, "error": "entry not found"}), 404
+    cache = get_cache()
+    row = cache.get_by_row(scan_index)
+    if row is None:
+        return jsonify({"ok": False, "error": "scan_index not found in cache"}), 404
+    old_date = row.date
+    old_time = row.time
 
-    old_ts_iso = entry.get("timestamp_iso", "")
-    old_date = old_ts_iso[:10] if old_ts_iso else entry.get("date", "")
-    old_time = old_ts_iso[11:16] if len(old_ts_iso) >= 16 else entry.get("time", "")
+    sheet_result = _sheet_update_nutrition_cells(scan_index, [
+        ("A", new_date),
+        ("B", new_time_full),
+    ])
+    if not sheet_result.get("ok"):
+        return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
 
-    # Update entry fields
-    entry["timestamp_iso"] = new_ts_iso
-    entry["date"] = new_date
-    entry["time"] = new_time
-    # v2.7.43 audit trail
-    correction = {
-        "type": "edit_datetime",
-        "corrected_at": now_iso(),
-        "from_date": old_date,
-        "from_time": old_time,
-        "to_date": new_date,
-        "to_time": new_time,
-    }
-    entry.setdefault("user_corrections", []).append(correction)
-    _save_scan_log(scan_log)
-
-    # Cascade 1: nutrition_log.json — match by old timestamp_iso + meal_type=scan
-    nutrition_updated = 0
-    try:
-        if NUTRITION_LOG_PATH.exists():
-            nlog = json.loads(NUTRITION_LOG_PATH.read_text())
-            meals = nlog.get("meals", [])
-            for m in meals:
-                if (m.get("timestamp_iso") == old_ts_iso
-                        and m.get("meal_type") == "scan"):
-                    m["timestamp_iso"] = new_ts_iso
-                    m["date"] = new_date
-                    m["time"] = new_time
-                    m.setdefault("user_corrections", []).append(correction)
-                    nutrition_updated += 1
-            nlog["meals"] = meals
-            NUTRITION_LOG_PATH.write_text(json.dumps(nlog, ensure_ascii=False, indent=2))
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"nutrition_log write failed: {e}"}), 500
-
-    # Cascade 2: Google Sheet Nutrition tab — find row by (old_date, old_time, calories)
-    sheet_result = {"ok": False, "updated": 0, "errors": ["not_attempted"]}
-    try:
-        entry_cal = str(int(entry.get("calories", 0) or 0))
-        old_time_minutes = None
-        if old_time and ':' in old_time:
-            h, m = old_time.split(':')[:2]
-            old_time_minutes = int(h) * 60 + int(m)
-
-        # Read current sheet rows to find match
-        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
-        access = tok.get("token") or tok.get("access_token")
-        if not access:
-            raise Exception("no access token")
-        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:K500"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access}"})
-        rows = json.loads(urllib.request.urlopen(req, timeout=15).read()).get("values", [])
-
-        matched_row = None
-        for i, row in enumerate(rows):
-            if i == 0:
-                continue  # skip header
-            if not row:
-                continue
-            row_date = row[0] if len(row) > 0 else ""
-            row_time_full = row[1] if len(row) > 1 else ""
-            row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
-            row_cal = row[5] if len(row) > 5 else ""
-            if row_date != old_date:
-                continue
-            if old_time_minutes is not None and ':' in row_time:
-                try:
-                    h, m = row_time.split(':')[:2]
-                    row_minutes = int(h) * 60 + int(m)
-                    if abs(row_minutes - old_time_minutes) > 3:
-                        continue
-                except Exception:
-                    if row_time != old_time:
-                        continue
-            else:
-                if row_time != old_time:
-                    continue
-            if row_cal == entry_cal:
-                matched_row = i + 1  # 1-indexed for sheets API
-                break
-        if matched_row:
-            sheet_result = _sheet_update_nutrition_cells(matched_row, [
-                ("A", new_date),
-                ("B", new_time_full),
-            ])
-        else:
-            sheet_result = {"ok": False, "updated": 0, "errors": [f"no matching sheet row for {old_date} {old_time} cal={entry_cal}"]}
-    except Exception as e:
-        sheet_result = {"ok": False, "updated": 0, "errors": [str(e)]}
+    cache.refresh_one(scan_index, _sheet_read_nutrition_row)
+    row_after = cache.get_by_row(scan_index)
 
     return jsonify({
         "ok": True,
-        "entry": entry,
+        "scan_index": scan_index,
+        "entry": row_after.to_pwa_dict() if row_after else {},
         "old_date": old_date,
         "old_time": old_time,
         "new_date": new_date,
         "new_time": new_time,
-        "nutrition_updated": nutrition_updated,
         "sheet": sheet_result,
     })
 
@@ -5916,133 +5850,69 @@ def api_scan_delete():
     """Jim OOB 2026-08-06: 'Add function to remove historical upload. And cascade
     delete/update g sheet'.
 
-    Cascades across 3 stores:
-      1. food_scan_log.json → pop entry at scan_index (or by fallback matcher)
-      2. nutrition_log.json → drop matching meal (by timestamp_iso + meal_type=scan)
-      3. Google Sheet Nutrition tab → delete row(s) matching (date, time, calories, name)
-
-    Image file on disk is preserved (audit trail).
-
-    Body: { scan_index: int, timestamp_iso?: str, name?: str, calories?: int }
-    The scan_index is a HINT (array index in current scan_log snapshot); the
-    server uses (timestamp_iso, name, calories) for authoritative matching to
-    avoid stale-index issues after multiple deletes shift the array.
-    Returns: { ok, scan_index_removed, nutrition_log_removed, sheet_rows_deleted, errors }
+    v3.3.2: scan_index is now the Sheet row index. Deletes the row from the
+    Sheet via _sheet_delete_nutrition_rows and evicts the cache entry. No JSON
+    files. Image file on disk is preserved (audit trail).
     """
     data = request.get_json(silent=True) or {}
-    scan_index_hint = data.get("scan_index")
-    ts_iso_hint = data.get("timestamp_iso")
-    name_hint = data.get("name") or data.get("meal_name")
-    cal_hint = data.get("calories")
+    scan_index = data.get("scan_index")
+    if not isinstance(scan_index, int) or scan_index < 2:
+        return jsonify({"ok": False, "error": "scan_index required"}), 400
 
-    scan_log = _load_scan_log()
-    removed_entry = None
-    removed_idx = None
-    # Authoritative match: (timestamp_iso + name) — handles multi-delete index shifts
-    if ts_iso_hint and name_hint:
-        for i, e in enumerate(scan_log):
-            if (e.get("timestamp_iso") == ts_iso_hint
-                    and e.get("name") == name_hint):
-                removed_entry = scan_log.pop(i)
-                removed_idx = i
-                break
-    # Fallback: by scan_index (works only if no prior delete shifted array)
-    if removed_entry is None and isinstance(scan_index_hint, int) and 0 <= scan_index_hint < len(scan_log):
-        # If hint came with timestamp+name, also verify the hint entry matches
-        # the hint tuple — otherwise the index is stale from a prior delete.
-        hint_entry = scan_log[scan_index_hint]
-        if (ts_iso_hint and hint_entry.get("timestamp_iso") != ts_iso_hint):
-            # Stale index — do NOT delete (would shift other entries)
-            return jsonify({
-                "ok": False,
-                "error": "stale_index",
-                "hint": "頁面可能有過時嘅 scan_index，請 reload 後再試。Server 同時接 (timestamp_iso, name) 做權威 match。",
-                "current_index_length": len(scan_log),
-            }), 409
-        removed_entry = scan_log.pop(scan_index_hint)
-        removed_idx = scan_index_hint
-    if removed_entry is None:
-        return jsonify({"ok": False, "error": "entry not found"}), 404
+    cache = get_cache()
+    row = cache.get_by_row(scan_index)
+    if row is None:
+        return jsonify({"ok": False, "error": "scan_index not found in cache"}), 404
 
-    # Persist scan log
-    _save_scan_log(scan_log)
+    removed_date = row.date
+    removed_time = row.time
+    removed_cal = int(row.kcal)
+    removed_name = row.name
 
-    # Cascade 1: nutrition_log.json — match by timestamp_iso + meal_type=scan
-    nutrition_removed = 0
-    try:
-        if NUTRITION_LOG_PATH.exists():
-            nlog = json.loads(NUTRITION_LOG_PATH.read_text())
-            meals = nlog.get("meals", [])
-            ts_iso = removed_entry.get("timestamp_iso")
-            entry_name = removed_entry.get("name")
-            new_meals = []
-            for m in meals:
-                if (m.get("timestamp_iso") == ts_iso
-                        and m.get("meal_type") == "scan"
-                        and m.get("name") == entry_name):
-                    nutrition_removed += 1
-                    continue  # drop
-                new_meals.append(m)
-            nlog["meals"] = new_meals
-            NUTRITION_LOG_PATH.write_text(json.dumps(nlog, ensure_ascii=False, indent=2))
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"nutrition_log write failed: {e}",
-                        "scan_index_removed": removed_idx}), 500
+    # Sheet delete — match the exact row by date/time/kcal
+    entry_time_minutes = None
+    if removed_time and ':' in removed_time:
+        try:
+            hh, mm = removed_time.split(':')[:2]
+            entry_time_minutes = int(hh) * 60 + int(mm)
+        except Exception:
+            pass
 
-    # Cascade 2: Google Sheet Nutrition tab — match by (date, time ~±1 min, calories)
-    # Note: do NOT match by name — sheet column D uses raw vision description
-    # (e.g. "呢張相顯示咗一碟炸龍蝦肉，配有幾塊麵包...") which is different from
-    # the user-facing name field in scan_log (e.g. "椒鹽龍蝦"). Sheet's time column
-    # is also rounded to whole minutes ("09:35:32" → "09:35:00"), so allow ±1 min.
-    sheet_result = {"ok": False, "deleted": 0, "errors": ["not_attempted"]}
-    try:
-        ts_iso = removed_entry.get("timestamp_iso", "")
-        entry_date = ts_iso[:10] if ts_iso else ""
-        # Normalize entry time to HH:MM (sheet is whole-minute)
-        entry_time_hhmm = ts_iso[11:16] if len(ts_iso) >= 16 else ""
-        entry_time_minutes = None
-        if entry_time_hhmm and ':' in entry_time_hhmm:
+    def matcher(sheet_row, idx):
+        if not sheet_row:
+            return False
+        row_date = sheet_row[0] if len(sheet_row) > 0 else ""
+        row_time_full = sheet_row[1] if len(sheet_row) > 1 else ''
+        row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
+        row_cal = sheet_row[5] if len(sheet_row) > 5 else ''
+        if entry_time_minutes is not None and ':' in row_time:
             try:
-                hh, mm = entry_time_hhmm.split(':')[:2]
-                entry_time_minutes = int(hh) * 60 + int(mm)
-            except Exception:
-                pass
-        entry_cal = str(int(removed_entry.get("calories", 0) or 0))
-
-        def matcher(row, idx):
-            if not row:
-                return False
-            row_date = row[0] if len(row) > 0 else ""
-            row_time_full = row[1] if len(row) > 1 else ''
-            row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
-            row_cal = row[5] if len(row) > 5 else ''
-            # Time tolerance: ±3 minutes
-            # Note: sheet's time column records PUSH time (when _append_to_sheet_nutrition
-            # was called), which can drift from scan_log's COMMIT time by up to ~3 min
-            # due to background processing latency.
-            if entry_time_minutes is not None and ':' in row_time:
-                try:
-                    hh, mm = row_time.split(':')[:2]
-                    row_minutes = int(hh) * 60 + int(mm)
-                    if abs(row_minutes - entry_time_minutes) > 3:
-                        return False
-                except Exception:
-                    pass
-            else:
-                if row_time != entry_time_hhmm:
+                hh, mm = row_time.split(':')[:2]
+                row_minutes = int(hh) * 60 + int(mm)
+                if abs(row_minutes - entry_time_minutes) > 3:
                     return False
-            return (row_date == entry_date and row_cal == entry_cal)
+            except Exception:
+                if row_time != removed_time:
+                    return False
+        else:
+            if row_time != removed_time:
+                return False
+        return (row_date == removed_date and row_cal == str(removed_cal))
 
-        sheet_result = _sheet_delete_nutrition_rows(matcher)
-    except Exception as e:
-        sheet_result = {"ok": False, "deleted": 0, "errors": [str(e)]}
+    sheet_result = _sheet_delete_nutrition_rows(matcher)
+    if not sheet_result.get("ok"):
+        return jsonify({"ok": False, "error": f"sheet delete failed: {sheet_result.get('errors')}"}), 500
+
+    # Evict the deleted row from the cache
+    with cache._lock:  # type: ignore[attr-defined]
+        cache._evict(scan_index)
 
     return jsonify({
         "ok": True,
-        "scan_index_removed": removed_idx,
-        "removed_name": removed_entry.get("name", ""),
-        "removed_timestamp_iso": removed_entry.get("timestamp_iso", ""),
-        "nutrition_log_removed": nutrition_removed,
+        "scan_index_removed": scan_index,
+        "removed_name": removed_name,
+        "removed_date": removed_date,
+        "removed_time": removed_time,
         "sheet_rows_deleted": sheet_result.get("deleted", 0),
         "sheet_errors": sheet_result.get("errors", []),
     })
@@ -6061,22 +5931,18 @@ def api_scan_commit():
     image. Falls back to legacy `entry: {...}` for backward compat.
 
     Text-only path (Jim OOB 2026-08-02 02:50 HKT):
-        image_path = "" → text-only entry. NO file rename, no scan_log
-        append image, sheet row has image_url field empty / sheet
-        column K is left blank for the entry.
+        image_path = "" → text-only entry. NO file rename, sheet row has
+        image_url field empty / sheet column K is left blank for the entry.
 
-    ONLY NOW writes to nutrition_log.json + Google Sheet.
-
-    If user_corrections are submitted (correction_form), they're appended permanently.
+    v3.3.2: Sheet is the canonical store. cache.refresh_one() patches the
+    in-memory index after each append. No food_scan_log.json or
+    nutrition_log.json are written.
     """
     data = request.get_json(silent=True) or {}
     image_path = data.get("image_path", "")
-    user_correction = data.get("user_correction")  # optional dict
-    # v2.7.19: list of hint strings Jim typed during scan → re-estimate cycle
+    user_correction = data.get("user_correction")
     user_hints_in = data.get("user_hints", []) or []
 
-    # v3.2.7.9: accept either `entries: [...]` (new multi-entry) or
-    # `entry: {...}` (legacy single-entry) for backward compat
     entries_in = data.get("entries")
     if entries_in is None:
         single = data.get("entry", {})
@@ -6085,97 +5951,70 @@ def api_scan_commit():
         entries_in = [single]
     if not isinstance(entries_in, list) or not entries_in:
         return jsonify({"ok": False, "error": "entries must be non-empty list"}), 400
-    # Cap to 10 to prevent abuse
     entries_in = entries_in[:10]
 
-    # Validate image (shared across all entries)
     if image_path:
         img_path = Path(image_path)
         if not img_path.exists():
             return jsonify({"ok": False, "error": "image not found"}), 404
     else:
-        img_path = None  # text-only entry, no image
+        img_path = None
 
-    # Per-entry commit. All entries share same image + timestamp + scan_log row.
     now_iso_str = now_iso()
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
 
-    # Pre-compute image rename (one-time, shared)
-    drive_image_url = ""  # v3.2.7.45: golden copy — uploaded to Drive for sheet column N
+    drive_image_url = ""
+    final_path = None
+    image_url = ""
     if img_path is not None:
         final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
         final_path = SCAN_CACHE_DIR / final_name
         try:
             img_path.rename(final_path)
             image_url = f"/scan_img/{final_name}"
-            # v3.2.7.45: upload to Drive for Golden Copy (Jim OOB 2026-08-14).
-            # Best-effort: failure is logged but doesn't break the commit.
-            # The sheet will just get an empty column N if Drive is down.
             drive_image_url = _upload_to_drive(final_path)
-            # v3.2.7.46: 480px thumbnail for fast food history view.
             _make_thumb(final_path, _thumb_path_for(final_name))
         except Exception:
             final_path = img_path
             image_url = f"/scan_img/{img_path.name}"
-            # Try to upload the original file even if rename failed
             try:
                 drive_image_url = _upload_to_drive(final_path)
                 _make_thumb(final_path, _thumb_path_for(img_path.name))
             except Exception:
                 drive_image_url = ""
 
-    # v3.2.7.30: dedup by image md5 — reject duplicate scans of the same
-    # photo within 30 minutes. Fixes 'user taps confirm twice on a vision
-    # failure' → two entries pointing at the same image with junk names.
-    if img_path is not None and final_path and Path(final_path).exists():
-        try:
-            import hashlib
-            new_hash = hashlib.md5(Path(final_path).read_bytes()).hexdigest()
-            scan_log_pre = _load_scan_log()
-            for prev in scan_log_pre:
-                prev_img = prev.get("image_path") or ""
-                if not prev_img or not Path(prev_img).exists():
-                    continue
-                prev_hash = hashlib.md5(Path(prev_img).read_bytes()).hexdigest()
-                if prev_hash != new_hash:
-                    continue
-                # Same image. If within 30 min, treat as duplicate.
-                from datetime import datetime as _dt
-                prev_ts = prev.get("timestamp_iso", "")
-                try:
-                    prev_dt = _dt.fromisoformat(prev_ts)
-                    now_dt = _dt.fromisoformat(now_iso_str)
-                    age_min = abs((now_dt - prev_dt).total_seconds()) / 60
-                except Exception:
-                    age_min = 999
-                if age_min <= 30:
-                    return jsonify({
-                        "ok": False,
-                        "error": "duplicate_scan",
-                        "message": (f"呢張相喺 {age_min:.0f} 分鐘前已經 scan 過 "
-                                    f"({prev.get('name')!r}). 唔會重複記錄。"),
-                        "existing_scan_index": prev.get("scan_index"),
-                        "existing_name": prev.get("name"),
-                    }), 409
-        except Exception:
-            pass  # dedup is best-effort; never block a real commit
-    else:
-        final_path = ""
-        image_url = ""
+    # v3.3.2: signature-based dedup using the cache (hydrated from Sheet).
+    # Matches the (date, HH:MM, kcal) signature of any in-cache row. The
+    # legacy md5-of-image dedup is dropped — image bytes are no longer
+    # authoritative (Drive + Sheet are). Signature dedup catches "user
+    # tapped confirm twice within seconds".
+    if entries_in:
+        first = entries_in[0]
+        if isinstance(first, dict):
+            sig_date = first.get("date") or today_iso()
+            sig_time = (first.get("time") or now_hkt_dt.strftime("%H:%M"))[:5]
+            sig_cal = int(first.get("calories") or 0)
+            existing = get_cache().find_by_signature(sig_date, sig_time, sig_cal)
+            if existing is not None:
+                return jsonify({
+                    "ok": False,
+                    "error": "duplicate_scan",
+                    "message": (f"呢一餐已經喺 Sheet 記錄咗 "
+                                f"({existing.name!r}). 唔會重複 append。"),
+                    "existing_scan_index": existing.row_index,
+                    "existing_name": existing.name,
+                }), 409
 
-    # Common vision hints for dish-name re-derivation
     vision_hint_global = data.get("vision_desc", "") or data.get("vision_short", "") or ""
     pplx_hint_global = data.get("pplx_short", "") or ""
 
     committed = []
+    cache = get_cache()
     for e_idx, entry in enumerate(entries_in):
         if not isinstance(entry, dict):
             continue
-        # Per-entry user_correction (or shared one)
         e_user_correction = entry.get("user_correction") or (user_correction if e_idx == 0 else None)
-        # Per-entry user_hints (entry-level first, then top-level)
         e_user_hints = entry.get("user_hints") or user_hints_in
-        # Per-entry meal_type / time
         entry["timestamp_iso"] = now_iso_str
         if img_path is not None:
             entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
@@ -6188,7 +6027,6 @@ def api_scan_commit():
         entry["confidence"] = "Jim-confirmed preview"
         entry["sheet_synced"] = False
         entry["user_correction"] = None
-        # v3.2.7.3: single A-F grade via keyword+macro (replaces star rating)
         entry_name = entry.get("name") or entry.get("meal_name") or "食物"
         entry_kcal = entry.get("calories", entry.get("kcal", 0)) or 0
         entry_p = entry.get("protein", entry.get("protein_g", 0)) or 0
@@ -6196,11 +6034,9 @@ def api_scan_commit():
         entry_f = entry.get("fat", entry.get("fat_g", 0)) or 0
         entry_rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
         if entry_name and entry_kcal > 0:
-            entry["coach_comment"] = _coach_comment(entry_name, entry_kcal, entry_p, entry_c, entry_f, entry_rest)
-        # v3.2.7.3: legacy `rating` field (1-5 star) removed
+            entry["coach_comment"] = _coach_comment_keyword(entry_name, entry_kcal, entry_p, entry_c, entry_f, entry_rest)
         if "rating" in entry:
             del entry["rating"]
-        # v2.7.19: persist user hints (each round-trip = one hint in the list)
         cleaned_hints = []
         seen = set()
         for h in e_user_hints:
@@ -6214,8 +6050,6 @@ def api_scan_commit():
             if len(cleaned_hints) >= 20:
                 break
         entry["user_hints"] = cleaned_hints
-        # v3.2.7.48: enforce dish-name sanitiser on every commit (shared
-        # helper consolidates the inline criteria that lived here).
         current_name = _sanitise_dish_name(entry.get("name"))
         if current_name == "未識別菜式":
             vision_hint = (entry.get("vision_raw_desc")
@@ -6231,11 +6065,6 @@ def api_scan_commit():
                 entry["name"] = redrive
                 current_name = redrive
 
-        # v3.2.7.13: if user_hints[0] is a concrete food name (e.g.
-        # 'NOC 牛油果炒蛋多士'), prefer it over vision-derived name which
-        # can be wrong when vision AI can only see cup + straw (Jim OOB
-        # 2026-08-09 'noc coffee failed'). Heuristic: hint with 2-12 chars,
-        # no English, contains a known food suffix.
         if entry.get("user_hints"):
             hint = entry["user_hints"][0].strip()
             if 2 <= len(hint) <= 12 and not re.search(r"[A-Za-z]", hint):
@@ -6246,13 +6075,17 @@ def api_scan_commit():
                     entry["name"] = hint
                     current_name = hint
 
-        # v3.2.7.45: pass Drive URL onto entry so _append_to_sheet_nutrition
-        # writes column N (Golden Copy). Leave as empty string if upload failed.
         entry["drive_image_url"] = drive_image_url
 
-        # Append to nutrition_log
-        _append_to_nutrition_log(entry)
         sheet_result = _append_to_sheet_nutrition(entry)
+        new_row_index = None
+        if sheet_result.get("ok") and not sheet_result.get("skipped"):
+            try:
+                range_str = sheet_result.get("range", "")
+                new_row_index = int(range_str.split(":")[0].rstrip("ABCDEFGHIJKLM"))
+                cache.refresh_one(new_row_index, _sheet_read_nutrition_row)
+            except Exception:
+                pass
         committed.append({
             "name": entry.get("name", "?"),
             "calories": entry.get("calories", 0),
@@ -6260,57 +6093,20 @@ def api_scan_commit():
             "grade": (entry.get("coach_comment") or {}).get("grade", "—"),
             "sheet_row": sheet_result.get("range", ""),
             "sheet_ok": sheet_result.get("ok", False),
+            "scan_index": new_row_index,
         })
-
-    # Append scan_log rows (one per entry if image-backed, one per entry otherwise)
-    scan_log = _load_scan_log()
-    sheet_first_row = committed[0].get("sheet_row", "") if committed else ""
-    for e_idx, entry in enumerate([e for e in entries_in if isinstance(e, dict)]):
-        scan_index = len(scan_log)
-        log_row = {
-            "scan_index": scan_index,
-            "timestamp_iso": now_iso_str,
-            "name": entry.get("name", "scan"),
-            "calories": entry.get("calories", 0),
-            "protein": entry.get("protein", 0),
-            "carbs": entry.get("carbs", 0),
-            "fat": entry.get("fat", 0),
-            "fiber": entry.get("fiber", 0),
-            "sugar": entry.get("sugar", 0),
-            "sodium": entry.get("sodium", 0),
-            "sat_fat": entry.get("sat_fat", 0),
-            "trans_fat": entry.get("trans_fat", 0),
-            "vit_c": entry.get("vit_c", 0),
-            "iron": entry.get("iron", 0),
-            "calcium": entry.get("calcium", 0),
-            "shared": entry.get("is_shared_meal", False),
-            "image_path": str(final_path) if img_path is not None else "",
-            "image_url": image_url,
-            "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46: fast food history
-            "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy
-            "restaurant_chain": entry.get("restaurant_chain", ""),
-            "coach_comment": entry.get("coach_comment", {}),
-            "vision_short": (entry.get("vision_raw_desc") or entry.get("vision_desc") or vision_hint_global or "")[:120],
-            "user_corrections": [],
-        }
-        if img_path is None:
-            log_row["is_text_only"] = True
-        # v3.2.7.9: link sibling entries from same photo via multi_entry_id
-        log_row["multi_entry_id"] = f"me_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_{len(entries_in)}dishes"
-        scan_log.append(log_row)
-    _save_scan_log(scan_log)
 
     return jsonify({
         "ok": True,
-        "scan_index": scan_log[-len(committed)] if committed else None,
+        "scan_index": committed[0].get("scan_index") if committed else None,
         "committed": committed,
         "multi_entry": len(committed) > 1,
         "sheet_synced": all(c.get("sheet_ok") for c in committed) if committed else False,
         "sheet_range": committed[0].get("sheet_row", "") if committed else "",
         "is_text_only": img_path is None,
         "image_url": image_url,
-        "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46
-        "drive_image_url": drive_image_url,  # v3.2.7.45: Golden Copy URL
+        "thumbnail_url": _thumb_url_for(image_url),
+        "drive_image_url": drive_image_url,
     })
 
 
@@ -7772,7 +7568,8 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     jim_context_block = _get_jim_context_for_cheer()
 
     # Jim OOB 2026-07-25 13:30 HKT: monitor my food, enhance for food comment
-    # not just log nutrient. Pulls today's meals from NUTRITION_LOG_PATH
+    # not just log nutrient. Pulls today's meals via _load_today_nutrition()
+    # which reads from the in-memory NutritionCache (hydrated from Sheet on boot).
     # and injects as a structured block for pplx to comment on.
     nutrition_block = _get_today_nutrition_for_cheer()
 

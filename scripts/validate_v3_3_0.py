@@ -36,7 +36,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 HKT = timezone(timedelta(hours=8))
 BASE_URL = os.environ.get("GYMBRO_BASE_URL", "http://localhost:7000")
-EXPECTED_VERSION = "3.3.1"
+EXPECTED_VERSION = "3.3.2"
 SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
 SHEET_TAB = "Nutrition"
 SHEET_RANGE = f"{SHEET_TAB}!A1:K"
@@ -273,17 +273,23 @@ def check_photo_proxy(recent_data: dict | None) -> None:
     _record("5. /scan_thumb/<row> 200/302", ok_thumb, detail_thumb)
 
     # Image URL contract: scan dict should expose image_url + thumbnail_url.
+    # v3.3.1: lh3.googleusercontent.com/<id>=s480 / =s220 — direct image
+    # hosting, no redirect. Earlier versions used drive.google.com/uc URLs.
     img_url = first.get("image_url", "")
     thumb_url = first.get("thumbnail_url", "")
-    legacy_ok = img_url.startswith("/scan_img/") or (
-        img_url.startswith("http") and "drive.google.com" in img_url
+    img_ok = (
+        img_url.startswith("/scan_img/")
+        or "drive.google.com" in img_url
+        or "lh3.googleusercontent.com" in img_url
+        or img_url.startswith("/static/img/")  # placeholder
     )
-    # Drive URLs end with =s220-c for the thumbnail hint — proxy version uses
-    # the row-index path. Accept either.
-    thumb_ok = thumb_url.startswith("/scan_thumb/") or (
-        thumb_url.startswith("http") and "drive.google.com" in thumb_url
+    thumb_ok = (
+        thumb_url.startswith("/scan_thumb/")
+        or "drive.google.com" in thumb_url
+        or "lh3.googleusercontent.com" in thumb_url
+        or thumb_url.startswith("/static/img/")
     )
-    ok = bool(img_url) and bool(thumb_url) and legacy_ok and thumb_ok
+    ok = bool(img_url) and bool(thumb_url) and img_ok and thumb_ok
     _record(
         "6. image_url + thumbnail_url contract",
         ok,
