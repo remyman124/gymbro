@@ -23,10 +23,9 @@ NUTRITION_SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
 NUTRITION_TAB_NAME = "Nutrition"
 
 # v3.x version — keep in sync with __version__ in gym_web.py
-# v3.3.0: Sheet/Drive-only persistence (no file cache). Memory cache hydrates
-# from Google Sheet on startup; all writes go through the cache → Sheet.
-# food_scan_log.json + scan_cache/ are deprecated.
-VERSION = "3.3.0"
+# v3.3.1: split _coach_comment into _coach_comment_keyword (no AI) +
+# _coach_comment (with AI). Food history list now O(fast).
+VERSION = "3.3.1"
 GIT_COMMIT = "pre-release"  # updated on tag
 
 

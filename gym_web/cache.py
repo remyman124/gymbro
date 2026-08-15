@@ -237,6 +237,14 @@ class NutritionCache:
                     self.by_date.setdefault(row.date, []).append(sheet_row)
                     if row.dt:
                         tmp_recent.append((row.dt, sheet_row))
+                    elif row.date:
+                        # v3.3.1: legacy rows have date but no time. Use
+                        # midnight as the sort key so they still appear
+                        # in by_recent (at the end of their date).
+                        try:
+                            tmp_recent.append((datetime.strptime(row.date, "%Y-%m-%d"), sheet_row))
+                        except ValueError:
+                            pass
                 tmp_recent.sort(key=lambda t: t[0], reverse=True)
                 self.by_recent = [ri for _, ri in tmp_recent]
                 self._hydrated = True

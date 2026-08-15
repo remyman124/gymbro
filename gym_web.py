@@ -732,7 +732,9 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
-__version__ = "3.3.0"
+# v3.3.1: split _coach_comment into _coach_comment_keyword (no AI) +
+# _coach_comment (with AI). Food history list now O(fast).
+__version__ = "3.3.1"
 
 
 def _recovery_pct():
@@ -3439,25 +3441,16 @@ def _merge_nutrition_estimates(estimates: list) -> dict:
 # not be just recognizing but also what are good selection and bad selection of food")
 # Uses MiniMax M3 text-only (no image needed) to score + suggest.
 # Returns: {grade: 'A+'|'A'|'B'|'C'|'D'|'F', comment: str, suggestions: [str, ...], rationale: str}
-def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "", user_context: str = "") -> dict:
-    """Generate coach comment for a logged food.
+def _coach_comment_keyword(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "") -> dict:
+    """v3.3.1: fast keyword + macro grade, NO AI call.
 
-    v3.2.7.3: combined keyword + macro grade (Jim OOB 2026-08-08 16:25 HKT
-    'Not just macro. But overall good food or bad food' — grade reflects
-    the food's OVERALL healthiness, not just macro ratios).
-
-    Step 1: keyword-based pre-grade from food name (A+ very healthy ... F very bad)
-    Step 2: macro adjustment — fat_pct > 60% worsens 2 grades, fat > 50% worsens 1,
-             protein > 30% + fat < 30% improves 1, protein < 10% worsens 1.
-
-    Rubric:
-      - A+: 清淡零負擔 (coffee/tea/water/steamed veg/chicken breast/salad)
-      - A:  健康均衡 (fish/shrimp/sashimi/grilled chicken/oats/yogurt)
-      - B:  中性 (rice/noodle/steamed meat/HK home-cooked)
-      - C:  普通 (carb-heavy or unknown dish)
-      - D:  偏heavy (cake/dessert/cream/fried rice/焗飯)
-      - F:  極heavy (deep-fried/BBQ/buffet/sugary drink/processed meat)
+    Returns the same dict shape as _coach_comment but with empty
+    macro_breakdown / micronutrient_status / next_meal_suggestion fields.
+    Safe to call N times per request (food history list endpoint).
     """
+    if not dish_name:
+        dish_name = "(未命名菜式)"
+    combined = dish_name.lower()
     # Jim OOB 2026-08-11 'not every food has a rating. Pls fix it':
     # Even when calories=0 (early scan / data sync) or dish_name empty, we
     # still render a usable grade from whatever macros we DO have. The
@@ -3614,6 +3607,32 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         suggestions.append("加一隻蛋 / 雞胸 / 豆腐提升蛋白比例")
     if carb_pct > 65 and calories > 400:
         suggestions.append("配菜加多啲菜，飯量減 1/3")
+    return {
+        "grade": final_grade,
+        "comment": pre_comment,
+        "suggestions": suggestions[:2],
+        "rationale": f"蛋白 {protein_pct:.0f}% · 碳 {carb_pct:.0f}% · 脂 {fat_pct:.0f}%",
+        "macro_breakdown": "",
+        "micronutrient_status": "",
+        "next_meal_suggestion": suggestions[0] if suggestions else "",
+    }
+
+
+def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "", user_context: str = "") -> dict:
+    """v3.3.1: full coach comment = keyword + AI 4-section enrichment.
+
+    For single-row display (scan commit/correct/preview detail views).
+    /api/scan_recent MUST NOT call this — use _coach_comment_keyword instead.
+    Each AI call costs ~5s, so a list of N rows = N×5s (was the v3.3.0 bug).
+    """
+    base = _coach_comment_keyword(dish_name, calories, protein, carbs, fat, restaurant)
+    pre_comment = base["comment"]
+    final_grade = base["grade"]
+    suggestions = base["suggestions"]
+    protein_pct = (protein * 4) / max(calories, 1) * 100
+    fat_pct = (fat * 9) / max(calories, 1) * 100
+    carb_pct = (carbs * 4) / max(calories, 1) * 100
+
     # v3.2.7.11: comprehensive coach comment via MiniMax M3 (Jim OOB
     # 2026-08-08 20:35 HKT 'comment on the food can be much more
     # comprehensive'). 4-section structured response: overall health +
@@ -3694,15 +3713,11 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
         # Fallback to the original static template
         final_comment = pre_comment
 
-    return {
-        "grade": final_grade,
-        "comment": final_comment,
-        "suggestions": suggestions[:2],  # max 2
-        "rationale": f"蛋白 {protein_pct:.0f}% · 碳 {carb_pct:.0f}% · 脂 {fat_pct:.0f}%",
-        "macro_breakdown": macro_breakdown or pre_comment,
-        "micronutrient_status": micronutrient_status,
-        "next_meal_suggestion": next_meal_suggestion or (suggestions[0] if suggestions else ""),
-    }
+    base["comment"] = final_comment
+    base["macro_breakdown"] = macro_breakdown or pre_comment
+    base["micronutrient_status"] = micronutrient_status
+    base["next_meal_suggestion"] = next_meal_suggestion or (suggestions[0] if suggestions else "")
+    return base
 
 
 # v2.7.37: DDG web search (Jim OOB 2026-08-06: "bundled with all the search tools
@@ -4640,8 +4655,10 @@ def api_scan_recent():
     out = []
     for r in recent_rows:
         d = r.to_pwa_dict()
-        # Lazy-compute coach_comment (fast keyword match, no AI call)
-        d["coach_comment"] = _coach_comment(r.name, r.kcal, r.p, r.c, r.f, r.restaurant)
+        # v3.3.1: fast keyword+macro grade, NO AI call.
+        # Each row used to hit MiniMax (~5s) → limit=N took N×5s.
+        # AI 4-section enrichment only fires on single-row detail views.
+        d["coach_comment"] = _coach_comment_keyword(r.name, r.kcal, r.p, r.c, r.f, r.restaurant)
         out.append(d)
     return jsonify({
         "scans": out,

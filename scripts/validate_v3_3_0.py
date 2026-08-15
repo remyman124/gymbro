@@ -36,7 +36,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 HKT = timezone(timedelta(hours=8))
 BASE_URL = os.environ.get("GYMBRO_BASE_URL", "http://localhost:7000")
-EXPECTED_VERSION = "3.3.0"
+EXPECTED_VERSION = "3.3.1"
 SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
 SHEET_TAB = "Nutrition"
 SHEET_RANGE = f"{SHEET_TAB}!A1:K"
@@ -193,14 +193,21 @@ def check_cache_stats() -> dict | None:
 
 def check_recent_vs_sheet(recent_data: dict | None) -> int:
     """Compare cache scan count to actual Sheet row count.
-    Cache total = all cached rows (incl. failed scans); we filter out
-    the failed-name bucket the same way /api/scan_recent does."""
-    if not recent_data:
-        _record("3. recent vs sheet count", False, "no recent_data")
+    Pulls a fresh /api/scan_recent?limit=200 to get the cache's view of
+    total scanned rows, then compares to the live Sheet row count.
+    """
+    # Fresh fetch with high limit to capture the full cache view.
+    status, body, _ = http_get("/api/scan_recent?limit=200")
+    if status != 200:
+        _record("3. recent vs sheet count", False, f"/api/scan_recent?limit=200 status={status}")
         return 0
-    cache_total = recent_data.get("total", 0)
-    cache_filtered = recent_data.get("filtered", 0)
-    cache_successful = cache_total - cache_filtered
+    try:
+        fresh = json.loads(body)
+    except Exception as e:
+        _record("3. recent vs sheet count", False, f"JSON decode: {e}")
+        return 0
+    cache_stats = fresh.get("cache") or {}
+    cache_rows = cache_stats.get("rows", 0)
 
     try:
         rows = fetch_sheet_rows()
@@ -210,11 +217,11 @@ def check_recent_vs_sheet(recent_data: dict | None) -> int:
     sheet_count = sheet_data_row_count(rows)
     _record(
         "3. recent vs sheet count",
-        cache_successful == sheet_count,
-        f"cache_successful={cache_successful} sheet={sheet_count} "
-        f"(cache_total={cache_total} filtered={cache_filtered})",
+        cache_rows == sheet_count,
+        f"cache_rows={cache_rows} sheet={sheet_count} "
+        f"(response_total={fresh.get('total')} filtered={fresh.get('filtered')})",
     )
-    return cache_successful
+    return cache_rows
 
 
 def check_nutrition_today() -> None:
@@ -364,8 +371,27 @@ def check_hydration_resilience(baseline_count: int) -> None:
         return
     _record("7. server back up after restart", True, "")
 
-    # Re-query /api/scan_recent?limit=200
-    status, body, _ = http_get("/api/scan_recent?limit=200")
+    # Wait for cache hydration to finish: poll /api/scan_recent until 200.
+    hydration_deadline = time.time() + 60
+    hydrated = False
+    while time.time() < hydration_deadline:
+        status, body, _ = http_get("/api/scan_recent?limit=5", timeout=5)
+        if status == 200:
+            try:
+                d = json.loads(body)
+                if (d.get("cache") or {}).get("hydrated") is True:
+                    hydrated = True
+                    break
+            except Exception:
+                pass
+        time.sleep(1)
+    if not hydrated:
+        _record("7. cache hydrated after restart", False, "still 503 after 60s")
+        return
+    _record("7. cache hydrated after restart", True, "")
+
+    # Re-query /api/scan_recent?limit=200 (this is slow — coach_comment compute)
+    status, body, _ = http_get("/api/scan_recent?limit=200", timeout=120)
     if status != 200:
         _record("7. /api/scan_recent after restart", False, f"status={status}")
         return
@@ -375,15 +401,13 @@ def check_hydration_resilience(baseline_count: int) -> None:
         _record("7. /api/scan_recent JSON after restart", False, str(e))
         return
     cache = data.get("cache") or {}
-    total_after = data.get("total", 0)
-    filtered_after = data.get("filtered", 0)
-    successful_after = total_after - filtered_after
+    rows_after = cache.get("rows", 0)
     hydrated = cache.get("hydrated") is True
-    ok = hydrated and successful_after == baseline_count
+    ok = hydrated and rows_after == baseline_count
     _record(
         "7. hydration resilience (count unchanged after restart)",
         ok,
-        f"baseline={baseline_count} after={successful_after} "
+        f"baseline={baseline_count} after={rows_after} "
         f"hydrated={hydrated}",
     )
 
