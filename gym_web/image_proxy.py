@@ -26,7 +26,7 @@ from collections import OrderedDict
 from typing import Optional
 
 from flask import Blueprint, Response, redirect
-from PIL import Image
+from PIL import Image, ImageOps
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +65,34 @@ def get_drive_url(row_index: int) -> Optional[str]:
 def invalidate_drive_url(row_index: int) -> None:
     with _url_cache_lock:
         _url_cache.pop(row_index, None)
+
+
+def invalidate_thumb(row_index: int) -> None:
+    """Drop the cached thumbnail bytes for one row."""
+    with _thumb_cache._lock:
+        _thumb_cache._data.pop(row_index, None)
+
+
+def shift_thumb_cache(row_index: int) -> None:
+    """After deleting Sheet row R, every row > R has its row_index shifted
+    down by 1. The thumbnail-bytes LRU cache is keyed by row_index, so its
+    entries must move down by 1 as well — otherwise /scan_thumb/<new_idx>
+    would return a JPEG that originally belonged to a different row.
+    """
+    with _thumb_cache._lock:
+        if not _thumb_cache._data:
+            return
+        # Snapshot and rebuild — _BoundedBytesCache is OrderedDict-backed.
+        new_data = OrderedDict()
+        for k, v in _thumb_cache._data.items():
+            if k > row_index:
+                new_data[k - 1] = v
+            elif k != row_index:           # k < row_index stays; row_index itself is dropped
+                new_data[k] = v
+        # Cap to capacity if shift added many entries
+        while len(new_data) > _thumb_cache._cap:
+            new_data.popitem(last=False)
+        _thumb_cache._data = new_data
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +149,17 @@ def _fetch_drive_bytes(drive_url: str) -> bytes:
 
 
 def _make_thumbnail(raw: bytes) -> bytes:
-    """PIL downscale to max-side 480px, JPEG q=82. Re-encode always."""
+    """PIL downscale to max-side 480px, JPEG q=82. Re-encode always.
+
+    v3.3.7 (Jim OOB 2026-08-19 'last two photos rotated'): apply EXIF
+    orientation so portrait iPhone photos render right-side up. Without
+    this, a 1600x2133 portrait photo with EXIF=6 gets thumbnailed to
+    480x360 with the pixels still in the rotated raw state — display
+    shows it 90° off.
+    """
     with Image.open(io.BytesIO(raw)) as im:
         im.load()
+        im = ImageOps.exif_transpose(im)
         im = im.convert("RGB")
         im.thumbnail((THUMB_MAX_SIDE, THUMB_MAX_SIDE), Image.LANCZOS)
         buf = io.BytesIO()

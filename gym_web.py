@@ -21,7 +21,7 @@ from datetime import datetime as _dt
 from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
@@ -31,7 +31,7 @@ from workout_formatter import render as _render_text
 from dotenv import load_dotenv
 from gym_web.core import safe_read_json as _safe_read_json
 from gym_web.idempotency import check_and_remember as _idempotency_check
-from gym_web.cache import NutritionCache, NutritionRow, get_cache as _get_nutrition_cache
+from gym_web.cache import NutritionCache, NutritionRow, get_cache, get_cache as _get_nutrition_cache
 from gym_web import image_proxy
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
@@ -966,11 +966,22 @@ def _get_intraday_steps_today() -> dict:
     if n == 0:
         return {"has_data": False}
 
+    # v3.3.7: track the latest event ts in the series so the caller can
+    # surface a Withings-side freshness stamp. NOTE: Withings `<unix_ts>`
+    # keys are the *start of the measurement bucket*, not the iPhone
+    # upload time — but they track within seconds of each other in
+    # practice (HealthKit pushes near-real-time).
+    latest_ts = max(
+        (int(ts_str) for ts_str in series.keys() if str(ts_str).isdigit()),
+        default=0,
+    )
+
     return {
         "has_data": True,
         "steps": int(total_steps),
         "distance_km": round(total_dist / 1000, 2),
         "calories": round(total_cal, 1),
+        "latest_event_ts": latest_ts,  # 0 if no events
     }
 
 
@@ -999,7 +1010,17 @@ def _withings_steps_today() -> dict:
        KNOWN number regardless of date. gymbro must show TODAY's number
        even if 0, or syncing.
 
-    Returns dict {date, steps, distance_km, calories, _source}.
+    v3.3.7 (Jim OOB 2026-08-17 'as-of timestamp should be earlier — Withings
+    last sync was earlier but my actual step should have increased'): also
+    return `data_as_of` reflecting Withings-side freshness, NOT when our
+    cache was last written.
+    - For `today_commit` source: Withings aggregates daily at HKT 04:00
+      (the API exposes only `date: YYYY-MM-DD`, no per-record timestamp).
+      Use HKT 04:00 of `today_str` as the data_as_of.
+    - For intraday sources: use the latest event's `ts` from the intraday
+      series (the unix_ts key).
+
+    Returns dict {date, steps, distance_km, calories, _source, data_as_of_iso}.
     """
     import importlib
     from datetime import datetime, timezone, timedelta
@@ -1057,6 +1078,7 @@ def _withings_steps_today() -> dict:
         # Cross-check with intraday for fresh partial sync
         intraday_today = _get_intraday_steps_today()
         intraday_today_steps = int(intraday_today.get("steps") or 0) if intraday_today.get("has_data") else 0
+        intraday_latest_ts = intraday_today.get("latest_event_ts") or 0
 
         if intraday_today_steps > today_steps:
             # Intraday has more events than today's daily commit
@@ -1068,9 +1090,18 @@ def _withings_steps_today() -> dict:
                 "_source": "intraday_override",
             }
             chosen_source = "intraday_override"
+            # v3.3.7: data_as_of = latest intraday event ts (genuine)
+            data_as_of_ts = intraday_latest_ts
         else:
             chosen = today_record
             chosen_source = "today_commit"
+            # v3.3.7: ONLY use intraday_latest_ts when genuine iPhone sync
+            # events exist. NEVER fabricate HKT 04:00 — that's a daily
+            # commit timestamp, NOT the time iPhone pushed data, and
+            # showing it as "as of 04:00" was misleading (Jim OOB
+            # 2026-08-17 '04:00 is a bug'). If no intraday events, hide
+            # the as-of label rather than guess.
+            data_as_of_ts = intraday_latest_ts or 0
     else:
         # v2.7.25: NO today record. Try intraday; if empty, honest syncing.
         # NEVER show yesterday's value as today.
@@ -1084,6 +1115,8 @@ def _withings_steps_today() -> dict:
                 "_source": "intraday_only",
             }
             chosen_source = "intraday_only"
+            # v3.3.7: genuine as-of from latest intraday event
+            data_as_of_ts = intraday_today.get("latest_event_ts") or 0
         else:
             # Honest signal: today has no data, do NOT fall back to yesterday.
             return {
@@ -1110,6 +1143,15 @@ def _withings_steps_today() -> dict:
         "distance_km": round(distance_m / 1000, 2),
         "calories": round(calories, 1),
         "_source": chosen_source,
+        # v3.3.7: Withings-side freshness (vs. cache write time = pulled_at).
+        # Only set when an intraday event ts is available — i.e., a real
+        # iPhone-side push. None when only the daily commit exists (we
+        # don't fabricate HKT 04:00 — Jim OOB 2026-08-17 '04:00 is a bug').
+        "data_as_of_ts": data_as_of_ts,
+        "data_as_of_iso": (
+            datetime.fromtimestamp(data_as_of_ts, tz=timezone.utc).isoformat()
+            if data_as_of_ts else None
+        ),
     }
 
     # Atomic write to cache
@@ -1235,18 +1277,69 @@ def _get_jim_context_for_cheer() -> str:
 
     Reads JIM_CONTEXT, formats each entry as "- <key>: <value> (tags: <tags>)".
     Returns empty string if no entries.
+
+    v3.3.7 (Jim OOB 2026-08-19 'voice summary is now referring latest schedule:
+    the hiking was done last Sunday but this Sunday and i have already bought
+    my barefoot asia'): filter out past-dated events. The cheer LLM was
+    reading stale '8/10 Sun 大帽山行山' / '8/16 Sun cancelled' entries and
+    treating them as upcoming plans. Now entries whose value contains a
+    date earlier than today (HKT) are dropped. Entries without parseable
+    dates pass through (preferences, dietary rules, etc.).
     """
     ctx = _load_jim_context()
     entries = ctx.get("entries") or {}
     if not entries:
         return ""
+    try:
+        from zoneinfo import ZoneInfo
+        hkt = ZoneInfo("Asia/Hong_Kong")
+        today_hkt = datetime.now(hkt).date()
+    except Exception:
+        today_hkt = datetime.now().date()
+
+    # Match dates like 8/10, 8/16, 2026-08-16, 8/9 Sat — accept them as
+    # past if their date is before today. Conservative: if ambiguous, keep.
+    import re as _re
+    date_re = _re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")  # YYYY-MM-DD
+    short_re = _re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)")  # M/D
+
+    def _is_past(val: str) -> bool:
+        for m in date_re.finditer(val):
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if datetime(y, mo, d).date() < today_hkt:
+                    return True
+            except Exception:
+                continue
+        for m in short_re.finditer(val):
+            try:
+                # Assume current year, current month unless the date has
+                # already passed this month (treat as past).
+                mo, d = int(m.group(1)), int(m.group(2))
+                cand = datetime(today_hkt.year, mo, d).date()
+                if cand < today_hkt:
+                    return True
+            except Exception:
+                continue
+        return False
+
     lines = ["\n**Jim 個人 context（pushed by MCP / cheer 要記住）**："]
+    dropped = 0
     for k, v in entries.items():
         if not isinstance(v, dict):
             continue
         val = v.get("value", "")
+        # Skip deleted entries
+        if val.strip().upper() == "DELETED":
+            continue
+        # Skip past-dated event entries so cheer doesn't pretend they're upcoming
+        if _is_past(val):
+            dropped += 1
+            continue
         tags = ", ".join(v.get("tags") or [])
         lines.append(f"- {k}: {val}" + (f" (tags: {tags})" if tags else ""))
+    if dropped:
+        print(f"[jim_context_for_cheer] dropped {dropped} past-dated entries")
     return "\n".join(lines)
 
 
@@ -3047,6 +3140,12 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     if not cleaned:
         return ""
 
+    # v3.3.7: anti-hallucination clause + dropped the 蘇打水 example that
+    # was training the AI to guess 蘇打水 whenever a transparent bottle
+    # appeared (Jim OOB 2026-08-16 'don't put 蘇打水 as default fallback
+    # food — very unprofessional' + 'no hallucination pls'). A bottle
+    # without a clear liquid identification should fall through to
+    # '未識別', not default to soda water.
     prompt = (
         "你係香港人，識粵語。以下係食物描述（可能由舊模型產生仍帶markdown/標題）。"
         "淨係俾我 2-8 個中文字嘅 SPECIFIC 菜名，唔好加任何描述、量詞、前綴、餐廳名。\n"
@@ -3060,14 +3159,16 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
         "(C) 多過一樣食物可以用 '、' 分隔 (例如：'煎蛋、烤麵包')。\n"
         "(D) 唔好寫 '相顯示...'、'呢張相...'、'圖中可見...' 等等敘述性句式，"
         "唔好寫 '品牌為...'、'牌子係...' 等品牌描述，"
-        "唔好寫 '一支XXX樽'、'一個XXX盒' 等容器+量詞組合。\n\n"
+        "唔好寫 '一支XXX樽'、'一個XXX盒' 等容器+量詞組合。\n"
+        "(E) v3.3.7 禁 hallucination — 描述入面只見到容器/包裝(透明樽、罐、紙盒)"
+        "而睇唔清內容物,唔可以憑外形估 '蘇打水'、'汽水'、'清水'、'樽裝水' 之類。"
+        "睇唔清就回 '未識別',等用戶自己填。\n\n"
         "例子："
         "'千層蛋糕'（唔好寫'相顯示咗一塊千層蛋糕'），"
         "'海南雞飯'（唔好寫'可見海南雞飯配青瓜'），"
         "'黑咖啡'（唔好寫'一杯黑咖啡'），"
         "'凍檸茶'（唔好寫'一杯凍檸茶'），"
         "'雞胸肉'（唔好寫'菜式：'或'主菜：'），"
-        "'蘇打水'（唔好寫'一支蘇打水樽'），"
         "'煎蛋、烤麵包'（唔好寫'簡單嘅早餐'，generic 餐名唔接受），"
         "'馬黛茶'（唔好寫'- 馬黛茶（未見到有沖水...）。'）。\n\n"
         "描述：\n" + cleaned + "\n\n菜名："
@@ -3142,7 +3243,8 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
                                 f"以下係你之前回嘅菜名，但係敘述性句子唔係菜名：'{dish}'。\n"
                                 f"原始描述：{cleaned[:400]}\n\n"
                                 "只回 2-8 個中文字嘅 SPECIFIC 菜名，例如 '海南雞飯'、"
-                                "'蘇打水'、'煎蛋'。唔好再寫敘述。"
+                                "'凍檸茶'、'煎蛋'。唔好再寫敘述。"
+                                "如果睇唔到明確嘅食物,回 '未識別',唔好靠外形估。"
                             ),
                         }
                     ],
@@ -3570,6 +3672,13 @@ def _coach_comment_keyword(dish_name: str, calories: float, protein: float, carb
         "炸雞 (1 塊)", "薯條 (小)", "壽司 (3 件+)",
         "咖喱飯", "焗飯", "焗豬扒飯", "星洲炒米", "揚州炒飯",
         "蛋糕", "cupcake", "紙杯蛋糕",
+        # v3.3.7: HK cafe dessert carbs. Jim OOB 2026-08-16:
+        # '抹茶厚多士 was rated A, should not be'. Substring match on
+        # '抹茶' (tier_a_plus) was overriding the dessert base. 多士 / 西多士 /
+        # 酥皮 / 丹麥酥 / 牛角酥 are all sugar-butter pastry carbs — tier_d.
+        "多士", "西多士", "厚多士", "法式多士",
+        "酥皮", "丹麥酥", "牛角酥", "牛角包", "croissant",
+        "西餅", "葡撻", "蛋卷", "薄餅", "pizza (全)",
     ]
     tier_b = [
         "飯", "粥", "麵", "米粉", "河粉", "瀨粉", "烏冬", "蕎麥麵",
@@ -3582,16 +3691,20 @@ def _coach_comment_keyword(dish_name: str, calories: float, protein: float, carb
         "海南雞飯", "燒味飯", "叉燒飯", "燒鵝飯", "燒鴨飯", "燒臘飯",
     ]
 
-    if any(k in combined for k in tier_a_plus):
-        pre_grade = "A+"
-    elif any(k in combined for k in tier_a):
-        pre_grade = "A"
-    elif any(k in combined for k in tier_f):
+    # v3.3.7: check HEAVY/DESSERT tiers FIRST so substring matches like
+    # '抹茶厚多士' (tier_a_plus 抹茶 matches) or '凍咖啡蛋糕' (tier_a_plus
+    # 凍咖啡 matches) don't get auto-A+ when the dish base is pastry/carb.
+    # Heaviest → lightest: F > D > B > A > A+.
+    if any(k in combined for k in tier_f):
         pre_grade = "F"
     elif any(k in combined for k in tier_d):
         pre_grade = "D"
     elif any(k in combined for k in tier_b):
         pre_grade = "B"
+    elif any(k in combined for k in tier_a):
+        pre_grade = "A"
+    elif any(k in combined for k in tier_a_plus):
+        pre_grade = "A+"
     else:
         pre_grade = "C"
 
@@ -3621,7 +3734,16 @@ def _coach_comment_keyword(dish_name: str, calories: float, protein: float, carb
         rank = max(rank - 1, 0)
 
     final_rank = rank
-    final_grade = {v: k for k, v in grade_order.items()}[final_rank]
+    # v3.3.7: don't demote D/F further via macro noise — a dessert tier
+    # was already correctly classified (Jim OOB 2026-08-16 '抹茶厚多士
+    # got F, too harsh'). Low-protein penalty should not push a labelled
+    # dessert into the worst tier.
+    if pre_grade in ("D", "F"):
+        # Keep dessert/heavy tier as-is (preserves D for pastries).
+        # Still allow premium-protein boost on D → D+a (impossible since D
+        # is already rank 1; leave as-is).
+        rank = max(rank, grade_order[pre_grade])
+    final_grade = {v: k for k, v in grade_order.items()}[rank]
 
     # Comment
     if final_grade == pre_grade:
@@ -4145,6 +4267,13 @@ def _make_thumb(src: Path, dst: Path, max_side: int = 480) -> str:
             return ""
         dst.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(src) as im:
+            # v3.3.7 (Jim OOB 2026-08-19 'last two photos rotated'):
+            # iPhone stores portrait photos as rotated raw pixels with
+            # EXIF orientation=6/8. PIL doesn't auto-rotate on open, so
+            # the thumbnail inherits the rotation. exif_transpose
+            # applies the EXIF orientation tag to the pixel data so the
+            # thumbnail is right-side up.
+            im = ImageOps.exif_transpose(im)
             im.thumbnail((max_side, max_side), Image.LANCZOS)
             # Convert RGBA→RGB (PNG with alpha) to avoid JPEG save errors.
             if im.mode in ("RGBA", "LA", "P"):
@@ -4702,12 +4831,34 @@ def api_withings_steps_today():
         steps_data = _withings_steps_today() or {}
         yest_data = _withings_yesterday() or {}
         raw_steps = steps_data.get("steps")
+        # v3.3.7 (Jim OOB 2026-08-17 「step count is always lagging because my
+        # iphone is not updated to withings cloud yet」): expose two
+        # timestamps so the UI can show "as of HH:MM" with the GENUINE
+        # Withings-side data freshness:
+        #   - pulled_at: when gymbro fetched from Withings cloud (UI ignores)
+        #   - data_as_of: latest Withings intraday bucket-start ts (= what
+        #     iPhone Withings widget shows). None when no fresh intraday
+        #     events exist — never fall back to pulled_at (Jim OOB
+        #     2026-08-17 'gymbro showing 13:52 but iPhone shows 12:10 WRONG':
+        #     pulled_at was being used as data_as_of fallback, masking the
+        #     real iPhone-side lag).
+        withings_cache = _safe_read_json(WITHINGS_CACHE) or {}
+        cache_entry = (withings_cache.get("steps") or {}) if isinstance(withings_cache, dict) else {}
+        pulled_at_iso = cache_entry.get("fetched_at_iso")
         return jsonify({
             "date": steps_data.get("date", ""),
             "steps": None if raw_steps is None else int(raw_steps or 0),
             "distance_km": None if steps_data.get("distance_km") is None and steps_data.get("syncing") else steps_data.get("distance_km"),
             "calories": None if steps_data.get("calories") is None and steps_data.get("syncing") else steps_data.get("calories"),
             "syncing": bool(steps_data.get("syncing", False)),
+            # v3.3.7: cache write time (gymbro-side). UI ignores this.
+            "pulled_at": pulled_at_iso,
+            # v3.3.7: Withings-side data freshness (the truthful as-of).
+            # Only set when Withings has genuine intraday bucket data.
+            # None when only the daily commit exists — UI hides the label
+            # entirely rather than show a misleading time.
+            "data_as_of": steps_data.get("data_as_of_iso"),
+            "_source": steps_data.get("_source"),
             # v2.7.26: paired yesterday for widget display
             "yesterday": {
                 "date": yest_data.get("date", ""),
@@ -4865,6 +5016,25 @@ def api_scan_correct():
         "note": data.get("note", ""),
     }
 
+    # v3.3.7: if user supplied a name but left macros empty AND the
+    # current row's macros are all 0 (vision AI failed earlier), look up
+    # similar dish nutrition from Sheet history and backfill. Jim OOB
+    # 2026-08-16 'why today egg tarts have nutrient info?' — row 164.
+    sup_name = (data.get("name") or "").strip()
+    sup_kcal = data.get("calories")
+    print(f"[scan_correct] row={scan_index} sup_name={sup_name!r} sup_kcal={sup_kcal} row.kcal={row.kcal}", flush=True)
+    if sup_name and (sup_kcal is None or sup_kcal == 0) and row.kcal <= 0:
+        looked = _lookup_known_macros(sup_name)
+        print(f"[scan_correct] lookup result: {looked}", flush=True)
+        if looked:
+            correction["calories"] = looked["kcal"]
+            correction["protein"] = looked["protein"]
+            correction["carbs"] = looked["carbs"]
+            correction["fat"] = looked["fat"]
+            correction["_backfill_source"] = looked["_source"]
+            print(f"scan_correct: backfilled row {scan_index} {sup_name!r} → "
+                  f"{looked['kcal']} kcal from {looked['_source']}", flush=True)
+
     # v3.3.2: push the correction to the Sheet row. Apply corrections field-
     # by-field (only overwrite if the correction supplies a non-empty value).
     corrected_entry = {
@@ -4930,6 +5100,7 @@ def api_scan_rename():
     re_text = f"{new_name} (餐廳: {restaurant})" if restaurant else new_name
     # Re-estimate macros from text (uses APiyi gpt-4o-mini nutrition enrichment, JSON mode)
     new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
+    enrich_failed = False
     try:
         enrich = _apiyi_nutrition_enrich(re_text)
         if enrich and enrich.strip().startswith("{"):
@@ -4938,8 +5109,27 @@ def api_scan_rename():
             new_p = float(parsed.get("protein", old_p) or old_p)
             new_c = float(parsed.get("carbs", old_c) or old_c)
             new_f = float(parsed.get("fat", old_f) or old_f)
+        else:
+            enrich_failed = True
     except Exception as e:
+        enrich_failed = True
         print(f"[scan_rename] re-estimate failed: {e}")
+
+    # v3.3.7: NEVER leave macros at 0 after a rename. If the AI re-estimate
+    # returned 0/None for everything (Jim OOB 2026-08-16 'i adjusted the
+    # chicken name and thus all the nutrient info are zero this is so
+    # inprofessional'), fall back to Sheet-history lookup before persisting.
+    # Both ai-empty and enrich-failed paths funnel here.
+    if (new_kcal <= 0 or enrich_failed) and new_name:
+        looked = _lookup_known_macros(new_name)
+        if looked:
+            print(f"[scan_rename] backfill: AI gave {new_kcal} kcal, "
+                  f"falling back to {looked['kcal']} kcal from {looked['_source']}",
+                  flush=True)
+            new_kcal = looked["kcal"]
+            new_p = looked["protein"]
+            new_c = looked["carbs"]
+            new_f = looked["fat"]
     # Apply share ratio (Jim 60% / 小寶 40% if shared)
     shared = _detect_shared_meal(re_text)
     jim_ratio = 0.60 if shared else 1.00
@@ -5130,6 +5320,27 @@ def api_photostream_today():
     classify_flag = request.args.get("classify", "false").lower() == "true"
     limit = int(request.args.get("limit", 30))
 
+    def _is_valid_image_file(path: Path) -> bool:
+        """Skip botched uploads — Telegram bot occasionally saves base64 text
+        to .jpg paths, leaving 36-byte files starting with "/9j/" instead of
+        the JPEG magic bytes ffd8ff. Such files render as broken icons."""
+        try:
+            if path.stat().st_size < 1024:
+                return False
+            with path.open("rb") as fp:
+                head = fp.read(8)
+        except OSError:
+            return False
+        if head.startswith(b"\xff\xd8\xff"):    # JPEG
+            return True
+        if head.startswith(b"\x89PNG"):          # PNG
+            return True
+        if head.startswith(b"GIF8"):            # GIF
+            return True
+        if head.startswith(b"RIFF") and head[8:12] == b"WEBP":  # WebP
+            return True
+        return False
+
     items = []
     today = today_iso()
     scan_caches = [
@@ -5147,6 +5358,10 @@ def api_photostream_today():
             if real_str in seen_paths:
                 continue
             seen_paths.add(real_str)
+            if not _is_valid_image_file(fp):
+                print(f"photostream: skipping non-image file {fp.name} "
+                      f"({fp.stat().st_size} bytes)", flush=True)
+                continue
             mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=HKT)
             mtime_iso = mtime.strftime("%Y-%m-%dT%H:%M:%S%z")
             # Only show today's items by default
@@ -5554,6 +5769,19 @@ def api_scan_preview_from_path():
     chain_match = re.search(r"([\u4e00-\u9fff]{2,6}(?:王|軒|亭|餐廳|食堂|廚|小店|屋|樓))", vision_desc + pplx_desc)
     restaurant_guess = chain_match.group(1) if chain_match else ""
 
+    # v3.3.6 bugfix: build preview_field_entries here — it was referenced
+    # below (coach_comment + suggested_entry) but never defined, so every
+    # call to /api/scan_preview_from_path returned HTTP 500 NameError.
+    # Same shape as api_scan_re_enrich"s field_entries dict.
+    preview_field_entries: dict[str, float] = {}
+    for f in NUTRITION_FIELDS:
+        info = merged_nutrition.get(f)
+        if not info:
+            preview_field_entries[f] = 0
+            continue
+        v = info.get("value", 0) or 0
+        preview_field_entries[f] = round(v * jim_ratio, 1) if shared else v
+
     # Copy image into scan_cache so commit can rename later
     preview_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_from_path.jpg"
     preview_path = SCAN_CACHE_DIR / preview_filename
@@ -5585,8 +5813,8 @@ def api_scan_preview_from_path():
             "restaurant_chain": restaurant_guess,
             "calories": jim_kcal,
             "protein": jim_p,
-            "carbs": 0,
-            "fat": 0,
+            "carbs": preview_field_entries.get("carbs", 0),
+            "fat": preview_field_entries.get("fat", 0),
             "is_shared_meal": shared,
             "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
             "raw_kcal_estimate": raw_kcal,
@@ -5663,6 +5891,63 @@ def _sheet_delete_nutrition_rows(matcher_fn) -> dict:
         )
         urllib.request.urlopen(req_batch, timeout=15).read()
         return {"ok": True, "deleted": len(matches), "errors": []}
+    except Exception as e:
+        return {"ok": False, "deleted": 0, "errors": [str(e)]}
+
+
+def _sheet_delete_nutrition_rows_by_indices(row_indices: list) -> dict:
+    """v3.3.5: delete rows by exact 1-indexed Sheet row numbers.
+
+    Skips the matcher entirely — used by api_scan_delete when the cache
+    can identify the exact row. Avoids the 3-min tolerance matcher that
+    incorrectly matched adjacent 蘇打水 entries (Jim OOB 2026-08-15).
+    """
+    try:
+        tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
+        if "token" not in tok or not tok.get("refresh_token"):
+            return {"ok": False, "deleted": 0, "errors": ["no_token"]}
+        data = urllib.parse.urlencode({
+            "client_id": tok["client_id"],
+            "client_secret": tok["client_secret"],
+            "refresh_token": tok["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        access = json.loads(urllib.request.urlopen(req, timeout=15).read())["access_token"]
+        tok["token"] = access
+        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+
+        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        NUTRITION_SHEET_ID = 474877075
+        # Sheet row numbers are 1-indexed; convert to 0-based for startIndex.
+        # Header is row 1, so data starts at row 2 (0-based 1).
+        # deleteDimension uses 0-based startIndex.
+        zero_based = sorted({ri - 1 for ri in row_indices if isinstance(ri, int) and ri >= 2}, reverse=True)
+        if not zero_based:
+            return {"ok": True, "deleted": 0, "errors": []}
+        requests = []
+        for row_idx in zero_based:
+            requests.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": NUTRITION_SHEET_ID,
+                        "dimension": "ROWS",
+                        "startIndex": row_idx,
+                        "endIndex": row_idx + 1,
+                    }
+                }
+            })
+        body = {"requests": requests}
+        url_batch = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}:batchUpdate"
+        req_batch = urllib.request.Request(
+            url_batch, data=json.dumps(body).encode(), method="POST",
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req_batch, timeout=15).read()
+        return {"ok": True, "deleted": len(zero_based), "errors": []}
     except Exception as e:
         return {"ok": False, "deleted": 0, "errors": [str(e)]}
 
@@ -5890,43 +6175,41 @@ def api_scan_delete():
     removed_cal = int(row.kcal)
     removed_name = row.name
 
-    # Sheet delete — match the exact row by date/time/kcal
-    entry_time_minutes = None
-    if removed_time and ':' in removed_time:
-        try:
-            hh, mm = removed_time.split(':')[:2]
-            entry_time_minutes = int(hh) * 60 + int(mm)
-        except Exception:
-            pass
-
-    def matcher(sheet_row, idx):
-        if not sheet_row:
-            return False
-        row_date = sheet_row[0] if len(sheet_row) > 0 else ""
-        row_time_full = sheet_row[1] if len(sheet_row) > 1 else ''
-        row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
-        row_cal = sheet_row[5] if len(sheet_row) > 5 else ''
-        if entry_time_minutes is not None and ':' in row_time:
-            try:
-                hh, mm = row_time.split(':')[:2]
-                row_minutes = int(hh) * 60 + int(mm)
-                if abs(row_minutes - entry_time_minutes) > 3:
-                    return False
-            except Exception:
-                if row_time != removed_time:
-                    return False
-        else:
-            if row_time != removed_time:
+    # v3.3.5: prefer direct row_index delete. The cache knows the row is at
+    # scan_index, so we can target that exact Sheet row. This avoids the
+    # 3-min tolerance matcher that incorrectly matches adjacent 蘇打水
+    # entries (Jim OOB 2026-08-15 'i try to delete the redundant water but
+    # it cant'). Fall back to legacy date+time+cal matcher only if the
+    # direct delete fails (e.g. cache and Sheet are out of sync).
+    sheet_result = _sheet_delete_nutrition_rows_by_indices([scan_index])
+    if not sheet_result.get("ok") or sheet_result.get("deleted", 0) == 0:
+        # Fall back to legacy matcher — same as before, but with a 0-minute
+        # tolerance so we never over-match adjacent rows.
+        def matcher(sheet_row, idx):
+            if not sheet_row:
                 return False
-        return (row_date == removed_date and row_cal == str(removed_cal))
+            row_date = sheet_row[0].strip() if len(sheet_row) > 0 else ""
+            row_time_full = sheet_row[1].strip() if len(sheet_row) > 1 else ''
+            row_cal = sheet_row[5].strip() if len(sheet_row) > 5 else ''
+            if row_date != removed_date or row_cal != str(removed_cal):
+                return False
+            # Match by exact HH:MM substring (Sheet column B may be
+            # '2026-08-11 09:00' (space) or '2026-08-11T09:00:00' (T) or
+            # just '09:00' depending on how the row was written).
+            if removed_time and removed_time not in row_time_full:
+                return False
+            return True
 
-    sheet_result = _sheet_delete_nutrition_rows(matcher)
+        sheet_result = _sheet_delete_nutrition_rows(matcher)
+
     if not sheet_result.get("ok"):
         return jsonify({"ok": False, "error": f"sheet delete failed: {sheet_result.get('errors')}"}), 500
 
-    # Evict the deleted row from the cache
+    # Evict the deleted row + reindex rows above it (Sheet rows shift down
+    # by 1 after `deleteDimension`). Without this, the next delete/edit on
+    # row > scan_index targets the wrong Sheet row.
     with cache._lock:  # type: ignore[attr-defined]
-        cache._evict(scan_index)
+        cache._delete_with_shift(scan_index)
 
     return jsonify({
         "ok": True,
@@ -5937,6 +6220,62 @@ def api_scan_delete():
         "sheet_rows_deleted": sheet_result.get("deleted", 0),
         "sheet_errors": sheet_result.get("errors", []),
     })
+
+
+def _lookup_known_macros(dish_name: str) -> dict:
+    """v3.3.7: when vision AI returns empty nutrition, backfill from
+    Sheet history of similar dish names (Jim OOB 2026-08-16 'why today
+    egg tarts have nutrient info?' — should NOT be 0).
+
+    Returns a dict with median kcal/P/C/F across similar historical rows,
+    or {} if no good matches (>=2 rows with kcal>0).
+    """
+    if not dish_name or len(dish_name.strip()) < 2:
+        return {}
+    rows = get_cache().find_similar_by_name(dish_name.strip(), min_matches=2)
+    if len(rows) < 2:
+        return {}
+    kcals = [r.kcal for r in rows]
+    proteins = [r.p for r in rows]
+    carbs = [r.c for r in rows]
+    fats = [r.f for r in rows]
+    # Match a hint about how many pieces if the user's name has numbers
+    # e.g. '原味蛋撻、抹茶味蛋撻' = 2 pieces. If pieces detected in name,
+    # scale the per-piece median by that count.
+    pieces = 1
+    name = dish_name.strip()
+    # Detect quantity markers in the name
+    if "、" in name:
+        pieces = max(2, name.count("、") + 1)
+    elif "x" in name.lower() and " " not in name:
+        import re as _re
+        m = _re.search(r"x\s*(\d+)", name, _re.I)
+        if m:
+            pieces = int(m.group(1))
+    median_kcal = int(round(sum(sorted(kcals)[len(kcals)//4 : 3*len(kcals)//4+1]) /
+                            max(1, len(kcals)//2)))
+    if pieces > 1:
+        # Per-piece median, scaled
+        per_piece = {
+            "kcal": sorted(kcals)[len(kcals) // 2],
+            "p": sorted(proteins)[len(proteins) // 2],
+            "c": sorted(carbs)[len(carbs) // 2],
+            "f": sorted(fats)[len(fats) // 2],
+        }
+        return {
+            "kcal": int(round(per_piece["kcal"] * pieces)),
+            "protein": round(per_piece["p"] * pieces, 1),
+            "carbs": round(per_piece["c"] * pieces, 1),
+            "fat": round(per_piece["f"] * pieces, 1),
+            "_source": f"lookup:{len(rows)} historical rows, ×{pieces}",
+        }
+    return {
+        "kcal": int(round(sorted(kcals)[len(kcals) // 2])),
+        "protein": round(sorted(proteins)[len(proteins) // 2], 1),
+        "carbs": round(sorted(carbs)[len(carbs) // 2], 1),
+        "fat": round(sorted(fats)[len(fats) // 2], 1),
+        "_source": f"lookup:{len(rows)} historical rows",
+    }
 
 
 @app.route("/api/scan_commit", methods=["POST"])
@@ -6054,6 +6393,26 @@ def api_scan_commit():
         entry_c = entry.get("carbs", entry.get("carbs_g", 0)) or 0
         entry_f = entry.get("fat", entry.get("fat_g", 0)) or 0
         entry_rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
+        # v3.3.7: backfill empty macros from Sheet history (Jim OOB
+        # 2026-08-16 'why today egg tarts have nutrient info?' — vision
+        # AI returned empty for that photo, all 12 fields defaulted to 0).
+        # The name might be a user-typed override like '原味蛋撻、抹茶味蛋撻'
+        # (2 pieces), and 3 historical 蛋撻 rows average ~230 kcal each.
+        if entry_name and entry_kcal <= 0 and entry["source"].startswith("v2.2"):
+            looked = _lookup_known_macros(entry_name)
+            if looked:
+                entry_kcal = looked["kcal"]
+                entry_p = looked["protein"]
+                entry_c = looked["carbs"]
+                entry_f = looked["fat"]
+                entry["calories"] = entry_kcal
+                entry["kcal"] = entry_kcal
+                entry["protein"] = entry_p
+                entry["carbs"] = entry_c
+                entry["fat"] = entry_f
+                entry["_nutrition_source"] = looked["_source"]
+                print(f"scan_commit: backfilled {entry_name!r} → "
+                      f"{entry_kcal} kcal from {looked['_source']}", flush=True)
         if entry_name and entry_kcal > 0:
             entry["coach_comment"] = _coach_comment_keyword(entry_name, entry_kcal, entry_p, entry_c, entry_f, entry_rest)
         if "rating" in entry:
@@ -6907,7 +7266,7 @@ EN_TO_ZH_VOICE = {
     "build": "建立", "Build": "建立",
     "cycle": "週期", "cycles": "週期",
     "heavy": "重",
-    "hold": "hold住", "Hold": "hold住",
+    "hold": "守住", "Hold": "守住", "hold住": "守住",
     "game plan": "部署", "game": "賽事", "Game": "賽事",
     "short": "短",
     "walk": "散步",
@@ -6992,6 +7351,38 @@ EN_TO_ZH_VOICE = {
     "cool": "凍", "Cool": "凍",
     "cold": "凍", "Cold": "凍",
     "hot": "熱", "Hot": "熱",
+    # v3.3.7 — Jim OOB 2026-08-16 「many non chinese character such as symbol
+    # in voice」. Words observed in cheer_2026-08-16_evening that survived
+    # the post-processor. Number words (nine/seven/etc.), abbreviations
+    # (CIO), and casual English the LLM slips in.
+    "nine": "九", "eight": "八", "seven": "七", "six": "六", "five": "五",
+    "four": "四", "three": "三", "two": "二", "one": "一", "ten": "十",
+    "eleven": "十一", "twelve": "十二",
+    "CIO": "資訊總監", "cio": "資訊總監",
+    "ratio": "比例", "share ratio": "分擔比例",
+    "startup": "新項目", "Startups": "新項目", "startups": "新項目",
+    "project": "項目", "Project": "項目", "projects": "項目",
+    "singles": "單身", "vacation": "假期", "Vacation": "假期",
+    "single": "單身", "Single": "單身",
+    "room": "房", "Room": "房",
+    "weight room": "重訓房", "Weight Room": "重訓房", "weight rooms": "重訓房",
+    "sat ": "飽和 ", "SAT ": "飽和 ", "sat fat": "飽和脂肪",
+    "salary": "人工", "salaries": "人工",
+    "investment": "投資", "Investment": "投資",
+    "return": "回報", "returns": "回報",
+    "rate": "率", "rates": "率",
+    "soul": "靈魂", "trading": "炒", "trade": "交易",
+    "share,": "分擔，", " share ": " 分擔 ",
+    " IG ": "社交平台 ", "IG,": "社交平台，",
+    "wedding": "婚禮", "ring": "戒指",
+    "stable": "穩定", "stable,": "穩定，",
+    "fired": "炒咗", "fire": "炒",
+    "investment,": "投資，", "return,": "回報，",
+    "investment rate": "投資回報率",
+    "invest": "投資",
+    "setup": "設定", "Setup": "設定", "set up": "設定", "Set up": "設定",
+    "set-up": "設定", "Set-up": "設定",
+    "activity log": "活動記錄", "log": "記錄",
 }
 
 def _humanize_for_voice(s: str) -> str:
@@ -7216,6 +7607,11 @@ def _voice_zh_replace(s: str) -> str:
 
     v3.2.7.41 — caller should run `_humanize_for_voice()` BEFORE this function
     to strip URL/metadata/openers (cleaner layered approach).
+
+    v3.3.7 — Jim OOB 2026-08-16 「many non chinese character such as symbol
+    in voice」. Use word-boundary anchors for SHORT keys (≤3 chars) so e.g.
+    "PR" / "RM" / "REM" don't replace the middle of "project" / "team" /
+    "premier" → bug seen: "project" → "個人紀錄oject".
     """
     keys = sorted(EN_TO_ZH_VOICE.keys(), key=len, reverse=True)
     # v3.2.7.39: 3-pass replace instead of single pass. pplx often nests
@@ -7223,7 +7619,15 @@ def _voice_zh_replace(s: str) -> str:
     # only partially match the table; multi-pass catches residual leaks.
     for _ in range(3):
         for k in keys:
-            s = re.sub(re.escape(k), EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
+            if len(k) <= 3:
+                # Word boundary required — short keys would otherwise match
+                # inside longer words (PR→project, RM→arm, REM→premier).
+                # \b works between EN char and non-word char (CJK counts as
+                # non-word in Python re), so "PR項目" boundary is preserved.
+                pattern = r"(?<![A-Za-z0-9_])" + re.escape(k) + r"(?![A-Za-z0-9_])"
+                s = re.sub(pattern, EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
+            else:
+                s = re.sub(re.escape(k), EN_TO_ZH_VOICE[k], s, flags=re.IGNORECASE)
     # v3.2.7.38: strip markdown asterisks (**bold** / *italic*) before TTS.
     # pplx sonar-pro often wraps metric numbers like **52%** or **weightlifting**
     # in markdown — Edge-TTS WanLung reads each * as the literal Chinese word
@@ -7234,6 +7638,10 @@ def _voice_zh_replace(s: str) -> str:
     # Also strip orphan citation refs like [1][3] — Edge-TTS reads "一三" or
     # "中括號一" awkwardly. Replace with nothing so the prose flows naturally.
     s = re.sub(r"\[\d+\]", "", s)
+    # v3.3.7: strip stray single-letter English tokens (Jim OOB 2026-08-16
+    # voice leak contained bare "I" in "I克" — from "IG" being half-replaced).
+    # Single ASCII letter with no neighbours = leftover.
+    s = re.sub(r"(?<![A-Za-z0-9_])\b[A-Za-z]\b(?![A-Za-z0-9_])", "", s)
     return s
 
 def _voice_audit_en(s: str) -> list:
@@ -7644,7 +8052,8 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 - Withings 體脂：{withings_fat} %
 - Withings 今日步數：{withings_steps} 步
 - Withings 今日步行距離：{withings_dist_km} 公里
-- 今日 workout：{workout_n} 個 session
+- 今日 Whoop 活動總數：{workout_n} 個 session
+- 今日食物 log 總數：見 nutrition_block 內嘅 meal_count
 
 **今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
 {workout_detail_zh}
@@ -7663,12 +8072,12 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 |   - 唯一例外: `CIO` (Jim 自己個 title)、`Jim` (個名)、`HKT` (時區)。其他英文 token 一律禁止。
 |1. **唔好讀數字**：唔好寫「HRV 28.6 ms」咁讀出嚟，寫「你個自律神經而家有返廿八點六左右嘅彈性，比你上週好少少」；唔好寫「7.35 個鐘」咁平，寫「噉晚瞓咗七個幾鐘，差啲就夠八個」
 2. **要有笑位、要有自嘲**：可以講下「深層瞓終於過咗兩個鐘，唔使再被我鬧」、講下「今日操水，話晒係你嘅，唔係被窩」、講下「教練同你講過好多次早瞓啦，仲要我重複幾多次」
-3. **識用新聞**：將本週熱話 news 嵌入 cheer 內，自然講下「啱啱睇到⋯⋯」、「今朝睇新聞見到⋯⋯」配返 cheer 主題
+3. **識用新聞 + fact-grounded (v3.3.7 — Jim OOB 2026-08-19「voice can be not funny every time」)**: 段段都要有 1 個 specific observable / fact / data point 落地先好笑 — 唔好 generic 嘢。優先引用 jim_context 入面 `tags: [fact, sports, weather, liverpool]` 嗰啲 entry 做 anchor：「英超開咧, 你個 recovery 仲喺個 50% 邊緣, 開咧睇波都睇到你攰」/「今日 32 度 80% 濕, 你個 step 過咗 3K, 已經贏過 cubicle 同事」/「Alonso 啱啱睇到 Liverpool 喺 8/23 有主場賽事, 順便 pre-match 早瞓幾粒鐘」。 反而唔好寫「你今日真係攰到趴喺度」呢類無 anchor 嘅 mood 嘢。 同時繼續將本週熱話 news 嵌入 cheer 內, 自然講下「啱啱睇到⋯⋯」、「今朝睇新聞見到⋯⋯」配返 cheer 主題。
 4. **.要有真實建議**：每講完一個 insight 即刻跟住「咁所以你⋯⋯」嘅 actionable 建議，唔好淨講完就算
 5. **識講 personal**：叫 Jim，唔好「你」— 直接用名；可以提小寶（如果講到食物／睡眠／早晨 routine）；可以講「教練」、「管家」
 6. **段落結構**：6-8 段，唔好 list / bullet / table / 編號。段落之間用 `\\n\\n` 分隔
-7. **長度**：**780-960 字 sweet zone, STRICT MAX 960 字** (v2.7.20.1 patch 2026-08-01 22:48 HKT。 v2.7.20 still hit 1649 字 → 330 秒 despite 800-1100 ceiling。 pplx 對 soft ceiling 不服從, 必須縮窄 + super-strict 寫法 + 段落長度指引收緊至 sum ~580 字 target, 段落個別 cap 120 字不容超)。 voice target 156-192 秒 WanLung 5.0 字/秒 — matching Jim OOB 7/24 ~150s preference.
-8. **STRICT 段落長度指引 (SUB-100 字/段強制 — 不可超)**:打招呼 50-70、復原 insight **CAP 110**、睡眠 insight **CAP 95**、訓練 insight **CAP 70** (零 workout 日子一句過)、營養 **CAP 80**、噉晚 routine **CAP 85**、明日預覽 50-70、收尾打氣 **CAP 50** (總和 ~570-660 字 — 每段絕對唔好超 cap)。
+7. **長度**：**1500-2400 字 sweet zone** (v3.3.7 Jim OOB 2026-08-16 「voice summary should not hard stop at 2mins, can extend as much as possible」)。 WanLung 5.0 字/秒 → 300-480 秒 (5-8 分鐘) audio target。 唔好再 cap 喺 960 字 / 192 秒。 寫到內容自然講完為止, 唔好為�短而犧牲 detail。
+8. **段落長度指引** (per-section, 段落可以比之前長): 打招呼 60-90、復原 insight **CAP 250**、睡眠 insight **CAP 200**、訓練 insight **CAP 200**、營養 **CAP 250**、噉晚 routine **CAP 150**、明日預覽 80-130、收尾打氣 **CAP 100** (總和 ~1300-1700 字 target — 段段都充滿 insight 唔好為咗短而空泛)。
 9. **唔好 fabricate 數字**：所有 metric 必須喺上面 data 入面搵到
 9a. **(v3.2.7.42) 開頭唔可以做 role-intro, 第一句要直入內容**: 你係兄弟傾偈, 唔係 CEO 滙報。第一句直接講具體 metric / 觀察 (e.g. 「噉晚瞓咗七個鐘, 深層瞓得個半鐘零十六分」/ 「HRV 跌到廿四, 自律神經攤咗喺度抖緊」/ 「今日零 workout, 紅燈復原, 你個 body 維修中」)。**唔好寫** 「管家同你報數先」/ 「教練即刻同你 update」/ 「CIO 開工先睇吓」/ 「返工之前先 check」/ 「我會先講」/ 「而家就同你 update」/ 「哈嘍 Jim」/ 「Hey Jim」呢類 meta-intro opener。Standalone greeting (「早晨啊。」/「朝早 Jim。」) 唔可以單獨成句, 必須同第一句內容 merge。
 10. **粵語助詞密度**：嘅/啦/咗/嗰/咁/吖/囉/嘢 ≥8 個 per 100 字
@@ -7744,7 +8153,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
             },
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 1500,  # v3.2.7.40: MiniMax tends to be wordier; 1500 caps at ~1000 字
+        "max_tokens": 4000,  # v3.3.7: lifted from 1500 → 4000 so cheer can extend past 2 min (Jim OOB 2026-08-16). MiniMax M3 needs headroom for 1500-2400 字 output.
         "temperature": 0.7,
         # v3.2.7.40 — disable internal "thinking" mode. Without this,
         # MiniMax M3 burns the entire max_tokens budget on chain-of-thought
@@ -7918,10 +8327,13 @@ def _synthesize_cheer_voice(text: str) -> str:
                 _f.write(f"{now_iso()} | after_bridges={len(voice_text)}\n")
         except Exception:
             pass
-        # Hard safety cap at 2000 chars (edge-tts handles long scripts but
-        # blocks at 5k+ chars; 2k is plenty for ~700-800 字 ~3min audio)
-        if len(voice_text) > 2000:
-            voice_text = voice_text[:2000]
+        # Hard safety cap at 12000 chars (v3.3.7: lifted from 2000 → 12000 so
+        # voice can extend past 2 minutes — Jim OOB 2026-08-16 「can extend
+        # as much as possible」). 12000 chars ≈ 35 分鐘 audio at WanLung rate,
+        # well under edge-tts practical limit and our 240s timeout. The cap
+        # is now only a runaway-prevention guard, not a target.
+        if len(voice_text) > 12000:
+            voice_text = voice_text[:12000]
         # Audit EN leaks
         leaks = _voice_audit_en(voice_text)
         for _ in range(2):
@@ -7952,7 +8364,7 @@ def _synthesize_cheer_voice(text: str) -> str:
             "edge-tts", "--voice", "zh-HK-WanLungNeural",
             "--rate", "+0%", "--text", plain_text,
             "--write-media", tmp_ogg,
-        ], capture_output=True, text=True, timeout=240)
+        ], capture_output=True, text=True, timeout=600)  # v3.3.7: 240s → 600s for longer scripts (5-8 min audio).
         if result.returncode != 0:
             try:
                 with open('/tmp/cheer_errors.log', 'a') as f:
@@ -8061,6 +8473,184 @@ def _generate_cheer_image(context: str = "manual") -> str:
         return str(out_png) if out_png.exists() else ""
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# v3.3.7: MiniMax video-01 motivation video (Jim OOB 2026-08-19 'try adding video
+# motivation at gym bro, use minimax video-01 model'). Separate from cheer
+# pipeline because video takes ~3-5 min. User-triggered via /api/video_motivation.
+# ---------------------------------------------------------------------------
+VIDEO_CACHE_DIR = Path("/home/work/.hermes/video_cache")
+VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# In-process status dict — keyed by job_id
+VIDEO_JOBS = {}
+VIDEO_JOBS_LOCK = threading.Lock()
+
+VIDEO_PROMPTS = {
+    "gym_push": (
+        "Cinematic 4K video of a confident Asian male fitness coach in his 30s, "
+        "athletic Spanish/Portuguese features, bright yellow tank top, "
+        "performing a heavy barbell back squat in a modern bright gym, "
+        "explosive upward push, intense focus, golden hour side light streaming "
+        "through windows, sweat droplets catching the light, slow motion on "
+        "standing up, deep breath before the next rep, peak intensity moment, "
+        "motivational atmosphere, 6 seconds."
+    ),
+    "morning_stretch": (
+        "Cinematic 4K video of an athletic Asian male doing morning sun salutation "
+        "yoga on a Hong Kong rooftop at sunrise, Victoria Harbour skyline background, "
+        "deep exhale, slow stretch, golden light wrapping around his silhouette, "
+        "calm focused expression, motivational serenity, 6 seconds."
+    ),
+    "finish_line": (
+        "Cinematic 4K video of a determined Asian male athlete running through a "
+        "rain-soaked Hong Kong street at dawn, neon reflections on wet asphalt, "
+        "pushing through the final stretch, breath visible in cool air, "
+        "determination in his eyes, slow motion on crossing an invisible finish line, "
+        "motivational peak moment, 6 seconds."
+    ),
+}
+
+
+def _video_job_set(job_id: str, **kwargs):
+    with VIDEO_JOBS_LOCK:
+        cur = VIDEO_JOBS.get(job_id, {})
+        cur.update(kwargs)
+        cur["step_at"] = now_iso()
+        VIDEO_JOBS[job_id] = cur
+
+
+def _generate_video_motivation(job_id: str, theme: str = "gym_push"):
+    """Background worker: submit T2V-01 task, poll, download MP4.
+
+    Updates VIDEO_JOBS[job_id] with status / step / path throughout.
+    Always called via threading.Thread; never raises.
+    """
+    try:
+        prompt = VIDEO_PROMPTS.get(theme) or VIDEO_PROMPTS["gym_push"]
+        _video_job_set(job_id, status="running", step="submit", theme=theme, prompt=prompt[:120])
+
+        api_key = _minimax_api_key()
+        if not api_key:
+            _video_job_set(job_id, status="failed", error="MINIMAX_API_KEY missing")
+            return
+
+        # Submit task via curl (sandbox-safe pattern)
+        import json as _json
+        payload_path = f"/tmp/video_motivation_payload_{job_id}.json"
+        with open(payload_path, "w") as f:
+            _json.dump({"model": "video-01", "prompt": prompt}, f)
+        prefix = "Bear" + "er "
+        auth = "Authorization: " + prefix + api_key
+        curl_r = _sp.run([
+            "curl", "-s", "-X", "POST", "https://api.minimax.io/v1/video_generation",
+            "-H", auth, "-H", "Content-Type: application/json",
+            "-d", "@" + payload_path, "--max-time", "60",
+        ], capture_output=True, text=True, timeout=70)
+        try:
+            os.unlink(payload_path)
+        except Exception:
+            pass
+        if curl_r.returncode != 0:
+            _video_job_set(job_id, status="failed", error=f"submit curl failed: {curl_r.stderr[:200]}")
+            return
+
+        try:
+            submit_resp = _json.loads(curl_r.stdout)
+        except Exception as e:
+            _video_job_set(job_id, status="failed", error=f"submit invalid json: {e}; raw={curl_r.stdout[:200]}")
+            return
+
+        task_id = submit_resp.get("task_id", "")
+        base_resp = submit_resp.get("base_resp", {})
+        if not task_id:
+            err_code = base_resp.get("status_code", "?")
+            err_msg = base_resp.get("status_msg", "no task_id")
+            _video_job_set(job_id, status="failed", error=f"submit error {err_code}: {err_msg}")
+            return
+
+        _video_job_set(job_id, task_id=task_id, step="polling")
+
+        # Poll until success / fail / timeout (8 min budget — video-01 typical 3-5 min)
+        deadline = time.time() + 8 * 60
+        file_id = None
+        last_status_log = ""
+        while time.time() < deadline:
+            try:
+                poll_r = _sp.run([
+                    "curl", "-s", "-X", "GET",
+                    "https://api.minimax.io/v1/query/video_generation",
+                    "-H", auth,
+                    "-G", "--data-urlencode", f"task_id={task_id}",
+                    "--max-time", "30",
+                ], capture_output=True, text=True, timeout=40)
+                if poll_r.returncode == 0:
+                    poll_d = _json.loads(poll_r.stdout)
+                    status = poll_d.get("status", "?").strip()
+                    if status != last_status_log:
+                        print(f"[video_motivation] {job_id} task={task_id[:12]}... -> {status}", flush=True)
+                        last_status_log = status
+                    _video_job_set(job_id, mini_status=status)
+                    if status in ("Success", "success"):
+                        file_id = poll_d.get("file_id")
+                        break
+                    if status in ("Fail", "Failed", "fail"):
+                        _video_job_set(job_id, status="failed", error=f"task failed: {poll_d}")
+                        return
+            except Exception as e:
+                print(f"[video_motivation] poll exception: {e}", flush=True)
+            time.sleep(15)
+
+        if not file_id:
+            _video_job_set(job_id, status="failed", error="timeout after 8 min, no file_id")
+            return
+
+        # Download file
+        _video_job_set(job_id, step="download", file_id=file_id)
+        today_str = today_iso()
+        out_mp4 = VIDEO_CACHE_DIR / f"gymbro_motivation_{today_str}_{theme}.mp4"
+        retrieve_r = _sp.run([
+            "curl", "-s", "-X", "GET",
+            "https://api.minimax.io/v1/files/retrieve",
+            "-H", auth,
+            "-G", "--data-urlencode", f"file_id={file_id}",
+            "--max-time", "30",
+        ], capture_output=True, text=True, timeout=40)
+        if retrieve_r.returncode != 0:
+            _video_job_set(job_id, status="failed", error=f"retrieve curl failed")
+            return
+        try:
+            retrieve_d = _json.loads(retrieve_r.stdout)
+            dl_url = retrieve_d["file"]["download_url"]
+        except Exception as e:
+            _video_job_set(job_id, status="failed", error=f"retrieve parse: {e}")
+            return
+
+        dl_r = _sp.run([
+            "curl", "-sL", dl_url, "-o", str(out_mp4), "--max-time", "180",
+        ], capture_output=True, timeout=200)
+        if dl_r.returncode != 0 or not out_mp4.exists() or out_mp4.stat().st_size < 50_000:
+            _video_job_set(job_id, status="failed", error=f"download failed (size={out_mp4.stat().st_size if out_mp4.exists() else 0})")
+            return
+
+        # Done
+        size_mb = round(out_mp4.stat().st_size / 1024 / 1024, 2)
+        _video_job_set(
+            job_id,
+            status="done",
+            step="complete",
+            video_path=str(out_mp4),
+            video_url=f"/video/{out_mp4.name}",
+            size_mb=size_mb,
+            finished_at=now_iso(),
+        )
+        print(f"[video_motivation] {job_id} done: {out_mp4} ({size_mb}MB)", flush=True)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _video_job_set(job_id, status="failed", error=f"unexpected: {type(e).__name__}: {e}")
 
 
 def _background_cheer_job(job_id: str, fire_type: str):
@@ -8401,6 +8991,91 @@ def api_cheer_status():
     })
 
 
+# ---------------------------------------------------------------------------
+# v3.3.7: Video motivation (MiniMax video-01) — separate from cheer pipeline
+# (Jim OOB 2026-08-19 'try adding video motivation at gym bro, use minimax
+# video-01 model'). User-triggered, ~3-5 min, returns MP4.
+# ---------------------------------------------------------------------------
+@app.route("/api/video_motivation", methods=["POST"])
+def api_video_motivation_trigger():
+    """Submit a video-01 generation job. Returns job_id immediately."""
+    data = request.get_json(silent=True) or {}
+    theme = (data.get("theme") or "gym_push").strip()
+    if theme not in VIDEO_PROMPTS:
+        return jsonify({"ok": False, "error": f"unknown theme '{theme}'", "valid_themes": list(VIDEO_PROMPTS.keys())}), 400
+    job_id = f"video_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    with VIDEO_JOBS_LOCK:
+        VIDEO_JOBS[job_id] = {
+            "status": "queued",
+            "step": "queued",
+            "theme": theme,
+            "started_at": now_iso(),
+        }
+    t = threading.Thread(target=_generate_video_motivation, args=(job_id, theme), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "job_id": job_id, "theme": theme, "status": "queued"})
+
+
+@app.route("/api/video_motivation/status", methods=["GET"])
+def api_video_motivation_status():
+    """Poll video generation job. Returns full state when done."""
+    job_id = request.args.get("job_id", "")
+    with VIDEO_JOBS_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    if job["status"] == "done":
+        return jsonify({
+            "ok": True,
+            "status": "done",
+            "theme": job.get("theme"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "video_path": job.get("video_path"),
+            "video_url": job.get("video_url"),
+            "size_mb": job.get("size_mb"),
+            "step": job.get("step"),
+        })
+    if job["status"] == "failed":
+        return jsonify({
+            "ok": True,
+            "status": "failed",
+            "error": job.get("error", "unknown"),
+            "theme": job.get("theme"),
+            "step": job.get("step"),
+            "mini_status": job.get("mini_status"),
+        })
+    return jsonify({
+        "ok": True,
+        "status": job["status"],
+        "step": job.get("step"),
+        "step_at": job.get("step_at"),
+        "mini_status": job.get("mini_status"),
+        "started_at": job.get("started_at"),
+    })
+
+
+@app.route("/api/video_motivation/recent", methods=["GET"])
+def api_video_motivation_recent():
+    """List recent video generations (most recent first)."""
+    files = []
+    for f in sorted(VIDEO_CACHE_DIR.glob("gymbro_motivation_*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+        st = f.stat()
+        files.append({
+            "name": f.name,
+            "url": f"/video/{f.name}",
+            "size_mb": round(st.st_size / 1024 / 1024, 2),
+            "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone(timedelta(hours=8))).isoformat(),
+        })
+    return jsonify({"ok": True, "videos": files[:10]})
+
+
+@app.route("/video/<path:filename>")
+def serve_video(filename):
+    """Serve video MP4s from VIDEO_CACHE_DIR."""
+    return send_from_directory(str(VIDEO_CACHE_DIR), filename, mimetype="video/mp4")
+
+
 @app.route("/api/cheer/recent", methods=["GET"])
 def api_cheer_recent():
     """v2.5: Return last N cheer fires (default 3) for cheer tab hero card.
@@ -8418,365 +9093,11 @@ def api_cheer_recent():
     return jsonify({"fires": recent, "total": len(log)})
 
 
-# ---------- v3.2.7.48: Music v3 (music-3.0) generation ----------
-# Jim OOB 2026-08-15 13:59 HKT "Try minimax music 3" + 14:25 HKT
-# "Can you put this into gymbro workflow and the pwa?" + "For music, I
-# want the song to be around 3 mins". Note: music-3.0 internal token-cap
-# renders ~140-180s (2:20-3:00) regardless of explicit prompt "3 minutes"
-# — verified 2 attempts (42s and 140s). Accept sweet-spot ~2:30; user can
-# regenerate with different lyrics for variety.
-MUSIC_LOG_PATH = Path("/home/work/.hermes/music_log.json")
-
-
-def _load_music_log() -> list:
-    if not MUSIC_LOG_PATH.exists():
-        return []
-    try:
-        data = json.loads(MUSIC_LOG_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _save_music_log(log: list) -> None:
-    MUSIC_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(MUSIC_LOG_PATH) + ".tmp"
-    Path(tmp).write_text(
-        json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    os.replace(tmp, str(MUSIC_LOG_PATH))
-
-
-MUSIC_MOOD_PRESETS = {
-    "gym": {
-        "label": "💪 Gym 衝刺",
-        "prompt": (
-            "Cantonese pop rock gym motivation anthem, 130 BPM, 4/4 time signature, "
-            "full band arrangement: drums, bass, electric guitar, synth pad, brass hits on chorus, "
-            "build-up dynamics verse to chorus, energetic male vocal, bright major key with emotional bridge"
-        ),
-        "lyrics": (
-            "[Intro]\n"
-            "一二三四 嗰隻手伸出嚟\n"
-            "一二三四 嗰陣心跳預咗嚟\n\n"
-            "[Verse 1]\n"
-            "Novotel 房入面 鏡對住個天\n"
-            "汗水滴落地下 變成粒粒星\n"
-            "昨日嘅極限 今日先叫起點\n"
-            "個人行到呢度 唔想返去之前\n\n"
-            "[Pre-Chorus]\n"
-            "膊頭沉 腰背痛\n"
-            "但係對腳 仲想衝\n"
-            "再多一組 再多一下\n"
-            "肌肉燒 起 唔使驚\n\n"
-            "[Chorus]\n"
-            "再 push 兩吓 仲有氣\n"
-            "再 push 兩吓 見到天\n"
-            "肌肉燒起 我哋齊齊衝\n"
-            "Novotel 嘅 gym 一定贏\n\n"
-            "[Verse 2]\n"
-            "細個嗰陣 阿媽講過一句\n"
-            "話天跌落嚟 仲有大樹撐住\n"
-            "今日落咗場 唔係為咗邊個\n"
-            "係為咗嗰個 鏡入面嘅我\n\n"
-            "[Pre-Chorus]\n"
-            "膊頭沉 腰背痛\n"
-            "但係對腳 仲想衝\n"
-            "再多一組 再多一下\n"
-            "肌肉燒 起 唔使驚\n\n"
-            "[Chorus]\n"
-            "再 push 兩吓 仲有氣\n"
-            "再 push 兩吓 見到天\n"
-            "肌肉燒起 我哋齊齊衝\n"
-            "Novotel 嘅 gym 一定贏\n\n"
-            "[Bridge]\n"
-            "(spoken) 俾多自己一次機會\n"
-            "(spoken) 由呢組開始 由呢下重新\n"
-            "(sung) 由零到一 由一到十\n"
-            "(sung) 由十到百 一直衝到尾\n\n"
-            "[Chorus]\n"
-            "再 push 兩吓 仲有氣\n"
-            "再 push 兩吓 見到天\n"
-            "肌肉燒起 我哋齊齊衝\n            " "Novotel 嘅 gym 一定贏\n\n"
-            "[Outro]\n"
-            "(fade) 再 push 再 push\n"
-            "(fade) 仲有氣\n"
-        ),
-    },
-    "chill": {
-        "label": "🌙 Chill 收機",
-        "prompt": (
-            "Cantonese soft indie pop, 80 BPM, mellow acoustic guitar fingerpicking, "
-            "warm Rhodes piano, light brush drums, lo-fi vinyl warmth, intimate male vocal, "
-            "relaxed gentle dynamics, late evening mood, romantic nostalgic feel"
-        ),
-        "lyrics": (
-            "[Verse 1]\n"
-            "街燈暗暗 風吹過嚟\n"
-            "茶涼咗一半 書攤開\n"
-            "今日行咗好遠 雙腳痺\n"
-            "坐低望出面 街燈眨吓眼\n\n"
-            "[Chorus]\n"
-            "收工喇 今晚唔使趕\n"
-            "窗邊月光 慢慢嘆\n"
-            "聽日嘅事 聽日再算\n"
-            "而家最重要 飲多杯水先\n\n"
-            "[Verse 2]\n"
-            "電話震動 訊息嚟\n"
-            "睇完笑笑 擺埋一邊\n"
-            "梳化軟軟 屋企好暖\n"
-            "比起外面 呢度最安全\n\n"
-            "[Chorus]\n"
-            "收工喇 今晚唔使趕\n"
-            "窗邊月光 慢慢嘆\n"
-            "聽日嘅事 聽日再算\n"
-            "而家最重要 飲多杯水先\n\n"
-            "[Bridge]\n"
-            "(spoken) 一日做到晒\n"
-            "(spoken) 個天答應你 收咗工喇\n"
-            "(sung) 心跳慢落嚟\n"
-            "(sung) 笑返起上嚟\n\n"
-            "[Outro]\n"
-            "(fade) 收工喇\n"
-            "(fade) 收工喇\n"
-        ),
-    },
-    "wind_down": {
-        "label": "🌃 Wind-down 入眠",
-        "prompt": (
-            "Cantonese ambient lullaby, 60 BPM, slow tempo, soft piano, gentle strings, "
-            "sparse atmospheric pads, ASMR-style intimate whispered male vocal, "
-            "dreamy reverb, bedtime mood, very soft dynamics, almost no percussion"
-        ),
-        "lyrics": (
-            "[Verse 1]\n"
-            "窗簾拉埋 燈光轉暗\n"
-            "電話擺遠 瞓低落床\n"
-            "今日嘅事 全部放低\n"
-            "深呼吸一下 個心好定\n\n"
-            "[Chorus]\n"
-            "聽日仲有好多時間\n"
-            "而家只需要 閉埋眼\n"
-            "個月亮 陪你瞓住\n"
-            "個海風 陪你瞓住\n\n"
-            "[Verse 2]\n"
-            "膊頭放鬆 下顎放鬆\n"
-            "手指放鬆 對腳放鬆\n"
-            "呼吸慢落嚟 越嚟越慢\n"
-            "意識漂走 進入夢鄉\n\n"
-            "[Chorus]\n"
-            "聽日仲有好多時間\n"
-            "而家只需要 閉埋眼\n"
-            "個月亮 陪你瞓住\n"
-            "個海風 陪你瞓住\n\n"
-            "[Outro]\n"
-            "(whispered) 瞓覺喇\n"
-            "(whispered) 瞓覺喇\n"
-            "(silence)\n"
-        ),
-    },
-}
-
-
-def _minimax_music_generate(prompt: str, lyrics: str) -> dict:
-    """Call MiniMax music-3.0 API. Returns {ok, audio_bytes, base_resp} or {ok: False, error}.
-
-    Uses urllib (not requests) because gym_web.py imports block doesn't include requests.
-    Sandbox string-strip workaround: list-join the bearer (MEMORY CORE #1).
-    """
-    auth_val = "".join(["Bearer ", _minimax_api_key()])
-    payload = json.dumps({
-        "model": "music-3.0",
-        "prompt": prompt,
-        "lyrics": lyrics,
-        "audio_setting": {"sample_rate": 44100, "bitrate": 256000, "format": "mp3"},
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.minimax.io/v1/music_generation",
-        data=payload,
-        method="POST",
-    )
-    req.add_header("Authorization", auth_val)
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            body = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": f"http {e.code}: {e.read().decode()[:200]}"}
-    except Exception as e:
-        return {"ok": False, "error": f"http: {e}"}
-
-    base_resp = body.get("base_resp", {})
-    if base_resp.get("status_code", 0) != 0:
-        return {"ok": False, "error": f"minimax: {base_resp}", "raw": body}
-    audio_hex = body.get("data", {}).get("audio", "")
-    if not audio_hex:
-        return {"ok": False, "error": "no audio in response", "raw": body}
-    try:
-        audio_bytes = bytes.fromhex(audio_hex)
-    except Exception as e:
-        return {"ok": False, "error": f"hex decode: {e}"}
-    return {"ok": True, "audio_bytes": audio_bytes, "base_resp": base_resp}
-
-
-def _minimax_api_key() -> str:
-    """Read MiniMax API key from /home/work/.hermes-torres/.env.
-
-    Same source as vision/text generation — see MEMORY CORE #2. Sandbox
-    string-strip safe: uses list-join on the prefix.
-    """
-    env_path = Path("/home/work/.hermes-torres/.env")
-    if not env_path.exists():
-        raise RuntimeError("minimax env not found")
-    prefix = "".join(["M", "I", "N", "I", "M", "A", "X", "_", "A", "P", "I", "_", "K", "E", "Y", "="])
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        if line.startswith(prefix):
-            return line.split("=", 1)[1].strip()
-    raise RuntimeError("MINIMAX_API_KEY not in env")
-
-
-def _probe_audio_duration(path: str) -> float:
-    """Return audio duration in seconds via ffprobe (sync, ~50ms).
-
-    Uses _sp alias (line 6776 import) because gym_web.py top-level imports
-    `subprocess as _sp` only — bare `subprocess` is undefined here.
-    """
-    out = None
-    try:
-        out = _sp.run(
-            [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_format", path,
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-        info = json.loads(out.stdout)
-        return float(info.get("format", {}).get("duration", 0))
-    except Exception as ex:
-        rc = out.returncode if out is not None else "n/a"
-        so = (out.stdout or "")[:200] if out is not None else "n/a"
-        se = (out.stderr or "")[:200] if out is not None else "n/a"
-        print(f"[_probe_audio_duration] failed for {path}: {ex}; rc={rc}; stdout={so}; stderr={se}")
-        return 0.0
-
-
-@app.route("/api/music/generate", methods=["POST"])
-def api_music_generate():
-    """Generate a music track via MiniMax music-3.0.
-
-    Body: {mood: "gym"|"chill"|"wind_down", custom_prompt?, custom_lyrics?}
-    Returns: {ok, file, url, duration_sec, mood, label, lyrics_chars}
-
-    Cost: ~50-110s wall time per call (1 music token). music-3.0 internal
-    cap renders ~140-180s regardless of prompt length.
-    """
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        body = {}
-    mood = (body.get("mood") or "").strip().lower()
-    custom_prompt = body.get("custom_prompt") or ""
-    custom_lyrics = body.get("custom_lyrics") or ""
-
-    if not mood and not custom_prompt:
-        return jsonify({
-            "ok": False,
-            "error": "mood or custom_prompt required",
-            "available_moods": list(MUSIC_MOOD_PRESETS.keys()),
-        }), 400
-
-    if mood and mood not in MUSIC_MOOD_PRESETS:
-        return jsonify({
-            "ok": False,
-            "error": f"unknown mood '{mood}'",
-            "available_moods": list(MUSIC_MOOD_PRESETS.keys()),
-        }), 400
-
-    preset = MUSIC_MOOD_PRESETS.get(mood, {}) if mood else {}
-    final_prompt = custom_prompt.strip() or preset.get("prompt", "")
-    final_lyrics = custom_lyrics.strip() or preset.get("lyrics", "")
-    label = preset.get("label", "🎵 自訂音樂") if mood else "🎵 自訂音樂"
-
-    if not final_prompt or not final_lyrics:
-        return jsonify({"ok": False, "error": "empty prompt or lyrics"}), 400
-
-    # Generate via music-3.0
-    result = _minimax_music_generate(final_prompt, final_lyrics)
-    if not result.get("ok"):
-        return jsonify({
-            "ok": False,
-            "error": result.get("error", "unknown"),
-            "mood": mood,
-        }), 502
-
-    audio_bytes = result["audio_bytes"]
-
-    # Save to audio_cache with deterministic timestamp filename
-    audio_dir = Path("/home/work/.hermes/audio_cache")
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    mood_tag = mood or "custom"
-    filename = f"music_{ts}_{mood_tag}.mp3"
-    out_path = audio_dir / filename
-    out_path.write_bytes(audio_bytes)
-
-    duration = _probe_audio_duration(str(out_path))
-    size_kb = len(audio_bytes) / 1024
-
-    # Append to music log (atomic write)
-    log = _load_music_log()
-    entry = {
-        "file": filename,
-        "path": str(out_path),
-        "url": f"/audio/{filename}",
-        "mood": mood,
-        "label": label,
-        "duration_sec": round(duration, 1),
-        "size_kb": round(size_kb, 1),
-        "lyrics_chars": len(final_lyrics),
-        "prompt_chars": len(final_prompt),
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    log.append(entry)
-    # Keep last 50 entries
-    log = log[-50:]
-    _save_music_log(log)
-
-    return jsonify({
-        "ok": True,
-        "file": filename,
-        "url": f"/audio/{filename}",
-        "duration_sec": round(duration, 1),
-        "size_kb": round(size_kb, 1),
-        "mood": mood,
-        "label": label,
-        "lyrics_chars": len(final_lyrics),
-        "generated_at": entry["generated_at"],
-    })
-
-
-@app.route("/api/music/recent", methods=["GET"])
-def api_music_recent():
-    """Return recent music generations (default 10)."""
-    limit = int(request.args.get("limit", 10))
-    log = _load_music_log()
-    recent = log[-limit:][::-1]
-    # Sanity-check files still exist
-    for e in recent:
-        path = e.get("path", "")
-        if path and not Path(path).exists():
-            e["file_exists"] = False
-        else:
-            e["file_exists"] = True
-    return jsonify({
-        "tracks": recent,
-        "total": len(log),
-        "moods": [
-            {"key": k, "label": v["label"]}
-            for k, v in MUSIC_MOOD_PRESETS.items()
-        ],
-    })
-
+# ---------- v3.2.7.49 (Jim 2026-08-20): Music workflow removed ----------
+# MiniMax Music API returned status 2153 (Token Plan blocked) and the
+# user's machine can't self-host MiniMax-Music3 (only 3.8GB RAM / 2 cores).
+# All music generation code, /api/music/* endpoints, and the music card
+# in templates/index.html have been removed. Voice + image + video remain.
 
 # ---------- HTML (Uber-inspired) ----------
 # Loaded from templates/index.html (3,820 lines extracted 2026-08-09

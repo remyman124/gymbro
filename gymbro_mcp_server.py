@@ -552,55 +552,9 @@ def log_meal_text(food_desc: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool()
-def generate_music(mood: str = "chill", custom_prompt: str = "", custom_lyrics: str = "") -> str:
-    """Generate music via MiniMax music-3.0 (Jim OOB 2026-08-15 13:59 HKT 'Try minimax music 3'
-    + 14:25 HKT 'Can you put this into gymbro workflow and the pwa?' + 'For music, I want the
-    song to be around 3 mins'). Uses gym_web /api/music/generate — saves MP3 to audio_cache
-    and logs to /home/work/.hermes/music_log.json. Cost: ~50-110s wall time per call.
-
-    mood: 'gym' | 'chill' | 'wind_down' (presets) — leave empty if providing custom_prompt.
-    custom_prompt: free-form English music style description (optional, overrides mood preset).
-    custom_lyrics: Cantonese or English lyrics with [Intro]/[Verse]/[Chorus] markers (optional).
-
-    Returns: {ok, file, url, duration_sec, mood, label, lyrics_chars, generated_at}
-    """
-    api_url = "".join([GYM_WEB_URL, "/api/music/generate"])
-    payload = json.dumps({
-        "mood": mood,
-        "custom_prompt": custom_prompt,
-        "custom_lyrics": custom_lyrics,
-    }).encode()
-    req = urllib.request.Request(api_url, data=payload, method="POST")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=600) as r:
-            result = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:300]
-        return json.dumps({"ok": False, "error": f"HTTP {e.code}: {body}"}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-def get_recent_music(limit: int = 10) -> str:
-    """Return recent music generations (default 10) from music_log.json.
-
-    Shape: {tracks: [{file, url, mood, label, duration_sec, size_kb, lyrics_chars, generated_at}, ...],
-            total, moods: [{key, label}, ...]}
-
-    'moods' array lists available mood presets for use with generate_music().
-    """
-    api_url = "".join([GYM_WEB_URL, "/api/music/recent?limit=", str(limit)])
-    req = urllib.request.Request(api_url)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            result = json.loads(r.read())
-    except Exception as e:
-        return json.dumps({"ok": False, "error": str(e), "tracks": [], "moods": []}, ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+# v3.2.7.49 (Jim 2026-08-20): generate_music + get_recent_music tools removed —
+# MiniMax Music API returns 2153 for Token Plan keys and self-host isn't
+# feasible on this machine.
 
 
 @mcp.tool()

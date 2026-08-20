@@ -83,9 +83,13 @@ def test_food_tab_is_default(fresh_page):
 
 
 def test_gym_tab_switches_panel(fresh_page):
-    fresh_page.locator("button", has_text="Gym").first.click()
+    # Scope to the bottom <nav> — the cheer tab has a hidden
+    # `<button @click="generateMusic(...)">` whose text contains "Gym"
+    # (cheer moods are labelled with gym-style tags), which otherwise
+    # wins the "button, has_text=Gym" locator.
+    fresh_page.locator("nav button", has_text="Gym").first.click()
     fresh_page.wait_for_timeout(400)
-    gym_tab = fresh_page.locator("button", has_text="Gym").first
+    gym_tab = fresh_page.locator("nav button", has_text="Gym").first
     assert "tab-active" in (gym_tab.get_attribute("class") or "")
     _shot(fresh_page, "i02_gym_tab")
 
@@ -115,7 +119,7 @@ def test_gym_tab_has_intensity_pills(fresh_page):
     section. We don't assert visibility — they depend on the current state
     of the workout session. We just confirm the markup is reachable from
     the gym tab path."""
-    fresh_page.locator("button", has_text="Gym").first.click()
+    fresh_page.locator("nav button", has_text="Gym").first.click()
     fresh_page.wait_for_timeout(600)
     # Look for ANY pill in the DOM (visible or not)
     pill_count = fresh_page.locator("button.pill, button[class*='pill']").count()
@@ -124,7 +128,7 @@ def test_gym_tab_has_intensity_pills(fresh_page):
 
 
 def test_gym_tab_shows_cancel_button(fresh_page):
-    fresh_page.locator("button", has_text="Gym").first.click()
+    fresh_page.locator("nav button", has_text="Gym").first.click()
     fresh_page.wait_for_timeout(400)
     cancel = fresh_page.locator("button[aria-label='Cancel last set']").first
     assert cancel.count() >= 0  # present in DOM (visibility may depend on state)

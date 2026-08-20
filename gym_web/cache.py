@@ -338,6 +338,50 @@ class NutritionCache:
                     return row
         return None
 
+    def find_similar_by_name(self, name: str, min_matches: int = 2,
+                             limit: int = 20) -> list:
+        """v3.3.7: look up historical rows with similar dish name.
+
+        Used by _lookup_known_macros() to backfill empty nutrition when
+        the vision AI returns nothing (Jim OOB 2026-08-16 'why today egg
+        tarts have nutrient info?' — they shouldn't be 0).
+
+        Matching generates ALL 2-char and 3-char substrings from the
+        normalized input name. A row matches if ANY of those substrings
+        appears in its name. This handles compound dish names like
+        '原味蛋撻、抹茶味蛋撻' → substring '蛋撻' appears in 4+ other rows.
+
+        Excludes rows with kcal=0. Returns up to `limit` most-recent matches.
+        """
+        if not name or not name.strip():
+            return []
+        normalized = name.replace("、", "").replace(",", "").replace("，", "")
+        # Generate 2-char and 3-char substrings
+        needles = set()
+        if len(normalized) >= 2:
+            needles.add(normalized[-2:])
+        if len(normalized) >= 3:
+            needles.add(normalized[-3:])
+            needles.add(normalized[:3])
+        if len(normalized) >= 4:
+            needles.add(normalized[:4])
+            needles.add(normalized[-4:])
+        # Strip pure-qualifier tokens (原味/抹茶味/etc) by also including last 2 chars of any 'X味'/'X式' etc.
+        # Keep the union.
+        with self._lock:
+            results = []
+            for ri in self.by_recent:
+                row = self.by_row.get(ri)
+                if row is None or row.kcal <= 0:
+                    continue
+                for n in needles:
+                    if n in row.name:
+                        results.append(row)
+                        break
+                if len(results) >= limit:
+                    break
+        return results
+
     def stats(self) -> dict:
         with self._lock:
             return {
@@ -461,6 +505,85 @@ class NutritionCache:
         try:
             self.by_recent.remove(row_index)
         except ValueError:
+            pass
+
+    def _delete_with_shift(self, row_index: int) -> None:
+        """Sheet-row delete: remove row R, then reindex every row > R down by 1.
+
+        After `deleteDimension` removes row R from the Sheet, the rows that
+        were previously at R+1, R+2, ... now sit at R, R+1, ... — but the
+        cache's keys are those old (stale) row_indices. Without this shift
+        pass, the next remove/edit on a row above R targets the wrong Sheet
+        row.
+
+        Differs from `_evict` (which only removes the row) by also walking
+        every index and decrementing keys/values > row_index. The row
+        dataclass's `row_index` field is patched in place so `to_pwa_dict()`
+        and the image proxy see the new index.
+        """
+        old = self.by_row.pop(row_index, None)
+        if old is None:
+            return
+        self.by_id.pop(old.entry_id, None)
+        dlist = self.by_date.get(old.date)
+        if dlist is not None:
+            try:
+                dlist.remove(row_index)
+            except ValueError:
+                pass
+            if not dlist:
+                self.by_date.pop(old.date, None)
+        try:
+            self.by_recent.remove(row_index)
+        except ValueError:
+            pass
+
+        # Reindex every row above the deleted one. Mutates row.row_index in
+        # place so the row's own PWA dict carries the new index.
+        new_by_row: dict[int, NutritionRow] = {}
+        for k, v in self.by_row.items():
+            if k > row_index:
+                v.row_index = k - 1
+                new_by_row[k - 1] = v
+            else:
+                new_by_row[k] = v
+        self.by_row = new_by_row
+
+        new_by_id: dict[str, int] = {}
+        for entry_id, ri in self.by_id.items():
+            new_by_id[entry_id] = ri - 1 if ri > row_index else ri
+        self.by_id = new_by_id
+
+        new_by_date: dict[str, list[int]] = {}
+        for d, idxs in self.by_date.items():
+            new_by_date[d] = [ri - 1 if ri > row_index else ri for ri in idxs]
+        self.by_date = new_by_date
+
+        self.by_recent = [ri - 1 if ri > row_index else ri for ri in self.by_recent]
+
+        # Invalidate the image proxy's Drive-URL cache + thumbnail-bytes
+        # cache for the shifted rows and the deleted row. The thumbnail
+        # bytes cache is keyed by row_index, so /scan_thumb/<new_idx>
+        # would otherwise return a JPEG that used to belong to a
+        # different row. Local import avoids cycles with image_proxy.
+        try:
+            from gym_web.image_proxy import (
+                invalidate_drive_url, invalidate_thumb, shift_thumb_cache,
+            )
+            invalidate_drive_url(row_index)
+            invalidate_thumb(row_index)
+            for k in self.by_row:
+                if k > row_index:
+                    invalidate_drive_url(k)
+                    invalidate_thumb(k)
+            # Drop thumbnail-bytes entries that no longer correspond to a
+            # live row (>max_row_index). After the shift, those keys are
+            # now stale aliases.
+            shift_thumb_cache(row_index)
+        except Exception:
+            # image_proxy may not be importable in some test contexts —
+            # log and continue. The next /api/scan_recent will lazily
+            # repopulate the URL cache from the Sheet.
             pass
 
 

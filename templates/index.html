@@ -257,6 +257,13 @@
             <span class="text-base font-black tabular-nums"
                   :class="stepsRefreshing ? 'text-sky-300 animate-pulse' : (stepsSyncing ? 'text-gray-400' : (stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'))"
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
+            <!-- v3.3.7: 'as of HH:MM' freshness stamp (Jim OOB 2026-08-17).
+                 Tiny text under the step number so Jim knows how stale
+                 the count is (iPhone sync lag). Amber when > 30 min. -->
+            <span class="text-[8px] tabular-nums leading-none mt-0.5"
+                  :class="stepsStale ? 'text-amber-400/80' : 'text-gray-500'"
+                  x-show="stepsLastSync"
+                  x-text="stepsLastSync ? (stepsStale ? 'as of ' : 'as of ') + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) + (stepsStale ? ' ⚠' : '') : ''"></span>
           </div>
           <!-- Denominator: YESTERDAY (small, gray) — compact format (K/M) -->
           <div class="flex flex-col items-center justify-center leading-none" x-show="stepsYesterday !== null">
@@ -1257,58 +1264,70 @@
         </template>
       </div>
 
-      <!-- v3.2.7.48: Music v3 generation section -->
-      <div class="rounded-2xl bg-gradient-to-br from-indigo-900/30 to-purple-900/30 backdrop-blur border border-indigo-400/40 p-4 mb-4">
-        <div class="flex items-baseline justify-between mb-2">
-          <div class="text-[10px] uppercase tracking-[0.15em] text-indigo-300 font-bold">🎵 Music v3 音樂生成</div>
-          <div class="text-[10px] text-gray-400" x-text="musicTracks.length ? musicTracks.length + ' 首歌' : '未有歌'"></div>
-        </div>
-        <div class="text-xs text-gray-400 mb-3">MiniMax music-3.0 · 廣東話 · 約 2 分鐘 · 50-110 秒生成時間</div>
+      <!-- v3.2.7.49 (Jim 2026-08-20): Music v3 generation section removed.
+           Music API returned 2153 and self-host isn't feasible on this machine. -->
 
-        <!-- 3 mood preset buttons -->
+      <!-- v3.3.7: Video motivation (MiniMax video-01) — Jim OOB 2026-08-19
+           'try adding video motivation at gym bro, use minimax video-01 model'.
+           Separate from cheer pipeline because video takes ~3-5 min.
+           3 themes: gym_push / morning_stretch / finish_line. -->
+      <div class="rounded-2xl bg-gradient-to-br from-orange-900/30 to-red-900/30 backdrop-blur border border-orange-400/40 p-4 mb-4">
+        <div class="flex items-baseline justify-between mb-2">
+          <div class="text-[10px] uppercase tracking-[0.15em] text-orange-300 font-bold">🎬 Video 勵志片</div>
+          <div class="text-[10px] text-gray-400" x-text="videoTracks.length ? videoTracks.length + ' 條片' : '未有片'"></div>
+        </div>
+        <div class="text-xs text-gray-400 mb-3">MiniMax video-01 · 6 秒 4K 短片 · 約 3-5 分鐘生成時間</div>
+
+        <!-- 3 theme buttons -->
         <div class="grid grid-cols-3 gap-2 mb-3">
-          <template x-for="mood in (musicMoods.length ? musicMoods : [
-            {key: 'gym', label: '💪 Gym 衝刺'},
-            {key: 'chill', label: '🌙 Chill 收機'},
-            {key: 'wind_down', label: '🌃 Wind-down 入眠'}
-          ])" :key="mood.key">
-            <button @click="generateMusic(mood.key)"
-                    :disabled="musicGenerating"
-                    class="rounded-lg py-2 text-xs font-bold active:scale-95 disabled:opacity-50"
-                    style="background:rgba(99,102,241,0.18);box-shadow:inset 0 0 0 1px rgba(99,102,241,0.4);">
-              <span x-text="mood.label"></span>
-            </button>
-          </template>
+          <button @click="generateVideo('gym_push')"
+                  :disabled="videoGenerating"
+                  class="rounded-lg py-2 text-[11px] font-bold active:scale-95 disabled:opacity-50"
+                  style="background:rgba(249,115,22,0.18);box-shadow:inset 0 0 0 1px rgba(249,115,22,0.4);">
+            💪 重量訓練
+          </button>
+          <button @click="generateVideo('morning_stretch')"
+                  :disabled="videoGenerating"
+                  class="rounded-lg py-2 text-[11px] font-bold active:scale-95 disabled:opacity-50"
+                  style="background:rgba(245,158,11,0.18);box-shadow:inset 0 0 0 1px rgba(245,158,11,0.4);">
+            🌅 早晨伸展
+          </button>
+          <button @click="generateVideo('finish_line')"
+                  :disabled="videoGenerating"
+                  class="rounded-lg py-2 text-[11px] font-bold active:scale-95 disabled:opacity-50"
+                  style="background:rgba(239,68,68,0.18);box-shadow:inset 0 0 0 1px rgba(239,68,68,0.4);">
+            🏁 衝線
+          </button>
         </div>
 
         <!-- Live progress + error -->
-        <div x-show="musicGenProgress" class="my-2 text-xs" :class="musicGenError ? 'text-red-300' : 'text-indigo-300'" x-text="musicGenProgress"></div>
-        <div x-show="musicGenError" class="my-2 text-[10px] text-red-300" x-text="'錯誤：' + musicGenError"></div>
+        <div x-show="videoGenProgress" class="my-2 text-xs" :class="videoGenError ? 'text-red-300' : 'text-orange-300'" x-text="videoGenProgress"></div>
+        <div x-show="videoGenError" class="my-2 text-[10px] text-red-300" x-text="'錯誤：' + videoGenError"></div>
 
         <!-- Last generated inline player -->
-        <template x-if="musicActiveTrack">
-          <div class="mt-3 rounded-xl bg-black/40 border border-indigo-400/30 px-3 py-2">
+        <template x-if="videoActiveTrack">
+          <div class="mt-3 rounded-xl bg-black/40 border border-orange-400/30 px-3 py-2">
             <div class="flex items-baseline justify-between mb-1">
-              <div class="text-[10px] text-indigo-200 font-bold" x-text="musicActiveTrack.label || musicActiveTrack.mood"></div>
-              <div class="text-[10px] text-gray-400" x-text="Math.round((musicActiveTrack.duration_sec || 0) / 60 * 10) / 10 + ' 分 · ' + (musicActiveTrack.size_kb ? Math.round(musicActiveTrack.size_kb/1024 * 10) / 10 + 'MB' : '')"></div>
+              <div class="text-[10px] text-orange-200 font-bold" x-text="videoThemes.find(t => t.key === videoActiveTrack.theme)?.label || videoActiveTrack.theme"></div>
+              <div class="text-[10px] text-gray-400" x-text="(videoActiveTrack.size_mb || 0) + ' MB'"></div>
             </div>
-            <audio :src="musicActiveTrack.url" controls class="w-full" style="height:36px"></audio>
+            <video :src="videoActiveTrack.url" controls class="w-full rounded bg-black" style="max-height:300px"></video>
             <div class="flex gap-2 mt-2">
-              <a :href="musicActiveTrack.url" :download="musicActiveTrack.file" class="text-[10px] bg-emerald-500/20 text-emerald-300 rounded-full px-2 py-0.5">⬇ 下載</a>
-              <button @click="generateMusic(musicActiveTrack.mood)" :disabled="musicGenerating" class="text-[10px] bg-purple-500/20 text-purple-300 rounded-full px-2 py-0.5 active:scale-95">🔄 再整多次</button>
+              <a :href="videoActiveTrack.url" :download="videoActiveTrack.name" class="text-[10px] bg-emerald-500/20 text-emerald-300 rounded-full px-2 py-0.5">⬇ 下載</a>
+              <button @click="generateVideo(videoActiveTrack.theme)" :disabled="videoGenerating" class="text-[10px] bg-purple-500/20 text-purple-300 rounded-full px-2 py-0.5 active:scale-95">🔄 再整多次</button>
             </div>
           </div>
         </template>
 
-        <!-- Recent tracks list -->
-        <template x-if="musicTracks.length > 1">
+        <!-- Recent videos list -->
+        <template x-if="videoTracks.length > 1">
           <div class="mt-3">
-            <div class="text-[10px] text-gray-400 mb-1 font-bold">最近 5 首：</div>
-            <template x-for="(track, idx) in musicTracks.slice(0, 5)" :key="track.file || idx">
+            <div class="text-[10px] text-gray-400 mb-1 font-bold">最近 5 條片：</div>
+            <template x-for="(v, idx) in videoTracks.slice(0, 5)" :key="v.name || idx">
               <div class="flex items-center justify-between py-1.5 border-b border-white/5 last:border-b-0">
-                <button @click="playMusicTrack(track)" class="flex-1 text-left text-xs text-indigo-200 truncate active:scale-95" x-text="track.label || track.mood || track.file"></button>
-                <span class="text-[10px] text-gray-500 ml-2" x-text="Math.round((track.duration_sec || 0) / 60 * 10) / 10 + ' 分'"></span>
-                <a :href="track.url" :download="track.file" class="text-[10px] text-emerald-400 ml-2">⬇</a>
+                <button @click="playVideoTrack(v)" class="flex-1 text-left text-xs text-orange-200 truncate active:scale-95" x-text="videoThemes.find(t => t.key === v.theme)?.label || v.name"></button>
+                <span class="text-[10px] text-gray-500 ml-2" x-text="(v.size_mb || 0) + 'MB'"></span>
+                <a :href="v.url" :download="v.name" class="text-[10px] text-emerald-400 ml-2">⬇</a>
               </div>
             </template>
           </div>
@@ -1509,6 +1528,13 @@ function gymApp() {
     stepsYesterday: null,
     stepsKcal: 0,
     steps7dAvg: 0,
+    // v3.3.7 (Jim OOB 2026-08-17 'step count lagging because iPhone not
+    // synced to Withings cloud yet'): show 'as of HH:MM' so Jim knows how
+    // stale the step number is. Steps update only when Apple Watch pushes
+    // to Withings (typical 5-30 min lag, daily commit at HKT 04:00).
+    stepsLastSync: null,
+    stepsAgeMin: null,
+    stepsStale: false,
     // v2.7.42: HH:MM only 24h format (Jim OOB 2026-08-06 "HH:mm only")
     // Date is shown in the group header so per-entry display is just the time
     formatScanTime(iso) {
@@ -1669,14 +1695,20 @@ function gymApp() {
     deletingScanIndex: null,
     deleteSubmitting: false,
     deleteSubmitMsg: '',
-    // v3.2.7.48: Music v3 generation (Jim OOB 2026-08-15 "Try minimax music 3")
-    musicTracks: [],          // recent tracks from /api/music/recent
-    musicMoods: [],           // mood presets [{key, label}, ...]
-    musicGenerating: false,   // button disabled while music-3.0 renders
-    musicGenProgress: '',     // human-readable progress
-    musicGenError: '',        // error message from API
-    musicLastGenerated: null, // last successful track (object)
-    musicActiveTrack: null,   // currently playing track (for inline player)
+    // v3.2.7.49 (Jim 2026-08-20): Music state removed — see gym_web.py comment.
+    // v3.3.7: Video motivation (MiniMax video-01)
+    videoTracks: [],          // recent videos from /api/video_motivation/recent
+    videoThemes: [
+      {key: 'gym_push', label: '💪 重量訓練'},
+      {key: 'morning_stretch', label: '🌅 早晨伸展'},
+      {key: 'finish_line', label: '🏁 衝線'}
+    ],
+    videoGenerating: false,   // button disabled while video-01 renders
+    videoGenProgress: '',     // human-readable progress
+    videoGenError: '',        // error message from API
+    videoActiveTrack: null,   // currently selected video
+    videoJobId: null,         // current job_id while polling
+    videoJobPollTimer: null,  // polling timer for status
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
     photostream: [],           // today's images with optional classification
     photostreamClassifying: false,
@@ -2760,7 +2792,7 @@ function gymApp() {
         const r = await fetch('/api/withings_refresh', { method: 'POST' });
         const data = await r.json();
         if (data.ok) {
-          this.flash(`✓ Withings 已更新 (${data.pulled_at?.slice(11, 16) || 'now'})`);
+          this.flash(`✓ Withings 已更新 (${data.data_as_of?.slice(11, 16) || 'now'})`);
         } else {
           this.flash('Withings refresh 失敗：' + (data.error || '未知'));
         }
@@ -2789,6 +2821,27 @@ function gymApp() {
           this.stepsToday = data.steps || 0;
           this.stepsKcal = data.calories || 0;
           this.stepsSyncing = false;
+        }
+        // v3.3.7: data freshness stamp uses `data_as_of` (Withings-side),
+        // not `pulled_at` (when gymbro last queried). `data_as_of` is the
+        // latest iPhone-sync intraday event ts — i.e., when the watch last
+        // captured movement. Hide the label entirely when Withings has no
+        // genuine intraday events (Jim OOB 2026-08-17: never show pulled_at
+        // — that's gymbro's fetch time, not movement time).
+        const asOfIso = data.data_as_of;
+        if (asOfIso) {
+          this.stepsLastSync = asOfIso;
+          try {
+            const asOfMs = new Date(asOfIso).getTime();
+            const ageMs = Date.now() - asOfMs;
+            this.stepsAgeMin = Math.max(0, Math.round(ageMs / 60000));
+            // > 30 min since Withings got the data → flag stale amber
+            this.stepsStale = this.stepsAgeMin > 30;
+          } catch(e) { this.stepsAgeMin = null; this.stepsStale = false; }
+        } else {
+          this.stepsLastSync = null;
+          this.stepsAgeMin = null;
+          this.stepsStale = false;
         }
         // v2.7.26: paired yesterday for widget display
         if (data.yesterday && typeof data.yesterday.steps === 'number') {
@@ -2918,8 +2971,8 @@ function gymApp() {
       this.tab = 'cheer';
       this.flash('🔥 Cheer tab');
       this.loadCheerRecent();
-      // v3.2.7.48: also load music recent tracks
-      this.loadMusicRecent();
+      // v3.3.7: also load video recent list
+      this.loadVideoRecent();
     },
 
     // v2.5 cheer — load last N cheer fires from server log
@@ -3036,61 +3089,111 @@ function gymApp() {
       } catch (e) { /* silent — next poll will retry */ }
     },
 
-    // v3.2.7.48: Music v3 — load recent tracks + mood presets
-    async loadMusicRecent() {
-      try {
-        const r = await fetch('/api/music/recent?limit=10');
-        const data = await r.json();
-        if (data.tracks) this.musicTracks = data.tracks;
-        if (data.moods) this.musicMoods = data.moods;
-      } catch (e) {
-        console.error('loadMusicRecent failed', e);
-      }
-    },
-
-    // v3.2.7.48: Music v3 — trigger music-3.0 generation
-    // Cost: ~50-110s wall time, ~2:00-2:30 song. Token-cost: 1 music unit.
-    async generateMusic(mood) {
-      if (this.musicGenerating) return;
+    // v3.2.7.49 (Jim 2026-08-20): Music functions removed.
+    // v3.3.7: Video motivation (MiniMax video-01) — submit + poll
+    // Cost: ~3-5 min wall time. Async job_id pattern (cheer-style).
+    async generateVideo(theme) {
+      if (this.videoGenerating) return;
       try { window.__lastTapAt = Date.now(); } catch(e) { /* noop */ }
-      this.musicGenerating = true;
-      this.musicGenProgress = `🎵 生成緊「${mood}」音樂… 等 50-110 秒`;
-      this.musicGenError = '';
+      this.videoGenerating = true;
+      this.videoGenProgress = `🎬 提交緊「${theme}」短片生成…`;
+      this.videoGenError = '';
       try {
-        const r = await fetch('/api/music/generate', {
+        const r = await fetch('/api/video_motivation', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mood }),
+          body: JSON.stringify({ theme }),
         });
         const data = await r.json();
         if (!data.ok) {
-          this.musicGenError = data.error || '未知錯誤';
-          this.musicGenProgress = '';
-          this.flash('❌ 音樂生成失敗');
-          this.musicGenerating = false;
+          this.videoGenError = data.error || '未知錯誤';
+          this.videoGenProgress = '';
+          this.flash('❌ 影片生成失敗');
+          this.videoGenerating = false;
           return;
         }
-        this.musicLastGenerated = data;
-        this.musicActiveTrack = data;
-        const mins = Math.round((data.duration_sec || 0) / 60 * 10) / 10;
-        this.musicGenProgress = `✓ 完成 · ${mins} 分鐘`;
-        this.flash(`🎵 ${data.label || mood} 完成`);
-        // Refresh recent list so newest is on top
-        await this.loadMusicRecent();
-        // Clear progress after 8s (longer than cheer — user wants to hear it)
-        setTimeout(() => { this.musicGenProgress = ''; }, 8000);
+        this.videoJobId = data.job_id;
+        this.videoGenProgress = '⏳ 已提交 · 生成中（3-5 分鐘）';
+        await this._pollVideoJob(data.job_id);
       } catch (e) {
-        this.musicGenError = e.message || String(e);
-        this.musicGenProgress = '';
-        this.flash('Error：' + this.musicGenError);
-      } finally {
-        this.musicGenerating = false;
+        this.videoGenError = e.message || String(e);
+        this.videoGenProgress = '';
+        this.flash('Error：' + this.videoGenError);
+        this.videoGenerating = false;
       }
     },
 
-    // v3.2.7.48: Set a track as currently active for inline player
-    playMusicTrack(track) {
-      this.musicActiveTrack = track;
+    async _pollVideoJob(jobId) {
+      // Poll every 15s, max 8 min (MiniMax typical 3-5 min, allow buffer)
+      const maxPolls = 32;
+      let pollN = 0;
+      const tick = async () => {
+        pollN++;
+        try {
+          const r = await fetch(`/api/video_motivation/status?job_id=${encodeURIComponent(jobId)}`);
+          const data = await r.json();
+          if (data.status === 'done') {
+            this.videoActiveTrack = {
+              theme: data.theme,
+              name: (data.video_url || '').split('/').pop(),
+              url: data.video_url,
+              size_mb: data.size_mb,
+            };
+            this.videoGenProgress = '✓ 完成 · MP4 ready';
+            this.flash(`🎬 短片完成 · ${data.size_mb}MB`);
+            await this.loadVideoRecent();
+            setTimeout(() => { this.videoGenProgress = ''; }, 10000);
+            this.videoGenerating = false;
+            return;
+          }
+          if (data.status === 'failed') {
+            this.videoGenError = data.error || '未知';
+            this.videoGenProgress = '';
+            this.flash('❌ 影片失敗：' + this.videoGenError);
+            this.videoGenerating = false;
+            return;
+          }
+          // still running
+          const mini = data.mini_status || 'preparing';
+          this.videoGenProgress = `⏳ ${mini} · (${pollN}/${maxPolls})`;
+          if (pollN < maxPolls) {
+            this.videoJobPollTimer = setTimeout(tick, 15000);
+          } else {
+            this.videoGenError = 'polling timeout (8 min)';
+            this.videoGenProgress = '';
+            this.videoGenerating = false;
+          }
+        } catch (e) {
+          this.videoGenError = e.message || String(e);
+          this.videoGenProgress = '';
+          this.videoGenerating = false;
+        }
+      };
+      tick();
+    },
+
+    async loadVideoRecent() {
+      try {
+        const r = await fetch('/api/video_motivation/recent');
+        const data = await r.json();
+        if (data.ok) {
+          // Map filename into theme by parsing the convention gymbro_motivation_<date>_<theme>.mp4
+          this.videoTracks = (data.videos || []).map(v => {
+            const m = v.name.match(/^gymbro_motivation_\d{4}-\d{2}-\d{2}_(\w+)\.mp4$/);
+            return { ...v, theme: m ? m[1] : 'unknown' };
+          });
+          // Auto-select most recent if none active
+          if (!this.videoActiveTrack && this.videoTracks.length > 0) {
+            this.videoActiveTrack = this.videoTracks[0];
+          }
+        }
+      } catch (e) {
+        console.error('loadVideoRecent failed', e);
+      }
+    },
+
+    playVideoTrack(track) {
+      this.videoActiveTrack = track;
     },
 
     async onScanFile(event) {
@@ -4203,10 +4306,10 @@ setTimeout(checkLandscapeFood, 500);
          calendar to see full activity list with sport + strain + time. -->
     <div x-show="scheduleSelectedDay"
          x-transition.opacity
-         class="fixed inset-0 z-50 flex items-end justify-center bg-black/70 backdrop-blur-sm"
+         class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
          @click.self="scheduleSelectedDay = null"
          @keydown.escape.window="scheduleSelectedDay = null">
-      <div class="w-full max-w-md rounded-t-3xl bg-gradient-to-b from-zinc-900 to-black border-t border-white/10 p-5 pb-8 max-h-[70dvh] overflow-y-auto"
+      <div class="w-full max-w-md rounded-3xl bg-gradient-to-b from-zinc-900 to-black border border-white/10 p-5 pb-8 max-h-[70dvh] overflow-y-auto"
            x-show="scheduleSelectedDay"
            x-transition.duration.200ms>
         <div class="flex items-center justify-between mb-3">
