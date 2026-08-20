@@ -8921,8 +8921,8 @@ VIDEO_JOBS_LOCK = threading.Lock()
 
 VIDEO_PROMPTS = {
     "gym_push": (
-        "Cinematic 4K video of a confident Asian female fitness coach in her 30s, "
-        "athletic Spanish/Portuguese features, hair pulled back in a high ponytail, "
+        "Cinematic 4K video of a confident young white female fitness coach in her early 20s, "
+        "fair porcelain skin, light blue eyes, dirty blonde hair pulled back in a high ponytail, "
         "bright coral sports bra and black leggings, "
         "performing a heavy barbell back squat in a modern bright gym, "
         "explosive upward push, intense focus, golden hour side light streaming "
@@ -8931,17 +8931,20 @@ VIDEO_PROMPTS = {
         "motivational atmosphere, 6 seconds."
     ),
     "morning_stretch": (
-        "Cinematic 4K video of an athletic Asian female doing morning sun salutation "
-        "yoga on a Hong Kong rooftop at sunrise, Victoria Harbour skyline background, "
-        "hair flowing in the breeze, deep exhale, slow stretch, "
+        "Cinematic 4K video of an athletic young white female in her early 20s, "
+        "fair porcelain skin, light blue eyes, dirty blonde hair flowing in the breeze, "
+        "doing morning sun salutation yoga on a Hong Kong rooftop at sunrise, "
+        "Victoria Harbour skyline background, deep exhale, slow stretch, "
         "golden light wrapping around her silhouette, "
         "calm focused expression, motivational serenity, 6 seconds."
     ),
     "finish_line": (
-        "Cinematic 4K video of a determined Asian female athlete running through a "
-        "rain-soaked Hong Kong street at dawn, neon reflections on wet asphalt, "
-        "pushing through the final stretch, breath visible in cool air, "
-        "determination in her eyes, slow motion on crossing an invisible finish line, "
+        "Cinematic 4K video of a determined young white female athlete in her early 20s, "
+        "fair porcelain skin, light blue eyes, dirty blonde ponytail, "
+        "running through a rain-soaked Hong Kong street at dawn, "
+        "neon reflections on wet asphalt, pushing through the final stretch, "
+        "breath visible in cool air, determination in her eyes, "
+        "slow motion on crossing an invisible finish line, "
         "motivational peak moment, 6 seconds."
     ),
 }
