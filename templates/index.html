@@ -1440,6 +1440,7 @@ function gymApp() {
     // -2 = two months back, etc. No future navigation.
     scheduleMonthOffset: 0,
     scheduleViewLabel: '',
+    today_iso: new Date().toISOString().slice(0, 10),  // v3.3.7: for past/future styling
     // v3.2.7.25: pull-to-refresh state (Jim OOB 2026-08-11 'calendar
     // view does not support pull to refresh'). `schedulePullDistance`
     // tracks how far the user has dragged down from the top; once it
@@ -2901,24 +2902,49 @@ function gymApp() {
       if (pct >= 33) return 'text-sky-300';
       return 'text-rose-300';
     },
-    // v3.2.7: dayCellClass(day) — bg color + ring + clickability.
-    // (Replaces the inline ternary chain — too complex to read in HTML.)
-    dayCellClass(day) {
-      if (day.empty) return 'invisible';
-      if (day.count === 0 && !day.is_today) {
-        // Rest day: show only if recovery data exists, else blank.
-        return day.recovery_pct != null
-          ? 'bg-white/[0.025] ring-1 ring-white/[0.05] cursor-pointer'
-          : 'bg-transparent';
-      }
+    // v3.3.7: recoveryDotClass(pct) — bg color for tiny dot top-right of cell.
+    recoveryDotClass(pct) {
+      if (pct == null) return '';
+      if (pct >= 66) return 'bg-emerald-400';
+      if (pct >= 33) return 'bg-amber-400';
+      return 'bg-rose-400';
+    },
+    // v3.3.7: cellBgClass(day) — calendar cell background. Today gets a
+    // strong emerald ring + bg; gym days a subtle emerald tint; activity
+    // days a subtle sky tint; rest days with data get a faint white tint;
+    // pure rest days are transparent.
+    cellBgClass(day) {
       if (day.is_today) {
-        return 'bg-emerald-500/25 ring-2 ring-emerald-300/70 shadow-lg shadow-emerald-500/20';
+        return 'bg-emerald-500/20 ring-2 ring-emerald-400 rounded-lg';
       }
       if (day.has_gym) {
-        return 'bg-emerald-500/12 ring-1 ring-emerald-500/40 active:scale-95 cursor-pointer';
+        return 'bg-emerald-500/10 ring-1 ring-emerald-500/30 rounded-lg';
       }
-      return 'bg-sky-500/12 ring-1 ring-sky-500/30 active:scale-95 cursor-pointer';
+      if (day.activities && day.activities.length > 0) {
+        return 'bg-sky-500/10 ring-1 ring-sky-500/30 rounded-lg';
+      }
+      if (day.recovery_pct != null || day.hrv_ms != null || day.sleep_pct != null) {
+        return 'bg-white/[0.04] ring-1 ring-white/[0.06] rounded-lg';
+      }
+      return 'bg-transparent';
     },
+    // v3.3.7: dayTextColor(day) — day number color. Today + gym = emerald,
+    // activity = sky, Sunday (only) = rose tint, future days muted.
+    // (Jim OOB 2026-08-20 'saturday should not be marked red'.)
+    dayTextColor(day) {
+      if (day.is_today) return 'text-emerald-300';
+      if (day.has_gym) return 'text-emerald-200';
+      if (day.activities && day.activities.length > 0) return 'text-sky-200';
+      // Only Sunday (Python weekday=6) gets the rose tint, matching the
+      // weekday header where '日' is the only red column.
+      const wd = day.weekday ?? -1;
+      if (wd === 6) {
+        return day.date > this.today_iso ? 'text-rose-700' : 'text-rose-400/80';
+      }
+      return day.date > this.today_iso ? 'text-gray-600' : 'text-gray-400';
+    },
+    // v3.3.7: isPast/isFuture helpers — reserved for future cell opacity tuning.
+    // (Currently the dayTextColor already encodes past/future via gray vs rose-700.)
     closeDayPopover() {
       this.scheduleSelectedDay = null;
     },
@@ -4229,65 +4255,37 @@ setTimeout(checkLandscapeFood, 500);
       <div class="grid grid-cols-7 gap-1 flex-1 min-h-0 content-start"
            style="grid-auto-rows: minmax(50px, 1fr);">
         <template x-for="day in scheduleMonthAligned" :key="day.date">
-          <!-- v3.2.7: enriched cell layout — 3 visual states:
-               (1) gym day  → bg-emerald + day-num + volume + sets + recovery chip
-               (2) activity → bg-sky + day-num + icon + strain
-               (3) rest     → bg-transparent + day-num + recovery chip (if data)
-               Empty days + non-today are blank. Today always gets a ring.
-               (Jim OOB 2026-08-07 23:40 HKT 'beatify the month view with
-               enriched data'.)
-               v3.2.7.19: aspect-square so cells stay square (Jim OOB
-               2026-08-10 'calendar is now too tall'). -->
-          <div class="rounded-lg p-0.5 flex flex-col items-stretch justify-start transition-all overflow-hidden"
-               :class="dayCellClass(day)"
+          <!-- v3.3.7 calendar redesign (Jim OOB 2026-08-20 'need to overhaul
+               the calendar. the UI and coloring is very bad. the data
+               presentation is not consistent. the view is not like a
+               monthly calendar view'). Clean Apple/Google Calendar look:
+               prominent day number, today ring, single bottom icon
+               (gym = 💪, else first activity icon), recovery dot top-right.
+               All volume/sets/sleep/HRV stats moved to popover. -->
+          <div class="rounded-lg overflow-hidden transition-all relative"
+               :class="day.empty ? 'invisible pointer-events-none' : 'cursor-pointer'"
                :style="day.empty ? 'height: 4px; aspect-ratio: auto;' : 'aspect-ratio: 1 / 1;'"
-               @click="day.activities && day.activities.length > 0 ? openDayPopover(day) : (day.recovery_pct != null ? openDayPopover(day) : null)">
-            <!-- v3.2.8: single coherent layout rhythm for all cells.
-                 Day-num top-left, recovery chip top-right.
-                 ONE dominant stat fills the bottom (no double-stat clutter).
-                 (a) gym day   → volume + sets, gym-tinted
-                 (b) activity  → single icon + strain, sky-tinted
-                 (c) rest day  → sleep% chip, neutral
-                 (d) today     → ring + emerald
-                 Empty cells collapse to 4px strip (no wasted space). -->
+               @click="openDayPopover(day)">
             <template x-if="!day.empty">
-              <div class="flex flex-col h-full">
-                <!-- Top row: day number + recovery chip -->
-                <div class="flex items-start justify-between px-0.5 pt-0.5">
-                  <div class="text-[10px] tabular-nums font-black leading-none"
-                       :class="day.is_today ? 'text-emerald-200' : (day.has_gym ? 'text-emerald-200' : (day.count > 0 ? 'text-sky-200' : 'text-gray-500'))"
+              <div class="h-full flex flex-col p-1"
+                   :class="cellBgClass(day)">
+                <!-- Top row: day number (left) + recovery dot (right) -->
+                <div class="flex items-start justify-between leading-none">
+                  <div class="text-sm font-black tabular-nums"
+                       :class="dayTextColor(day)"
                        x-text="day.day_num"></div>
                   <template x-if="day.recovery_pct != null">
-                    <div class="text-[8px] tabular-nums font-black leading-none px-1 rounded-sm"
-                         :class="recoveryPillClass(day.recovery_pct)"
-                         x-text="day.recovery_pct + '%'"></div>
+                    <div class="w-1.5 h-1.5 rounded-full mt-1"
+                         :class="recoveryDotClass(day.recovery_pct)"></div>
                   </template>
                 </div>
-                <!-- Bottom area: ONE dominant stat -->
-                <div class="flex-1 flex flex-col items-center justify-center pb-0.5">
-                  <!-- (a) gym day → volume + sets stacked -->
-                  <template x-if="day.has_gym && day.gym_volume_kg != null">
-                    <div class="flex flex-col items-center leading-none">
-                      <div class="text-[11px] font-black tabular-nums text-emerald-200" x-text="formatVolume(day.gym_volume_kg) + 'kg'"></div>
-                      <div class="text-[8px] font-bold text-emerald-300/80 tabular-nums mt-0.5" x-text="day.gym_set_count + '套'"></div>
-                    </div>
+                <!-- Bottom: single icon (gym preferred, else first activity) -->
+                <div class="flex-1 flex items-center justify-center">
+                  <template x-if="day.has_gym">
+                    <div class="text-base leading-none">💪</div>
                   </template>
-                  <!-- (b) activity-only day → single icon + strain -->
                   <template x-if="!day.has_gym && day.activities && day.activities.length > 0">
-                    <div class="flex flex-col items-center leading-none">
-                      <div class="text-base leading-none">
-                        <span x-text="(day.activities[0] || {}).icon || '🏃'"></span>
-                      </div>
-                      <template x-if="day.total_strain && day.total_strain > 0">
-                        <div class="text-[8px] font-bold text-amber-300/90 tabular-nums mt-0.5" x-text="'⚡' + day.total_strain.toFixed(1)"></div>
-                      </template>
-                    </div>
-                  </template>
-                  <!-- (c) rest day → sleep chip -->
-                  <template x-if="day.sleep_pct != null && !day.has_gym && (!day.activities || day.activities.length === 0)">
-                    <div class="text-[10px] font-bold tabular-nums"
-                         :class="day.sleep_pct >= 80 ? 'text-emerald-300/80' : (day.sleep_pct >= 60 ? 'text-sky-300/80' : 'text-rose-300/80')"
-                         x-text="'💤' + day.sleep_pct + '%'"></div>
+                    <div class="text-base leading-none" x-text="(day.activities[0] || {}).icon || '🏃'"></div>
                   </template>
                 </div>
               </div>
