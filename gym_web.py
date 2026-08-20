@@ -8260,22 +8260,32 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
 # it, video picks theme + seed from it, coach comment weaves 今日主題 into
 # its 4 sections.
 #
-# Cache key: `YYYY-MM-DD` HKT + SHA1 of (last_food_ts, last_gym_ts,
-# last_whoop_ts, recovery_pct, sleep_pct). Invalidation on data-changing
-# events (scan_preview, end_session, whoop_refresh).
+# Cache key: `YYYY-MM-DD` HKT + fire_type + SHA1 of (last_food_ts,
+# last_gym_ts, last_whoop_ts, recovery_pct, sleep_pct). fire_type is
+# part of the key so the morning narrative doesn't get reused for an
+# evening cheer (Jim OOB 2026-08-20: "cheer routine not reflecting
+# current time"). Invalidation on data-changing events (scan_preview,
+# end_session, whoop_refresh).
 # ---------------------------------------------------------------------------
 
-daily_coaching_cache: dict = {}           # date_str → entry
+daily_coaching_cache: dict = {}           # (date_str, fire_type) → entry
 _DAILY_COACHING_LOCK = threading.Lock()
 
 
-def _daily_coaching_entry(date_str: str) -> dict:
-    """Return today's cache entry, creating an empty one if missing."""
+def _daily_coaching_entry(date_str: str, fire_type: str = "manual") -> dict:
+    """Return today's cache entry for this fire_type, creating one if missing.
+
+    v3.3.10: each fire_type (morning/afternoon/evening/late_night/post_gym/
+    post_meal/pre_lunch/manual) gets its own entry so a morning narrative
+    is never reused for an evening cheer.
+    """
+    key = (date_str, fire_type)
     with _DAILY_COACHING_LOCK:
-        e = daily_coaching_cache.get(date_str)
+        e = daily_coaching_cache.get(key)
         if e is None:
             e = {
                 "date": date_str,
+                "fire_type": fire_type,
                 "context_hash": None,
                 "narrative": None,
                 "theme": None,
@@ -8287,7 +8297,7 @@ def _daily_coaching_entry(date_str: str) -> dict:
                 "error": None,
                 "job_id": None,            # for client polling
             }
-            daily_coaching_cache[date_str] = e
+            daily_coaching_cache[key] = e
         return e
 
 
@@ -8372,15 +8382,28 @@ def _context_hash(ctx: dict) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
-def _invalidate_daily_coaching(date_str: str | None = None) -> None:
-    """Drop the cached narrative so the next read regenerates."""
+def _invalidate_daily_coaching(date_str: str | None = None, fire_type: str | None = None) -> None:
+    """Drop the cached narrative so the next read regenerates.
+
+    v3.3.10: defaults to invalidating ALL fire_types for the given date
+    (a new meal/gym/whoop data should re-flow into every narrative).
+    Pass `fire_type` to invalidate only one bucket.
+    """
     date_str = date_str or today_iso()
     with _DAILY_COACHING_LOCK:
-        e = daily_coaching_cache.get(date_str)
-        if e is not None:
-            e["context_hash"] = None
-            e["narrative"] = None
-            e["status"] = "idle"
+        if fire_type is not None:
+            e = daily_coaching_cache.get((date_str, fire_type))
+            if e is not None:
+                e["context_hash"] = None
+                e["narrative"] = None
+                e["status"] = "idle"
+            return
+        # Invalidate every fire_type entry for this date
+        for k, e in list(daily_coaching_cache.items()):
+            if k[0] == date_str:
+                e["context_hash"] = None
+                e["narrative"] = None
+                e["status"] = "idle"
 
 
 def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
@@ -8585,15 +8608,14 @@ def _get_or_make_daily_narrative(date_str: str, fire_type: str = "manual",
                                  block: bool = True, timeout_s: float = 25) -> dict:
     """Cache wrapper.
 
-    - If `block=True` (default) and the cache is empty/stale, generate
-      synchronously in the caller's thread (capped at `timeout_s`).
-    - If `block=False` and a generation is needed, kick off a background
-      thread and return the entry in 'generating' state immediately.
+    v3.3.10: cache is per `(date_str, fire_type)` so a morning narrative
+    never gets reused for an evening cheer. Otherwise same logic:
+    - If cache is empty/stale, generate (sync or background per `block`).
     - Returns the cache entry dict; caller reads .narrative.
     """
     ctx = _build_daily_context()
     new_hash = _context_hash(ctx)
-    entry = _daily_coaching_entry(date_str)
+    entry = _daily_coaching_entry(date_str, fire_type)
     with _DAILY_COACHING_LOCK:
         if entry.get("narrative") and entry.get("context_hash") == new_hash and entry.get("status") == "ready":
             return entry
@@ -8602,7 +8624,7 @@ def _get_or_make_daily_narrative(date_str: str, fire_type: str = "manual",
         entry["status"] = "generating"
         entry["started_at"] = now_iso()
         entry["error"] = None
-        entry["job_id"] = f"dc-{date_str}-{int(time.time())}"
+        entry["job_id"] = f"dc-{date_str}-{fire_type}-{int(time.time())}"
 
     if not block:
         # Background fire-and-forget
@@ -8616,15 +8638,19 @@ def _get_or_make_daily_narrative(date_str: str, fire_type: str = "manual",
 
     # Blocking path: just run inline
     _run_daily_coaching_generation(date_str, ctx, fire_type, entry["job_id"])
-    return _daily_coaching_entry(date_str)
+    return _daily_coaching_entry(date_str, fire_type)
 
 
 def _run_daily_coaching_generation(date_str: str, ctx: dict, fire_type: str, job_id: str) -> None:
-    """Worker called by both blocking and async paths. Always updates the entry."""
+    """Worker called by both blocking and async paths. Always updates the entry.
+
+    v3.3.10: keyed by (date_str, fire_type) so morning/afternoon/evening
+    narratives don't share storage.
+    """
     try:
         result = _generate_daily_narrative(ctx, fire_type)
         with _DAILY_COACHING_LOCK:
-            e = daily_coaching_cache.get(date_str) or _daily_coaching_entry(date_str)
+            e = daily_coaching_cache.get((date_str, fire_type)) or _daily_coaching_entry(date_str, fire_type)
             e["narrative"] = result.get("narrative") or ""
             e["theme"] = result.get("theme") or ""
             e["video_seed"] = result.get("video_seed") or ""
@@ -8632,27 +8658,36 @@ def _run_daily_coaching_generation(date_str: str, ctx: dict, fire_type: str, job
             e["status"] = "ready" if e["narrative"] else "failed"
             e["generated_at"] = now_iso()
             e["error"] = None if e["narrative"] else "empty narrative"
-            daily_coaching_cache[date_str] = e
+            daily_coaching_cache[(date_str, fire_type)] = e
     except Exception as e:
         with _DAILY_COACHING_LOCK:
-            entry = daily_coaching_cache.get(date_str) or _daily_coaching_entry(date_str)
+            entry = daily_coaching_cache.get((date_str, fire_type)) or _daily_coaching_entry(date_str, fire_type)
             entry["status"] = "failed"
             entry["error"] = f"{type(e).__name__}: {e}"
-            daily_coaching_cache[date_str] = entry
+            daily_coaching_cache[(date_str, fire_type)] = entry
 
 
 def _daily_ctx_seed() -> str:
     """Tiny helper used by food coach callers — returns today's theme tag
     from the unified daily coaching cache, or '' if not yet generated.
 
-    Single source of truth so /api/scan_preview, /api/scan_correct, etc. all
-    see the same 今日主題 without each one re-deriving it.
+    v3.3.10: scans all fire_type buckets for today and returns the first
+    theme found. Food coach doesn't care which fire_type the user is in.
     """
     try:
-        entry = daily_coaching_cache.get(today_iso())
-        if not entry:
+        d = today_iso()
+        # Prefer the latest generated entry across all fire_types
+        best = None
+        for k, e in daily_coaching_cache.items():
+            if k[0] != d:
+                continue
+            if e.get("status") != "ready":
+                continue
+            if best is None or (e.get("generated_at") or "") > (best.get("generated_at") or ""):
+                best = e
+        if not best:
             return ""
-        return entry.get("theme") or entry.get("food_seed") or ""
+        return best.get("theme") or best.get("food_seed") or ""
     except Exception:
         return ""
 
@@ -8969,10 +9004,18 @@ def _generate_video_motivation(job_id: str, theme: str = "gym_push"):
     """
     try:
         base_prompt = VIDEO_PROMPTS.get(theme) or VIDEO_PROMPTS["gym_push"]
-        # Inject daily narrative seed (first sentence) if available
+        # Inject daily narrative seed (first sentence) if available.
+        # v3.3.10: pick the latest-ready entry across all fire_type buckets
+        # for today so the video reflects whatever the user just heard.
         try:
-            dc = daily_coaching_cache.get(today_iso()) or {}
-            seed = (dc.get("video_seed") or "").strip()
+            d = today_iso()
+            best = None
+            for k, e in daily_coaching_cache.items():
+                if k[0] != d or e.get("status") != "ready":
+                    continue
+                if best is None or (e.get("generated_at") or "") > (best.get("generated_at") or ""):
+                    best = e
+            seed = ((best or {}).get("video_seed") or "").strip()
         except Exception:
             seed = ""
         if seed and len(seed) > 5:
@@ -9581,7 +9624,29 @@ def api_daily_coaching_get():
     wait = request.args.get("wait", "false").lower() == "true"
     fire_type = request.args.get("fire_type", "manual")
     date_str = today_iso()
-    entry = _daily_coaching_entry(date_str)
+    # v3.3.10: if no fire_type specified, return the most recently generated
+    # entry across all fire_types for today (cheer tab "open" doesn't need
+    # to pin a specific time-bucket).
+    if fire_type == "manual" and "fire_type" not in request.args:
+        best = None
+        for k, e in daily_coaching_cache.items():
+            if k[0] != date_str or e.get("status") != "ready":
+                continue
+            if best is None or (e.get("generated_at") or "") > (best.get("generated_at") or ""):
+                best = e
+        if best is not None:
+            return jsonify({
+                "status": "ready",
+                "date": date_str,
+                "fire_type": best.get("fire_type"),
+                "narrative": best.get("narrative"),
+                "theme": best.get("theme"),
+                "video_seed": best.get("video_seed"),
+                "food_seed": best.get("food_seed"),
+                "generated_at": best.get("generated_at"),
+            })
+        # No ready entry — fall through and generate a "manual" one
+    entry = _daily_coaching_entry(date_str, fire_type)
     # If ready and hash matches current context, return it.
     ctx = _build_daily_context()
     new_hash = _context_hash(ctx)
@@ -9589,6 +9654,7 @@ def api_daily_coaching_get():
         return jsonify({
             "status": "ready",
             "date": date_str,
+            "fire_type": fire_type,
             "narrative": entry["narrative"],
             "theme": entry.get("theme"),
             "video_seed": entry.get("video_seed"),
@@ -9601,6 +9667,7 @@ def api_daily_coaching_get():
         return jsonify({
             "status": entry.get("status", "ready"),
             "date": date_str,
+            "fire_type": fire_type,
             "narrative": entry.get("narrative") or "",
             "theme": entry.get("theme"),
             "video_seed": entry.get("video_seed"),
@@ -9613,6 +9680,7 @@ def api_daily_coaching_get():
     return jsonify({
         "status": "generating",
         "date": date_str,
+        "fire_type": fire_type,
         "job_id": entry.get("job_id"),
     }), 202
 
