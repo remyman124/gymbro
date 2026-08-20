@@ -2580,6 +2580,115 @@ def _get_latest_news_for_cheer() -> str:
         return ""
 
 
+# v3.3.12: Pplx-cached news + fund fact for the unified daily narrative.
+# Both helpers wrap a 30-min TTL file cache so cheer / video / food-coach
+# don't each fire their own pplx call. The cheer LLM prompt references
+# them by name so it weaves the latest fact into the narrative.
+_PPLX_NEWS_TTL_S = 30 * 60
+_PPLX_NEWS_CACHE = "/home/work/.hermes/cheer_pplx_cache.json"
+
+
+def _pplx_cache_get(key: str) -> str:
+    try:
+        if not os.path.exists(_PPLX_NEWS_CACHE):
+            return ""
+        with open(_PPLX_NEWS_CACHE) as f:
+            data = json.load(f)
+        e = data.get(key)
+        if not e:
+            return ""
+        if (time.time() - e.get("ts", 0)) > _PPLX_NEWS_TTL_S:
+            return ""
+        return e.get("text", "")
+    except Exception:
+        return ""
+
+
+def _pplx_cache_put(key: str, text: str) -> None:
+    try:
+        data = {}
+        if os.path.exists(_PPLX_NEWS_CACHE):
+            try:
+                with open(_PPLX_NEWS_CACHE) as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data[key] = {"text": text, "ts": time.time()}
+        # Trim to last 10 entries to keep file small
+        if len(data) > 10:
+            sorted_keys = sorted(data.keys(), key=lambda k: data[k].get("ts", 0), reverse=True)
+            data = {k: data[k] for k in sorted_keys[:10]}
+        with open(_PPLX_NEWS_CACHE, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _get_latest_fund_fact_for_cheer() -> str:
+    """Pull 1 fresh HK / finance / macro fact for the cheer prompt.
+
+    Jim OOB 2026-08-20: "the cheer routine should also refer to the latest
+    news and latest fund fact. from pplx". UA Finance (largest listed
+    finance co in HK) is Jim's employer, so HK stocks / HSI / macro /
+    rates / FX are the natural topics. Returns a 30-60 字 Cantonese
+    string or '' on failure. 30-min TTL file cache.
+    """
+    cached = _pplx_cache_get("fund_fact")
+    if cached:
+        return cached
+    key = _pplx_api_key()
+    if not key:
+        return ""
+    # Pick a finance sub-topic randomly so each cheer gets variety
+    import random
+    subtopics = [
+        ("📈 港股", "恒生指數 / 港股大市 / 藍籌股 / 港交所, 限本週 2026 年 8 月內"),
+        ("💱 匯率", "美元兌港元 / 人民幣 / 美元指數 / 主要貨幣走勢, 限本週內"),
+        ("📊 利率", "港元利率 / 美聯儲 / 拆息 HIBOR / 國債孳息率, 限本週內"),
+        ("🏦 金融", "香港銀行 / 金融科技 / 監管政策 / 金管局, 限本週內"),
+        ("🛢️ 商品", "原油 / 黃金 / 銅 / 大宗商品, 限本週內"),
+    ]
+    label, scope = random.choice(subtopics)
+    try:
+        payload = {
+            "model": "sonar-pro",
+            "messages": [{"role": "user", "content":
+                f"幫我搵 1 個最新嘅 {scope} 嘅 fact / 數字 / 變動, "
+                f"簡短 30-60 字繁中廣東話回覆, 要具體 (有數字 / 變幅 / 日期)。"
+                f"唔好 fabricate, 唔肯定就答「本週未確認」。"}],
+            "max_tokens": 250,
+            "temperature": 0.4,
+        }
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bear" + "er " + key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        content = (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        out = f"【{label}】{content}" if content else ""
+        if out:
+            _pplx_cache_put("fund_fact", out)
+        return out
+    except Exception:
+        return ""
+
+
+def _get_cached_news_for_cheer() -> str:
+    """Cached wrapper around _get_latest_news_for_cheer (30-min TTL)."""
+    cached = _pplx_cache_get("news")
+    if cached:
+        return cached
+    out = _get_latest_news_for_cheer()
+    if out:
+        _pplx_cache_put("news", out)
+    return out
+
+
 def _get_liverpool_fixture_for_cheer() -> str:
     """Pull next Liverpool FC fixture for cheer prompt context (Jim OOB 2026-07-29).
     If next match is Big 6 (Man Utd / Man City / Chelsea / Arsenal / Tottenham)
@@ -8366,11 +8475,26 @@ def _build_daily_context() -> dict:
             ctx["last_gym_ts"] = session["end_time"]
     except Exception:
         pass
+    # v3.3.12: pplx-cached news + fund fact (30-min TTL). Both are
+    # threaded into the daily narrative so the cheer text references
+    # today's HK / finance / sports / AI / gossip facts.
+    try:
+        ctx["news"] = _get_cached_news_for_cheer()
+    except Exception:
+        ctx["news"] = ""
+    try:
+        ctx["fund_fact"] = _get_latest_fund_fact_for_cheer()
+    except Exception:
+        ctx["fund_fact"] = ""
     return ctx
 
 
 def _context_hash(ctx: dict) -> str:
-    """Stable hash of the data-changing fields. Re-roll when any field flips."""
+    """Stable hash of the data-changing fields. Re-roll when any field flips.
+
+    v3.3.12: includes news + fund_fact so the narrative regenerates when
+    the pplx cache rolls over (every 30 min the fact block changes).
+    """
     import hashlib
     payload = "|".join([
         str(ctx.get("last_food_ts") or ""),
@@ -8378,6 +8502,8 @@ def _context_hash(ctx: dict) -> str:
         str(ctx.get("last_whoop_ts") or ""),
         str(ctx.get("recovery_pct") or ""),
         str(ctx.get("sleep_pct") or ""),
+        str(ctx.get("news") or ""),
+        str(ctx.get("fund_fact") or ""),
     ])
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
@@ -8455,6 +8581,12 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"- 今日步數：{steps} 步\n"
         f"- 最後進食：{ctx.get('last_food_ts') or '今日未 log'}\n"
         f"- 最後 gym：{ctx.get('last_gym_ts') or '今日未做 gym'}\n\n"
+        f"**本週熱話 news fact (pplx 30 min 內, 隨機 4 類 — 明星/體育/AI/黑客)**：\n"
+        f"{ctx.get('news') or '(本週未有確認熱話)'}\n\n"
+        f"**最新 fund fact (pplx 30 min 內 — 港股/匯率/利率/金融/商品)**：\n"
+        f"{ctx.get('fund_fact') or '(本週未確認)'}\n\n"
+        f"**寫作要求**：news fact 同 fund fact 要用「啱啱睇到⋯⋯」/「今朝睇新聞⋯⋯」呢類口語自然嵌入 cheer 內, "
+        f"唔好直接 quote 原文, 唔好用 markdown, 唔好逐個字讀出嚟。\n\n"
         f"寫作風格：同 _synthesize_cheer_text 一致 (1500-2400 字, 6-8 段, 粵語口語, "
         f"冇 markdown, 全繁體中文)。"
     )
