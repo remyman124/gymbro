@@ -1789,6 +1789,10 @@ function gymApp() {
           this.streak = streakData.streak;
         }
       } catch(e) { /* keep 0 */ }
+      // v3.3.8: pre-warm the unified daily coaching cache so the first
+      // cheer/video of the day hits a warm narrative (no ~5s LLM wait).
+      // Non-blocking; runs in background server-side.
+      fetch('/api/daily_coaching').catch(() => {});
       // Pull health overlay (Whoop recovery + Withings weight + fat %) — single number each
       try {
         const healthRes = await fetch('/api/health_overlay');

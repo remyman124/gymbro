@@ -564,6 +564,9 @@ def api_end_session():
     log = load_log()
     log[today_iso()] = session
     save_log(log)
+    # v3.3.8: invalidate daily coaching so the next cheer/video reflects
+    # the freshly completed gym session.
+    _invalidate_daily_coaching()
 
     # Aggregate pyramid
     exercises = {}
@@ -3771,12 +3774,16 @@ def _coach_comment_keyword(dish_name: str, calories: float, protein: float, carb
     }
 
 
-def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "", user_context: str = "") -> dict:
+def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float, fat: float, restaurant: str = "", user_context: str = "", daily_ctx_seed: str = "") -> dict:
     """v3.3.1: full coach comment = keyword + AI 4-section enrichment.
 
     For single-row display (scan commit/correct/preview detail views).
     /api/scan_recent MUST NOT call this — use _coach_comment_keyword instead.
     Each AI call costs ~5s, so a list of N rows = N×5s (was the v3.3.0 bug).
+
+    v3.3.8: optional `daily_ctx_seed` is prepended to the prompt so the
+    4-section comment can reference today's theme (e.g. "復原日 蛋白優先").
+    Comes from the daily coaching narrative; empty = no theme hint.
     """
     base = _coach_comment_keyword(dish_name, calories, protein, carbs, fat, restaurant)
     pre_comment = base["comment"]
@@ -3795,8 +3802,12 @@ def _coach_comment(dish_name: str, calories: float, protein: float, carbs: float
     micronutrient_status = ""
     next_meal_suggestion = ""
     try:
+        # v3.3.8: weave today's theme into the food coach comment so the
+        # 4 sections feel like part of the same day's narrative.
+        theme_line = f"\n今日主題: {daily_ctx_seed}\n" if daily_ctx_seed else ""
         prompt = (
-            f"你係香港私人健身教練，操繁體中文廣東話。分析以下食物。\n"
+            f"你係香港私人健身教練，操繁體中文廣東話。分析以下食物。"
+            f"{theme_line}\n"
             f"食物：{dish_name}\n"
             f"餐廳：{restaurant or '無'}\n"
             f"份量：{calories:.0f} kcal · 蛋白 {protein:.0f}g · 碳 {carbs:.0f}g · 脂 {fat:.0f}g\n"
@@ -4702,6 +4713,7 @@ def api_scan_food():
             field_entries.get("name") or _extract_dish_name(vision_desc, pplx_desc),
             field_entries["calories"], field_entries["protein"],
             field_entries["carbs"], field_entries["fat"],
+            daily_ctx_seed=_daily_ctx_seed(),
         ),
         "user_correction": None,  # permanent — never trimmed (Jim OOB 2026-07-23 22:30 HKT "no trimming of data")
     }
@@ -4802,6 +4814,9 @@ def api_whoop_refresh():
         sleep = len(data.get("sleep") or [])
         workouts = len(data.get("workouts") or [])
         synced_at = data.get("synced_at") or now_iso()
+        # v3.3.8: invalidate daily coaching — fresh Whoop data means the
+        # next cheer/video should re-evaluate recovery.
+        _invalidate_daily_coaching()
         return jsonify({
             "ok": True,
             "synced_at": synced_at,
@@ -5531,7 +5546,8 @@ def api_scan_preview():
             "name": _sanitise_dish_name(d_name, vision_desc=vision_desc, pplx_desc=pplx_desc),
             "coach_comment": _coach_comment(
                 d_name, e_macros["calories"], e_macros["protein"],
-                e_macros.get("carbs", 0), e_macros.get("fat", 0), restaurant_guess
+                e_macros.get("carbs", 0), e_macros.get("fat", 0), restaurant_guess,
+                daily_ctx_seed=_daily_ctx_seed(),
             ),
             "restaurant_chain": restaurant_guess,
             "calories": e_macros["calories"],
@@ -5568,6 +5584,7 @@ def api_scan_preview():
                 preview_field_entries.get("carbs", 0),
                 preview_field_entries.get("fat", 0),
                 restaurant_guess,
+                daily_ctx_seed=_daily_ctx_seed(),
             ),
             "restaurant_chain": restaurant_guess,
             "calories": preview_field_entries["calories"],
@@ -5680,6 +5697,9 @@ def api_scan_preview():
     # extractor (lines 4674-4688 above) to do its best job and write
     # the entry unconditionally. If Jim sees a wrong name, he can
     # use ✏️ edit / 🗑️ delete on the food card after-the-fact.
+    # v3.3.8: invalidate daily coaching so the next cheer/video/food-coach
+    # reflects the freshly scanned meal.
+    _invalidate_daily_coaching()
     return jsonify({
         "ok": True,
         "auto_committed": True,
@@ -5809,6 +5829,7 @@ def api_scan_preview_from_path():
                 preview_field_entries.get("carbs", 0),
                 preview_field_entries.get("fat", 0),
                 restaurant_guess,
+                daily_ctx_seed=_daily_ctx_seed(),
             ),
             "restaurant_chain": restaurant_guess,
             "calories": jim_kcal,
@@ -6883,6 +6904,7 @@ def api_scan_preview_text():
         field_entries.get("carbs", 0) or 0,
         field_entries.get("fat", 0) or 0,
         restaurant_guess,
+        daily_ctx_seed=_daily_ctx_seed(),
     )
 
     preview = {
@@ -8225,6 +8247,416 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# v3.3.8: Unified daily coaching (single LLM call feeds cheer + video + food coach)
+#
+# Background: 4 AI touchpoints (food scan, cheer voice, video motivation, coach
+# comment) each made independent LLM calls with no shared context. Result:
+# cheer voice had no idea what the food scan just said, video ran fixed
+# prompts oblivious to recovery, food coach comment was a 4-section island.
+#
+# This module unifies them: a single `daily_narrative` (M3 LLM call, cached by
+# date+context_hash) becomes the canonical daily summary. Cheer voice reads
+# it, video picks theme + seed from it, coach comment weaves 今日主題 into
+# its 4 sections.
+#
+# Cache key: `YYYY-MM-DD` HKT + SHA1 of (last_food_ts, last_gym_ts,
+# last_whoop_ts, recovery_pct, sleep_pct). Invalidation on data-changing
+# events (scan_preview, end_session, whoop_refresh).
+# ---------------------------------------------------------------------------
+
+daily_coaching_cache: dict = {}           # date_str → entry
+_DAILY_COACHING_LOCK = threading.Lock()
+
+
+def _daily_coaching_entry(date_str: str) -> dict:
+    """Return today's cache entry, creating an empty one if missing."""
+    with _DAILY_COACHING_LOCK:
+        e = daily_coaching_cache.get(date_str)
+        if e is None:
+            e = {
+                "date": date_str,
+                "context_hash": None,
+                "narrative": None,
+                "theme": None,
+                "video_seed": None,
+                "food_seed": None,
+                "status": "idle",          # idle | generating | ready | failed
+                "started_at": None,
+                "generated_at": None,
+                "error": None,
+                "job_id": None,            # for client polling
+            }
+            daily_coaching_cache[date_str] = e
+        return e
+
+
+def _build_daily_context() -> dict:
+    """Pure-Python data gather — no LLM. Called by cheer and daily coaching.
+
+    Returns dict with:
+        - whoop snapshot (recovery_pct, hrv_ms, sleep_pct, sleep_bed_hr, ...)
+        - withings (weight, fat, steps, distance)
+        - last_food_ts, last_gym_ts (ISO strings; "" if none)
+        - recovery_pct, sleep_pct (top-level for hash)
+        - now_hkt
+    Failures default to None/empty so a single broken source doesn't kill
+    the whole narrative.
+    """
+    ctx: dict = {
+        "now_hkt": now_iso(),
+        "whoop": {},
+        "withings": {},
+        "last_food_ts": "",
+        "last_gym_ts": "",
+        "last_whoop_ts": "",
+        "recovery_pct": None,
+        "sleep_pct": None,
+    }
+    # Whoop
+    try:
+        whoop = _run_whoop_pull_cached(force=False) or {}
+        m = _extract_whoop_metrics(whoop) if isinstance(whoop, dict) else {}
+        ctx["whoop"] = m
+        ctx["recovery_pct"] = m.get("recovery_pct")
+        ctx["sleep_pct"] = m.get("sleep_perf_pct") or m.get("sleep_eff_pct")
+        try:
+            if WHOOP_CACHE_PATH.exists():
+                ctx["last_whoop_ts"] = _dt.fromtimestamp(
+                    WHOOP_CACHE_PATH.stat().st_mtime, tz=HKT
+                ).isoformat(timespec="seconds")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Withings (non-blocking — values already in cache from cheer flow)
+    try:
+        ctx["withings"] = {
+            "weight_kg": _withings_weight() if "_withings_weight" in globals() else None,
+            "fat_pct": _withings_fat_pct() if "_withings_fat_pct" in globals() else None,
+            "steps": (_withings_steps_today() or {}).get("steps") if "_withings_steps_today" in globals() else None,
+        }
+    except Exception:
+        pass
+    # Last food timestamp
+    try:
+        from gym_web.cache import get_cache as _gc
+        cache = _gc()
+        rows = cache.today() if hasattr(cache, "today") else []
+        if rows:
+            ctx["last_food_ts"] = max((r.time_iso or r.timestamp_iso or "") for r in rows if hasattr(r, "time_iso") or hasattr(r, "timestamp_iso"))
+    except Exception:
+        pass
+    # Last gym timestamp
+    try:
+        log = load_log()
+        today = today_iso()
+        session = log.get(today, {})
+        if session.get("end_time"):
+            ctx["last_gym_ts"] = session["end_time"]
+    except Exception:
+        pass
+    return ctx
+
+
+def _context_hash(ctx: dict) -> str:
+    """Stable hash of the data-changing fields. Re-roll when any field flips."""
+    import hashlib
+    payload = "|".join([
+        str(ctx.get("last_food_ts") or ""),
+        str(ctx.get("last_gym_ts") or ""),
+        str(ctx.get("last_whoop_ts") or ""),
+        str(ctx.get("recovery_pct") or ""),
+        str(ctx.get("sleep_pct") or ""),
+    ])
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _invalidate_daily_coaching(date_str: str | None = None) -> None:
+    """Drop the cached narrative so the next read regenerates."""
+    date_str = date_str or today_iso()
+    with _DAILY_COACHING_LOCK:
+        e = daily_coaching_cache.get(date_str)
+        if e is not None:
+            e["context_hash"] = None
+            e["narrative"] = None
+            e["status"] = "idle"
+
+
+def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
+    """Build the user prompt for the daily narrative LLM call.
+
+    Reuses the data-freshness / persona / style scaffolding from
+    _synthesize_cheer_text so the output tone matches what cheer produced
+    before unification.
+    """
+    whoop = ctx.get("whoop", {})
+    w = ctx.get("withings", {})
+    rec = whoop.get("recovery_pct")
+    hrv = whoop.get("hrv_ms")
+    rhr = whoop.get("rhr_bpm")
+    sleep_hr = whoop.get("sleep_bed_hr")
+    sleep_perf = whoop.get("sleep_perf_pct") or whoop.get("sleep_eff_pct")
+    strain = whoop.get("strain")
+    steps = (w.get("steps") or {}).get("steps") if isinstance(w.get("steps"), dict) else w.get("steps")
+    weight = w.get("weight_kg")
+    fat = w.get("fat_pct")
+
+    rec_state = "綠燈" if (rec or 0) >= 67 else ("黃燈" if (rec or 0) >= 34 else "紅燈")
+    fire_type_zh = {
+        "morning": "朝早 cheer",
+        "evening": "夜晚 cheer",
+        "manual": "即場 cheer",
+        "pre_lunch": "午餐前 cheer",
+        "afternoon": "下午 cheer",
+        "post_gym": "操完 gym cheer",
+        "post_meal": "食完嘢 cheer",
+        "late_night": "深夜 cheer",
+    }.get(fire_type, "即場 cheer")
+
+    hkt = datetime.now(HKT)
+    hkt_str = hkt.strftime("%H:%M")
+
+    return (
+        f"{fire_type_zh} 嘅 daily narrative 嚟喇，目標：俾 cheer voice 讀 + "
+        f"video 主題 seed + 食物 coach comment 主題。三個 consumer 共用呢段 narrative，"
+        f"所以寫嘅時候要兼顧：(1) cheer voice 直接讀得出嚟 (2) 頭兩句可以做 video 嘅 visual seed "
+        f"(3) 第一段可以畀食物 coach comment 引用做 今日主題。\n\n"
+        f"數據快照時間：HKT {hkt_str}\n"
+        f"- 復原指數：{rec}% ({rec_state})\n"
+        f"- 心跳變異：{hrv} 毫秒\n"
+        f"- 靜止心跳：{rhr} 下/分鐘\n"
+        f"- 噉晚瞓：{sleep_hr} 個鐘頭（表現 {sleep_perf}%）\n"
+        f"- 疲勞度：{strain}\n"
+        f"- Withings 體重：{weight} 公斤 / 體脂 {fat} %\n"
+        f"- 今日步數：{steps} 步\n"
+        f"- 最後進食：{ctx.get('last_food_ts') or '今日未 log'}\n"
+        f"- 最後 gym：{ctx.get('last_gym_ts') or '今日未做 gym'}\n\n"
+        f"寫作風格：同 _synthesize_cheer_text 一致 (1500-2400 字, 6-8 段, 粵語口語, "
+        f"冇 markdown, 全繁體中文)。"
+    )
+
+
+def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
+    """One M3 call. Returns {narrative, theme, video_seed, food_seed}."""
+    api_key = _minimax_api_key()
+    if not api_key:
+        # Reuse cheer fallback so the rest of the pipeline still has text
+        metrics = {
+            "recovery_pct": ctx.get("recovery_pct"),
+            "hrv_ms": ctx.get("whoop", {}).get("hrv_ms"),
+            "rhr_bpm": ctx.get("whoop", {}).get("rhr_bpm"),
+            "sleep_bed_hr": ctx.get("whoop", {}).get("sleep_bed_hr"),
+            "sleep_perf_pct": ctx.get("sleep_pct"),
+            "today_workout_count": 0,
+        }
+        text = _cheer_fallback_text(metrics, fire_type)
+        return {
+            "narrative": text,
+            "theme": _theme_from_ctx(ctx, fire_type),
+            "video_seed": text[:80],
+            "food_seed": text[:60],
+        }
+    user_prompt = _daily_coaching_narrative_prompt(ctx, fire_type)
+    # Reuse the cheer system prompt verbatim — same persona, same rules.
+    cheer_sys = (
+        "你係香港私人教練 Alonso, 識粵語, 識繁體中文。\n"
+        "你嘅唯一工作: 直接寫 cheer text 俾 Jim 聽。\n"
+        "規則 (一條都唔可以違反):\n"
+        "1. **只可以用繁體中文同粵語助詞寫 cheer 文字本身。唔好任何英文字。** 包括唔可以用 Level / Keep / OK / hey / hi / goal / target / etc.\n"
+        "2. **唔好寫 'Here is the cheer' / 'Let me think' / 'Sure' / '以下是' 等開場白。** 直接寫 cheer 第一句就係內容。\n"
+        "3. **唔好用 markdown**: 唔好用 **bold**、唔好用 *italic*、唔好用 [n] citation、唔好用 ```code```。文字純文字。\n"
+        "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
+        "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
+        "6. 150-200 字, 6-8 段, 用 \\n\\n 分隔段落, 每段 50-110 字。\n"
+        "7. **(v3.2.7.42) 開頭第一句必須直入內容, 唔可以做 role-intro meta 自我介紹。** "
+        "即係唔可以寫以下呢啲 mechanical opener:\n"
+        "   - ❌ 「管家同你報數先」 / 「管家即刻同你 update」 / 「管家嚟喇」\n"
+        "   - ❌ 「教練即刻同你 update」 / 「教練先同你講吓」 / 「教練要嚟喇」\n"
+        "   - ❌ 「CIO 開工先睇吓個身體點」 / 「Boss 起身先 check」\n"
+        "   - ❌ 「返工之前先睇吓」 / 「落 gym 之前先 check」 / 「開工前先 update」\n"
+        "   - ❌ 「我會先講」 / 「我即刻同你 update」 / 「我依家嚟喇」\n"
+        "   - ❌ 「而家就同你 update」 / 「而家嚟同你講」 / 「先同你 update」\n"
+        "   - ❌ 「哈嘍 Jim」 / 「Hey Jim」 / 「Hi Jim」 / 「Hello Jim」\n"
+        "   第一句直接寫具體內容: e.g. 「噉晚瞓咗七個鐘, 深層瞓差唔多兩個鐘」/ "
+        "「HRV 跌到廿四, 你個自律神經而家係攤喺度抖緊嘅狀態」/ 「今日零 workout, 紅燈復原, 你個 body 喺度維修中」。\n"
+    )
+    payload = {
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "system", "content": cheer_sys},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 4000,
+        "temperature": 0.7,
+        "thinking": {"type": "disabled"},
+    }
+    text = ""
+    try:
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "".join(["Bearer ", api_key]),
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
+        text = resp["choices"][0]["message"]["content"].strip()
+        # Strip think + opener prefixes (same regex as cheer)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+        text = re.sub(
+            r"^(Here[ ']s the cheer[\s\S]{0,200}?:|Let me think[\s\S]{0,200}?:|"
+            r"Sure[\s,]+|Below is[\s\S]{0,100}?:|以下是[\s\S]{0,100}?:)\s*",
+            "", text, flags=re.IGNORECASE
+        ).strip()
+    except Exception as e:
+        metrics = {
+            "recovery_pct": ctx.get("recovery_pct"),
+            "hrv_ms": ctx.get("whoop", {}).get("hrv_ms"),
+            "rhr_bpm": ctx.get("whoop", {}).get("rhr_bpm"),
+            "sleep_bed_hr": ctx.get("whoop", {}).get("sleep_bed_hr"),
+            "sleep_perf_pct": ctx.get("sleep_pct"),
+            "today_workout_count": 0,
+        }
+        text = _cheer_fallback_text(metrics, fire_type)
+    if not text:
+        return {"narrative": "", "theme": "", "video_seed": "", "food_seed": ""}
+    # Split into pieces the downstream consumers use
+    first_sentence = text.split("。", 1)[0] + "。" if "。" in text else text[:80]
+    return {
+        "narrative": text,
+        "theme": _theme_from_ctx(ctx, fire_type),
+        "video_seed": first_sentence,
+        "food_seed": first_sentence,
+    }
+
+
+def _theme_from_ctx(ctx: dict, fire_type: str) -> str:
+    """Pick today's theme tag (5-12 字) based on data + time of day."""
+    rec = ctx.get("recovery_pct") or 0
+    hkt = datetime.now(HKT)
+    hr = hkt.hour
+    if 4 <= hr < 11:
+        return "早晨啟動"
+    if 11 <= hr < 14:
+        return "午餐前衝刺"
+    if rec < 34:
+        return "紅燈復原日"
+    if rec < 67:
+        return "黃燈保養日"
+    if ctx.get("last_gym_ts"):
+        return "操完 gym 修補"
+    if 14 <= hr < 18:
+        return "下午動起來"
+    if 18 <= hr < 22:
+        return "夜晚收工"
+    return "深夜 chill"
+
+
+def _pick_video_theme(ctx: dict) -> str:
+    """Map daily context → one of gym_push / morning_stretch / finish_line."""
+    rec = ctx.get("recovery_pct") or 0
+    hkt = datetime.now(HKT)
+    hr = hkt.hour
+    # 1) morning hours → stretch
+    if 4 <= hr < 11:
+        return "morning_stretch"
+    # 2) low recovery → stretch (rest day)
+    if rec < 50:
+        return "morning_stretch"
+    # 3) recent gym (within 90 min) → push
+    if ctx.get("last_gym_ts"):
+        try:
+            last = _dt.fromisoformat(ctx["last_gym_ts"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=HKT)
+            mins = (datetime.now(HKT) - last).total_seconds() / 60
+            if 0 < mins < 90:
+                return "gym_push"
+        except Exception:
+            pass
+    return "finish_line"
+
+
+def _get_or_make_daily_narrative(date_str: str, fire_type: str = "manual",
+                                 block: bool = True, timeout_s: float = 25) -> dict:
+    """Cache wrapper.
+
+    - If `block=True` (default) and the cache is empty/stale, generate
+      synchronously in the caller's thread (capped at `timeout_s`).
+    - If `block=False` and a generation is needed, kick off a background
+      thread and return the entry in 'generating' state immediately.
+    - Returns the cache entry dict; caller reads .narrative.
+    """
+    ctx = _build_daily_context()
+    new_hash = _context_hash(ctx)
+    entry = _daily_coaching_entry(date_str)
+    with _DAILY_COACHING_LOCK:
+        if entry.get("narrative") and entry.get("context_hash") == new_hash and entry.get("status") == "ready":
+            return entry
+        # Stale or missing — start fresh
+        entry["context_hash"] = new_hash
+        entry["status"] = "generating"
+        entry["started_at"] = now_iso()
+        entry["error"] = None
+        entry["job_id"] = f"dc-{date_str}-{int(time.time())}"
+
+    if not block:
+        # Background fire-and-forget
+        t = threading.Thread(
+            target=_run_daily_coaching_generation,
+            args=(date_str, ctx, fire_type, entry["job_id"]),
+            daemon=True,
+        )
+        t.start()
+        return entry
+
+    # Blocking path: just run inline
+    _run_daily_coaching_generation(date_str, ctx, fire_type, entry["job_id"])
+    return _daily_coaching_entry(date_str)
+
+
+def _run_daily_coaching_generation(date_str: str, ctx: dict, fire_type: str, job_id: str) -> None:
+    """Worker called by both blocking and async paths. Always updates the entry."""
+    try:
+        result = _generate_daily_narrative(ctx, fire_type)
+        with _DAILY_COACHING_LOCK:
+            e = daily_coaching_cache.get(date_str) or _daily_coaching_entry(date_str)
+            e["narrative"] = result.get("narrative") or ""
+            e["theme"] = result.get("theme") or ""
+            e["video_seed"] = result.get("video_seed") or ""
+            e["food_seed"] = result.get("food_seed") or ""
+            e["status"] = "ready" if e["narrative"] else "failed"
+            e["generated_at"] = now_iso()
+            e["error"] = None if e["narrative"] else "empty narrative"
+            daily_coaching_cache[date_str] = e
+    except Exception as e:
+        with _DAILY_COACHING_LOCK:
+            entry = daily_coaching_cache.get(date_str) or _daily_coaching_entry(date_str)
+            entry["status"] = "failed"
+            entry["error"] = f"{type(e).__name__}: {e}"
+            daily_coaching_cache[date_str] = entry
+
+
+def _daily_ctx_seed() -> str:
+    """Tiny helper used by food coach callers — returns today's theme tag
+    from the unified daily coaching cache, or '' if not yet generated.
+
+    Single source of truth so /api/scan_preview, /api/scan_correct, etc. all
+    see the same 今日主題 without each one re-deriving it.
+    """
+    try:
+        entry = daily_coaching_cache.get(today_iso())
+        if not entry:
+            return ""
+        return entry.get("theme") or entry.get("food_seed") or ""
+    except Exception:
+        return ""
+
+
 def _cheer_duration_s(text_len: int) -> float:
     """Empirical WanLung +0% rate ≈ 5.69 char/sec (measured 7/24).
     For Jim-targeted 150s voice, text_len target ≈ 855 chars.
@@ -8528,9 +8960,26 @@ def _generate_video_motivation(job_id: str, theme: str = "gym_push"):
 
     Updates VIDEO_JOBS[job_id] with status / step / path throughout.
     Always called via threading.Thread; never raises.
+
+    v3.3.8: appends the daily narrative's first sentence to the video prompt
+    so the on-screen action visually echoes the cheer voice's theme.
     """
     try:
-        prompt = VIDEO_PROMPTS.get(theme) or VIDEO_PROMPTS["gym_push"]
+        base_prompt = VIDEO_PROMPTS.get(theme) or VIDEO_PROMPTS["gym_push"]
+        # Inject daily narrative seed (first sentence) if available
+        try:
+            dc = daily_coaching_cache.get(today_iso()) or {}
+            seed = (dc.get("video_seed") or "").strip()
+        except Exception:
+            seed = ""
+        if seed and len(seed) > 5:
+            prompt = (
+                f"{base_prompt} "
+                f"Visual mood: {seed} "
+                f"The on-screen action should feel like a visual embodiment of this moment."
+            )
+        else:
+            prompt = base_prompt
         _video_job_set(job_id, status="running", step="submit", theme=theme, prompt=prompt[:120])
 
         api_key = _minimax_api_key()
@@ -8739,8 +9188,13 @@ def _background_cheer_job(job_id: str, fire_type: str):
         except Exception:
             metrics["workout_detail_zh"] = "(運動 detail 讀取失敗)"
 
-        # 2. Text
-        text = _synthesize_cheer_text(metrics, fire_type)
+        # 2. v3.3.8: Text — use unified daily coaching narrative (single LLM call
+        # shared with video + coach comment). Falls back to cheer-only call if
+        # the daily narrative is empty or in failed state. Reuses cached
+        # narrative if the day's context hasn't changed.
+        date_str = today_iso()
+        dc_entry = _get_or_make_daily_narrative(date_str, fire_type=fire_type, block=True)
+        text = dc_entry.get("narrative") or _synthesize_cheer_text(metrics, fire_type)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({"step": "voice_gen", "step_at": now_iso(), "text": text})
 
@@ -9000,22 +9454,37 @@ def api_cheer_status():
 # ---------------------------------------------------------------------------
 @app.route("/api/video_motivation", methods=["POST"])
 def api_video_motivation_trigger():
-    """Submit a video-01 generation job. Returns job_id immediately."""
+    """Submit a video-01 generation job. Returns job_id immediately.
+
+    v3.3.8: if `theme` is "auto" (or omitted), derive the best theme from the
+    daily coaching context (time of day + recovery + last gym). The video
+    prompt also gets the daily narrative's first sentence injected as a
+    visual seed so the coach in the video references the same theme the
+    cheer voice just narrated.
+    """
     data = request.get_json(silent=True) or {}
-    theme = (data.get("theme") or "gym_push").strip()
-    if theme not in VIDEO_PROMPTS:
-        return jsonify({"ok": False, "error": f"unknown theme '{theme}'", "valid_themes": list(VIDEO_PROMPTS.keys())}), 400
+    requested = (data.get("theme") or "auto").strip()
+    if requested == "auto":
+        ctx = _build_daily_context()
+        theme = _pick_video_theme(ctx)
+        auto_picked = True
+    elif requested in VIDEO_PROMPTS:
+        theme = requested
+        auto_picked = False
+    else:
+        return jsonify({"ok": False, "error": f"unknown theme '{requested}'", "valid_themes": list(VIDEO_PROMPTS.keys()) + ["auto"]}), 400
     job_id = f"video_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     with VIDEO_JOBS_LOCK:
         VIDEO_JOBS[job_id] = {
             "status": "queued",
             "step": "queued",
             "theme": theme,
+            "auto_picked": auto_picked,
             "started_at": now_iso(),
         }
     t = threading.Thread(target=_generate_video_motivation, args=(job_id, theme), daemon=True)
     t.start()
-    return jsonify({"ok": True, "job_id": job_id, "theme": theme, "status": "queued"})
+    return jsonify({"ok": True, "job_id": job_id, "theme": theme, "auto_picked": auto_picked, "status": "queued"})
 
 
 @app.route("/api/video_motivation/status", methods=["GET"])
@@ -9093,6 +9562,75 @@ def api_cheer_recent():
                 fire["image_path"] = ""
                 fire["has_image"] = False
     return jsonify({"fires": recent, "total": len(log)})
+
+
+# v3.3.8: Unified daily coaching endpoint.
+# GET  /api/daily_coaching        — returns current day's narrative (or 'generating' 202)
+# POST /api/daily_coaching/refresh — force-regenerate (used by cheer tab refresh btn)
+@app.route("/api/daily_coaching", methods=["GET"])
+def api_daily_coaching_get():
+    """Return today's unified daily narrative.
+
+    Query params:
+        wait=true   — block up to 25s for the first generation
+        fire_type=  — pass-through to the narrative prompt
+    """
+    wait = request.args.get("wait", "false").lower() == "true"
+    fire_type = request.args.get("fire_type", "manual")
+    date_str = today_iso()
+    entry = _daily_coaching_entry(date_str)
+    # If ready and hash matches current context, return it.
+    ctx = _build_daily_context()
+    new_hash = _context_hash(ctx)
+    if entry.get("status") == "ready" and entry.get("context_hash") == new_hash and entry.get("narrative"):
+        return jsonify({
+            "status": "ready",
+            "date": date_str,
+            "narrative": entry["narrative"],
+            "theme": entry.get("theme"),
+            "video_seed": entry.get("video_seed"),
+            "food_seed": entry.get("food_seed"),
+            "generated_at": entry.get("generated_at"),
+        })
+    # Need to generate. If wait=true, do it blocking. Otherwise return 202.
+    if wait:
+        entry = _get_or_make_daily_narrative(date_str, fire_type=fire_type, block=True)
+        return jsonify({
+            "status": entry.get("status", "ready"),
+            "date": date_str,
+            "narrative": entry.get("narrative") or "",
+            "theme": entry.get("theme"),
+            "video_seed": entry.get("video_seed"),
+            "food_seed": entry.get("food_seed"),
+            "generated_at": entry.get("generated_at"),
+            "job_id": entry.get("job_id"),
+        })
+    # Fire-and-forget background generation
+    _get_or_make_daily_narrative(date_str, fire_type=fire_type, block=False)
+    return jsonify({
+        "status": "generating",
+        "date": date_str,
+        "job_id": entry.get("job_id"),
+    }), 202
+
+
+@app.route("/api/daily_coaching/refresh", methods=["POST"])
+def api_daily_coaching_refresh():
+    """Force-regenerate today's narrative. Bypasses cache."""
+    data = request.get_json(silent=True) or {}
+    fire_type = data.get("fire_type", "manual")
+    date_str = today_iso()
+    _invalidate_daily_coaching(date_str)
+    entry = _get_or_make_daily_narrative(date_str, fire_type=fire_type, block=True)
+    return jsonify({
+        "status": entry.get("status", "ready"),
+        "date": date_str,
+        "narrative": entry.get("narrative") or "",
+        "theme": entry.get("theme"),
+        "video_seed": entry.get("video_seed"),
+        "food_seed": entry.get("food_seed"),
+        "generated_at": entry.get("generated_at"),
+    })
 
 
 # ---------- v3.2.7.49 (Jim 2026-08-20): Music workflow removed ----------
