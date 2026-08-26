@@ -11,6 +11,7 @@ PWA: installable, wake-lock enabled
 import base64
 import json
 import os
+import random
 import re
 import secrets
 import urllib.request
@@ -3857,9 +3858,28 @@ def _coach_comment_keyword(dish_name: str, calories: float, protein: float, carb
         rank = max(rank, grade_order[pre_grade])
     final_grade = {v: k for k, v in grade_order.items()}[rank]
 
-    # Comment
+    # Comment — v3.3.13: macro-specific phrasing. The old single phrase
+    # "整體均衡，可以接受。" fired for every grade-unchanged meal (Jim OOB
+    # 2026-08-26 "整體均衡 too generic"). Now branch on macro profile so
+    # each scan carries a concrete observation; only the genuinely-balanced
+    # fall-through uses the classic line, and even there we vary wording.
     if final_grade == pre_grade:
-        pre_comment = "整體均衡，可以接受。"
+        if protein_pct >= 20 and fat_pct <= 30:
+            pre_comment = f"蛋白質 {protein_pct:.0f}% 夠，脂肪 {fat_pct:.0f}% 適中。"
+        elif fat_pct >= 40:
+            pre_comment = f"脂肪佔 {fat_pct:.0f}% 卡路里，少油版本會更好。"
+        elif protein_pct < 15:
+            pre_comment = f"蛋白質只佔 {protein_pct:.0f}%，加蛋/雞胸平衡更好。"
+        elif carb_pct >= 60:
+            pre_comment = f"碳水佔 {carb_pct:.0f}% 為主，飯量可減 1/3。"
+        elif calories <= 200:
+            pre_comment = f"份量輕 ({calories:.0f} kcal)，snack 級。"
+        else:
+            pre_comment = random.choice([
+                "整體均衡，可以接受。",
+                "比例適中，可以。",
+                "組合 OK，唔差。",
+            ])
     elif final_rank > grade_order[pre_grade]:
         pre_comment = f"蛋白質 {protein_pct:.0f}%，脂肪 {fat_pct:.0f}%，比例好。"
     else:
