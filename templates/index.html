@@ -518,32 +518,23 @@
     <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
     <section x-show="isTabVisible('scan')" x-cloak class="px-4 pb-32 pt-3">
       <div class="text-[10px] uppercase tracking-[0.2em] text-emerald-400 mb-2 text-center font-bold">掃描食物 / 餐單</div>
-      <div class="text-xs text-gray-400 text-center mb-4">影相 → 自動記錄卡路里、蛋白質、餐廳</div>
 
       <!-- v2.3: two file inputs — (1) live camera + (2) iPhone photo stream picker (multiple) -->
       <input type="file" accept="image/*" capture="environment" @change="onScanFile($event)" x-ref="scanInputEl" style="display:none">
       <input type="file" accept="image/*" multiple @change="onScanPhotosPicked($event)" x-ref="scanPhotosInputEl" style="display:none">
 
-      <!-- v2.7.36 → v2.7.54: Photo action buttons (camera + photo stream) —
+      <!-- v2.7.36 → v2.7.54 → v3.3.14: Photo action buttons (camera + photo stream) —
            both on one line, small chips, half-width each.
            (Jim OOB 2026-08-07 14:35 HKT 'for the two photo action button.
            make one line. small button.')
            Prior v2.7.36 was: large primary (full-width 64px) + small chip
            (full-width 48px) stacked. New: both equal-weight, 1 line, ~44px,
            icon + 3-4 char label, half-width each. Text-direct input
-           moved to inline mode (openScanTextInput via purple chip). -->
+           moved to inline mode (openScanTextInput via purple chip).
+           v3.3.14: photo-stream (📷 相簿) now left, camera (📸 影相) right —
+           Jim prefers picking from existing photos first. -->
       <div class="grid grid-cols-2 gap-2 mb-3">
-        <!-- Live camera (left) -->
-        <button @click="$refs.scanInputEl.click()"
-                :disabled="scanUploading"
-                class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                style="background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)); border: 1px solid rgba(16,185,129,0.45);">
-          <div class="flex items-center justify-center gap-1.5">
-            <div class="text-lg" x-text="scanUploading ? '⏳' : '📸'"></div>
-            <div class="text-[11px] font-bold text-emerald-300" x-text="scanUploading ? '影緊…' : '影相'"></div>
-          </div>
-        </button>
-        <!-- iPhone photo stream picker (right) -->
+        <!-- iPhone photo stream picker (left) -->
         <button @click="$refs.scanPhotosInputEl.click()"
                 :disabled="scanUploading || scanPhotosQueue.length > 0"
                 class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -551,6 +542,16 @@
           <div class="flex items-center justify-center gap-1.5">
             <div class="text-lg">📷</div>
             <div class="text-[11px] font-bold text-emerald-300">相簿多選</div>
+          </div>
+        </button>
+        <!-- Live camera (right) -->
+        <button @click="$refs.scanInputEl.click()"
+                :disabled="scanUploading"
+                class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                style="background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)); border: 1px solid rgba(16,185,129,0.45);">
+          <div class="flex items-center justify-center gap-1.5">
+            <div class="text-lg" x-text="scanUploading ? '⏳' : '📸'"></div>
+            <div class="text-[11px] font-bold text-emerald-300" x-text="scanUploading ? '影緊…' : '影相'"></div>
           </div>
         </button>
       </div>
