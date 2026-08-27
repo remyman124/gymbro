@@ -738,7 +738,7 @@ WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.5"
+__version__ = "3.3.6"
 
 
 def _recovery_pct():
@@ -7536,6 +7536,266 @@ EN_TO_ZH_VOICE = {
     "activity log": "活動記錄", "log": "記錄",
 }
 
+def _strip_voice_slash_symbols(s: str) -> str:
+    """v3.3.6 (NEW 2026-08-27, Jim OOB 「Never use slash in voice. Spell out
+    the date if applicable」): strip slash / symbol characters that Edge-TTS
+    WanLung reads literally as 「slash」 / 「斜線」 / 「冒號」, producing
+    robotic gibberish in voice bubbles.
+
+    Rule 74 (text-coach-summary-voice skill). MUST run BEFORE
+    _humanize_for_voice() and _voice_zh_replace() so slash-broken tokens
+    never reach the TTS engine.
+
+    Transformations (chat/text replies unaffected — voice output only):
+      - 8/27             → 八月二十七號
+      - 2026/08/27       → 二零二六年八月二十七號
+      - 7/4              → 七月四號
+      - 3:30 PM          → 下午三點半
+      - 9:00 AM          → 上午九點
+      - 21:30            → 晚上九點半
+      - 25kg             → 二十五公斤
+      - 500ml            → 五百毫升
+      - 2.5km            → 兩點五公里
+      - 38°C             → 三十八度
+      - 70% (round tens) → 七成 (NOT 百分之七十 — too verbose)
+      - 65% (non-round)  → 百分之六十五
+      - 100-120          → 一百到一百二十
+      - slash separator  → 同 / 加 (Cantonese)
+      - 81% 🟢  (emoji after %) → 81% preserved before percent rule runs
+    """
+    import re as _re_slash
+
+    if not s:
+        return s
+
+    # 1. Date with slash: 2026/08/27 or 8/27 or 08/27 (year optional).
+    # IMPORTANT: only treat as date if it looks like a real date context.
+    # We rely on a CONSERVATIVE heuristic — the slash-separated digits must
+    # be plausible as month/day (1-31), AND the surrounding context must
+    # look date-y. Otherwise patterns like "50/10" or "3/4 mile" become
+    # garbled "三月四號"/"五十月十號". The fallback (rule 6 below) catches
+    # " / " (with spaces) as a separator.
+    def _md_date(m):
+        mo, d = int(m.group(1)), int(m.group(2))
+        return f"{_zh_month(mo)}月{_zh_day(d)}號"
+
+    # 1a. Year-first full date: 2026/08/27 — unambiguous, always replace
+    def _year_date(m):
+        y, mo, d = m.group(1), int(m.group(2)), int(m.group(3))
+        year_zh = {
+            "2024": "二零二四", "2025": "二零二五", "2026": "二零二六",
+            "2027": "二零二七", "2028": "二零二八", "2029": "二零二九",
+            "2030": "二零三零",
+        }.get(y, y) + "年"
+        return f"{year_zh}{_zh_month(mo)}月{_zh_day(d)}號"
+
+    s = _re_slash.sub(r"\b(20\d{2})/(\d{1,2})/(\d{1,2})\b", _year_date, s)
+
+    # 1b. M/D date WITHOUT year — ONLY convert if BOTH numbers are in valid
+    # date range (1-12 for month, 1-31 for day). Anything else (e.g. 50/10
+    # reps, 3/4 fraction, 100/200 ratio) is left untouched. Negative lookbehind
+    # for digit prevents "2026/08/27" sub-match; negative lookahead prevents
+    # "/something" with denominator >31 from matching.
+    def _md_strict(m):
+        mo, d = int(m.group(1)), int(m.group(2))
+        # Must be plausible date
+        if not (1 <= mo <= 12 and 1 <= d <= 31):
+            return m.group(0)  # leave unchanged
+        return f"{_zh_month(mo)}月{_zh_day(d)}號"
+
+    s = _re_slash.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d|/)", _md_strict, s)
+
+    # 2. Dash-separated date: 07-25 → 七月二十五號
+    s = _re_slash.sub(r"(?<!\d)(\d{1,2})-(\d{1,2})(?!\d)", _md_date, s)
+
+    # 3. Time with colon: 3:30 PM / 9:00 / 21:30
+    def _time_replace(m):
+        h = int(m.group(1))
+        mins = int(m.group(2))
+        ap = (m.group(3) or "").upper().replace(" ", "")
+        # AM/PM aware
+        if ap == "AM":
+            if h == 12:
+                hour_zh = "凌晨十二點"
+            else:
+                hour_zh = f"上午{_zh_hour(h)}點"
+        elif ap == "PM":
+            if h == 12:
+                hour_zh = "中午十二點"
+            else:
+                hour_zh = f"下午{_zh_hour(h)}點"
+        else:
+            # 24-hour format
+            if h == 0:
+                hour_zh = "凌晨十二點"
+            elif h < 12:
+                hour_zh = f"上午{_zh_hour(h)}點"
+            elif h == 12:
+                hour_zh = "中午十二點"
+            elif h < 18:
+                hour_zh = f"下午{_zh_hour(h - 12)}點"
+            else:
+                hour_zh = f"晚上{_zh_hour(h - 12)}點"
+        if mins == 0:
+            return hour_zh
+        elif mins == 30:
+            return hour_zh.rstrip("點") + "點半"
+        elif mins == 15:
+            return hour_zh.rstrip("點") + "點一刻"
+        elif mins == 45:
+            return hour_zh.rstrip("點") + "點三刻"
+        else:
+            return hour_zh.rstrip("點") + f"點{_zh_minute(mins)}分"
+
+    s = _re_slash.sub(
+        r"(?<!\d)(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\b",
+        _time_replace, s
+    )
+
+    # 4. Units with letters: 25kg, 500ml, 2.5km, 38°C, 100g, 65bpm
+    def _unit_replace(m):
+        num = float(m.group(1))
+        unit = m.group(2)
+        # Number → spoken Chinese (with decimal support)
+        if num == int(num):
+            num_zh = _zh_number(int(num))
+        else:
+            whole, frac = str(num).split(".")
+            num_zh = f"{_zh_number(int(whole))}點{_zh_digit(int(frac))}"
+        unit_zh = {
+            "kg": "公斤", "g": "克", "ml": "毫升", "l": "公升",
+            "km": "公里", "m": "米", "cm": "厘米", "mm": "毫米",
+            "bpm": "下心率", "mg": "毫克", "dl": "分升",
+            "°C": "度", "°F": "度", "cal": "卡路里", "kcal": "千卡",
+        }.get(unit, unit)
+        return f"{num_zh}{unit_zh}"
+
+    # Order matters: kg before g, km before m, °C before C
+    s = _re_slash.sub(
+        r"(\d+\.?\d*)\s*(kg|km|ml|cm|mm|mg|dl|°C|°F|kcal|cal|bpm)\b",
+        _unit_replace, s, flags=_re_slash.IGNORECASE
+    )
+    # Bare g/l — risk of false positive (e.g. "3 g 糖"), only do if preceded
+    # by space + digit; skip standalone single-letter matches to avoid breaking
+    # Chinese 「g」 or English words
+    s = _re_slash.sub(r"(\d+\.?\d*)\s*(g|l)\b(?![A-Za-z])", _unit_replace, s)
+
+    # 4b. AFTER unit replacement, re-run dash range so "100-120 bpm" → after
+    # bpm rule the trailing "100-" might be stranded. Re-run dash pattern on
+    # whatever survived.
+    s = _re_slash.sub(
+        r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)",
+        lambda m: f"{_zh_number_str(m.group(1))}到{_zh_number_str(m.group(2))}",
+        s
+    )
+
+    # 5. Percentage: 70% / 65.5% — round tens use 成, others use 百分之
+    def _pct_replace(m):
+        num = float(m.group(1))
+        if num == int(num) and num % 10 == 0 and 10 <= num <= 90:
+            return _zh_number(int(num // 10)) + "成"
+        elif num == int(num):
+            return "百分之" + _zh_number(int(num))
+        else:
+            whole, frac = str(num).split(".")
+            return f"百分之{_zh_number(int(whole))}點{_zh_digit(int(frac))}"
+
+    s = _re_slash.sub(r"(\d+\.?\d*)\s*%", _pct_replace, s)
+
+    # 6. Standalone slash separator with spaces: "weight / reps" → "weight 同 reps"
+    s = _re_slash.sub(r"\s+/\s+", " 同 ", s)
+    # Bare slash in date context already handled above; remaining slashes in
+    # patterns like "週一/二" leave alone (rare, WanLung handles short slashes OK)
+
+    # 7. Final dash range pass — catches any "N-M" pairs that survived earlier
+    # rules (e.g. standalone numbers without units). Already done at 4b after
+    # unit pass; this catches pre-/post-percent contexts like "100-120".
+    s = _re_slash.sub(
+        r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)",
+        lambda m: f"{_zh_number_str(m.group(1))}到{_zh_number_str(m.group(2))}",
+        s
+    )
+
+    return s
+
+
+def _zh_number(n: int) -> str:
+    """Convert integer 0-9999 to spoken Cantonese-friendly Chinese.
+    Edge-TTS WanLung reads 一/二/三/.../九 + 十/百/千 naturally."""
+    if n == 0:
+        return "零"
+    if n < 0:
+        return "負" + _zh_number(-n)
+    digits = "零一二三四五六七八九"
+    if n < 10:
+        return digits[n]
+    if n < 20:
+        return "十" + (digits[n - 10] if n > 10 else "")
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return digits[tens] + "十" + (digits[ones] if ones else "")
+    if n < 1000:
+        hundreds, rem = divmod(n, 100)
+        result = digits[hundreds] + "百"
+        if rem == 0:
+            return result
+        elif rem < 10:
+            return result + "零" + digits[rem]
+        elif rem < 20:
+            return result + "一十" + (digits[rem - 10] if rem > 10 else "")
+        else:
+            tens, ones = divmod(rem, 10)
+            return result + digits[tens] + "十" + (digits[ones] if ones else "")
+    if n < 10000:
+        thousands, rem = divmod(n, 1000)
+        result = digits[thousands] + "千"
+        if rem == 0:
+            return result
+        elif rem < 100:
+            return result + "零" + _zh_number(rem)
+        else:
+            return result + _zh_number(rem)
+    return str(n)  # 萬+ fall back to digits
+
+
+def _zh_digit(n: int) -> str:
+    """Single digit 0-9 → Chinese digit character."""
+    return "零一二三四五六七八九"[n]
+
+
+def _zh_hour(h: int) -> str:
+    """Hour 1-12 → Chinese (just the number, caller wraps in 上午/下午/晚上)."""
+    return _zh_number(h)
+
+
+def _zh_minute(m: int) -> str:
+    """Minute 1-59 → spoken Chinese. 0 handled by caller."""
+    if m < 10:
+        return "零" + _zh_digit(m)
+    return _zh_number(m)
+
+
+def _zh_month(mo: int) -> str:
+    """Month 1-12 → Chinese spoken (e.g. 8 → 八, 11 → 十一)."""
+    return _zh_number(mo)
+
+
+def _zh_day(d: int) -> str:
+    """Day 1-31 → Chinese spoken. 20+ uses 二十X (no 零)."""
+    if d < 20:
+        return _zh_number(d)
+    tens, ones = divmod(d, 10)
+    return "二十" + (_zh_digit(ones) if ones else "")
+
+
+def _zh_number_str(s: str) -> str:
+    """Convert numeric string (possibly with decimal) to spoken Chinese."""
+    if "." in s:
+        whole, frac = s.split(".")
+        return f"{_zh_number(int(whole))}點{_zh_digit(int(frac))}"
+    return _zh_number(int(s))
+
+
 def _humanize_for_voice(s: str) -> str:
     """v3.2.7.42: HARD guardrail — make cheer text human-friendly for voice.
 
@@ -8891,11 +9151,18 @@ def _synthesize_cheer_voice(text: str) -> str:
     Returns file path or '' on failure.
     """
     try:
-        # Step 0: humanize guardrail (v3.2.7.41 — Jim OOB 2026-08-12 01:15 HKT
+        # Step 0a (v3.3.6 NEW 2026-08-27, Jim OOB 「Never use slash in voice.
+        # Spell out the date if applicable」): strip slash + symbol characters
+        # (dates with /, times with :, units kg/g/ml/°C, % percentages, dash
+        # ranges) BEFORE humanize/zh-replace so TTS WanLung reads 「八月二十七號」
+        # not 「八 slash 二十七」. Rule 74 in text-coach-summary-voice.
+        voice_text = _strip_voice_slash_symbols(text)
+
+        # Step 0b: humanize guardrail (v3.2.7.41 — Jim OOB 2026-08-12 01:15 HKT
         # 「voice is so mechanical, so many non-narrative words at the
         # beginning」). Strip URL + metadata + bad openers BEFORE zh-replace
         # so the TTS never sees gibberish like 「H-T-T-P-S 冒號 斜線」.
-        voice_text = _humanize_for_voice(text)
+        voice_text = _humanize_for_voice(voice_text)
         try:
             with open("/tmp/cheer_voice_debug.log", "a") as _f:
                 _f.write(f"{now_iso()} | text_in={len(text)} chars | after_humanize={len(voice_text)}\n")
@@ -9031,17 +9298,23 @@ def _generate_cheer_image(context: str = "manual") -> str:
     api_key = _minimax_api_key()
     if not api_key:
         return ""
+    # v3.3.6 (NEW 2026-08-27, Jim OOB「don't use white girl, use the female
+    # character in gymbro and be more sexy」): same Jennie identity as video
+    # themes, with sensual-but-tasteful pose language (sweat sheen, confident
+    # gaze, motivational-but-flirty energy).
     prompt = (
         "Ultra wide 16:9 cinematic photograph, modern bright gym interior with motivational atmosphere. "
         "Two Asian fitness coaches side by side, dynamic duo composition. "
         "LEFT: athletic Asian male coach, age 30, bright yellow tank top, Spanish/Portuguese features, "
         "athletic muscular body, friendly warm smile. "
-        "RIGHT: young Asian female fitness coach, age 22, Blackpink Jennie style — jet black long hair, "
-        "sharp cat-eye makeup, fair skin, slim elegant build, cropped pink sports bra, high-waist black leggings, "
+        "RIGHT: young Asian female fitness coach, age 22, Blackpink Jennie style — jet black long hair with middle part, "
+        "sharp cat-eye makeup, fair porcelain skin with sweat sheen on collarbones, slim elegant toned build, "
+        "wearing a cropped pink sports bra showing midriff and high-waist black leggings, "
         "holding pink protein shaker in left hand, making peace sign with right hand, "
-        "confident idol pose with subtle smile. "
-        "Both looking at camera, motivational energy, photorealistic portrait photography, sharp focus, "
-        "professional fitness editorial look, golden hour lighting."
+        "confident idol pose with subtle seductive smile and smoldering eye contact with camera, "
+        "shoulders slightly back to emphasize posture. "
+        "Both looking at camera, motivational sensual energy, photorealistic portrait photography, sharp focus, "
+        "professional fitness editorial look, golden hour lighting streaming from the side."
     )
     try:
         payload = {
@@ -9107,32 +9380,45 @@ VIDEO_JOBS = {}
 VIDEO_JOBS_LOCK = threading.Lock()
 
 VIDEO_PROMPTS = {
+    # v3.3.6 (NEW 2026-08-27, Jim OOB「don't use white girl, use the female
+    # character in gymbro and be more sexy」): replace all 3 themes with
+    # gymbro's Blackpink Jennie character — jet black hair, cat-eye makeup,
+    # slim build, cropped pink sports bra. Same identity as cheer image
+    # prompt (line 9306) so video + image are visually consistent.
     "gym_push": (
-        "Cinematic 4K video of a confident young white female fitness coach in her early 20s, "
-        "fair porcelain skin, light blue eyes, dirty blonde hair pulled back in a high ponytail, "
-        "bright coral sports bra and black leggings, "
+        "Cinematic 4K video of a confident young Asian female fitness coach, age 22, "
+        "Blackpink Jennie aesthetic — jet black long hair with middle part, "
+        "sharp cat-eye makeup, fair porcelain skin, slim athletic build, "
+        "wearing a cropped pink sports bra and high-waist black leggings, "
         "performing a heavy barbell back squat in a modern bright gym, "
-        "explosive upward push, intense focus, golden hour side light streaming "
-        "through windows, sweat droplets catching the light, slow motion on "
-        "standing up, deep breath before the next rep, peak intensity moment, "
-        "motivational atmosphere, 6 seconds."
+        "explosive upward push, intense confident gaze toward camera, "
+        "sweat droplets on collarbones and shoulders catching golden hour light, "
+        "slow motion on standing up, deep breath before next rep, "
+        "subtle seductive smile at camera on the lockout, "
+        "motivational sensual energy, 6 seconds."
     ),
     "morning_stretch": (
-        "Cinematic 4K video of an athletic young white female in her early 20s, "
-        "fair porcelain skin, light blue eyes, dirty blonde hair flowing in the breeze, "
+        "Cinematic 4K video of an athletic young Asian female, age 22, "
+        "Blackpink Jennie aesthetic — jet black long hair flowing in the breeze, "
+        "sharp cat-eye makeup, fair porcelain skin, slim toned physique, "
+        "wearing a lacy black sports bra and high-waist black leggings, "
         "doing morning sun salutation yoga on a Hong Kong rooftop at sunrise, "
-        "Victoria Harbour skyline background, deep exhale, slow stretch, "
-        "golden light wrapping around her silhouette, "
-        "calm focused expression, motivational serenity, 6 seconds."
+        "Victoria Harbour skyline background, deep exhale, slow stretch "
+        "with hips subtly arched, golden light wrapping around her silhouette, "
+        "confident smoldering expression looking at camera, "
+        "motivational sensual serenity, 6 seconds."
     ),
     "finish_line": (
-        "Cinematic 4K video of a determined young white female athlete in her early 20s, "
-        "fair porcelain skin, light blue eyes, dirty blonde ponytail, "
+        "Cinematic 4K video of a determined young Asian female athlete, age 22, "
+        "Blackpink Jennie aesthetic — jet black ponytail with middle part, "
+        "sharp cat-eye makeup, fair porcelain skin with sweat sheen, slim athletic build, "
+        "wearing a cropped pink sports bra and high-waist black leggings, "
         "running through a rain-soaked Hong Kong street at dawn, "
-        "neon reflections on wet asphalt, pushing through the final stretch, "
-        "breath visible in cool air, determination in her eyes, "
+        "neon reflections on wet asphalt, water droplets on shoulders and arms, "
+        "pushing through the final stretch, breath visible in cool air, "
         "slow motion on crossing an invisible finish line, "
-        "motivational peak moment, 6 seconds."
+        "turning to camera with confident seductive smile, "
+        "motivational sensual peak moment, 6 seconds."
     ),
 }
 
@@ -10084,7 +10370,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v138';
+const CACHE = 'gym-web-v139';
 // SW v64 → v137 changelog (compressed)
 // v137 (Jim OOB 2026-08-12 23:18 HKT): /api/* 改 network-first，唔再 cache API responses。
 //   修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug (例如 燒烤牛肉片10片 deep-search correction)。
