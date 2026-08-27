@@ -31,6 +31,7 @@ from flask import Flask, jsonify, request, render_template_string, send_from_dir
 from workout_formatter import render as _render_text
 from dotenv import load_dotenv
 from gym_web.core import safe_read_json as _safe_read_json
+from gym_web.core import safe_write_json as _safe_write_json
 from gym_web.idempotency import check_and_remember as _idempotency_check
 from gym_web.cache import NutritionCache, NutritionRow, get_cache, get_cache as _get_nutrition_cache
 from gym_web import image_proxy
@@ -7910,7 +7911,12 @@ def _humanize_for_voice(s: str) -> str:
     # the first sentence entirely and start from sentence 2. Cantonese voice
     # must open with Chinese words, no English/numbers/markdown at all.
     sentences = re.split(r"(?<=[。！？\n])", s, maxsplit=3)
-    if sentences and len(sentences[0]) < 200:
+    # Only run the opener audit when the text actually has Chinese sentence
+    # breaks (。！？\n). For single-sentence inputs (typical of voice-reply
+    # templates), `sentences == [s]` — dropping the first "sentence" would
+    # delete the entire reply. Skip in that scenario. The cheer pipeline feeds
+    # multi-sentence paragraphs, where this audit still fires.
+    if len(sentences) > 1 and sentences and len(sentences[0]) < 200:
         first = sentences[0]
         # Strip leading whitespace
         first = first.strip()
@@ -10147,6 +10153,605 @@ def api_cheer_recent():
                 fire["image_path"] = ""
                 fire["has_image"] = False
     return jsonify({"fires": recent, "total": len(log)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3.3.7 (NEW 2026-08-27): Multi-turn voice conversation endpoints
+#
+# Three routes:
+#   POST /api/voice/session        — create session, snapshot server context
+#   POST /api/voice/turn           — workhorse: classify intent, execute,
+#                                    render voice-ready reply (Rule 74 applied)
+#   POST /api/voice/session/end    — close session explicitly
+#
+# Design notes:
+# - Server-side intent classification (was previously on iOS client).
+#   Server has full context (today's meals, Whoop, Withings, last cheer)
+#   so the reply is grounded in real data.
+# - Every reply runs through _strip_voice_slash_symbols (Rule 74) so the
+#   text is voice-safe for Edge-TTS WanLung — iOS just hands the
+#   reply_text to AVSpeechSynthesizer.
+# - Multi-turn context: each session carries `last_intent` + `last_data`
+#   so follow-ups like "仲有呢?" after a query_nutrition turn surface
+#   the next macro without re-querying.
+# - Persistence: single index file at /home/work/.gymbro_voice_index.json
+#   matching the JIM_CONTEXT pattern (safe_read_json + safe_write_json).
+#   Pruned on every turn: drop sessions > 24h old.
+# - Active session reuse: if iOS sends a turn without session_id AND a
+#   recent active session exists (< 5 min idle), server reuses it.
+#   Otherwise creates a new one. Explicit session_id always wins.
+# ─────────────────────────────────────────────────────────────────────────────
+
+VOICE_INDEX_PATH = Path("/home/work/.gymbro_voice_index.json")
+VOICE_SESSION_IDLE_MINUTES = 5
+VOICE_SESSION_TTL_HOURS = 24
+VOICE_UNKNOWN_LOG_PATH = Path("/home/work/.gymbro_voice_unknown.jsonl")
+
+
+def _voice_now_iso() -> str:
+    return datetime.now(timezone(timedelta(hours=8))).isoformat()
+
+
+def _voice_new_session_id() -> str:
+    """vs_YYYYMMDD_HHMMSS_xxxxxxxx — sortable + unique."""
+    import secrets
+    hkt = datetime.now(timezone(timedelta(hours=8)))
+    return f"vs_{hkt.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
+
+
+def _voice_load_index() -> dict:
+    """Load the full session index. Never raises; returns {} on miss/corrupt."""
+    return _safe_read_json(VOICE_INDEX_PATH, {}) or {}
+
+
+def _voice_save_index(idx: dict) -> bool:
+    return _safe_write_json(VOICE_INDEX_PATH, idx)
+
+
+def _voice_prune_stale(idx: dict) -> dict:
+    """Drop sessions older than VOICE_SESSION_TTL_HOURS. Returns pruned dict."""
+    if not idx:
+        return idx
+    from datetime import datetime as _dt
+    cutoff = _dt.now(timezone(timedelta(hours=8)))
+    keep = {}
+    for sid, s in idx.items():
+        try:
+            last_active = _dt.fromisoformat(s.get("last_active_at", ""))
+            if (cutoff - last_active).total_seconds() < VOICE_SESSION_TTL_HOURS * 3600:
+                keep[sid] = s
+        except Exception:
+            continue
+    return keep
+
+
+def _voice_snapshot_context() -> dict:
+    """Best-effort snapshot of "where Jim is right now" for session start."""
+    snap = {"today": today_iso(), "snapshot_at": _voice_now_iso()}
+    # Today's nutrition (Sheet-backed via _load_today_nutrition)
+    try:
+        n = _load_today_nutrition()
+        if n and isinstance(n, dict):
+            t = n.get("totals") or {}
+            snap["today_calories"] = t.get("calories")
+            snap["today_protein"] = t.get("protein")
+            snap["today_carbs"] = t.get("carbs")
+            snap["today_fat"] = t.get("fat")
+            snap["meal_count"] = n.get("meal_count")
+    except Exception:
+        pass
+    # Health overlay (recovery, weight, steps)
+    try:
+        snap["recovery_pct"] = _recovery_pct()
+        snap["weight_kg"] = _withings_weight()
+        steps = _withings_steps_today() or {}
+        snap["steps_today"] = steps.get("steps")
+    except Exception:
+        pass
+    # Last cheer MP3 path (if any)
+    try:
+        cheer_log = _load_cheer_log() or []
+        if cheer_log:
+            last = cheer_log[-1]
+            snap["last_cheer_url"] = last.get("voice_url") or last.get("audio_url")
+    except Exception:
+        pass
+    return snap
+
+
+def _voice_classify_intent(transcript: str, prior_intent: str | None) -> tuple[str, dict]:
+    """Return (intent_name, parsed_args). Server-side port of iOS VoiceIntentRouter.
+
+    Keyword coverage is intentionally small — unknown turns are logged so
+    Jim can grow the keyword set over time (Risks #1 in the plan).
+    """
+    t = (transcript or "").strip().lower()
+    if not t:
+        return ("unknown", {"reason": "empty"})
+
+    # end_session wins over everything if the user is closing out
+    if any(k in t for k in ("stop", "拜拜", "結束", "end session", "that's it", "done")):
+        return ("end_session", {})
+
+    # Multi-turn follow-up phrases: only meaningful if the prior turn was a
+    # query we can extend. Match these BEFORE the broad keyword scan so they
+    # don't get shadowed by accident.
+    followup_phrases = ("仲有呢", "仲有冇", "more", "and?", "再嚟", "繼續", "點")
+    if any(k in t for k in followup_phrases) and prior_intent in (
+        "query_nutrition", "query_health", "log_meal", "trigger_cheer",
+    ):
+        # Map prior intent to follow-up intent
+        followup_map = {
+            "query_nutrition": "query_nutrition_followup",
+            "query_health": "query_health_followup",
+            "log_meal": "log_meal_followup",
+            "trigger_cheer": "trigger_cheer_followup",
+        }
+        return (followup_map[prior_intent], {})
+
+    # log_meal — strip common prefixes and pass remainder to scan_preview_text
+    log_prefixes = ("log ", "食咗 ", "記低 ", "record ", "剛剛食咗 ", "啱啱食咗 ")
+    for p in log_prefixes:
+        if t.startswith(p):
+            payload = (transcript[len(p):]).strip()
+            return ("log_meal", {"text": payload})
+
+    # log_set — bench/squat/deadlift + numbers + kg
+    import re as _re_set
+    if _re_set.search(r"\b(bench|squat|deadlift|press|row|pulldown|fly|curl|extension|raise)\b", t):
+        m_kg = _re_set.search(r"(\d+(?:\.\d+)?)\s*(?:kg|kilo)", t)
+        m_reps = _re_set.search(r"(\d+)\s*(?:reps?|下|次)", t)
+        m_set = _re_set.search(r"第\s*(\d+)\s*set", t)
+        m_ex = _re_set.search(r"\b(bench|squat|deadlift|press|row|pulldown|fly|curl|extension|raise)\b", t)
+        if m_kg and m_reps:
+            return ("log_set", {
+                "exercise": (m_ex.group(1) if m_ex else "bench press").title(),
+                "weight_kg": float(m_kg.group(1)),
+                "reps": int(m_reps.group(1)),
+                "set": int(m_set.group(1)) if m_set else 1,
+            })
+
+    # query_nutrition
+    if any(k in t for k in ("食咗幾多", "卡路里", "calorie", "calories", "protein", "蛋白")):
+        # multi-turn: if prior was query_nutrition and transcript is short,
+        # treat as follow-up asking for next macro
+        if prior_intent == "query_nutrition" and len(t) <= 8:
+            return ("query_nutrition_followup", {})
+        return ("query_nutrition", {})
+
+    # query_health
+    if any(k in t for k in ("狀態", "recovery", "recover", "體重", "weight", "steps", "步數")):
+        return ("query_health", {})
+
+    # trigger_cheer
+    if any(k in t for k in ("cheer", "打氣", "加油", "cheer me", "幫我打氣")):
+        return ("trigger_cheer", {})
+
+    return ("unknown", {"transcript": transcript})
+
+
+def _voice_render_reply(intent: str, result: dict, prior_data: dict | None) -> str:
+    """Templated Cantonese reply. Voice-ready (Rule 74 cleaned at the end)."""
+    if intent == "log_meal":
+        if result.get("ok"):
+            dish = result.get("dish") or "食物"
+            kcal = result.get("calories")
+            if kcal is not None:
+                return f"已記低 {dish}, {kcal:.0f} 卡路里"
+            return f"已記低 {dish}"
+        err = result.get("error") or "唔知點解失敗"
+        return f"上傳失敗, {err}"
+
+    if intent == "query_nutrition":
+        kcal = result.get("calories")
+        p = result.get("protein")
+        c = result.get("carbs")
+        f_ = result.get("fat")
+        if kcal is None or kcal == 0:
+            return "今日未食過嘢"
+        return f"今日食咗 {kcal:.0f} 卡路里, 蛋白 {p:.0f} 克, 碳 {c:.0f} 克, 脂 {f_:.0f} 克"
+
+    if intent == "query_nutrition_followup":
+        # surface whichever macro was NOT mentioned in the prior reply
+        prior = prior_data or {}
+        c = prior.get("carbs") or 0
+        f_ = prior.get("fat") or 0
+        if c == 0 and f_ == 0:
+            return "今日未食過嘢, 冇嘢可以再講"
+        return f"仲有碳 {c:.0f} 克, 脂 {f_:.0f} 克"
+
+    if intent == "query_health_followup":
+        prior = prior_data or {}
+        steps = prior.get("steps_today")
+        if steps:
+            return f"今日行咗 {steps:.0f} 步"
+        return "未拉到步數資料"
+
+    if intent == "log_meal_followup":
+        return "想 log 多樣嘢食就講, 例如 log 一杯 latte"
+
+    if intent == "trigger_cheer_followup":
+        return "30 秒左右就準備好, 會自動同你講"
+
+    if intent == "query_health":
+        rec = result.get("recovery_pct")
+        w = result.get("weight_kg")
+        steps = result.get("steps_today")
+        bits = []
+        if rec is not None:
+            bits.append(f"recovery {rec:.0f} 巴仙")
+        if w is not None:
+            bits.append(f"體重 {w:.1f} 公斤")
+        return "，".join(bits) if bits else "未拉到健康資料"
+
+    if intent == "log_set":
+        if result.get("ok"):
+            ex = result.get("exercise", "set")
+            return f"已記 {ex}, 第 {result.get('set', 1)} set"
+        return f"記唔到, {result.get('error', '再嚟多次')}"
+
+    if intent == "trigger_cheer":
+        return "幫你準備緊 cheer, 大概 30 秒, 準備好同你講"
+
+    if intent == "end_session":
+        return "OK 收工, 拜拜"
+
+    return "唔識呢句, 試下 log 或者 cheer"
+
+
+def _voice_execute_intent(intent: str, args: dict, ctx: dict) -> dict:
+    """Run the side-effecting action for an intent. Returns a result dict
+    that _voice_render_reply uses to compose the reply."""
+    if intent == "log_meal":
+        text = args.get("text", "").strip()
+        if not text:
+            return {"ok": False, "error": "empty"}
+        # Two-step flow matching the existing PWA: preview (AI estimate)
+        # then commit (write to Sheet). /api/scan_preview_text with
+        # commit=true does NOT actually commit — that's a known quirk;
+        # use the canonical /api/scan_commit path.
+        try:
+            import urllib.request as _ur
+            payload = json.dumps({"text": text, "commit": False}).encode()
+            req = _ur.Request(
+                "http://127.0.0.1:7000/api/scan_preview_text",
+                data=payload,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with _ur.urlopen(req, timeout=30) as r:
+                preview_data = json.loads(r.read())
+            preview = (preview_data or {}).get("preview") or {}
+            meal = preview.get("suggested_entry") or {}
+            if not meal:
+                return {"ok": False, "error": "no preview returned"}
+            # Commit step — text-only path uses image_path=""
+            commit_payload = json.dumps({
+                "entries": [meal],
+                "image_path": "",
+            }).encode()
+            req2 = _ur.Request(
+                "http://127.0.0.1:7000/api/scan_commit",
+                data=commit_payload,
+                method="POST",
+            )
+            req2.add_header("Content-Type", "application/json")
+            with _ur.urlopen(req2, timeout=30) as r:
+                commit_data = json.loads(r.read())
+            # Parse sheet row number from sheet_range like "Nutrition!A197:K197"
+            sheet_row = None
+            sheet_range = commit_data.get("sheet_range") or ""
+            if sheet_range:
+                import re as _re_row
+                m = _re_row.search(r"[A-Z]+(\d+):", sheet_range)
+                if m:
+                    try:
+                        sheet_row = int(m.group(1))
+                    except Exception:
+                        pass
+            return {
+                "ok": bool(commit_data.get("ok")),
+                "dish": meal.get("name") or text,
+                "calories": meal.get("calories"),
+                "sheet_row": sheet_row,
+                "sheet_synced": commit_data.get("sheet_synced"),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:80]}
+
+    if intent == "query_nutrition":
+        n = ctx.get("nutrition") or {}
+        t = n.get("totals") or {}
+        return {
+            "calories": t.get("calories"),
+            "protein": t.get("protein"),
+            "carbs": t.get("carbs"),
+            "fat": t.get("fat"),
+        }
+
+    if intent == "query_health":
+        return ctx.get("health") or {}
+
+    if intent == "log_set":
+        try:
+            import urllib.request as _ur
+            payload = json.dumps({
+                "exercise": args["exercise"],
+                "weight_kg": args["weight_kg"],
+                "reps": args["reps"],
+                "set": args["set"],
+                "intensity": "working",
+                "form_check": "ok",
+            }).encode()
+            req = _ur.Request(
+                "http://127.0.0.1:7000/api/log_set",
+                data=payload,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with _ur.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+            return {
+                "ok": data.get("ok", False),
+                "exercise": args["exercise"],
+                "set": args["set"],
+                "error": data.get("error"),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:80]}
+
+    if intent == "trigger_cheer":
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(
+                "http://127.0.0.1:7000/api/cheer",
+                data=b'{"fire_type":"manual"}',
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with _ur.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            return {
+                "ok": True,
+                "cheer_job_id": data.get("job_id"),
+                "cheer_status_url": f"/api/cheer/status?job_id={data.get('job_id')}",
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:80]}
+
+    return {}
+
+
+def _voice_log_unknown(transcript: str, intent: str, session_id: str) -> None:
+    """Append unknown transcripts so Jim can grow the keyword set later."""
+    try:
+        with open(VOICE_UNKNOWN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": _voice_now_iso(),
+                "session_id": session_id,
+                "transcript": transcript,
+                "intent": intent,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _voice_apply_rule74(text: str) -> str:
+    """Run Rule 74 cleanup so the reply is voice-safe for TTS."""
+    if not text:
+        return text
+    try:
+        text = _strip_voice_slash_symbols(text)
+        text = _humanize_for_voice(text)
+        text = _voice_zh_replace(text)
+    except Exception:
+        # If any step fails, return the un-cleaned text — better than nothing
+        pass
+    return text
+
+
+@app.route("/api/voice/session", methods=["POST"])
+def api_voice_session():
+    """v3.3.7: Create a new voice conversation session."""
+    data = request.get_json(silent=True) or {}
+    fire_type = data.get("fire_type", "voice")
+
+    sid = _voice_new_session_id()
+    ctx = _voice_snapshot_context()
+
+    idx = _voice_load_index()
+    idx = _voice_prune_stale(idx)
+    idx[sid] = {
+        "session_id": sid,
+        "created_at": _voice_now_iso(),
+        "last_active_at": _voice_now_iso(),
+        "fire_type": fire_type,
+        "status": "active",
+        "context_snapshot": ctx,
+        "last_intent": None,
+        "last_data": None,
+        "turns": [],
+    }
+    _voice_save_index(idx)
+
+    return jsonify({
+        "ok": True,
+        "session_id": sid,
+        "created_at": idx[sid]["created_at"],
+        "context_snapshot": ctx,
+    })
+
+
+@app.route("/api/voice/turn", methods=["POST"])
+def api_voice_turn():
+    """v3.3.7: One turn of a voice conversation.
+
+    Body: { session_id?, transcript, fire_type? }
+    Response: { ok, session_id, intent, reply_text, side_effects, follow_up_hint }
+    """
+    data = request.get_json(silent=True) or {}
+    transcript = (data.get("transcript") or "").strip()
+    if not transcript:
+        return jsonify({"ok": False, "error": "missing transcript"}), 400
+
+    idx = _voice_load_index()
+    idx = _voice_prune_stale(idx)
+
+    # Resolve session_id: explicit wins; else reuse most-recent active within idle window
+    sid = data.get("session_id")
+    if not sid or sid not in idx:
+        sid = None
+        from datetime import datetime as _dt
+        now = _dt.now(timezone(timedelta(hours=8)))
+        for k, s in idx.items():
+            if s.get("status") != "active":
+                continue
+            try:
+                last = _dt.fromisoformat(s.get("last_active_at", ""))
+                idle_min = (now - last).total_seconds() / 60
+                if idle_min <= VOICE_SESSION_IDLE_MINUTES:
+                    sid = k
+                    break
+            except Exception:
+                continue
+    if not sid:
+        # create fresh
+        sid = _voice_new_session_id()
+        idx[sid] = {
+            "session_id": sid,
+            "created_at": _voice_now_iso(),
+            "last_active_at": _voice_now_iso(),
+            "fire_type": data.get("fire_type", "voice"),
+            "status": "active",
+            "context_snapshot": _voice_snapshot_context(),
+            "last_intent": None,
+            "last_data": None,
+            "turns": [],
+        }
+
+    sess = idx[sid]
+    prior_intent = sess.get("last_intent")
+    prior_data = sess.get("last_data") or {}
+
+    intent, args = _voice_classify_intent(transcript, prior_intent)
+
+    # Build context for action intents (re-fetch fresh — small overhead)
+    ctx = {}
+    if intent in ("query_nutrition", "query_nutrition_followup", "log_meal"):
+        try:
+            ctx["nutrition"] = _load_today_nutrition()
+        except Exception:
+            ctx["nutrition"] = {}
+    if intent == "query_health":
+        try:
+            ctx["health"] = {
+                "recovery_pct": _recovery_pct(),
+                "weight_kg": _withings_weight(),
+                "steps_today": (_withings_steps_today() or {}).get("steps"),
+            }
+        except Exception:
+            ctx["health"] = {}
+
+    # Execute
+    result = _voice_execute_intent(intent, args, ctx)
+
+    # For follow-ups, merge prior_data into result so the reply renderer
+    # can show the next macro that wasn't in the prior reply.
+    if intent == "query_nutrition_followup":
+        result = {**prior_data, **result}
+
+    # Render + Rule 74
+    raw_reply = _voice_render_reply(intent, result, prior_data)
+    reply_text = _voice_apply_rule74(raw_reply)
+
+    # Build side_effects list (what happened server-side)
+    side_effects = []
+    if intent == "log_meal" and result.get("ok"):
+        side_effects.append({
+            "kind": "meal_logged",
+            "sheet_row": result.get("sheet_row"),
+            "dish": result.get("dish"),
+            "calories": result.get("calories"),
+        })
+    elif intent == "log_set" and result.get("ok"):
+        side_effects.append({
+            "kind": "set_logged",
+            "exercise": result.get("exercise"),
+            "set": result.get("set"),
+        })
+    elif intent == "trigger_cheer" and result.get("ok"):
+        side_effects.append({
+            "kind": "cheer_triggered",
+            "job_id": result.get("cheer_job_id"),
+            "status_url": result.get("cheer_status_url"),
+        })
+
+    # Update session
+    sess["last_active_at"] = _voice_now_iso()
+    sess["last_intent"] = intent
+    sess["last_data"] = result
+    sess["turns"].append({
+        "ts": _voice_now_iso(),
+        "transcript": transcript,
+        "intent": intent,
+        "reply_text": reply_text,
+        "side_effects": side_effects,
+    })
+    # Keep last 50 turns per session — bounded memory
+    if len(sess["turns"]) > 50:
+        sess["turns"] = sess["turns"][-50:]
+
+    # end_session intent closes the session
+    if intent == "end_session":
+        sess["status"] = "ended"
+
+    idx[sid] = sess
+    _voice_save_index(idx)
+
+    # Log unknown for keyword-set growth
+    if intent == "unknown":
+        _voice_log_unknown(transcript, intent, sid)
+
+    # Follow-up hint: what would naturally come next
+    follow_up_hint = ""
+    if intent == "query_nutrition":
+        follow_up_hint = "仲有呢?"
+    elif intent == "log_meal":
+        follow_up_hint = "改返?"
+    elif intent == "trigger_cheer":
+        follow_up_hint = "點解咁短?"
+
+    return jsonify({
+        "ok": True,
+        "session_id": sid,
+        "intent": intent,
+        "reply_text": reply_text,
+        "side_effects": side_effects,
+        "session_active": sess.get("status") == "active",
+        "follow_up_hint": follow_up_hint,
+    })
+
+
+@app.route("/api/voice/session/end", methods=["POST"])
+def api_voice_session_end():
+    """v3.3.7: Close a voice session explicitly."""
+    data = request.get_json(silent=True) or {}
+    sid = data.get("session_id")
+    if not sid:
+        return jsonify({"ok": False, "error": "missing session_id"}), 400
+    idx = _voice_load_index()
+    if sid not in idx:
+        return jsonify({"ok": False, "error": "session not found"}), 404
+    sess = idx[sid]
+    sess["status"] = "ended"
+    sess["last_active_at"] = _voice_now_iso()
+    idx[sid] = sess
+    _voice_save_index(idx)
+    return jsonify({
+        "ok": True,
+        "ended_at": sess["last_active_at"],
+        "total_turns": len(sess.get("turns", [])),
+    })
 
 
 # v3.3.8: Unified daily coaching endpoint.
