@@ -42,7 +42,19 @@ MCP `get_health_overlay`:`steps_band_off_basis`、`steps_frozen_min`、
 `whoop_nutrition.py --sync` 每次 pull 都喺 `_meta.steps_history` 記低
 `{ts, steps, date}`(保留 96 條 ≈ 4 日),下游由佢計「最後一次變化」。
 
-### 5. 測試
+### 5. 跟進 v3.3.36 —— 步數歷史只記「真變化」+ 唔好畀第三個 writer wipe 咗
+
+`whoop_pull_inline.py`(第三個 writer,9am/9pm 幾個 cron 都會跑)以前**覆寫**
+成個 cache → 20:16 實測:跑完 `_meta.steps_history` 只剩 3 條,而且真正嘅
+「變化邊界」唔見咗 → as-of 退化返做「最後一次 pull 時間」(就係 v3.3.31 嗰個
+Jim 投訴嘅講大話版本)。而家佢 merge + 保留 + 延伸 history。
+
+另外 `whoop_nutrition.py --sync` 改成**只喺個數真係變咗嘅時候**先記一條:
+如果每次 pull 都記,96 條只夠 8 個鐘(app 每 5 分鐘 pull 一次)→ 真正嘅變化
+邊界會被剪走,as-of 會慢慢飄向「而家」。只記變化 → 96 條 = 96 次真變化,
+「最後一次變化」長期保住,as-of 企喺真實停低嗰刻(08:14 就一直 08:14)。
+
+### 6. 測試
 - `tests/qa/test_whoop_freshness.py`(新,6 個 test):舊推論已死、
   凍結先會 flag、as-of = 最後一次變化、pull age / source age 分開、
   writer 每次都重新蓋章、health age 用 mtime。

@@ -156,6 +156,37 @@ def test_pull_age_and_source_age_are_separate(cache_file):
 
 # ── 3) writer 一定要每次都重新蓋章 _meta(否則 health age 會停喺舊時間)──
 
+def test_history_only_records_changes_not_every_pull():
+    """v3.3.35+: 步數歷史**只記真變化**。
+
+    如果每次 pull 都記(即使值一樣),96 條只夠 8 個鐘(app 每 5 分鐘 pull
+    一次)→ 真正嘅「變化邊界」會被剪走,as-of 就會慢慢飄向「而家」,
+    變返 v3.3.31 嗰個「講大話」嘅 as-of。
+    """
+    src = WHOOP_TOOL.read_text(encoding="utf-8")
+    assert "_last_steps != _cur_steps" in src, \
+        "writer 唔係只記變化(會令 96 條 history 只夠 8 個鐘)"
+    assert "steps_last_seen_epoch" in src, "writer 冇記 last_seen"
+
+
+def test_canonical_pull_script_preserves_and_extends_history():
+    """v3.3.36: `whoop_pull_inline.py` 係第三個 writer。
+
+    佢以前**覆寫**成個 cache → 靜靜哋 wipe 咗 `_meta.steps_history`
+    (2026-10-21 20:16 實測:跑完 history 只剩 3 條,而且「變化邊界」唔見咗)。
+    而家佢要 merge + 保留 + 延伸。
+    """
+    script = Path("/home/work/.hermes/skills/fitness/whoop/scripts/whoop_pull_inline.py")
+    src = script.read_text(encoding="utf-8")
+    assert "_prev_meta.get(\"steps_history\")" in src or \
+        '_prev_meta.get("steps_history")' in src, \
+        "canonical pull script 冇保留 steps_history"
+    assert "steps_history" in src, "canonical pull script 完全冇提及 steps_history"
+    # 一定要 merge(唔可以淨係覆寫)
+    assert "cache.setdefault(_k, _v)" in src, \
+        "canonical pull script 仍然係覆寫式寫 cache(會 wipe 其他 writer 嘅嘢)"
+
+
 def test_writer_restamps_meta_on_every_sync():
     """`whoop_nutrition.py --sync` 每次寫入都要更新 sync_time_* + 步數歷史。
 
