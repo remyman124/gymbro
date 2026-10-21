@@ -11,11 +11,17 @@ Notes:
   ('檸檬茶 (Nestea)' + 160 kcal), but scan_log #48 still shows '總結'.
   We patch scan_log #48 with the same corrected name.
 - For the 3 remaining junk entries, we re-run vision → dish extraction →
-  pplx+apiyi nutrition merge. The narration AI check is skipped because
+  pplx+minimax nutrition merge. The narration AI check is skipped because
   these entries already had real kcal logged (so vision clearly identified
   food) and the classifier has been observed to flag legitimate names
   ('罐 330ml 嘅檸檬茶') as narration.
 - Matching is by image basename to avoid substring false positives.
+
+v3.3.30 (2026-10-21): the APIyI leg was removed (its key died with HTTP 401
+on every endpoint). The two APIyI calls below were renamed to their MiniMax
+equivalents, otherwise this script raised AttributeError on the first run:
+  gw._apiyi_vision_analyze  → gw._vision_second_opinion
+  gw._apiyi_nutrition_enrich → gw._minimax_nutrition_enrich
 """
 import argparse
 import base64
@@ -61,7 +67,7 @@ def re_extract(image_path: str, fallback_kcal: float):
         return None, 0, 0, 0, 0, f"read fail: {e}"
 
     vision_a = gw._minimax_vision(img_b64, VISION_PROMPT) or ""
-    vision_b = gw._apiyi_vision_analyze(img_b64, VISION_PROMPT) or ""
+    vision_b = gw._vision_second_opinion(img_b64, VISION_PROMPT) or ""
     if not vision_a and not vision_b:
         return None, 0, 0, 0, 0, "vision both failed"
 
@@ -71,13 +77,13 @@ def re_extract(image_path: str, fallback_kcal: float):
         return None, 0, 0, 0, 0, f"dish name still junk: {dish!r}"
 
     pplx = gw._pplx_enrich(dish) or ""
-    apiyi = gw._apiyi_nutrition_enrich(dish) or ""
+    minimax = gw._minimax_nutrition_enrich(dish) or ""
     pplx_parsed = gw._parse_nutrition_block(pplx)
     try:
-        apiyi_parsed = json.loads(apiyi)
+        minimax_parsed = json.loads(minimax)
     except Exception:
-        apiyi_parsed = gw._parse_nutrition_block(apiyi)
-    merged = gw._merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
+        minimax_parsed = gw._parse_nutrition_block(minimax)
+    merged = gw._merge_nutrition_estimates([pplx_parsed, minimax_parsed])
     cal = float(merged.get("calories", {}).get("value") or 0)
     p = float(merged.get("protein", {}).get("value") or 0)
     c = float(merged.get("carbs", {}).get("value") or 0)

@@ -1,0 +1,75 @@
+{
+  "note": "live server / shared Redis gymbro:overlay:health / stale gym-web-v121 assert / playwright networkidle timeout (gymbro PWA 有持續 polling,networkidle 唔會 settle)",
+  "failed": [
+    "tests/api/test_endpoints.py::test_health_overlay_reads_caches",
+    "tests/api/test_food_log_visibility.py::test_api_scan_recent_returns_hainanji",
+    "tests/api/test_food_log_visibility.py::test_frontend_grouping_keeps_hainanji",
+    "tests/api/test_food_log_visibility.py::test_sw_cache_bumped",
+    "tests/api/test_whoop_steps.py::test_health_overlay_whoop_only_no_withings_fallback",
+    "tests/e2e/test_food_log_regressions.py::test_pwa_food_log_no_broken_image",
+    "tests/e2e/test_food_log_regressions.py::test_pwa_food_log_no_narration_titles",
+    "tests/e2e/test_homepage.py::test_bottom_nav_has_four_tabs",
+    "tests/e2e/test_homepage.py::test_gym_tab_renders",
+    "tests/e2e/test_homepage.py::test_homepage_loads",
+    "tests/e2e/test_homepage.py::test_log_tab_interaction",
+    "tests/e2e/test_homepage.py::test_pwa_markers_present",
+    "tests/e2e/test_homepage.py::test_schedule_tab_renders",
+    "tests/e2e/test_interactions.py::test_full_reload_still_renders",
+    "tests/e2e/test_interactions.py::test_no_console_errors_during_navigation",
+    "tests/e2e/test_pull_refresh.py::test_full_drag_triggers_refresh",
+    "tests/e2e/test_pull_refresh.py::test_refresh_shows_success_toast"
+  ],
+  "errored": [
+    "tests/api/test_pwa_check_duplication.py",
+    "tests/api/test_pwa_dump_rendered.py",
+    "tests/api/test_pwa_group_structure.py",
+    "tests/api/test_pwa_search_text.py",
+    "tests/e2e/test_interactions.py::test_brand_title_tappable",
+    "tests/e2e/test_interactions.py::test_cheer_tab_switches_panel",
+    "tests/e2e/test_interactions.py::test_food_tab_has_camera_trigger",
+    "tests/e2e/test_interactions.py::test_food_tab_is_default",
+    "tests/e2e/test_interactions.py::test_food_tab_text_submit_present",
+    "tests/e2e/test_interactions.py::test_gym_tab_has_intensity_pills",
+    "tests/e2e/test_interactions.py::test_gym_tab_shows_cancel_button",
+    "tests/e2e/test_interactions.py::test_gym_tab_switches_panel",
+    "tests/e2e/test_interactions.py::test_hero_banner_present",
+    "tests/e2e/test_interactions.py::test_manifest_loads",
+    "tests/e2e/test_interactions.py::test_schedule_tab_hidden_when_empty",
+    "tests/e2e/test_interactions.py::test_sw_js_loads",
+    "tests/e2e/test_pull_refresh.py::test_pull_does_not_fire_when_scrolled",
+    "tests/e2e/test_pull_refresh.py::test_pull_state_resets_on_init",
+    "tests/e2e/test_pull_refresh.py::test_small_drag_does_not_trigger_refresh"
+  ],
+  "fingerprint": {
+    "python": "Python 3.11.15",
+    "executable": "/home/work/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin/python3.11",
+    "platform": "Linux-6.17.0-1021-gcp-x86_64-with-glibc2.42"
+  },
+  "runs_recorded": 6,
+  "runs_detail": [
+    {
+      "file": "cap_run1.txt",
+      "not_passing": 27
+    },
+    {
+      "file": "cap_run2.txt",
+      "not_passing": 32
+    },
+    {
+      "file": "gymbro_full_run.txt",
+      "not_passing": 28
+    },
+    {
+      "file": "gymbro_baseline_raw.txt",
+      "not_passing": 21
+    },
+    {
+      "file": "cap_run4.txt",
+      "not_passing": 11
+    },
+    {
+      "file": "cap_run5.txt",
+      "not_passing": 24
+    }
+  ]
+}

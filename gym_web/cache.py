@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Optional
 
 from .core import NUTRITION_SHEET_ID, NUTRITION_TAB_NAME, now_hkt
@@ -48,6 +48,31 @@ DEFAULT_REFRESH_S = 60
 COL_DATE, COL_TIME, COL_MEAL, COL_NAME, COL_RESTAURANT = 0, 1, 2, 3, 4
 COL_KCAL, COL_P, COL_C, COL_F, COL_NOTES, COL_IMG = 5, 6, 7, 8, 9, 10
 EXPECTED_COLS = 11
+
+# v3.3.23al: serial date/time formatters for UNFORMATTED_VALUE Sheet responses.
+# Google Sheets returns date as a serial number (e.g. 46088 = 2026-02-28) when
+# valueRenderOption=UNFORMATTED_VALUE. Time is fractional (0.5 = noon). Without
+# these, .strip() on int raises AttributeError and the hydration thread crashes
+# silently → food log appears empty.
+_SHEET_EPOCH = datetime(1899, 12, 30).date()
+
+
+def _format_serial_date(serial: "int | float") -> str:
+    try:
+        d = _SHEET_EPOCH + timedelta(days=int(serial))
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        return str(serial)
+
+
+def _format_serial_time(fraction: "int | float") -> str:
+    try:
+        total_seconds = int(float(fraction) * 86400)
+        hh = total_seconds // 3600
+        mm = (total_seconds % 3600) // 60
+        return f"{hh:02d}:{mm:02d}"
+    except Exception:
+        return str(fraction)
 
 # ---------- Row dataclass ----------
 @dataclass
@@ -76,7 +101,21 @@ class NutritionRow:
     @classmethod
     def from_sheet_row(cls, row_index: int, cells: list[str]) -> "NutritionRow":
         """cells = list of 11 strings (A..K). Defensive: missing/short → ""."""
-        cells = (cells + [""] * EXPECTED_COLS)[:EXPECTED_COLS]
+        # v3.3.23al (Jim OOB 2026-09-27 'food log empty now'): handle
+        # UNFORMATTED_VALUE which returns dates/times as serial numbers
+        # (floats) instead of strings. Coerce all cells to strings first,
+        # then format date/time from serial numbers.
+        def _coerce_str(c):
+            if isinstance(c, (int, float)):
+                # Check if it's a date serial (after 1900-01-01)
+                if c > 1000:
+                    return _format_serial_date(c)
+                # Check if it's a time fraction (0.0 - 1.0)
+                if 0 <= c <= 1:
+                    return _format_serial_time(c)
+                return str(c)
+            return str(c) if c is not None else ""
+        cells = [_coerce_str(c) for c in (cells + [""] * EXPECTED_COLS)[:EXPECTED_COLS]]
         date = cells[COL_DATE].strip()
         time = cells[COL_TIME].strip()
         try:

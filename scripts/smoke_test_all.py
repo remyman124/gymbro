@@ -194,10 +194,10 @@ def test_health() -> None:
     check(a, "health_overlay", "/api/health_overlay", json_keys=())
     check(a, "whoop_calendar", "/api/whoop_activities_calendar?days=7",
           json_keys=())
-    check(a, "withings_steps_today", "/api/withings_steps_today",
+    # v3.3.25: WHOOP is the only step source — the Withings step endpoints
+    # (/api/withings_steps_today, /api/withings_steps_7d_avg) are removed.
+    check(a, "whoop_steps", "/api/whoop_steps",
           json_keys=("date",))
-    check(a, "withings_steps_7d_avg", "/api/withings_steps_7d_avg",
-          json_keys=())
 
 
 def test_cheer() -> None:

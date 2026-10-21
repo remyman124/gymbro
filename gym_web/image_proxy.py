@@ -16,6 +16,7 @@ The Sheet row layout is unchanged: column K (index 10) holds the Drive URL.
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import logging
@@ -36,30 +37,45 @@ log = logging.getLogger(__name__)
 
 THUMB_MAX_SIDE = 480
 THUMB_JPEG_QUALITY = 82
-THUMB_CACHE_MAX = 100                      # LRU bound
+# v3.3.23al: bound thumb LRU at 100 rows. With ~50KB/thumb, 100 = 5MB
+# total — fits comfortably in memory even on small VPS instances.
+THUMB_CACHE_MAX = 100
 DRIVE_FETCH_TIMEOUT = 8                    # seconds
 USER_AGENT = "gymbro-image-proxy/1.0"
 DRIVE_PUBLIC_HOST = "drive.google.com"
+# v3.3.23al: cap Drive URL cache too. Previously unbounded dict —
+# could grow to thousands of entries on long-running instances, leaking
+# memory. LRU bound 600 (~3 weeks of daily meals) is plenty.
+URL_CACHE_MAX = 600
 
 # ---------------------------------------------------------------------------
-# Per-row Drive-URL cache (read-through).
+# Per-row Drive-URL cache (read-through, LRU-bounded).
 # /api/scan_recent populates this after each scan so the image endpoints
 # don't re-fetch the Sheet for every image render.
+# v3.3.23al: bounded OrderedDict — drops oldest entries past URL_CACHE_MAX.
 # ---------------------------------------------------------------------------
 
-_url_cache: "dict[int, Optional[str]]" = {}
+_url_cache: "OrderedDict[int, Optional[str]]" = OrderedDict()
 _url_cache_lock = threading.Lock()
 
 
 def remember_drive_url(row_index: int, drive_url: Optional[str]) -> None:
     """Called by /api/scan_recent (or any writer) to seed the URL cache."""
     with _url_cache_lock:
+        if row_index in _url_cache:
+            _url_cache.move_to_end(row_index)
         _url_cache[row_index] = drive_url
+        # Enforce LRU bound
+        while len(_url_cache) > URL_CACHE_MAX:
+            _url_cache.popitem(last=False)
 
 
 def get_drive_url(row_index: int) -> Optional[str]:
     with _url_cache_lock:
-        return _url_cache.get(row_index)
+        if row_index in _url_cache:
+            _url_cache.move_to_end(row_index)
+            return _url_cache[row_index]
+        return None
 
 
 def invalidate_drive_url(row_index: int) -> None:
@@ -128,6 +144,71 @@ class _BoundedBytesCache:
 
 
 _thumb_cache = _BoundedBytesCache(THUMB_CACHE_MAX)
+
+
+# v3.3.23al: MODULE-LEVEL shared ThreadPoolExecutor for Drive fetches.
+# Previously each scan_thumb call created its own ThreadPoolExecutor
+# with max_workers=1, which is effectively serial. With 8 parallel
+# JPG render calls each waiting 8s for Drive timeout, total = 48s
+# (misleading — looks like "sequential scan_thumb calls"). Sharing
+# one pool with 8 workers means all 8 Drive fetches run in parallel
+# and complete in ~2s even with cold cache.
+_DRIVE_FETCH_WORKERS = 8
+_DRIVE_FETCH_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_DRIVE_FETCH_WORKERS,
+    thread_name_prefix="drive-fetch",
+)
+
+
+# ------------------------------------------------------------------
+# Bounded LRU JPG-card cache (keyed by date string)
+# v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+# win'): disk cache alone isn't enough — /api/nutrition/card still
+# runs PIL even when the file exists (then send_file reads from disk).
+# Adding in-memory LRU so the second+ request in the same session
+# is served from RAM (~10ms vs 150ms). Capacity 14 ≈ ~2 weeks of
+# cached JPGs (each ~200KB → ~3MB total).
+# ------------------------------------------------------------------
+
+JPG_CACHE_MAX = 14
+_jpg_cache: "OrderedDict[str, bytes]" = OrderedDict()
+_jpg_cache_lock = threading.Lock()
+
+
+def _jpg_cache_get(date_str: str) -> "Optional[bytes]":
+    with _jpg_cache_lock:
+        if date_str not in _jpg_cache:
+            return None
+        _jpg_cache.move_to_end(date_str)
+        return _jpg_cache[date_str]
+
+
+def _jpg_cache_put(date_str: str, jpg_bytes: bytes) -> None:
+    with _jpg_cache_lock:
+        if date_str in _jpg_cache:
+            _jpg_cache.move_to_end(date_str)
+            _jpg_cache[date_str] = jpg_bytes
+        else:
+            _jpg_cache[date_str] = jpg_bytes
+            if len(_jpg_cache) > JPG_CACHE_MAX:
+                _jpg_cache.popitem(last=False)
+
+
+def _jpg_cache_invalidate(date_str: str) -> None:
+    """v3.3.23al: invalidate on scan_edit/correct/rename/delete so
+    stale JPGs don't show after edits. Called by api_scan_commit etc.
+
+    v3.3.23av (Jim OOB 2026-10-12 'the edited 兩個鮮竹卷 is not updated
+    in jpg download'): also clear multi-page variants (_p1, _p2, ...).
+    api_nutrition_card stores per-page entries as 'date_p1', 'date_p2' so
+    we must purge all of them, not just the base date key.
+    """
+    with _jpg_cache_lock:
+        _jpg_cache.pop(date_str, None)
+        # Also drop any per-page variants (date_p1, date_p2, ...)
+        stale = [k for k in list(_jpg_cache.keys()) if k.startswith(f"{date_str}_p")]
+        for k in stale:
+            _jpg_cache.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -224,9 +305,25 @@ def scan_thumb(row_index: int) -> Response:
     if not drive_url:
         return Response(b"", status=404)
 
+    # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+    # win'): parallel Drive fetch with timeout. Multiple scan_thumb
+    # calls (e.g. JPG card rendering 8 meals in parallel) used to be
+    # blocked behind this serial network call. Each fetch can be 1-2s
+    # on cold cache, multiplied by 8 meals = 8-16s. With concurrent
+    # futures, all 8 fetch in parallel and complete in 1-2s total.
+    #
+    # IMPORTANT: use a MODULE-LEVEL ThreadPoolExecutor (not per-call!)
+    # because nested ThreadPoolExecutor instances are serial — each
+    # outer worker waits for its own single-worker inner pool. This
+    # caused 50-second renders when 8 meals each had to wait 8s for
+    # Drive timeout. Sharing the module pool fixes this.
+    import concurrent.futures as _cf_scan
     try:
-        raw = _fetch_drive_bytes(drive_url)
+        raw = _DRIVE_FETCH_POOL.submit(_fetch_drive_bytes, drive_url).result(timeout=8)
         thumb = _make_thumbnail(raw)
+    except concurrent.futures.TimeoutError:
+        log.warning("drive fetch timeout (thumb) row=%s", row_index)
+        return Response(b"drive fetch timeout", status=504)
     except _DriveFetchError as e:
         log.warning("drive fetch failed (thumb) row=%s: %s", row_index, e)
         return Response(b"upstream fetch failed", status=502)

@@ -131,7 +131,7 @@ points plus a package:
 - 🤖 **AI coach comments** — Traditional Chinese, 4-section, A–F grade per scan
 - 📊 **Whoop + Withings overlays** — recovery %, steps, body composition
 - 📅 **Schedule tab** — Whoop activities on a monthly calendar
-- 🎙️ **8-section cheer pipeline** — text + voice (edge-tts) + image (MiniMax)
+- 🎙️ **8-section cheer pipeline** — text + voice (edge-tts WanLung 雲龍) + image (MiniMax)
 - 🔌 **MCP server** — `get_latest_cheer`, `get_today_workout`, `trigger_cheer_pipeline`
 - 🔁 **Retro migrations** in `scripts/migrations/` — one-shot data fixes
 
@@ -145,7 +145,7 @@ gymbro/
 ├── gym_web/                    # Gradual refactor package (in progress)
 │   ├── core.py                 # Shared constants + helpers
 │   ├── whoop.py                # Whoop cache reader
-│   └── withings.py             # Withings cache reader
+│   └── (withings.py removed)  # v3.3.26 — Withings retired; WHOOP is the only source
 ├── templates/
 │   └── index.html              # PWA shell (extracted from gym_web.py)
 ├── scripts/
