@@ -19,7 +19,9 @@ NOTE: this test only READS the sheet. It never writes.
 """
 
 import json
+import os
 import re
+import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -38,12 +40,8 @@ def _sheet_ids():
     return sid, tab
 
 
-def _access_token():
-    tok = json.loads(TOKEN_PATH.read_text())
-    if tok.get("token"):
-        return tok["token"]
-    if not tok.get("refresh_token"):
-        return None
+def _refresh(tok):
+    """用 refresh_token 換新 access token,原子寫返落 token 檔。"""
     body = urllib.parse.urlencode({
         "client_id": tok["client_id"],
         "client_secret": tok["client_secret"],
@@ -53,9 +51,36 @@ def _access_token():
     req = urllib.request.Request(
         "https://oauth2.googleapis.com/token", data=body, method="POST")
     data = json.loads(urllib.request.urlopen(req, timeout=20).read())
-    tok["token"] = data["access_token"]
-    TOKEN_PATH.write_text(json.dumps(tok, indent=2))
-    return tok["token"]
+    new_at = data["access_token"]
+    tok["access_token"] = new_at
+    tok["token"] = new_at
+    tok["expires_at"] = time.time() + float(data.get("expires_in", 3600))
+    tok["refreshed_at"] = time.time()
+    # 原子寫:temp file + os.replace(避免半個檔被其他 process 讀到)
+    tmp = TOKEN_PATH.with_suffix(".json.tmp-%d" % os.getpid())
+    tmp.write_text(json.dumps(tok, indent=2))
+    os.replace(tmp, TOKEN_PATH)
+    return new_at
+
+
+def _access_token():
+    """攞一個**有效**嘅 access token。
+
+    ⚠️ 2026-10-21 修正:舊版淨係喺 `token` 欄缺失時先 refresh,但個欄
+    可能仲留住**已經過期**嘅 token → Sheets API 直接 401,QA 組就報
+    「pollution」—— 其實係 token 過期,唔係真有污染(虛驚一場,
+    但會掩蓋真正嘅污染)。所以而家:
+      1) 讀 `expires_at`,過期就即刻 refresh
+      2) 401 都會再 refresh 一次重試
+    """
+    tok = json.loads(TOKEN_PATH.read_text())
+    at = tok.get("access_token") or tok.get("token")
+    exp = tok.get("expires_at")
+    if at and isinstance(exp, (int, float)) and exp > time.time() + 60:
+        return at
+    if not tok.get("refresh_token"):
+        return at
+    return _refresh(tok)
 
 
 def _read_nutrition_rows():
@@ -66,7 +91,16 @@ def _read_nutrition_rows():
     url = (f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/"
            f"{urllib.parse.quote(tab, safe='')}!A1:N2000")
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + at})
-    payload = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    try:
+        payload = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        # token 過期/被 revoke → refresh 一次再試
+        tok = json.loads(TOKEN_PATH.read_text())
+        at = _refresh(tok)
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + at})
+        payload = json.loads(urllib.request.urlopen(req, timeout=30).read())
     return payload.get("values", [])
 
 
