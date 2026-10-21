@@ -1,6 +1,158 @@
+## v3.3.30 — 2026-10-21 — APIyI removed + Rule 25 generic-name hard block
+
+Jim OOB 2026-10-21:「Remove apiyi stuff」
+
+### Why the removal was total
+The APIyI key was probed on every endpoint and returned **HTTP 401
+"Invalid token"** on all of them — gpt-4o, gpt-4o-mini, vip.apiyi.com,
+vision, and audio/transcriptions. Not just the vision path: the whole key
+was dead, including the voice transcription path.
+
+### Removed / renamed
+- Vision provider pool → `minimax-text-01` → `pplx sonar` (2 providers)
+- Deleted `_apiyi_vision_gpt4o`, `_apiyi_api_key`
+- `_apiyi_vision_analyze` → `_vision_second_opinion`
+- `_apiyi_nutrition_enrich[_multi]` → `_minimax_nutrition_enrich[_multi]`
+  (these already called MiniMax internally — the name was simply wrong)
+- Variables: `apiyi_desc/parsed/text_desc/name_raw/enrichment/json_parsed/
+  vision_desc` → `mm_*` / `minimax_*` / `opinion2_desc`
+- `gym_web.py` now has **0** `apiyi` references; `models_used` and `source`
+  labels cleaned; 2 template comments updated
+
+### Voice transcription → local faster-whisper
+`/api/voice/transcribe` used to call `audio/transcriptions` (routed through
+the dead APIyI key). Now uses `_local_whisper_transcribe()`.
+
+Three pitfalls, all verified:
+- `av` must be `==15.1.0` (faster-whisper 1.2.1 needs `metadata_errors`;
+  av ≥ 16 removed it → TypeError)
+- `vad_filter=True` is mandatory (without it, sparse/silent audio returns
+  garbage)
+- `language='yue'` returns **ZERO segments** on the `small` checkpoint →
+  use `'zh'` with a Cantonese-bias `initial_prompt`; output is Simplified,
+  so it is converted to Traditional with opencc `s2twp`
+
+Verified over HTTP: `ok=True`, `model=faster-whisper-small`, Cantonese output.
+
+### Rule 25 hard block — the hole v3.3.25 left open
+While running the provider-chain end-to-end test repeatedly, one run in
+four produced「未識別菜式」**with a perfectly healthy vision provider** —
+the description and macros were there, only the *name* extraction failed.
+v3.3.25 only blocked "all providers dead", so that case still wrote a
+placeholder name into Jim's golden copy — the exact signature of the
+2026-10-20 pollution incident (26 rows + 7 rows of junk).
+
+Now, in `_scan_preview_core`, **before** the Drive upload:
+1. `_GENERIC_DISH_NAMES_BLOCKLIST` holds the placeholder names
+2. Every dish generic → `ok:false`, zero Drive file, zero Sheet row, and the
+   same top-level key set as the success path (Isak §4.3 contract)
+3. Only some generic → those entries are dropped, the named ones commit
+4. The frontend shows `status='failed'` and tells Jim the photo was not
+   logged instead of pretending it was committed
+
+Verified: forcing the name extractor to return「未識別菜式」→ fully blocked,
+zero writes, key set identical; mixed names → the placeholder is dropped and
+the real name is kept.
+
+### QA
+Suite is now **10 groups, all PASS** (new `rule25` group). The `vision` and
+`aifallback` groups were updated for the removal — the stubbed symbols were
+renamed, the test semantics are unchanged.
+
+Production check: 2026-10-20 = 3 rows (Jim's real dinner), 2026-10-21 = **0
+rows**,「未識別菜式」= 0 rows, Drive files created on/after 2026-10-21 = **0**.
+
+
+## v3.3.26 — 2026-10-21 — WHOOP is the ONLY health source (Withings fully retired)
+
+Jim OOB 2026-10-20:「Fully remove withings / Steps is whoop!」→ then
+「I mean weight. If whoop has weight data. Remove all withings」
+
+**The premise check that changed the plan:** WHOOP's body endpoint was recorded
+as "404 / unavailable" in the pipeline doc — but that note tested the WRONG path.
+Live verification 2026-10-21 found it:
+
+```
+GET /developer/v2/user/measurement/body      (scope read:body_measurement)
+→ {"height_meter":1.778, "weight_kilogram":78.107, "max_heart_rate":182}
+```
+
+78.107 kg vs the Withings scale's 78.11 kg — same number, so the condition
+Jim set ("if WHOOP has weight data") IS met and Withings can go.
+
+### Removed
+- `gym_web/withings.py` module (git rm)
+- 6 Withings body helpers → replaced by `_body_latest/_body_weight/_body_fat_pct/
+  _body_muscle_kg/_body_bone_kg/_body_hydration_pct` (WHOOP-backed)
+- `/api/withings_steps_today`, `/api/withings_steps_7d_avg`, `/api/withings_refresh` → 404
+- Withings pull from the cheer pipeline (`WITHINGS_PULL_SCRIPT` subprocess)
+- MCP `withings_refresh` tool → `whoop_refresh`
+- MCP payload keys `withings_weight_kg` / `withings_fat_pct` / `withings_weight_date` →
+  `weight_kg` / `weight_source` / `height_m` / `bmi` / `fat_pct` / `muscle_kg` / `bone_kg` / `hydration_pct`
+- `withings-token-refresh` + `Withings 30min refresh` cron jobs
+- `~/.withings_latest_cache.json`, and the `withings` skill → `.archive/withings`
+
+### Added
+- `/developer/v2/user/measurement/body` in the WHOOP pull script (5 → **6/6 endpoints OK**)
+- `whoop_get_body()` in `gym_web/whoop.py` → weight / height / BMI
+- `whoop_get_steps()` → cycle `step_count`, in-progress cycle as today, yesterday,
+  7-day average, series, `stale` / `band_off` / `in_progress` freshness
+- `/api/whoop_steps` endpoint
+- Front-end: WHOOP source badge, band-off warning, WHOOP tap-to-refresh
+
+### Fixed (real bugs found on the way)
+1. **Cache clobber** — `whoop_nutrition.py --sync` and `whoop_pull_inline.py` both
+   write `~/.whoop_data_latest.json`; the nutrition sync wrote only 5 keys and
+   silently DROPPED `body_measurement`, so the weight vanished every 9am cron.
+   Both writers now MERGE.
+2. **UTC/HKT day bug** — cycle `start` is UTC; slicing it gave the wrong day
+   (up to 8 h off). Now converted to HKT, matching `whoop_get_steps()`.
+3. **Redis cache leak into the test suite** — `/api/health_overlay` caches its
+   payload in a process-wide Redis key SHARED WITH THE LIVE SERVER, so tests
+   read production weight/recovery. Added an autouse conftest fixture that
+   clears the key around every test.
+4. **Timezone fallback bug** — `_date_of` referenced an un-imported name, so the
+   HKT conversion always raised and silently fell back to the wrong UTC slice.
+
+### Truthfulness rules now enforced
+- `cycles[0]` (`end: null`) is TODAY's running total — never a previous day
+- `updated_at` drives the `stale` / `band_off` flags; a stale record is shown
+  as last-known, never as live
+- When WHOOP has no step count the UI shows `—` + `steps_syncing`, never a
+  Withings number and never yesterday's number
+
+### Known gap
+WHOOP has **no bioimpedance sensor** — fat% / muscle / bone / hydration have
+no source now that the Withings BIA scale is retired. The UI renders `—`
+rather than a fabricated 0.
+
 # Changelog
 
 All notable changes to gymbro are documented here.
+
+## [3.3.15] — 2026-09-04
+
+### 🎙️ Cheer voice: switch back to Edge-TTS WanLungNeural (雲龍) — Jim preferred (Jim OOB 2026-09-04「for gymbro, please use edge tts instead. wanlun voice is better than minimax tts」)
+
+Per Jim OOB — v3.3.11→v3.3.14 MiniMax TTS path (Cantonese_crisp_news_anchor_vv2) demoted to **fallback only**. Primary cheer voice is again **Edge-TTS zh-HK-WanLungNeural (雲龍)**, Jim's preferred engine since 2026-08-30.
+
+**Why WanLung over MiniMax**:
+- Natural Microsoft HK Cantonese male voice — Jim says it sounds better than MiniMax synthetic output.
+- Lower per-call cost (free via edge-tts CLI) vs MiniMax Token Plan quota (5.6 RPM, 1002 errors on burst).
+- No `language_boost` / Jyutping workarounds needed — WanLung handles Cantonese out of the box.
+
+**Changes**:
+- `_synthesize_cheer_voice()` wrapper: now calls `_synthesize_cheer_voice_edge_tts(voice_text)` instead of `_synthesize_cheer_voice_new(voice_text)` (was MiniMax primary).
+- `_synthesize_cheer_voice_edge_tts()`: voice flipped from `zh-HK-HiuMaanNeural` (曉曼) → `zh-HK-WanLungNeural` (雲龍). Error logging now includes stderr for debug.
+- `_synthesize_cheer_voice_new()`: retained as fallback (Network/edge outage path) but no longer the primary entry. Docstring updated.
+- `templates/index.html:voice_gen` label: 「Edge-TTS 整緊曉曼語音…」 → 「Edge-TTS 整緊雲龍語音…」
+- `gymbro_mcp_server.py:trigger_cheer_pipeline` next_steps: voice comment flipped to WanLung.
+- `README.md` cheer pipeline description: now mentions WanLung 雲龍 explicitly.
+- Duration log `/tmp/cheer_durations.log` format: added `provider=edge-tts-WanLung` field for clearer audit trail.
+
+**Rule 79 still enforced**: this function renders MP3 to `CHEER_AUDIO_CACHE/cheer_<date>.mp3` only. NO Telegram push from this layer. PWA cheer tab decides whether to embed voice bubble.
+
+**Rate calibration**: WanLung 5.69 char/sec @ +0% (re-applied — was the baseline before v3.3.11). Target 130-160s audio for 600-720 字 sweet zone unchanged.
 
 ## [2.7.28] — 2026-08-04
 

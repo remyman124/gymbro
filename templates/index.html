@@ -248,7 +248,7 @@
              :class="stepsRefreshing ? 'opacity-90' : 'active:opacity-70'"
              class="flex items-stretch gap-1 rounded-xl px-1.5 py-1 cursor-pointer select-none transition-opacity"
              style="background:rgba(59,130,246,0.18);border:1px solid rgba(59,130,246,0.45); -webkit-tap-highlight-color: transparent;"
-             :title="stepsRefreshing ? '從 Withings 拉緊新數據…' : '撳一下即時 refresh Withings 步數'">
+             :title="stepsRefreshing ? '從 WHOOP 拉緊新數據…' : '撳一下即時 refresh WHOOP 步數'">
           <div class="flex flex-col items-center justify-center leading-none">
             <span class="text-sm" :class="stepsRefreshing ? 'animate-spin inline-block' : ''">👟</span>
           </div>
@@ -264,6 +264,17 @@
                   :class="stepsStale ? 'text-amber-400/80' : 'text-gray-500'"
                   x-show="stepsLastSync"
                   x-text="stepsLastSync ? (stepsStale ? 'as of ' : 'as of ') + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) + (stepsStale ? ' ⚠' : '') : ''"></span>
+            <!-- v3.3.25 (Jim OOB 2026-10-20「Steps is whoop!」): the source
+                 badge + the band-off warning. When the Whoop band has been
+                 off-body for >6h the count is a real LAST-KNOWN total, not a
+                 live running total — say so instead of implying "live". -->
+            <span class="text-[7px] leading-none mt-0.5"
+                  :class="stepsBandOff ? 'text-amber-400/80' : 'text-gray-500/70'"
+                  x-show="stepsBandOff"
+                  x-text="'WHOOP band off'"></span>
+            <span class="text-[7px] leading-none mt-0.5 text-gray-500/60"
+                  x-show="stepsSource"
+                  x-text="stepsSource === 'whoop' ? 'WHOOP' : 'Withings'"></span>
           </div>
           <!-- Denominator: YESTERDAY (small, gray) — compact format (K/M) -->
           <div class="flex flex-col items-center justify-center leading-none" x-show="stepsYesterday !== null">
@@ -304,64 +315,189 @@
     <!-- SET TAB (default) -->
     <section x-show="isTabVisible('set')" class="flex min-h-[calc(100dvh-14rem)] flex-col" x-cloak>
 
-      <!-- Hero motivation banner -->
-      <div class="relative mb-3 h-40 w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-black via-gray-800 to-emerald-950 shadow-2xl">
-        <img x-show="motivationImage" :src="motivationImage"
-             class="absolute inset-0 z-[1] h-40 w-full object-cover"
-             @error="motivationImage = ''">
-        <div x-show="!motivationImage"
-             class="absolute inset-0 z-[1] flex h-40 w-full items-center justify-center text-3xl">
-          💪🔥🏋️
-        </div>
-        <div class="absolute inset-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2">
-          <div class="min-w-0 pr-[120px]">
-            <div class="text-[9px] uppercase tracking-[0.2em] text-gray-300">Today</div>
-            <div class="quote-line line-clamp-2 text-sm font-medium" x-text="quote"></div>
+      <!-- v3.3.13 (Jim OOB 2026-09-01「Make UIUX change on gym — Make it
+           like whoop as attached」): redesigned gym tab hero to mimic
+           Whoop Today layout. Old 160h horizontal banner replaced with:
+             (1) Hero video/image background card (smaller, optional)
+             (2) Big circular Recovery ring (center) — primary metric
+             (3) 3-col metric grid (Strain · Sleep · HRV)
+             (4) Body Comp 4-col grid (Weight · Fat · Muscle · Bone)
+             (5) Steps widget (Today big + Yesterday small)
+             (6) Quote line + audio overlay -->
+      <div class="space-y-3">
+
+        <!-- (1) Optional hero image/video — small banner above the score circle.
+             Background only; doesn't compete with the recovery ring. -->
+        <div class="relative h-32 w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-black via-gray-800 to-emerald-950 shadow-2xl">
+          <!-- v3.3.13 (Jim OOB 2026-09-01「loop the latest 5 videos」):
+               removed `loop` attr — each video plays once, then @ended
+               advances to the next video in the playlist. -->
+          <video x-show="heroVideoUrl" :src="heroVideoUrl" autoplay muted playsinline preload="auto" :muted="heroVideoMuted" @error="heroVideoUrl = ''" @ended="advanceHeroVideo()"
+                 class="absolute inset-0 z-[1] h-32 w-full object-cover"
+                 style="pointer-events:none"></video>
+          <img x-show="!heroVideoUrl && motivationImage" :src="motivationImage"
+               class="absolute inset-0 z-[1] h-32 w-full object-cover" @error="motivationImage = ''">
+          <div x-show="!heroVideoUrl && !motivationImage"
+               class="absolute inset-0 z-[1] flex h-32 w-full items-center justify-center text-2xl">
+            💪🔥🏋️
           </div>
-        </div>
-        <div x-show="false" class="streak-badge absolute left-1/2 top-2 -translate-x-1/2 z-20 shadow-lg shadow-black/40" style="display:none">
-          <span class="text-yellow-300">🔥</span>
-          <span x-text="`${streak} day${streak === 1 ? '' : 's'}`"></span>
-        </div>
-        <!-- Top-left: Whoop recovery % — Jim OOB 2026-07-20 make prominent (PROMINENT PILL) -->
-        <div x-show="recovery !== null" class="absolute left-2 top-2 z-20 flex items-center gap-1.5 rounded-full border-2 border-emerald-400/50 bg-black/65 px-3 py-1 text-base font-black text-emerald-300 shadow-lg shadow-emerald-500/20 backdrop-blur">
-          <span class="text-lg">💚</span><span x-text="`${recovery}%`" class="tabular-nums"></span>
-        </div>
-        <!-- Top-right: Withings weight (single number, minimal) -->
-        <!-- Top-right: Withings weight kg + fat % (Jim's goal: drive fat down) -->
-        <div class="absolute right-2 top-2 z-20 flex flex-col items-end gap-1">
-          <div class="flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] font-bold backdrop-blur"
-               :class="weightKg !== null ? 'text-sky-300' : 'text-gray-500'">
-            <span>⚖️</span><span x-text="weightKg !== null ? `${weightKg}kg` : '—'"></span>
+          <!-- Dark gradient overlay -->
+          <div class="absolute inset-0 z-[2] bg-gradient-to-t from-black/80 via-black/35 to-transparent pointer-events-none"></div>
+          <!-- Quote line bottom-left -->
+          <div class="absolute inset-x-0 bottom-0 z-10 flex items-end bg-gradient-to-t from-black/80 via-black/25 to-transparent px-3 py-2 pointer-events-none">
+            <div class="min-w-0 pr-[140px]">
+              <div class="text-[9px] uppercase tracking-[0.2em] text-gray-300">Today</div>
+              <div class="quote-line line-clamp-2 text-sm font-medium" x-text="quote"></div>
+            </div>
           </div>
-          <div class="flex items-center gap-1 rounded-full border bg-black/55 px-2 py-0.5 text-[10px] font-bold backdrop-blur ring-1"
-               :class="fatPct !== null ? 'border-yellow-400/30 text-yellow-300 ring-yellow-400/20' : 'border-white/15 text-gray-500 ring-transparent'">
-            <span>🔥</span><span x-text="fatPct !== null ? `${fatPct}%` : '—'"></span>
-          </div>
-        </div>
-        <!-- Audio overlay: play/pause/skip — bottom-right of image, doesn't block subject -->
-        <div x-show="audioTrack && audioTrack.available" class="absolute bottom-2 right-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-1.5 py-1 text-[10px] backdrop-blur">
-          <button @click="togglePlay()" class="flex h-7 w-7 items-center justify-center rounded-full text-white hover:bg-white/15 active:scale-95 transition" :title="audioPlaying ? '暫停' : '播放'">
-            <span class="text-sm" x-text="audioPlaying ? '⏸' : '▶'"></span>
+          <!-- Cycle image button -->
+          <button x-show="!heroVideoUrl && motivationImageList.length > 1"
+                  @click="cycleMotivationImage()"
+                  class="absolute bottom-2 right-2 z-30 flex h-7 items-center justify-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 text-[10px] font-medium text-gray-200 backdrop-blur"
+                  :class="audioTrack && audioTrack.available ? 'mr-[68px]' : ''"
+                  title="換下一張 + 刷新主頁資料">
+            <span>↻</span><span x-text="`${motivationImageIndex + 1}/${motivationImageList.length}`"></span>
           </button>
-          <button x-show="audioPlaylist.length > 1" @click="audioNext()" class="flex h-7 w-7 items-center justify-center rounded-full text-gray-300 hover:bg-white/15 active:scale-95 transition" title="下一首">
-            <span class="text-sm">⏭</span>
+          <!-- Audio overlay -->
+          <div x-show="audioTrack && audioTrack.available" class="absolute bottom-2 right-2 z-20 flex items-center gap-1 rounded-full border border-white/15 bg-black/55 px-1.5 py-1 text-[10px] backdrop-blur">
+            <button @click="togglePlay()" class="flex h-6 w-6 items-center justify-center rounded-full text-white active:scale-95 transition" :title="audioPlaying ? '暫停' : '播放'">
+              <span class="text-xs" x-text="audioPlaying ? '⏸' : '▶'"></span>
+            </button>
+            <button x-show="audioPlaylist.length > 1" @click="audioNext()" class="flex h-6 w-6 items-center justify-center rounded-full text-gray-300 active:scale-95 transition" title="下一首">
+              <span class="text-xs">⏭</span>
+            </button>
+          </div>
+          <!-- Video mute toggle -->
+          <button x-show="heroVideoUrl" @click="heroVideoMuted = !heroVideoMuted"
+                  class="absolute bottom-2 left-2 z-30 flex h-7 items-center justify-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 text-[10px] font-medium text-gray-200 backdrop-blur"
+                  :title="heroVideoMuted ? '開聲' : '靜音'">
+            <span x-text="heroVideoMuted ? '🔇' : '🔊'"></span>
+            <span x-text="heroVideoMuted ? '靜' : '聲'"></span>
           </button>
+          <audio x-ref="audioEl" :src="currentAudioUrl" @ended="audioEnded()" @timeupdate="audioProgress = $event.target.currentTime" @loadedmetadata="audioDuration = $event.target.duration" style="display:none"></audio>
         </div>
-        <!-- Jim OOB 2026-07-19: Cycle motivation image button — placed INSIDE the
-             same bottom-right pill group as the audio controls (separated by a
-             thin divider). Stops overlap with the bottom-left "quote" line that
-             the bottom-left placement collided with. Tapping also refreshes all
-             home data (overlay + streak + history). -->
-        <button x-show="motivationImageList.length > 1"
-                @click="cycleMotivationImage()"
-                class="absolute bottom-2 right-2 z-30 flex h-8 items-center justify-center gap-1 rounded-full border border-white/15 bg-black/55 px-2 text-[10px] font-medium text-gray-200 hover:bg-white/15 active:scale-95 transition backdrop-blur"
-                :class="audioTrack && audioTrack.available ? 'mr-[68px]' : ''"
-                title="換下一張 + 刷新主頁資料">
-          <span>↻</span><span x-text="`${motivationImageIndex + 1}/${motivationImageList.length}`"></span>
-        </button>
-        <!-- Hidden audio element (HTML5 audio, no UI chrome, controlled via Alpine) -->
-        <audio x-ref="audioEl" :src="currentAudioUrl" @ended="audioEnded()" @timeupdate="audioProgress = $event.target.currentTime" @loadedmetadata="audioDuration = $event.target.duration" style="display:none"></audio>
+
+        <!-- (2) Whoop-style big circular Recovery score ring (center) -->
+        <div class="relative mx-auto flex items-center justify-center"
+             style="height: 220px;">
+          <!-- SVG ring background (full circle, dim) -->
+          <svg class="absolute inset-0 m-auto" width="220" height="220" viewBox="0 0 220 220" style="transform: rotate(-90deg)">
+            <circle cx="110" cy="110" r="92" fill="none"
+                    stroke="rgba(255,255,255,0.06)" stroke-width="14"/>
+            <!-- Foreground progress arc — colored by recovery tier -->
+            <circle cx="110" cy="110" r="92" fill="none"
+                    :stroke="recovery === null ? 'rgba(120,120,120,0.4)' :
+                              (recovery >= 66 ? '#10b981' :
+                               recovery >= 33 ? '#38bdf8' : '#fb7185')"
+                    stroke-width="14" stroke-linecap="round"
+                    :stroke-dasharray="`${2 * Math.PI * 92}`"
+                    :stroke-dashoffset="recovery === null ? 0 :
+                                        (2 * Math.PI * 92) * (1 - Math.max(0, Math.min(100, recovery)) / 100)"
+                    style="transition: stroke-dashoffset 1.2s ease-out;"/>
+          </svg>
+          <!-- Center text: recovery % -->
+          <div class="relative z-10 flex flex-col items-center justify-center text-center">
+            <div class="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Recovery</div>
+            <div class="mt-1 text-6xl font-black leading-none tabular-nums"
+                 :class="recovery === null ? 'text-gray-500' :
+                         (recovery >= 66 ? 'text-emerald-300' :
+                          recovery >= 33 ? 'text-sky-300' : 'text-rose-300')"
+                 x-text="recovery !== null ? recovery + '%' : '—'"></div>
+            <div class="mt-1 text-[11px] font-semibold"
+                 :class="recovery === null ? 'text-gray-500' :
+                         (recovery >= 66 ? 'text-emerald-400' :
+                          recovery >= 33 ? 'text-sky-400' : 'text-rose-400')"
+                 x-text="recovery === null ? 'waiting' :
+                         (recovery >= 66 ? 'green · ready' :
+                          recovery >= 33 ? 'yellow · moderate' : 'red · rest')"></div>
+          </div>
+        </div>
+
+        <!-- (3) 3-col metric grid: Strain · Sleep · HRV -->
+        <div class="grid grid-cols-3 gap-2">
+          <div class="glass rounded-2xl px-3 py-3 text-center">
+            <div class="text-[9px] font-bold uppercase tracking-[0.15em] text-gray-400">Strain</div>
+            <div class="mt-1 text-2xl font-black tabular-nums text-amber-300"
+                 x-text="whoopStrain !== null ? whoopStrain.toFixed(1) : '—'"></div>
+            <div class="mt-0.5 text-[9px] font-semibold text-gray-500"
+                 x-text="whoopStrain !== null ? '/ 21.0' : ''"></div>
+          </div>
+          <div class="glass rounded-2xl px-3 py-3 text-center">
+            <div class="text-[9px] font-bold uppercase tracking-[0.15em] text-gray-400">Sleep</div>
+            <div class="mt-1 text-2xl font-black tabular-nums"
+                 :class="whoopSleepPct !== null ? (whoopSleepPct >= 85 ? 'text-emerald-300' : whoopSleepPct >= 70 ? 'text-sky-300' : 'text-rose-300') : 'text-gray-500'"
+                 x-text="whoopSleepPct !== null ? whoopSleepPct + '%' : '—'"></div>
+            <div class="mt-0.5 text-[9px] font-semibold text-gray-500"
+                 x-text="whoopSleepHrs !== null ? whoopSleepHrs.toFixed(1) + 'h last night' : ''"></div>
+          </div>
+          <div class="glass rounded-2xl px-3 py-3 text-center">
+            <div class="text-[9px] font-bold uppercase tracking-[0.15em] text-gray-400">HRV</div>
+            <div class="mt-1 text-2xl font-black tabular-nums text-violet-300"
+                 x-text="whoopHrvMs !== null ? whoopHrvMs.toFixed(1) : '—'"></div>
+            <div class="mt-0.5 text-[9px] font-semibold text-gray-500"
+                 x-text="whoopRhrBpm !== null ? whoopRhrBpm.toFixed(0) + ' bpm · RHR' : ''"></div>
+          </div>
+        </div>
+
+        <!-- (4) Body Comp 4-col grid: Weight · Fat · Muscle · Bone (v3.3.12+13) -->
+        <div>
+          <div class="mb-1.5 flex items-center justify-between px-1">
+            <div class="text-[10px] font-bold uppercase tracking-[0.15em] text-gray-400">Body Composition</div>
+            <div class="text-[9px] text-gray-500" x-text="weightDate ? `as of ${weightDate}` : ''"></div>
+          </div>
+          <div class="grid grid-cols-4 gap-1.5">
+            <div class="glass rounded-xl px-2 py-2 text-center">
+              <div class="text-[9px] font-bold uppercase tracking-[0.12em] text-sky-300">Weight</div>
+              <div class="mt-0.5 text-lg font-black tabular-nums" :class="weightKg !== null ? 'text-white' : 'text-gray-500'"
+                   x-text="weightKg !== null ? weightKg : '—'"></div>
+              <div class="text-[8px] text-gray-500">kg</div>
+            </div>
+            <div class="glass rounded-xl px-2 py-2 text-center">
+              <div class="text-[9px] font-bold uppercase tracking-[0.12em] text-yellow-300">Fat</div>
+              <div class="mt-0.5 text-lg font-black tabular-nums" :class="fatPct !== null ? 'text-white' : 'text-gray-500'"
+                   x-text="fatPct !== null ? fatPct : '—'"></div>
+              <div class="text-[8px] text-gray-500">%</div>
+            </div>
+            <div class="glass rounded-xl px-2 py-2 text-center">
+              <div class="text-[9px] font-bold uppercase tracking-[0.12em] text-emerald-300">Muscle</div>
+              <div class="mt-0.5 text-lg font-black tabular-nums" :class="muscleKg !== null ? 'text-white' : 'text-gray-500'"
+                   x-text="muscleKg !== null ? muscleKg : '—'"></div>
+              <div class="text-[8px] text-gray-500">kg</div>
+            </div>
+            <div class="glass rounded-xl px-2 py-2 text-center">
+              <div class="text-[9px] font-bold uppercase tracking-[0.12em] text-purple-300">Bone</div>
+              <div class="mt-0.5 text-lg font-black tabular-nums" :class="boneKg !== null ? 'text-white' : 'text-gray-500'"
+                   x-text="boneKg !== null ? boneKg : '—'"></div>
+              <div class="text-[8px] text-gray-500">kg</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- (5) Steps widget — paired Today big + Yesterday small -->
+        <div class="glass flex items-stretch gap-2 rounded-2xl px-3 py-2">
+          <div class="flex items-center gap-2">
+            <span class="text-xl">👟</span>
+            <div class="flex flex-col leading-none">
+              <span class="text-[9px] font-bold uppercase tracking-[0.12em] text-gray-400">Steps</span>
+              <span class="text-[8px] text-gray-500">today / yesterday</span>
+            </div>
+          </div>
+          <div class="flex-1"></div>
+          <!-- Today big -->
+          <div class="flex flex-col items-center justify-center leading-none">
+            <span class="text-xl font-black tabular-nums"
+                  :class="stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'"
+                  x-text="stepsToday.toLocaleString()"></span>
+            <span class="mt-0.5 text-[9px] text-gray-500"
+                  x-text="stepsLastSync ? 'as of ' + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) : 'sync…'"></span>
+          </div>
+          <!-- Yesterday small -->
+          <div class="flex items-center pl-2 border-l border-white/15">
+            <span class="text-sm font-bold tabular-nums text-gray-400"
+                  x-text="stepsYesterday !== null ? stepsYesterday.toLocaleString() : '—'"></span>
+          </div>
+        </div>
+
       </div>
 
       <!-- Current set: exercise + weight + reps + intensity in one compact row -->
@@ -522,6 +658,11 @@
       <!-- v2.3: two file inputs — (1) live camera + (2) iPhone photo stream picker (multiple) -->
       <input type="file" accept="image/*" capture="environment" @change="onScanFile($event)" x-ref="scanInputEl" style="display:none">
       <input type="file" accept="image/*" multiple @change="onScanPhotosPicked($event)" x-ref="scanPhotosInputEl" style="display:none">
+      <!-- v3.3.24: replace-photo picker (Jim OOB 2026-10-16 'I want to replace
+           existing photo but the ui does not allow me to do so'). Single
+           file, no capture, the active scan_index is stashed on the
+           element by openReplaceImagePicker(scan). -->
+      <input type="file" accept="image/*" @change="onReplaceImagePicked($event)" x-ref="replaceImageInputEl" style="display:none">
 
       <!-- v2.7.36 → v2.7.54 → v3.3.14: Photo action buttons (camera + photo stream) —
            both on one line, small chips, half-width each.
@@ -534,9 +675,12 @@
            v3.3.14: photo-stream (📷 相簿) now left, camera (📸 影相) right —
            Jim prefers picking from existing photos first. -->
       <div class="grid grid-cols-2 gap-2 mb-3">
-        <!-- iPhone photo stream picker (left) -->
+        <!-- iPhone photo stream picker (left) — v3.3.24 (Jim OOB 2026-10-16
+             'pls allow me to reupload an image'): only block while queue
+             is actively processing; allow re-upload when all items are
+             committed/failed/skipped. -->
         <button @click="$refs.scanPhotosInputEl.click()"
-                :disabled="scanUploading || scanPhotosQueue.length > 0"
+                :disabled="scanUploading || scanPhotosQueue.some(q => q.status === 'pending' || q.status === 'processing' || q.status === 'uploading' || q.status === 'uploaded' || q.status === 'recognising')"
                 class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                 style="background: rgba(255,255,255,0.05); border: 1px solid rgba(16,185,129,0.3);">
           <div class="flex items-center justify-center gap-1.5">
@@ -556,7 +700,65 @@
         </button>
       </div>
 
+      <!-- v3.3.24e (Torres): 兩階段進度條 — 上傳 (藍/綠) + AI 識別 (琥珀/紫).
+           Phase 1 = 全部相片上傳完,先開始 Phase 2 AI 識別 (Jim 明確要求).
+           上傳 bar = 真實 byte 進度 (XHR.upload.onprogress);
+           AI bar = server 真實 stage / pct (GET /api/scan_progress/<job_id>).
+           冇任何假進度:舊嗰條 setInterval +5% 已移除。 -->
+      <div x-show="scanPhase !== 'idle'" x-cloak
+           class="mb-4 rounded-2xl bg-white/5 border border-white/10 p-3"
+           data-scan-progress>
+        <!-- Phase 1 — 上傳 -->
+        <div data-scan-upload-bar>
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <span class="text-[11px] font-bold text-sky-300" x-text="scanUploadTitle"></span>
+            <span class="text-[10px] font-mono text-white/60" x-text="scanUploadPct + '%'"></span>
+          </div>
+          <div class="h-2 rounded-full bg-white/10 overflow-hidden">
+            <div class="h-2 rounded-full bg-gradient-to-r from-sky-400 to-emerald-400 transition-all duration-300"
+                 :style="`width: ${scanUploadPct}%`"></div>
+          </div>
+          <div class="text-[10px] text-white/50 mt-1 font-mono" x-text="scanUploadBytesLabel"></div>
+        </div>
+
+        <div class="border-t border-white/10 my-3"></div>
+
+        <!-- Phase 2 — AI 識別 -->
+        <div data-scan-ai-bar>
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <span class="text-[11px] font-bold text-amber-300" x-text="scanAiTitle"></span>
+            <span class="text-[10px] font-mono text-white/60"
+                  x-text="scanAiIndeterminate ? '' : (scanAiPct + '%')"></span>
+          </div>
+          <div class="h-2 rounded-full bg-white/10 overflow-hidden">
+            <div class="h-2 rounded-full transition-all duration-300"
+                 :class="scanAiIndeterminate
+                            ? 'w-full bg-gradient-to-r from-amber-500/40 to-purple-500/40 animate-pulse'
+                            : 'bg-gradient-to-r from-amber-400 to-purple-500'"
+                 :style="scanAiIndeterminate ? '' : `width: ${scanAiPct}%`"></div>
+          </div>
+          <div class="text-[10px] text-white/50 mt-1 flex items-center justify-between gap-2">
+            <span data-scan-stage-label x-text="scanAiStageLabel"></span>
+            <span class="font-mono text-white/40 shrink-0"
+                  x-show="scanAiElapsed > 0"
+                  x-text="scanAiElapsed.toFixed(0) + ' 秒'"></span>
+          </div>
+        </div>
+      </div>
+
       <!-- Text-direct input mode (toggled by openScanTextInput) -->
+      <!-- v3.3.20: trigger chip — was previously only reachable via
+           voice transcript hand-off. Now visible 1-tap entry to text mode. -->
+      <div class="mb-3 flex items-center justify-center">
+        <button @click="openScanTextInput()"
+                class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-bold transition-all active:scale-95"
+                :style="scanTextMode
+                  ? 'background: linear-gradient(135deg, rgba(168,85,247,0.35), rgba(168,85,247,0.18)); border: 1.5px solid rgba(168,85,247,0.55); color: rgb(216,180,254);'
+                  : 'background: rgba(168,85,247,0.10); border: 1.5px solid rgba(168,85,247,0.30); color: rgb(192,132,252);'">
+          <span x-text="scanTextMode ? '✓ 文字輸入模式（點擊收埋）' : '✏️ 唔想影相？直接輸入文字'"></span>
+        </button>
+      </div>
+
       <div x-show="scanTextMode" x-cloak class="mb-4 rounded-2xl p-4"
            style="background: rgba(168,85,247,0.08); border: 1.5px solid rgba(168,85,247,0.35);">
         <div class="text-[10px] uppercase tracking-[0.2em] text-purple-300 mb-2 font-bold">文字輸入模式</div>
@@ -583,6 +785,20 @@
             <div class="text-[10px] uppercase tracking-[0.2em] text-purple-300 font-bold">📝 文字估算結果</div>
             <button @click="scanTextPreview = null" class="text-[10px] text-gray-400 active:opacity-60">✕ 取消</button>
           </div>
+          <!-- v3.3.20: render downloaded food image (Brave search result)
+               so Jim can visually confirm the dish before commit. -->
+          <template x-if="scanTextPreview.image_path">
+            <div class="mb-3">
+              <img :src="'/scan_thumb/' + (scanTextPreview.image_path.split('/').pop().replace('.jpg', '.thumb.jpg'))"
+                   :alt="scanTextPreview.suggested_entry.name || 'food'"
+                   class="w-full rounded-xl object-cover"
+                   style="max-height: 240px; background: rgba(0,0,0,0.3);"
+                   loading="lazy"
+                   @error="$el.src = scanTextPreview.image_path">
+              <div class="text-[9px] text-gray-500 mt-1 italic"
+                   x-text="`🖼 來源: ${scanTextPreview.image_search?.source || 'web'} · AI 自動搵嘅代表相`"></div>
+            </div>
+          </template>
           <div class="text-xs text-white mb-2 line-clamp-3" x-text="scanTextPreview.vision_short || ''"></div>
           <div class="flex items-baseline gap-3 text-sm text-gray-200 mb-2">
             <span><span class="text-purple-300 font-bold text-lg" x-text="scanTextEditForm.calories ?? scanTextPreview.suggested_entry.calories"></span> kcal</span>
@@ -629,11 +845,17 @@
       </template>
 
       <!-- v2.3: Progress indicator when multi-photo queue is processing -->
+      <!-- v3.3.24e (Torres): 改成跟 phase 走 — 上傳期間顯示上傳進度,
+           AI 期間顯示識別進度,唔再淨係講「處理中」。 -->
       <div x-show="scanPhotosQueue.length > 0" class="mb-4 rounded-xl bg-blue-500/10 border border-blue-400/30 px-3 py-2 text-xs text-blue-200" x-cloak>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 flex-wrap">
           <span>📷 處理中相簿：</span>
           <span class="font-bold text-blue-100" x-text="`${scanPhotosQueueDone}/${scanPhotosQueue.length} 完成`"></span>
-          <span class="text-blue-300/80" x-text="scanPhotosQueueDone === scanPhotosQueue.length ? '（全部已直接寫入 log）' : '（AI 睇緊下一張…）'"></span>
+          <span class="text-blue-300/80" x-text="{
+            uploading: '（上傳緊…）',
+            recognising: '（AI 睇緊…）',
+            done: '（全部已直接寫入 log）'
+          }[scanPhase] || '（AI 睇緊下一張…）'"></span>
         </div>
       </div>
 
@@ -645,6 +867,8 @@
                'border-white/10 bg-white/5 opacity-50': item.status === 'skipped',
                'border-red-400/40 bg-red-500/10': item.status === 'failed',
                'border-blue-400/40 bg-blue-500/10': item.status === 'processing',
+               'border-sky-400/40 bg-sky-500/10': item.status === 'uploading',
+               'border-purple-400/40 bg-purple-500/10': item.status === 'recognising',
              }">
           <!-- Header: file name + status pill -->
           <div class="flex items-center justify-between px-3 pt-2">
@@ -657,10 +881,16 @@
                     'bg-white/20 text-white/60': item.status === 'skipped',
                     'bg-red-400 text-white': item.status === 'failed',
                     'bg-blue-400 text-black': item.status === 'processing',
+                    'bg-sky-400 text-black': item.status === 'uploading',
+                    'bg-purple-400 text-black': item.status === 'recognising',
                     'bg-white/10 text-white/60': item.status === 'pending',
+                    'bg-teal-400 text-black': item.status === 'uploaded',
                   }"
                   x-text="{
                     pending: '排隊',
+                    uploading: '上傳緊',
+                    uploaded: '已上傳',
+                    recognising: 'AI 睇緊',
                     processing: 'AI 睇緊',
                     committed: '已 log',
                     skipped: '跳過',
@@ -708,10 +938,16 @@
           </template>
 
           <!-- Pending/Processing state — show spinner -->
-          <template x-if="!item.preview && (item.status === 'pending' || item.status === 'processing')">
+          <template x-if="!item.preview && (item.status === 'pending' || item.status === 'processing' || item.status === 'uploading' || item.status === 'uploaded' || item.status === 'recognising')">
             <div class="p-4 text-center text-xs text-white/60">
               <div class="text-3xl mb-2 animate-spin inline-block">⏳</div>
-              <div>AI 睇緊呢張相…</div>
+              <div x-text="{
+                pending: '排隊緊…',
+                uploading: '上傳緊呢張相…',
+                uploaded: '已上傳,等 AI 開始…',
+                recognising: 'AI 睇緊呢張相…',
+                processing: 'AI 睇緊呢張相…'
+              }[item.status] || '處理緊…'"></div>
             </div>
           </template>
 
@@ -731,10 +967,10 @@
         清空相簿 queue
       </button>
 
-      <!-- Upload progress bar -->
-      <div x-show="scanUploading" class="mb-4 rounded-full bg-white/10 h-2 overflow-hidden">
-        <div class="bg-emerald-400 h-2 transition-all duration-500" :style="`width: ${scanProgress}%`"></div>
-      </div>
+      <!-- v3.3.24e (Torres): 舊嗰條假進度 bar (setInterval +5%) 已移除。
+           改用上面嘅兩階段進度面板 (data-scan-progress):
+           上傳 bar = 真實 byte 進度, AI bar = server 真實 stage。
+           scanProgress / scanUploading 變數照舊保留俾其他 code 參考。 -->
 
       <!-- v2.2 PREVIEW card (Jim confirms before log) -->
       <div x-show="previewEntry"
@@ -841,15 +1077,28 @@
       <template x-for="group in recentScansGrouped" :key="group.date">
         <div class="mb-5">
           <!-- Date header: date + count + day total kcal + day total protein (Jim OOB 2026-08-11) -->
-          <div class="flex items-baseline justify-between mb-2 px-1">
+          <div class="flex items-center justify-between mb-2 px-1">
             <div class="flex items-baseline gap-2">
               <div class="text-base font-black text-emerald-300" x-text="group.date_label"></div>
               <div class="text-[11px] text-gray-500 font-semibold" x-text="group.weekday"></div>
               <div class="text-[10px] text-gray-500" x-text="`· ${group.count} 項`"></div>
             </div>
-            <div class="text-[11px] text-gray-400 flex items-baseline gap-2.5">
-              <span><span class="text-white font-bold tabular-nums" x-text="group.total_kcal"></span><span class="text-gray-400"> kcal</span></span>
-              <span><span class="text-purple-300 font-bold tabular-nums" x-text="group.total_protein"></span><span class="text-gray-400">g P</span></span>
+            <div class="flex items-center gap-2">
+              <div class="text-[11px] text-gray-400 flex items-baseline gap-2.5">
+                <span><span class="text-white font-bold tabular-nums" x-text="group.total_kcal"></span><span class="text-gray-400"> kcal</span></span>
+                <span><span class="text-purple-300 font-bold tabular-nums" x-text="group.total_protein"></span><span class="text-gray-400">g P</span></span>
+              </div>
+              <!-- v3.3.23c (Jim OOB 2026-09-12 'No response on the button'):
+                   per-day download JPG button. Lives INSIDE the x-for
+                   loop so `group.date` is in scope. Opens in-PWA modal
+                   with explicit 下載 + 關閉 (so user can return to app,
+                   no blank-page issue). -->
+              <button @click="showFoodCardPreview(group.date)"
+                      class="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-bold transition-all active:scale-95"
+                      style="background: linear-gradient(135deg, rgba(251,191,36,0.20), rgba(251,191,36,0.08)); border: 1px solid rgba(251,191,36,0.50); color: rgb(251,191,36);"
+                      title="預覽 + 下載當日食物日結 JPG">
+                <span>📸</span><span>下載日結</span>
+              </button>
             </div>
           </div>
 
@@ -927,6 +1176,13 @@
                 <button @click="openRenamePopover(scan)"
                         class="text-xs text-emerald-300 hover:text-emerald-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
                         title="改名 / 重新辨識">✏️</button>
+                <!-- v3.3.24: replace photo button (Jim OOB 2026-10-16
+                     'I want to replace existing photo but the ui does not
+                     allow me to do so'). Opens hidden file picker, uploads
+                     via /api/scan_replace_image, refreshes food log. -->
+                <button @click="openReplaceImagePicker(scan)"
+                        class="text-xs text-fuchsia-300 hover:text-fuchsia-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
+                        title="換張相">🖼</button>
                 <!-- v2.7.43: edit date/time button -->
                 <button @click="openEditDateTimePopover(scan)"
                         class="text-xs text-sky-300 hover:text-sky-200 px-1.5 py-0.5 rounded flex-shrink-0 active:scale-95"
@@ -997,6 +1253,14 @@
                        maxlength="30"
                        autofocus>
                 <div class="flex gap-2 mt-2">
+                  <!-- v3.3.23ad (Jim OOB 2026-09-16 'use ai to help rewrite the food name in a better way'): AI rewrite button -->
+                  <button @click="aiRewriteName()"
+                          :disabled="!editingScanNewName.trim() || aiRewriting"
+                          class="flex-1 rounded-lg bg-purple-500 px-3 py-1.5 text-xs font-bold text-white active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="用 AI 改寫食物名稱（保留 macro numbers）">
+                    <span x-show="!aiRewriting">✨ AI 改寫</span>
+                    <span x-show="aiRewriting">⏳ AI 度…</span>
+                  </button>
                   <button @click="submitRename()"
                           :disabled="!editingScanNewName.trim() || renameSubmitting"
                           class="flex-1 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-black active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
@@ -1007,6 +1271,22 @@
                           class="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-gray-300 active:scale-95">
                     ✕ 取消
                   </button>
+                </div>
+                <!-- AI rewrite preview (v3.3.23ad): shows detected macros + source -->
+                <div x-show="aiRewritePreview" x-cloak
+                     class="mt-2 rounded-md bg-purple-900/30 border border-purple-400/30 p-2">
+                  <div class="text-[10px] text-purple-300 font-bold mb-1">
+                    ✨ AI 改寫結果 <span x-text="'(' + (aiRewritePreview?.source || '') + ')'" class="text-purple-400/70 font-normal"></span>
+                  </div>
+                  <div class="text-xs text-white" x-text="aiRewritePreview?.rewritten"></div>
+                  <div x-show="aiRewritePreview?.macros && Object.keys(aiRewritePreview.macros).length > 0"
+                       class="mt-1 text-[10px] text-purple-200">
+                    <span class="font-bold">Detected macros:</span>
+                    <span x-text="Object.entries(aiRewritePreview?.macros || {}).map(([k,v]) => k + '=' + v).join(', ')"></span>
+                  </div>
+                  <div class="text-[9px] text-gray-400 mt-1">
+                    撳 ✓ 改名套用呢個版本，撳 ✏️ 編輯改寫內容
+                  </div>
                 </div>
                 <div x-show="renameSubmitMsg" class="mt-1.5 text-[10px]" x-text="renameSubmitMsg"
                      :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
@@ -1071,6 +1351,125 @@
         ✓ 已顯示全部 <span x-text="recentScans.length"></span> 條紀錄
       </div>
     </section>
+
+
+    <!-- v3.3.23b (Jim OOB 2026-09-12 'there should be a way to go back after
+         download'): in-PWA modal that shows the generated food log JPG
+         with explicit 下載 + 關閉 buttons. Replaces the prior
+         blob-trigger-download flow that on iOS PWA standalone mode
+         rendered the JPG in the current tab (blank page with no back
+         button). Modal stays inside the SPA shell — user can always
+         click 關閉 to return to food log.
+         v3.3.23e (Jim OOB 2026-09-12 'Not displaying the image. And also
+         miss alignment for font'):
+           (1) Image now has explicit width=100% height=auto + no max-height
+               so the JPG renders at natural aspect ratio instead of being
+               squished into a 70dvh box. Replaced object-fit: contain with
+               explicit display:block to avoid iOS PWA blob URL rendering
+               quirks.
+           (2) Replaced x-cloak (which delays display until Alpine init) with
+               x-show only — the modal renders immediately when visible.
+           (3) Header uses flex with align-items:center + explicit gap to
+               ensure title and close X are vertically aligned regardless
+               of font metrics.
+           (4) Added fallback content (try the /api/nutrition/card_url
+               raw URL via <img> if blob URL doesn't load — works around
+               iOS PWA blob URL issues).
+           (5) Replaced single x-show chain with explicit onerror handler
+               so if image fails, we surface the error immediately. -->
+    <div x-show="foodCardPreview.visible"
+         class="fixed inset-0 z-50 flex items-center justify-center p-4"
+         style="background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(6px);"
+         @click.self="closeFoodCardPreview()"
+         @keydown.escape.window="closeFoodCardPreview()">
+      <div class="w-full max-w-md max-h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
+           style="background: linear-gradient(180deg, rgb(28, 25, 46) 0%, rgb(12, 10, 24) 100%); border: 1.5px solid rgba(251, 191, 36, 0.45); box-shadow: 0 0 40px rgba(251, 191, 36, 0.18);">
+        <!-- Header (fixed alignment via inline-block + line-height) -->
+        <div class="flex items-center justify-between px-4"
+             style="height: 56px; background: rgba(251, 191, 36, 0.08); border-bottom: 1px solid rgba(251, 191, 36, 0.25);">
+          <div style="line-height: 1.2;">
+            <div class="text-sm font-black" style="color: rgb(251, 191, 36); letter-spacing: 0.02em;">📸 食物日結</div>
+            <div class="text-[10px] text-gray-400"
+                 x-text="`${foodCardPreview.date || ''} · ${foodCardPreview.sizeKb} KB`"></div>
+          </div>
+          <button @click="closeFoodCardPreview()"
+                  class="flex items-center justify-center rounded-full active:scale-95"
+                  style="height: 36px; width: 36px; line-height: 1; background: rgba(255, 255, 255, 0.10); font-size: 18px;"
+                  aria-label="關閉"
+                  data-testid="food-card-close">
+            ✕
+          </button>
+        </div>
+        <!-- JPG preview (v3.3.23q: max-height + object-fit contain
+             so the JPG scales down to fit modal — no more button overlap) -->
+        <div class="flex-1 overflow-y-auto"
+             style="background: rgba(0, 0, 0, 0.4); max-height: calc(90dvh - 56px - 76px);">
+          <!-- Loading spinner -->
+          <div x-show="foodCardPreview.loading"
+               class="flex flex-col items-center justify-center"
+               style="min-height: 240px; padding: 48px 0;">
+            <div style="font-size: 36px; margin-bottom: 12px; animation: spin 1.2s linear infinite; display: inline-block;">⏳</div>
+            <div class="text-xs text-gray-300">生成緊食物日結 JPG...</div>
+          </div>
+          <!-- Image preview — server-side URL. v3.3.23q: object-fit:contain
+               so JPG shrinks to fit, never overflows the modal. -->
+          <img x-show="!foodCardPreview.loading && foodCardPreview.url"
+               :src="foodCardPreview.url"
+               :alt="foodCardPreview.fileName"
+               @error="if (foodCardPreview.date) foodCardPreview.fallbackUrl = '/nutrition_card/nutrition_' + foodCardPreview.date + '.jpg?v=2'"
+               @load="foodCardPreview.imageLoaded = true"
+               style="display: block; width: 100%; max-width: 100%; height: auto; max-height: 100%; object-fit: contain; background: rgba(0, 0, 0, 0.6); padding: 12px; box-sizing: border-box; -webkit-appearance: none; appearance: none;" />
+          <!-- Fallback (v3.3.23g): alternate server URL with cache-buster -->
+          <img x-show="!foodCardPreview.loading && foodCardPreview.fallbackUrl && !foodCardPreview.imageLoaded"
+               :src="foodCardPreview.fallbackUrl"
+               :alt="foodCardPreview.fileName + ' (fallback)'"
+               style="display: block; width: 100%; max-width: 100%; height: auto; min-height: 200px; background: rgba(0, 0, 0, 0.6); padding: 12px; box-sizing: border-box; -webkit-appearance: none; appearance: none;" />
+          <!-- Error fallback (shouldn't happen given showFoodCardPreview
+               closes the modal on error) -->
+          <div x-show="!foodCardPreview.loading && !foodCardPreview.url"
+               class="text-center text-xs text-red-300"
+               style="padding: 32px 0;">
+            ❌ JPG 唔見咗 — 撳「關閉」再試過
+          </div>
+        </div>
+        <!-- v3.3.23ax: page navigation (only shown for multi-page days) -->
+        <div x-show="foodCardPreview.pageTotal > 1"
+             class="flex items-center justify-between gap-2 px-4 py-2"
+             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
+          <button @click="switchFoodCardPage(-1)"
+                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum <= 1"
+                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
+                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
+            ‹ 上一頁
+          </button>
+          <div class="text-xs text-gray-300"
+               x-text="`第 ${foodCardPreview.pageNum} / ${foodCardPreview.pageTotal} 頁`"></div>
+          <button @click="switchFoodCardPage(1)"
+                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum >= foodCardPreview.pageTotal"
+                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
+                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
+            下一頁 ›
+          </button>
+        </div>
+        <!-- Action bar -->
+        <div class="grid grid-cols-2 gap-2 px-4 py-3"
+             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
+          <button @click="downloadFoodCardFromModal()"
+                  :disabled="foodCardPreview.loading || !foodCardPreview.url"
+                  class="rounded-xl text-sm font-bold transition-all active:scale-95 disabled:opacity-40"
+                  style="padding: 14px 0; background: linear-gradient(135deg, rgba(251, 191, 36, 0.45), rgba(251, 191, 36, 0.20)); border: 1.5px solid rgba(251, 191, 36, 0.55); color: rgb(28, 25, 46); line-height: 1.2;">
+            <span x-show="!foodCardPreview.pageTotal || foodCardPreview.pageTotal <= 1">⬇ 下載 JPG</span>
+            <span x-show="foodCardPreview.pageTotal > 1" x-text="'⬇ 下載全部 ' + (foodCardPreview.pageTotal || 0) + ' 頁'"></span>
+          </button>
+          <button @click="closeFoodCardPreview()"
+                  class="rounded-xl text-sm font-bold transition-all active:scale-95"
+                  style="padding: 14px 0; background: rgba(255, 255, 255, 0.10); border: 1.5px solid rgba(255, 255, 255, 0.20); color: rgb(240, 240, 245); line-height: 1.2;">
+            <span x-show="!foodCardPreview.pageTotal || foodCardPreview.pageTotal <= 1">✕ 關閉</span>
+            <span x-show="foodCardPreview.pageTotal > 1" x-text="'✕ 關閉 (' + (foodCardPreview.pageTotal || 0) + ' 頁已生成)'"></span>
+          </button>
+        </div>
+      </div>
+    </div>
 
 
     <!-- END TAB -->
@@ -1195,8 +1594,11 @@
             </div>
           </div>
           <div class="text-sm text-white whitespace-pre-wrap leading-relaxed mb-3" x-text="cheerLatest.text || ''"></div>
+          <!-- v3.3.16 (Jim 2026-09-05): bump height to 48px so native controls
+               play button renders fully on iOS Safari + Android Chrome
+               (was 36px — play button cropped on both viewports). -->
           <template x-if="cheerLatest.voice_url">
-            <audio :src="cheerLatest.voice_url" controls class="w-full mb-2" style="height:36px"></audio>
+            <audio :src="cheerLatest.voice_url" controls playsinline preload="metadata" class="w-full mb-2 rounded-lg bg-black/40" style="height:48px"></audio>
           </template>
           <template x-if="cheerLatest.image_url">
             <img :src="cheerLatest.image_url" class="w-full rounded-xl mb-2" loading="lazy">
@@ -1247,8 +1649,10 @@
               <details class="mt-2">
                 <summary class="text-emerald-300 cursor-pointer text-[10px]">睇返上一個 cheer 內容</summary>
                 <div class="text-[11px] text-white whitespace-pre-wrap leading-relaxed mt-2" x-text="cheerLastFire.text"></div>
+                <!-- v3.3.16 (Jim 2026-09-05): bump height 32→44px so play
+                     button fully visible (was cropped on iOS Safari). -->
                 <template x-if="cheerLastFire.voice_url">
-                  <audio :src="cheerLastFire.voice_url" controls class="w-full mt-2" style="height:32px"></audio>
+                  <audio :src="cheerLastFire.voice_url" controls playsinline preload="metadata" class="w-full mt-2 rounded-lg bg-black/40" style="height:44px"></audio>
                 </template>
                 <template x-if="cheerLastFire.image_url">
                   <img :src="cheerLastFire.image_url" class="w-full rounded-lg mt-2" loading="lazy">
@@ -1437,6 +1841,62 @@ function gymApp() {
     scheduleTotalSets: 0,
     scheduleRangeLabel: '',
     scheduleHasAny: false,
+    // v3.3.23ao: computed properties for the monthly strain+recovery chart.
+    // Returns SVG-ready polyline strings + per-day coordinate arrays so the
+    // template can render with simple x-bind (avoids Alpine choking on complex
+    // map().filter().join() inline expressions that didn't react properly).
+    get scheduleChartStrainPoints() {
+      const days = this.scheduleMonth || [];
+      if (days.length === 0) return '';
+      return days.map((d, i) => {
+        if (!d.total_strain || d.total_strain <= 0) return null;
+        const x = 40 + (i * 310 / Math.max(1, days.length - 1));
+        const y = 110 - (Math.min(d.total_strain, 21) / 21 * 100);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).filter(Boolean).join(' ');
+    },
+    get scheduleChartRecoveryPoints() {
+      const days = this.scheduleMonth || [];
+      if (days.length === 0) return '';
+      return days.map((d, i) => {
+        if (d.recovery_pct == null) return null;
+        const x = 40 + (i * 310 / Math.max(1, days.length - 1));
+        const y = 110 - (d.recovery_pct / 100 * 100);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).filter(Boolean).join(' ');
+    },
+    // v3.3.24e (Isak QA): recovery/strain DOTS as raw SVG strings.
+    // Previously they were <template x-for> + :cx/:cy, which Alpine
+    // evaluated before the x-for scope existed → "d is not defined" /
+    // "i is not defined" ReferenceError → empty cx/cy attributes → 4 SVG
+    // parse errors. Building the markup as a string sidesteps Alpine
+    // expression scoping entirely (same pattern as the :points polylines).
+    get scheduleRecoveryDotsHtml() {
+      const days = this.scheduleMonth || [];
+      const n = days.length;
+      if (!n) return '';
+      const out = [];
+      days.forEach((d, i) => {
+        if (!d || d.recovery_pct == null) return;
+        const x = 40 + (i * 310 / Math.max(1, n - 1));
+        const y = 110 - (d.recovery_pct / 100 * 100);
+        out.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.5" fill="#34d399" pointer-events="none"/>`);
+      });
+      return out.join('');
+    },
+    get scheduleStrainDotsHtml() {
+      const days = this.scheduleMonth || [];
+      const n = days.length;
+      if (!n) return '';
+      const out = [];
+      days.forEach((d, i) => {
+        if (!d || !d.total_strain || d.total_strain <= 0) return;
+        const x = 40 + (i * 310 / Math.max(1, n - 1));
+        const y = 110 - (Math.min(d.total_strain, 21) / 21 * 100);
+        out.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.5" fill="#60a5fa" pointer-events="none"/>`);
+      });
+      return out.join('');
+    },
     // v3.2.7.19: monthly navigation — 0 = current month, -1 = previous,
     // -2 = two months back, etc. No future navigation.
     scheduleMonthOffset: 0,
@@ -1537,6 +1997,13 @@ function gymApp() {
     stepsLastSync: null,
     stepsAgeMin: null,
     stepsStale: false,
+    // v3.3.25 (Jim OOB 2026-10-20「Steps is whoop! 用 whoop count step」):
+    // 'whoop' | 'withings' — which source the displayed count came from.
+    // stepsBandOff: the Whoop band was off-body for >6h, so the count is a
+    // real LAST-KNOWN total, not a live running total. Surfaced in the UI so
+    // the number is never implied to be live when it isn't.
+    stepsSource: 'whoop',
+    stepsBandOff: false,
     // v2.7.42: HH:MM only 24h format (Jim OOB 2026-08-06 "HH:mm only")
     // Date is shown in the group header so per-entry display is just the time
     formatScanTime(iso) {
@@ -1624,7 +2091,26 @@ function gymApp() {
     streak: 0,
     recovery: null,
     weightKg: null,
+    // v3.3.24e: `weightDate` was referenced in the Body Composition header
+    // (x-text="weightDate ? `as of ${weightDate}` : ''") but NEVER declared
+    // in data() → Alpine threw "weightDate is not defined" on every page
+    // load (caught by Isak's QA as a PAGEERR). Declared here + populated
+    // from healthData.weight_date (the /api/health_overlay field).
+    weightDate: null,
     fatPct: null,
+    // v3.3.13 (Jim OOB 2026-09-01「Make UIUX change on gym — Make it like
+    // whoop」): Whoop-style extended metrics state. Populated from cheer
+    // job payload (which already pulls Whoop sleep/strain/HRV/RHR via
+    // the existing pipeline) and exposed in /api/health_overlay.
+    whoopStrain: null,
+    whoopSleepPct: null,
+    whoopSleepHrs: null,
+    whoopHrvMs: null,
+    whoopRhrBpm: null,
+    // v3.3.12: extended body comp (Withings)
+    muscleKg: null,
+    boneKg: null,
+    hydrationPct: null,
     clockStr: '',
     elapsedSec: 0,
     elapsedStr: '0:00',
@@ -1650,6 +2136,27 @@ function gymApp() {
     scanProgress: 0,
     lastScan: null,
     recentScans: [],
+
+    // v3.3.24e: two-phase scan progress (Torres — SCAN_PROGRESS_SPEC §3).
+    // Phase 1 = upload all (real byte progress via XHR.upload.onprogress),
+    // Phase 2 = AI recognise (real server stage via /api/scan_progress poll).
+    // Old scanUploading / scanProgress kept for backward compat.
+    scanPhase: 'idle',            // idle | uploading | recognising | done
+    scanUploadPct: 0,             // 0-100, real byte progress
+    scanUploadCurrent: 0,         // 1-based index of photo being uploaded
+    scanUploadTotal: 0,
+    scanUploadBytesLabel: '',     // "1.2 MB / 2.8 MB"
+    scanUploadTitle: '📸 上傳',
+    scanAiPct: 0,                 // 0-100, from server
+    scanAiStageLabel: '',         // 繁中 stage label from server
+    scanAiCurrent: 0,             // 1-based
+    scanAiTotal: 0,
+    scanAiTitle: '🤖 AI 識別',
+    scanAiElapsed: 0,
+    scanAiJobId: null,
+    scanAiIndeterminate: false,   // legacy flow: no real stage pct available
+    scanApiMode: 'unknown',       // unknown | two-phase | legacy (Frimpong API 未上線時 fallback)
+    _scanLastResults: [],
 
     // v2.7.45 P3: Voice memo → text (gpt-4o-transcribe)
     voiceInputMode: false,
@@ -1684,6 +2191,8 @@ function gymApp() {
     editingScanIndex: null,
     editingScanOldName: '',
     editingScanNewName: '',
+    aiRewriting: false,           // v3.3.23ad: AI rewrite in-flight
+    aiRewritePreview: null,        // v3.3.23ad: {rewritten, source, macros}
     renameSubmitting: false,
     renameSubmitMsg: '',
     // v2.7.43: edit date/time state
@@ -1711,6 +2220,16 @@ function gymApp() {
     videoActiveTrack: null,   // currently selected video
     videoJobId: null,         // current job_id while polling
     videoJobPollTimer: null,  // polling timer for status
+    // v3.3.8 (Jim OOB 2026-08-30「Move video motivation as front page of gym tab.
+    // Keep it looping」): looping video in the gym set tab hero banner. Auto-loads
+    // the latest video from /api/video_motivation/recent on init, plays silently
+    // + looped in background. Mute toggle available via banner pill.
+    heroVideoUrl: '',         // URL of looping video on gym set tab hero banner
+    heroVideoMuted: true,     // default muted (iOS Safari + autoplay policy)
+    // v3.3.13 (Jim OOB 2026-09-01「loop the latest 5 videos」): playlist
+    // + index state to cycle through multiple videos on the hero banner.
+    heroVideoPlaylist: [],     // up to 5 most-recent video URLs
+    heroVideoIndex: 0,         // current video index in playlist
     // v2.2 features (Jim OOB 2026-07-23 22:42 HKT)
     photostream: [],           // today's images with optional classification
     photostreamClassifying: false,
@@ -1720,14 +2239,37 @@ function gymApp() {
     previewEditing: false,     // toggle edit-mode for preview fields
     previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
     // v2.7.19: supplementary hint (Jim OOB 2026-07-31 13:25 HKT)
-    // After preview shown, Jim types hint → re-runs pplx + APiyi enrichment → swaps in new preview
+    // After preview shown, Jim types hint → re-runs pplx + MiniMax enrichment → swaps in new preview
     previewHint: '',           // current hint textarea content (cleared after each re-enrich)
     previewUserHints: [],      // history of hints Jim already used in this preview session
     reEnrichInFlight: false,   // prevent double-tap on "🔄 用補充資料再 estimate"
     // v2.7.22: text-direct food input mode (Jim OOB 2026-08-02 02:50 HKT)
-    // Type what you ate without taking a photo. APiyi estimates, you confirm, commit.
+    // Type what you eat without taking a photo. MiniMax estimates, you confirm, commit.
     scanTextMode: false,       // toggle on by openScanTextInput()
     scanTextInput: '',         // current textarea content
+    // v3.3.23b (Jim OOB 2026-09-12 'there should be a way to go back after
+    // download. Currently it stuck to a blank page that i cannot go
+    // back to continue the app'): preview-modal state for the food
+    // log JPG download. On iOS PWA standalone mode, `Content-Disposition:
+    // attachment` is ignored for blob URLs, so the JPG would render in
+    // the current PWA tab (effectively a blank page since the tab no
+    // longer renders the SPA shell). The fix is to show the JPG inside
+    // a PWA-native modal with explicit 下載 + 關閉 buttons — user always
+    // has a way back.
+    foodCardPreview: {
+      visible: false,
+      date: null,
+      url: '',         // blob: URL of generated JPG
+      fileName: '',    // gymbro_foodlog_YYYY-MM-DD.jpg
+      sizeKb: 0,
+      loading: false,
+      // v3.3.23e (Jim OOB 2026-09-12 'Not displaying the image'): blob
+      // URLs can fail on iOS PWA standalone mode. The fallback chain
+      // loads the same JPG from the server-side cache (/nutrition_card/)
+      // which is a regular HTTP URL and works reliably everywhere.
+      fallbackUrl: '',
+      imageLoaded: false,
+    },
     scanTextUploading: false,  // prevent double-tap on AI estimate
     scanTextPreview: null,     // last preview object (same shape as image preview)
     scanTextEditForm: {        // editable overrides for the preview
@@ -1774,6 +2316,26 @@ function gymApp() {
           this.motivationImage = list[0].url;
         }
       } catch(e) {}
+      // v3.3.8 (Jim OOB 2026-08-30「Move video motivation as front page of gym
+      // tab. Keep it looping」): pre-load the latest video motivation into the
+      // hero banner so it plays silently + looped as background. Falls back to
+      // the image-only hero if no video exists yet.
+      // v3.3.13 (Jim OOB 2026-09-01「on gym front-page, loop the latest 5
+      // videos instead of only the latest video」): load the latest 5
+      // videos and cycle through them on the hero banner (each plays for
+      // its full duration before advancing to the next). Falls back to
+      // image-only hero if no video exists yet.
+      try {
+        const vidRes = await fetch('/api/video_motivation/recent');
+        const vidData = await vidRes.json();
+        const vids = (vidData && vidData.videos) || [];
+        if (vids.length > 0) {
+          // v3.3.13: keep up to 5 most-recent videos and cycle through them.
+          this.heroVideoPlaylist = vids.slice(0, 5).map(v => v.url);
+          this.heroVideoIndex = 0;
+          this.heroVideoUrl = this.heroVideoPlaylist[0];
+        }
+      } catch(e) { /* no video yet — hero stays as image */ }
       // v2.1: preload recent scans (for Scan tab)
       this.loadRecentScans();
       // v2.2: preload today's photostream (F1 — auto-suggest food log candidates)
@@ -1795,12 +2357,12 @@ function gymApp() {
       // Non-blocking; runs in background server-side.
       fetch('/api/daily_coaching').catch(() => {});
       // Pull health overlay (Whoop recovery + Withings weight + fat %) — single number each
+      let _initialHealthData = null;
       try {
         const healthRes = await fetch('/api/health_overlay');
         const healthData = await healthRes.json();
-        this.recovery = (typeof healthData.recovery === 'number') ? healthData.recovery : null;
-        this.weightKg = (typeof healthData.weight_kg === 'number') ? healthData.weight_kg : null;
-        this.fatPct = (typeof healthData.fat_pct === 'number') ? healthData.fat_pct : null;
+        _initialHealthData = healthData;
+        this.applyHealthOverlay(healthData);
       } catch(e) { /* keep nulls, badges hidden */ }
       // Pull today's audio (non-blocking, fails silently if no audio exists)
       try {
@@ -1896,7 +2458,27 @@ function gymApp() {
       this.pullIndicatorOpacity = 1;
       this.haptic();
       try {
-        // Re-fetch all SPA data in parallel
+        // v3.3.16 (Jim OOB 2026-09-05 'pull to refresh, whoop and withings
+        // data is not updated'): main pull-to-refresh previously only
+        // re-fetched CACHED data via loadSteps/loadSchedule — never told
+        // backend to actually re-pull from the APIs.
+        // v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is
+        // whoop!」): Withings is no longer a step source, and its step-refresh
+        // endpoint is gone. WHOOP is the only backend the pull has to wake.
+        const refreshOk = { whoop: false, whoopError: null };
+        const [whoopRes] = await Promise.allSettled([
+          fetch('/api/whoop_refresh', { method: 'POST' }),
+        ]);
+        if (whoopRes.status === 'fulfilled') {
+          try {
+            const d = await whoopRes.value.json();
+            refreshOk.whoop = !!d.ok;
+            if (!d.ok) refreshOk.whoopError = d.error || 'unknown';
+          } catch (e) { refreshOk.whoopError = e.message; }
+        } else {
+          refreshOk.whoopError = whoopRes.reason && whoopRes.reason.message || 'fetch failed';
+        }
+        // Re-fetch all SPA data in parallel (now reading freshly refreshed caches)
         await Promise.all([
           this.loadSteps(),
           this.loadSchedule(),
@@ -1904,13 +2486,26 @@ function gymApp() {
           this.loadPhotostream(true),
           this.loadCheerRecent(),
         ]);
+        // v3.3.16: refresh health-overlay hero card so whoop_strain /
+        // whoop_sleep_pct / whoop_hrv_ms / whoop_rhr_bpm update too
+        // (these were not part of the previous parallel set).
+        try {
+          const hr = await fetch('/api/health_overlay');
+          const hd = await hr.json();
+          if (hd && typeof hd === 'object') this.applyHealthOverlay(hd);
+        } catch (e) { /* silent — overlay optional */ }
         // Pull /api/state for session re-sync
         try {
           const r = await fetch('/api/state');
           const data = await r.json();
           if (data && data.session) this.session = data.session;
         } catch (e) { /* silent */ }
-        this.flash('✓ 數據已刷新');
+        // v3.3.16: flash reflects which backends actually refreshed, so
+        // Jim can see if one source failed without digging into logs.
+        const parts = [];
+        if (refreshOk.whoop) parts.push('Whoop ✓');
+        else parts.push('Whoop ✗' + (refreshOk.whoopError ? ` (${refreshOk.whoopError.slice(0, 30)})` : ''));
+        this.flash('✓ ' + parts.join(' · '));
         this.haptic();
       } catch (e) {
         this.flash('刷新失敗：' + e.message);
@@ -1941,6 +2536,30 @@ function gymApp() {
       this.clockStr = `${String(hh24).padStart(2,'0')}:${mm}:${ss}`;
       // v3.2.2: header compact version (HH:MM only) for slim top bar
       this.clockStrShort = `${String(hh24).padStart(2,'0')}:${mm}`;
+    },
+
+    // v3.3.16 (Jim OOB 2026-09-05 'pull to refresh, whoop and withings
+    // data is not updated'): extracted from inline init() so pull-to-refresh
+    // can re-apply the same field updates without duplicating ~14 lines.
+    // Same null-coalescing behavior as the original inline code.
+    applyHealthOverlay(healthData) {
+      if (!healthData || typeof healthData !== 'object') return;
+      this.recovery = (typeof healthData.recovery === 'number') ? healthData.recovery : null;
+      this.weightKg = (typeof healthData.weight_kg === 'number') ? healthData.weight_kg : null;
+      // v3.3.24e: populate the "as of <date>" label in the Body Composition
+      // header. Was missing → header always blank + the PAGEERR above.
+      this.weightDate = healthData.weight_date || null;
+      this.fatPct = (typeof healthData.fat_pct === 'number') ? healthData.fat_pct : null;
+      // v3.3.12: muscle / bone / hydration extended body comp (Withings).
+      this.muscleKg = (typeof healthData.muscle_kg === 'number') ? healthData.muscle_kg : null;
+      this.boneKg = (typeof healthData.bone_kg === 'number') ? healthData.bone_kg : null;
+      this.hydrationPct = (typeof healthData.hydration_pct === 'number') ? healthData.hydration_pct : null;
+      // v3.3.13: Whoop extended metrics (strain / sleep / HRV / RHR).
+      this.whoopStrain = (typeof healthData.whoop_strain === 'number') ? healthData.whoop_strain : null;
+      this.whoopSleepPct = (typeof healthData.whoop_sleep_pct === 'number') ? healthData.whoop_sleep_pct : null;
+      this.whoopSleepHrs = (typeof healthData.whoop_sleep_hrs === 'number') ? healthData.whoop_sleep_hrs : null;
+      this.whoopHrvMs = (typeof healthData.whoop_hrv_ms === 'number') ? healthData.whoop_hrv_ms : null;
+      this.whoopRhrBpm = (typeof healthData.whoop_rhr_bpm === 'number') ? healthData.whoop_rhr_bpm : null;
     },
 
     tickElapsed() {
@@ -2269,6 +2888,7 @@ function gymApp() {
         const d = await r.json();
         this.recovery = d.recovery;
         this.weightKg = d.weight_kg;
+        this.weightDate = d.weight_date || null;
         this.fatPct = d.fat_pct;
       } catch(e) { /* keep stale */ }
       // 2. streak
@@ -2280,6 +2900,15 @@ function gymApp() {
       // 3. history (forces sheet pre-sync so other-device rows surface)
       await this.refreshHistory(true);
       this.flash(`已換圖 · 同步 ${this.motivationImageList.length} 張 · ${this.history.length} 個 session`);
+    },
+
+    // v3.3.13 (Jim OOB 2026-09-01「loop the latest 5 videos」): advance
+    // to the next video in the hero playlist when one finishes. Cycles
+    // back to the start after the last video. Empty playlist = no-op.
+    advanceHeroVideo() {
+      if (!this.heroVideoPlaylist || this.heroVideoPlaylist.length <= 1) return;
+      this.heroVideoIndex = (this.heroVideoIndex + 1) % this.heroVideoPlaylist.length;
+      this.heroVideoUrl = this.heroVideoPlaylist[this.heroVideoIndex];
     },
 
     async loadHistory(force = false) {
@@ -2618,7 +3247,20 @@ function gymApp() {
         const target = new Date(now.getFullYear(), now.getMonth() + this.scheduleMonthOffset, 1);
         const monthStr = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}`;
         const monthRes = await fetch(`/api/whoop_activities_calendar?month=${monthStr}`).then(r => r.json());
+        // v3.3.12 (Jim OOB 2026-09-01「the calendar tab on gymbro is
+        // disappearing」): on the 1st of each month, the calendar tab was
+        // hiding because `scheduleHasAny` only checked the CURRENT month's
+        // days, missing the last 1-2 days of the previous month where the
+        // most recent workout sits. Also fetch the previous month so the
+        // tab stays visible on month-boundary days. Calendar grid still
+        // renders only `scheduleMonth` (current month view); the prev-month
+        // fetch is purely for the `scheduleHasAny` flag.
+        const prevTarget = new Date(target.getFullYear(), target.getMonth() - 1, 1);
+        const prevMonthStr = `${prevTarget.getFullYear()}-${String(prevTarget.getMonth() + 1).padStart(2, '0')}`;
+        const prevRes = await fetch(`/api/whoop_activities_calendar?month=${prevMonthStr}`).then(r => r.json());
+        const prevDays = prevRes.days || [];
         this.scheduleMonth = monthRes.days || [];
+        this.schedulePrevMonthDays = prevDays;
         this.scheduleMonthGymCount = monthRes.gym_count || 0;
         this.scheduleMonthOtherCount = monthRes.other_count || 0;
         this.scheduleTotalVolume = monthRes.total_volume_kg || 0;
@@ -2650,7 +3292,14 @@ function gymApp() {
           }
         }
         this.scheduleMonthAligned = aligned;
-        this.scheduleHasAny = this.scheduleMonth.some(d => d.count > 0);
+        // v3.3.12 (Jim OOB 2026-09-01「the calendar tab on gymbro is
+        // disappearing」): scheduleHasAny now combines current month +
+        // previous month so the 📅 tab stays visible on the 1st day of
+        // each month when the most recent workout sat on the last day of
+        // the previous month. Calendar grid still shows current month only.
+        const hasAnyCurrent = this.scheduleMonth.some(d => d.count > 0);
+        const hasAnyPrev = this.schedulePrevMonthDays && this.schedulePrevMonthDays.some(d => d.count > 0);
+        this.scheduleHasAny = hasAnyCurrent || hasAnyPrev;
       } catch (e) {
         console.error('[loadSchedule] failed', e);
         this.scheduleHasAny = false;
@@ -2784,23 +3433,28 @@ function gymApp() {
     // today record yet (凌晨 / Apple Watch 還未 commit). Distinguish
     // "0 steps" (real empty day) from "still syncing" (no data).
     // v2.7.40: Force-refresh from Withings (called by tap on 👟 widget)
-    // 1. Call /api/withings_refresh to trigger backend subprocess
-    // 2. Backend runs withings.py activity getactivity, updates WITHINGS_CACHE
-    // 3. Re-fetch /api/withings_steps_today + /api/withings_steps_7d_avg for display
+    // v3.3.26 (2026-10-21「I mean weight. If whoop has weight data. Remove all withings」):
+    // 1. Call /api/whoop_refresh to trigger a fresh WHOOP pull
+    // 2. Backend re-pulls WHOOP (cycles + body_measurement) and rewrites the cache
+    // 3. Re-fetch /api/whoop_steps for display
+    // There is NO Withings step call here any more.
     // Visual: stepsRefreshing = true → 👟 spins + number pulses sky blue
     async refreshSteps() {
       if (this.stepsRefreshing) return;  // debounce: ignore taps during refresh
       this.stepsRefreshing = true;
       this.haptic(15);
-      this.flash('從 Withings 拉新步數…');
+      // v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is whoop!」):
+      // tapping the shoes widget now forces a WHOOP pull — Withings was
+      // removed as a step source, so its step-refresh endpoint is gone.
+      this.flash('從 WHOOP 拉新步數…');
       try {
-        // Step 1: trigger backend force refresh (~3-5s)
-        const r = await fetch('/api/withings_refresh', { method: 'POST' });
+        // Step 1: trigger backend force refresh (~5-15s)
+        const r = await fetch('/api/whoop_refresh', { method: 'POST' });
         const data = await r.json();
         if (data.ok) {
-          this.flash(`✓ Withings 已更新 (${data.data_as_of?.slice(11, 16) || 'now'})`);
+          this.flash(`✓ WHOOP 已更新 (${data.synced_at?.slice(11, 16) || 'now'})`);
         } else {
-          this.flash('Withings refresh 失敗：' + (data.error || '未知'));
+          this.flash('WHOOP refresh 失敗：' + (data.error || '未知'));
         }
       } catch(e) {
         this.flash('Error：' + e.message);
@@ -2814,34 +3468,36 @@ function gymApp() {
     },
 
     async loadSteps() {
+      // v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is whoop!」):
+      // WHOOP is the ONLY step source. `/api/whoop_steps` returns today's
+      // running total (cycles[0] — the in-progress cycle), yesterday (the
+      // previous complete cycle), the 7d average, the freshness stamp and
+      // the band_off flag. There is NO Withings step call here any more.
       try {
-        const r = await fetch('/api/withings_steps_today');
+        const r = await fetch('/api/whoop_steps');
         const data = await r.json();
-        if (data.syncing) {
-          // No today record from Withings yet. Show 0 + syncing flag
-          // (rather than freezing yesterday's number as today).
-          this.stepsToday = 0;
-          this.stepsKcal = 0;
+        if (!data || !data.ok) {
           this.stepsSyncing = true;
-        } else {
-          this.stepsToday = data.steps || 0;
-          this.stepsKcal = data.calories || 0;
-          this.stepsSyncing = false;
+          return;
         }
-        // v3.3.7: data freshness stamp uses `data_as_of` (Withings-side),
-        // not `pulled_at` (when gymbro last queried). `data_as_of` is the
-        // latest iPhone-sync intraday event ts — i.e., when the watch last
-        // captured movement. Hide the label entirely when Withings has no
-        // genuine intraday events (Jim OOB 2026-08-17: never show pulled_at
-        // — that's gymbro's fetch time, not movement time).
+        this.stepsSource = 'whoop';
+        this.stepsToday = data.steps || 0;
+        this.stepsSyncing = (data.steps === null || data.steps === undefined);
+        // Whoop cycles carry no step-specific calories/distance.
+        this.stepsKcal = 0;
+        // v3.3.7: data freshness stamp uses `data_as_of` (source-side), not
+        // `pulled_at` (when gymbro last queried). For Whoop this is the cycle
+        // record's own `updated_at` — i.e. when the band last wrote. Hide the
+        // label entirely when there is no genuine as-of stamp (Jim OOB
+        // 2026-08-17: never show pulled_at).
         const asOfIso = data.data_as_of;
         if (asOfIso) {
           this.stepsLastSync = asOfIso;
           try {
             const asOfMs = new Date(asOfIso).getTime();
             const ageMs = Date.now() - asOfMs;
-            this.stepsAgeMin = Math.max(0, Math.round(ageMs / 60000));
-            // > 30 min since Withings got the data → flag stale amber
+            this.stepsAgeMin = Math.max(0, Math.round(ageMs/60000));
+            // > 30 min since the source wrote the data → flag stale amber
             this.stepsStale = this.stepsAgeMin > 30;
           } catch(e) { this.stepsAgeMin = null; this.stepsStale = false; }
         } else {
@@ -2849,16 +3505,14 @@ function gymApp() {
           this.stepsAgeMin = null;
           this.stepsStale = false;
         }
-        // v2.7.26: paired yesterday for widget display
-        if (data.yesterday && typeof data.yesterday.steps === 'number') {
-          this.stepsYesterday = data.yesterday.steps;
-        } else {
-          this.stepsYesterday = null;
-        }
-        // 7d avg
-        const r7 = await fetch('/api/withings_steps_7d_avg');
-        const d7 = await r7.json();
-        this.steps7dAvg = d7.avg || 0;
+        // v3.3.25: the band was off-body for >6h => the count is a real
+        // LAST-KNOWN total, not a live running total. Say so rather than
+        // implying "live".
+        this.stepsBandOff = !!data.band_off;
+        // Paired yesterday — Whoop's previous complete cycle.
+        this.stepsYesterday = (typeof data.steps_yesterday === 'number') ? data.steps_yesterday : null;
+        // 7d avg — Whoop's own, over the last 7 complete cycles.
+        this.steps7dAvg = (typeof data.steps_7d_avg === 'number') ? data.steps_7d_avg : 0;
       } catch(e) { /* silent */ }
     },
 
@@ -3117,15 +3771,14 @@ function gymApp() {
           // Running — update progress label with as-of timestamps (7/29 Jim OOB)
           const stepMap = {
             whoop_pull: '🟢 WHOOP 拉緊數據…',
-            withings_pull: '🟢 Withings 拉緊數據…',
+            whoop_body: '🟢 WHOOP 拉緊身體數據…',
             text_gen: '✍️ pplx 寫緊 cheer 文字…',
-            voice_gen: '🎙 Edge-TTS 整緊 WanLung 語音…',
+            voice_gen: '🎙 Edge-TTS 整緊雲龍語音…',
             image_gen: '🖼 MiniMax 整緊勵志圖…',
           };
           let suffix = '';
           if (data.whoop_pulled_at) suffix += ` · WHOOP ${data.whoop_pulled_at}`;
-          if (data.withings_pulled_at) suffix += ` · Withings ${data.withings_pulled_at}`;
-          if (data.step_at) suffix += ` · step ${data.step_at}`;
+                    if (data.step_at) suffix += ` · step ${data.step_at}`;
           this.cheerProgress = (stepMap[data.step] || `${data.status}: ${data.step}`) + suffix;
           this.cheerPct = Math.min(this.cheerPct + 8, 90);
         }
@@ -3239,48 +3892,444 @@ function gymApp() {
       this.videoActiveTrack = track;
     },
 
-    async onScanFile(event) {
-      const file = event.target.files[0];
-      if (!file) return;
-      this.scanUploading = true;
-      this.scanProgress = 20;
-      this.flash('AI 睇緊你張相…');
-      try {
-        const formData = new FormData();
-        formData.append('image', file);
-        const progressTimer = setInterval(() => {
-          if (this.scanProgress < 85) this.scanProgress += 5;
-        }, 400);
+    // ===== v3.3.24e (Torres): 兩階段 scan flow =====================
+    // Phase 1 UPLOAD  → POST /api/scan_upload          (multipart, 真實 byte 進度)
+    // Phase 2 RECOGNISE → POST /api/scan_recognize     (JSON, 即返 job_id)
+    //                    → GET  /api/scan_progress/<job_id> (poll, 真實 stage)
+    //
+    // Jim 明確要求 (2026-10-20):「when multiple upload, I want gymbro to
+    // handle the upload first. AI recognition can be done later」
+    // → Phase 1 一定要全部上傳完,先開始 Phase 2。
+    //
+    // 註: fetch() 冇 upload progress event,一定要用 XMLHttpRequest.upload.onprogress。
 
-        // v3.2.7.23: scan_preview ALWAYS auto-commits (Jim OOB 2026-08-10
-        // 'we dont need to preview for my confirmation. just log it right
-        // away'). We don't populate previewEntry/commitPreview any more —
-        // doing so would risk a double-write when Jim taps 確認 again on
-        // the preview card. Just refresh the recent-scans feed so the new
-        // entry shows up immediately. If Jim wants to edit, he uses the
-        // ✏️ button on the food log row.
-        const r = await fetch('/api/scan_preview', { method: 'POST', body: formData });
-        clearInterval(progressTimer);
-        this.scanProgress = 100;
-        const data = await r.json();
-        if (!data.ok) {
-          this.flash('Scan 失敗：' + (data.error || '未知錯誤'));
-          this.scanUploading = false;
-          return;
+    // 真實 byte 上傳進度 (fetch 做不到)
+    _scanUploadXhr(url, formData, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url);
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable && e.total > 0) {
+            try { onProgress(Math.round((e.loaded / e.total) * 100), e.loaded, e.total); } catch (_) {}
+          }
+        };
+        xhr.onload = () => {
+          let data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (err) { data = null; }
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve({ status: xhr.status, data: data });
+          } else {
+            const err = new Error((data && (data.error || data.message)) || ('HTTP ' + xhr.status));
+            err.status = xhr.status;
+            err.data = data;
+            reject(err);
+          }
+        };
+        xhr.onerror = () => { const err = new Error('網絡錯誤 — 連唔到伺服器'); err.status = 0; reject(err); };
+        xhr.onabort = () => { const err = new Error('上傳已取消'); err.status = 0; reject(err); };
+        xhr.send(formData);
+      });
+    },
+
+    _scanFmtBytes(b) {
+      const n = Number(b);
+      if (!isFinite(n) || n < 0) return '—';
+      if (n < 1024) return Math.round(n) + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    },
+
+    // server 冇返 stage_label 嘅後備中文 label (SCAN_PROGRESS_SPEC §2.3)
+    _scanStageLabelLocal(stage) {
+      return ({
+        queued: '排隊緊…',
+        uploading_not_needed: '上傳已完成',
+        vision: 'AI 睇緊相…',
+        second_opinion: '第二個 AI 交叉檢查…',
+        enrich: '估算緊營養…',
+        enrich2: '交叉核對緊營養值…',
+        multi: '分析緊有幾多餸…',
+        brand: '對照緊品牌營養表…',
+        drive: '上載緊去雲端…',
+        commit: '寫入緊 Google Sheet…',
+        done: '完成',
+      })[stage] || '';
+    },
+
+    // 探測 /api/scan_upload 存在唔存在 (Frimpong 未上線時行舊流程,
+    // 咁 Jim 嘅 scan 功能唔會壞)。Flask 對已註冊 route 嘅 OPTIONS 會回
+    // 200/405,對未註冊 URL 會回 404。
+    async _scanProbeApi() {
+      if (this.scanApiMode && this.scanApiMode !== 'unknown') return this.scanApiMode === 'two-phase';
+      try {
+        const r = await fetch('/api/scan_upload', { method: 'OPTIONS' });
+        this.scanApiMode = (r.status === 404) ? 'legacy' : 'two-phase';
+      } catch (e) {
+        this.scanApiMode = 'legacy';
+      }
+      console.log('[scan] api mode =', this.scanApiMode);
+      return this.scanApiMode === 'two-phase';
+    },
+
+    // 上傳單張相 → /api/scan_upload。field 名優先用 images (可多檔),
+    // 如果 server 話 field 唔對就 fallback 用 image (單張相容)。
+    async _scanUploadOne(file, clientIndex) {
+      const fname = file.name || ('photo_' + (clientIndex + 1) + '.jpg');
+      const onProg = (pct, loaded, total) => {
+        this.scanUploadPct = pct;
+        this.scanUploadBytesLabel = this._scanFmtBytes(loaded) + ' / ' + this._scanFmtBytes(total);
+        this.scanProgress = pct;   // 舊變數,保留兼容
+      };
+      const build = (field) => {
+        const fd = new FormData();
+        fd.append(field, file, fname);
+        fd.append('client_index', String(clientIndex));
+        return fd;
+      };
+      let res;
+      try {
+        res = await this._scanUploadXhr('/api/scan_upload', build('images'), onProg);
+      } catch (e) {
+        if (e.status === 404 || e.status === 405) { e.endpointMissing = true; throw e; }
+        // server 可能淨係收 image 欄位 → 試一次
+        if (e.status === 400 && /image|file|field|照片|相/i.test(String(e.message || ''))) {
+          res = await this._scanUploadXhr('/api/scan_upload', build('image'), onProg);
+        } else {
+          throw e;
         }
-        const committedNames = (data.committed || [])
-          .map(c => c.name)
-          .filter(Boolean)
-          .slice(0, 3)
-          .join(' · ');
-        this.flash(`✓ 已寫入：${committedNames || data.entries?.[0]?.name || '食物'}`);
+      }
+      const data = res.data;
+      if (!data || !data.ok) throw new Error((data && data.error) || '上傳失敗');
+      const uploads = Array.isArray(data.uploads) ? data.uploads : [];
+      const up = uploads[0];
+      if (!up || !up.path) throw new Error('伺服器冇返上傳後嘅路徑');
+      // 用自己嘅 client index 做 mapping key(唔靠 server echo,避免單張
+      // request 全部 echo 返 0)。Phase 2 會用同一組 index 對返 queue。
+      return {
+        client_index: clientIndex,
+        path: up.path,
+        filename: up.filename || fname,
+        image_url: up.image_url || '',
+        thumbnail_url: up.thumbnail_url || '',
+        size_kb: up.size_kb || Math.round(file.size / 1024),
+        capture_iso: up.capture_iso || '',
+        capture_hhmm: up.capture_hhmm || '',
+      };
+    },
+
+    // Phase 2:開 job + poll 真實進度
+    async _scanRecognisePhase(uploads, queueItems) {
+      const paths = uploads.map(u => u.path);
+      const client_indexes = uploads.map(u => u.client_index);
+      const r = await fetch('/api/scan_recognize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: paths, client_indexes: client_indexes }),
+      });
+      let data = null;
+      try { data = await r.json(); } catch (e) { data = null; }
+      if (!r.ok || !data || !data.ok) {
+        throw new Error((data && (data.error || data.message)) || ('啟動 AI 識別失敗 HTTP ' + r.status));
+      }
+      const jobId = data.job_id;
+      if (!jobId) throw new Error('伺服器冇返 job_id');
+      this.scanAiJobId = jobId;
+      this.scanAiTotal = Number(data.total) || uploads.length;
+      console.log('[scan] recognise job', jobId, 'total', this.scanAiTotal);
+      await this._scanPollJob(jobId, uploads, queueItems);
+    },
+
+    // Poll GET /api/scan_progress/<job_id> — 每次 700ms (SCAN_PROGRESS_SPEC §3.2)
+    async _scanPollJob(jobId, uploads, queueItems) {
+      const started = Date.now();
+      const MAX_MS = 15 * 60 * 1000;
+      let lastPct = 0;
+      // queueItems === this.scanPhotosQueue 呢個 reference 會喺 loop 入面
+      // 被換掉 (this.scanPhotosQueue = [...]),所以要喺入 loop 之前 freeze。
+      const isAppQueue = (queueItems === this.scanPhotosQueue);
+      for (;;) {
+        if (Date.now() - started > MAX_MS) {
+          throw new Error('AI 識別等太耐(超過 15 分鐘),試下再 upload 一次');
+        }
+        const r = await fetch('/api/scan_progress/' + encodeURIComponent(jobId));
+        if (!r.ok) throw new Error('查 AI 進度失敗 HTTP ' + r.status);
+        let d = null;
+        try { d = await r.json(); } catch (e) { d = null; }
+        if (!d || !d.ok) throw new Error((d && (d.error || d.message)) || '查 AI 進度失敗');
+
+        // 真實 server pct (單調遞增,唔會倒退)
+        const pct = Math.max(0, Math.min(100, Number(d.pct) || 0));
+        this.scanAiPct = Math.max(lastPct, pct);
+        lastPct = this.scanAiPct;
+        this.scanAiStageLabel = d.stage_label || this._scanStageLabelLocal(d.stage) || 'AI 睇緊…';
+        const cur = Number(d.current_index);
+        this.scanAiCurrent = isFinite(cur) && cur >= 0 ? cur + 1 : this.scanAiCurrent;
+        this.scanAiTotal = Number(d.total) || this.scanAiTotal;
+        this.scanAiElapsed = Number(d.elapsed_s) || 0;
+        this.scanAiTitle = '🤖 AI 睇緊第 ' + this.scanAiCurrent + ' 張相…';
+
+        // 逐張結果 → queue
+        // 重要:server 只會收到成功上傳嗰啲 path,所以佢 echo 返嘅
+        // client_index 係「成功上傳名單」入面嘅位置,唔等於原始
+        // client_index。所以要靠 uploads[] 嘅順序嚟對返 queue item。
+        (Array.isArray(d.results) ? d.results : []).forEach((res, ri) => {
+          // uploads[] 入面第 ri 個 = server 處理緊嗰張 (server 順序處理)
+          const up = uploads[ri];
+          if (!up) return;
+          const item = queueItems.find(q => q.client_index === up.client_index);
+          if (!item) return;
+          if (item.__done) return;
+          item.__done = true;
+          const pv = res.preview || {};
+          item.preview = {
+            ...pv,
+            image_url: pv.image_url || res.image_url || '',
+            thumbnail_url: pv.thumbnail_url || res.thumbnail_url || '',
+          };
+          item.committed = res.committed || [];
+          // v3.3.30 (2026-10-21, Rule 25): server 會攔截「未識別菜式」呢類
+          // 泛用名,回 ok=false = 呢張相冇入账(唔係「入咗账但冇名」)。
+          // 一定要話畀 Jim 聽,唔好扮成成功。
+          if (res.ok === false) {
+            item.status = 'failed';
+            item.auto_committed = false;
+            item.error = '呢張相搵唔到菜名,冇入账(唔會寫「未識別菜式」落你嘅記錄)';
+            return;
+          }
+          item.status = 'committed';
+          item.auto_committed = true;
+          item.error = null;
+        });
+
+        // 逐張錯誤 → queue
+        (Array.isArray(d.errors) ? d.errors : []).forEach((err, ei) => {
+          const up = uploads[ei];
+          if (!up) return;
+          const item = queueItems.find(q => q.client_index === up.client_index);
+          if (!item) return;
+          if (item.__done) return;
+          item.__done = true;
+          item.status = 'failed';
+          item.error = err.error || 'AI 識別失敗';
+        });
+
+        // 邊張正處理緊 → queue 顯示「AI 睇緊」
+        if (isFinite(cur) && cur >= 0) {
+          const upNow = uploads[cur];
+          if (upNow) {
+            const itemNow = queueItems.find(q => q.client_index === upNow.client_index);
+            if (itemNow && itemNow.status === 'uploaded') itemNow.status = 'recognising';
+          }
+        }
+        if (isAppQueue) {
+          this.scanPhotosQueue = [...this.scanPhotosQueue];
+          this.scanPhotosQueueDone = this.scanPhotosQueue.filter(
+            q => q.status === 'committed' || q.status === 'skipped' || q.status === 'failed'
+          ).length;
+        }
+
+        if (d.status === 'completed' || d.status === 'failed') {
+          console.log('[scan] job done', jobId, d.status);
+          break;
+        }
+        await new Promise(res2 => setTimeout(res2, 700));
+      }
+    },
+
+    // 舊流程 fallback (Fr impong 個 API 未上線): 逐張 POST /api/scan_preview。
+    // 上傳 bar 仍然係真實 byte 進度 (用 XHR),AI bar 冇 stage 就唔報假 %.
+    async _scanLegacyRun(files, queueItems) {
+      this.scanAiIndeterminate = true;
+      this.scanAiStageLabel = 'AI 睇緊緊…';
+      const isAppQueue = (queueItems === this.scanPhotosQueue);
+      for (let i = 0; i < files.length; i++) {
+        const item = queueItems[i];
+        item.status = 'processing';
+        if (isAppQueue) this.scanPhotosQueue = [...this.scanPhotosQueue];
+        try {
+          const fd = new FormData();
+          fd.append('image', files[i]);
+          const res = await this._scanUploadXhr('/api/scan_preview', fd, (pct, loaded, total) => {
+            this.scanUploadPct = pct;
+            this.scanUploadBytesLabel = this._scanFmtBytes(loaded) + ' / ' + this._scanFmtBytes(total);
+          });
+          const data = res.data;
+          if (!data || !data.ok) throw new Error((data && data.error) || 'scan failed');
+          item.preview = data.preview;
+          item.committed = data.committed || [];
+          item.status = 'committed';
+          item.auto_committed = true;
+        } catch (e) {
+          item.status = 'failed';
+          item.error = e.message || String(e);
+        }
+        if (isAppQueue) {
+          this.scanPhotosQueue = [...this.scanPhotosQueue];
+          this.scanPhotosQueueDone = this.scanPhotosQueue.filter(
+            q => q.status === 'committed' || q.status === 'skipped' || q.status === 'failed'
+          ).length;
+        }
+      }
+      // 舊流程冇 stage 資料,所以唔會報假 %;但完成後要收返條 bar
+      this.scanAiIndeterminate = false;
+      this.scanAiPct = 100;
+      this.scanAiStageLabel = '完成';
+    },
+
+    // 單張上傳 (影相)。同樣行兩階段:上傳 → AI 識別。
+    async onScanFile(event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      const picker = event.target;
+      this.scanUploading = true;
+      this.scanPhase = 'uploading';
+      this.scanUploadPct = 0;
+      this.scanUploadCurrent = 1;
+      this.scanUploadTotal = 1;
+      this.scanUploadBytesLabel = '0 B / ' + this._scanFmtBytes(file.size);
+      this.scanUploadTitle = '📸 上傳緊 1/1 相';
+      this.scanAiPct = 0;
+      this.scanAiCurrent = 1;
+      this.scanAiTotal = 1;
+      this.scanAiStageLabel = '等緊上傳完成…';
+      this.scanAiTitle = '🤖 AI 識別緊 (等緊上傳完成)';
+      this.scanAiElapsed = 0;
+      this.scanAiJobId = null;
+      this.scanAiIndeterminate = false;
+      this.flash('上傳緊你張相…');
+      const queueItems = [{
+        client_index: 0,
+        filename: file.name || 'image.jpg',
+        file_size_kb: Math.round(file.size / 1024),
+        status: 'uploading',
+        preview: null,
+        error: null,
+      }];
+      try {
+        const twoPhase = await this._scanProbeApi();
+        if (twoPhase) {
+          const up = await this._scanUploadOne(file, 0);
+          queueItems[0].status = 'uploaded';
+          this.scanUploadPct = 100;
+          this.scanUploadTitle = '✅ 上傳完成 1/1';
+          this.scanPhase = 'recognising';
+          this.scanAiTitle = '🤖 AI 睇緊第 1 張相…';
+          this.scanAiStageLabel = '準備緊…';
+          await this._scanRecognisePhase([up], queueItems);
+          this.scanAiPct = 100;
+          this.scanAiStageLabel = '完成';
+          const names = (queueItems[0].committed || []).map(c => c.name).filter(Boolean).slice(0, 3).join(' · ');
+          this.flash('✓ 已寫入：' + (names || (queueItems[0].preview && queueItems[0].preview.suggested_entry
+            ? queueItems[0].preview.suggested_entry.name : '') || '食物'));
+        } else {
+          this.scanUploadTitle = '📸 上傳緊 1/1 相';
+          await this._scanLegacyRun([file], queueItems);
+          const names = (queueItems[0].committed || []).map(c => c.name).filter(Boolean).slice(0, 3).join(' · ');
+          this.flash('✓ 已寫入：' + (names || '食物'));
+        }
+        this.scanPhase = 'done';
+        this.scanUploadTitle = '✅ 上傳完成 1/1';
+        this.scanAiTitle = '✅ AI 識別完成';
         await this.loadRecentScans();
-      } catch(e) {
-        this.flash('Error：' + e.message);
+      } catch (e) {
+        console.error('[scan] onScanFile failed', e);
+        this.flash('Scan 失敗：' + (e.message || '未知錯誤'));
+        this.scanPhase = 'done';
+        this.scanUploadTitle = '❌ 上傳失敗';
+        this.scanAiStageLabel = (e.message || '未知錯誤');
       } finally {
         this.scanUploading = false;
         this.scanProgress = 0;
-        event.target.value = '';
+        picker.value = '';
+      }
+    },
+
+    // v3.3.24: open the hidden file picker, stash the target scan_index
+    // on the input so onReplaceImagePicked knows which row to update
+    // (Jim OOB 2026-10-16 'I want to replace existing photo but the ui
+    // does not allow me to do so. Pls make this happening').
+    // v3.3.24a: removed window.confirm() — it was unreliable inside the
+    // iOS Telegram WebView. Now shows an inline "上傳緊新相…" flash + a
+    // native 5-second "⏪ 還原舊相" undo button after success.
+    openReplaceImagePicker(scan) {
+      const el = this.$refs.replaceImageInputEl;
+      if (!el) { console.warn('[replace-image] no input el'); return; }
+      const scanIndex = scan.scan_index ?? scan.row_index;
+      if (!scanIndex) {
+        this.flash('呢個 row 冇 scan_index, 換唔到相');
+        return;
+      }
+      el.dataset.scanIndex = String(scanIndex);
+      el.dataset.scanName = scan.name || '';
+      el.value = '';   // allow re-picking the same file
+      console.log('[replace-image] opening picker for row', scanIndex);
+      el.click();
+    },
+    async onReplaceImagePicked(event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      const el = event.target;
+      const scanIndex = el.dataset.scanIndex;
+      const scanName = el.dataset.scanName || '';
+      if (!scanIndex) {
+        this.flash('冇對應到 row, 唔 send');
+        return;
+      }
+      console.log('[replace-image] picked', file.name, file.size, 'bytes for row', scanIndex);
+      this.flash('⏳ 上傳緊新相…');
+      // Keep dataset intact across the await — Alpine re-renders can
+      // swap the element under us, so re-grab via x-ref by name.
+      try {
+        const formData = new FormData();
+        formData.append('image', file);
+        formData.append('scan_index', scanIndex);
+        const r = await fetch('/api/scan_replace_image', { method: 'POST', body: formData });
+        const data = await r.json();
+        if (!r.ok || !data.ok) {
+          console.error('[replace-image] server error', r.status, data);
+          this.flash('換相失敗：' + (data.error || `HTTP ${r.status}`));
+          return;
+        }
+        console.log('[replace-image] success', data);
+        // v3.3.24a: cache-bust the thumbnail/image URLs by appending
+        // ?v=<timestamp> to every <img> bound to this row. Without this
+        // the iOS browser shows the OLD image even after loadRecentScans
+        // re-runs, because the static URL `/scan_thumb/637` is the same
+        // and the browser may serve a cached decoded bitmap.
+        const bust = Date.now();
+        try {
+          document.querySelectorAll(`img[src*="/scan_thumb/${scanIndex}"], img[src*="/scan_img/scan_"]`).forEach(img => {
+            const u = new URL(img.src, window.location.origin);
+            u.searchParams.set('v', bust);
+            img.src = u.toString();
+          });
+        } catch(e) { /* non-fatal */ }
+        this.flash(`✓ 換咗新相 (row ${scanIndex}) · 5 秒內可撳 ⏪ 還原`);
+        this._replaceUndo = {
+          scanIndex,
+          oldImageUrl: data.old_image_url || '',
+          oldDriveUrl: data.old_drive_url || '',
+          newImageUrl: data.image_url,
+          expiresAt: Date.now() + 5000,
+          timer: setTimeout(() => {
+            if (this._replaceUndo && this._replaceUndo.scanIndex === scanIndex) {
+              this._replaceUndo = null;
+              this.flash('⏪ 還原時限過咗');
+            }
+          }, 5000),
+        };
+        // Refresh food log in background
+        await this.loadRecentScans();
+        if (typeof this.loadFoodHistory === 'function') {
+          await this.loadFoodHistory();
+        }
+      } catch (e) {
+        console.error('[replace-image] fetch error', e);
+        this.flash('換相 Error：' + e.message);
+      } finally {
+        el.value = '';
+        delete el.dataset.scanIndex;
+        delete el.dataset.scanName;
       }
     },
 
@@ -3292,65 +4341,153 @@ function gymApp() {
     // AI finishes. Cards are still shown briefly for transparency so Jim
     // can see what was logged; if anything's wrong he can ✏️ edit / 🗑️
     // delete on the food card after-the-fact.
+    //
+    // v3.3.24e (Torres): 改成兩階段 — Phase 1 全部相片先上傳晒,
+    // Phase 2 先開始 AI 識別 (Jim OOB 2026-10-20 'I want gymbro to handle
+    // the upload first. AI recognition can be done later')。
     async onScanPhotosPicked(event) {
       const files = Array.from(event.target.files || []);
-      if (files.length === 0) return;
-      this.flash(`你揀咗 ${files.length} 張相，AI 逐張睇緊同寫入 log…`);
+      if (!files.length) return;
+      const picker = event.target;
       this.scanPhotosQueue = files.map((f, i) => ({
         client_index: i,
         filename: f.name || `image_${i+1}.jpg`,
         file_size_kb: Math.round(f.size / 1024),
-        status: 'pending',  // pending | processing | committed | skipped | failed
+        status: 'pending',
         preview: null,
         error: null,
       }));
       this.scanPhotosQueueDone = 0;
+      this.scanUploading = true;
+      this.scanPhase = 'uploading';
+      this.scanUploadPct = 0;
+      this.scanUploadCurrent = 0;
+      this.scanUploadTotal = files.length;
+      this.scanUploadBytesLabel = '準備緊…';
+      this.scanUploadTitle = '📸 準備上傳 ' + files.length + ' 張相…';
+      this.scanAiPct = 0;
+      this.scanAiCurrent = 0;
+      this.scanAiTotal = files.length;
+      this.scanAiStageLabel = '等緊全部相片上傳完成…';
+      this.scanAiTitle = '🤖 AI 識別緊 (等緊上傳完成)';
+      this.scanAiElapsed = 0;
+      this.scanAiJobId = null;
+      this.scanAiIndeterminate = false;
+      this.flash(`你揀咗 ${files.length} 張相，先全部上傳，跟住 AI 慢慢睇…`);
 
-      // Sequential processing — MiniMax + pplx is rate-limited; parallel = MiniMax quota burning
-      for (let i = 0; i < this.scanPhotosQueue.length; i++) {
-        const queueItem = this.scanPhotosQueue[i];
-        queueItem.status = 'processing';
-        // Force reactivity (Alpine.js tracks direct index write but be safe)
-        this.scanPhotosQueue = [...this.scanPhotosQueue];
-        try {
-          const formData = new FormData();
-          formData.append('image', files[i]);
-          const r = await fetch('/api/scan_preview', { method: 'POST', body: formData });
-          const data = await r.json();
-          if (!data.ok) {
-            queueItem.status = 'failed';
-            queueItem.error = data.error || 'scan failed';
-          } else {
-            queueItem.preview = data.preview;
-            // v3.2.7.23: server always auto-commits, so the queue item
-            // goes straight to 'committed'. No 'ready' state anymore —
-            // the confirm button is gone from the queue card UI.
-            queueItem.status = 'committed';
-            queueItem.auto_committed = true;
+      const uploads = [];
+      let failedUploads = 0;
+      try {
+        const twoPhase = await this._scanProbeApi();
+        if (twoPhase) {
+          // ---------- PHASE 1: 全部上傳 (真實 byte 進度) ----------
+          // 逐張上傳 (每張一個 request),所以每張都有真實 byte 進度,
+          // 而且一張 fail 都唔會影響其他張 (SCAN_PROGRESS_SPEC §3.4)。
+          for (let i = 0; i < files.length; i++) {
+            const item = this.scanPhotosQueue[i];
+            item.status = 'uploading';
+            this.scanPhotosQueue = [...this.scanPhotosQueue];
+            this.scanUploadCurrent = i + 1;
+            this.scanUploadTitle = `📸 上傳緊 ${i+1}/${files.length} 相`;
+            this.scanUploadPct = 0;
+            this.scanUploadBytesLabel = '0 B / ' + this._scanFmtBytes(files[i].size);
+            try {
+              const up = await this._scanUploadOne(files[i], i);
+              uploads.push(up);
+              item.status = 'uploaded';
+              item.path = up.path;
+              item.image_url = up.image_url;
+              item.thumbnail_url = up.thumbnail_url;
+              item.capture_iso = up.capture_iso;
+              item.capture_hhmm = up.capture_hhmm;
+              console.log('[scan] uploaded', i, up.path);
+            } catch (e) {
+              console.error('[scan] upload failed for index', i, e);
+              failedUploads++;
+              item.status = 'failed';
+              item.error = (e.message || '上傳失敗');
+              if (e.endpointMissing) {
+                // API 未上線 → 全部跌返舊流程
+                throw e;
+              }
+            }
+            this.scanPhotosQueue = [...this.scanPhotosQueue];
+            this.scanPhotosQueueDone = this.scanPhotosQueue.filter(
+              q => q.status === 'committed' || q.status === 'skipped' || q.status === 'failed'
+            ).length;
           }
-        } catch (e) {
-          queueItem.status = 'failed';
-          queueItem.error = e.message;
+
+          // ---------- PHASE 2: AI 識別 (全部上傳完先開始) ----------
+          if (!uploads.length) {
+            throw new Error('全部相片都上傳失敗');
+          }
+          this.scanUploadPct = 100;
+          this.scanUploadTitle = `✅ 上傳完成 ${uploads.length}/${files.length} 相`;
+          this.scanPhase = 'recognising';
+          this.scanAiTitle = '🤖 AI 睇緊第 1 張相…';
+          this.scanAiStageLabel = '準備緊…';
+          this.scanAiCurrent = 1;
+          await this._scanRecognisePhase(uploads, this.scanPhotosQueue);
+          this.scanAiPct = 100;
+          this.scanAiStageLabel = '完成';
+        } else {
+          // ---------- 舊流程 fallback (API 未上線) ----------
+          await this._scanLegacyRun(files, this.scanPhotosQueue);
         }
-        this.scanPhotosQueueDone = i + 1;
-        this.scanPhotosQueue = [...this.scanPhotosQueue];  // trigger reactivity
+
+        // 摘要
+        const ok = this.scanPhotosQueue.filter(q => q.status === 'committed').length;
+        const fail = this.scanPhotosQueue.filter(q => q.status === 'failed').length;
+        this.scanPhase = 'done';
+        this.scanUploadTitle = `✅ 上傳完成 ${uploads.length || files.length}/${files.length} 相`;
+        this.scanAiTitle = fail ? '⚠️ AI 識別完成(部分失敗)' : '✅ AI 識別完成';
+        if (fail === 0) {
+          this.flash(`✓ 全部 ${ok} 張已直接寫入 log + Sheet`);
+        } else if (ok > 0) {
+          this.flash(`✓ ${ok} 張寫入 · ⚠️ ${fail} 張失敗，睇下點解`);
+        } else {
+          this.flash(`⚠️ ${fail} 張全部失敗`);
+        }
+        // Refresh food log so the new entries appear immediately on the
+        // scan tab (Jim OOB 2026-08-10 'just log it right away' — wants
+        // to see the row in the timeline without tab-switching).
+        await this.loadRecentScans();
+      } catch (e) {
+        console.error('[scan] onScanPhotosPicked failed', e);
+        this.flash('Scan 失敗：' + (e.message || '未知錯誤'));
+        this.scanPhase = 'done';
+        this.scanUploadTitle = '❌ 上傳/識別失敗';
+        this.scanAiStageLabel = (e.message || '未知錯誤');
+        if (e.endpointMissing) {
+          // API 未上線 → 改用舊流程重試一次,唔好就係死咗
+          this.scanApiMode = 'legacy';
+          try {
+            this.scanPhotosQueue = files.map((f, i) => ({
+              client_index: i,
+              filename: f.name || `image_${i+1}.jpg`,
+              file_size_kb: Math.round(f.size / 1024),
+              status: 'pending', preview: null, error: null,
+            }));
+            await this._scanLegacyRun(files, this.scanPhotosQueue);
+            const ok = this.scanPhotosQueue.filter(q => q.status === 'committed').length;
+            const fail = this.scanPhotosQueue.filter(q => q.status === 'failed').length;
+            this.scanPhase = 'done';
+            this.scanUploadTitle = `✅ 上傳完成 ${files.length}/${files.length} 相`;
+            this.scanAiTitle = fail ? '⚠️ AI 識別完成(部分失敗)' : '✅ AI 識別完成';
+            this.flash(fail === 0
+              ? `✓ 全部 ${ok} 張已直接寫入 log + Sheet`
+              : `✓ ${ok} 張寫入 · ⚠️ ${fail} 張失敗`);
+            await this.loadRecentScans();
+          } catch (e2) {
+            console.error('[scan] legacy fallback failed', e2);
+            this.flash('Scan 失敗：' + (e2.message || '未知錯誤'));
+          }
+        }
+      } finally {
+        this.scanUploading = false;
+        this.scanProgress = 0;
+        picker.value = '';  // reset picker so same files can be re-picked later
       }
-      // v3.2.7.23: summarise per-photo outcomes. With always-auto-commit,
-      // every successful scan is committed; only failures need attention.
-      const ok = this.scanPhotosQueue.filter(q => q.status === 'committed').length;
-      const fail = this.scanPhotosQueue.filter(q => q.status === 'failed').length;
-      if (fail === 0) {
-        this.flash(`✓ 全部 ${ok} 張已直接寫入 log + Sheet`);
-      } else if (ok > 0) {
-        this.flash(`✓ ${ok} 張寫入 · ⚠️ ${fail} 張失敗，睇下點解`);
-      } else {
-        this.flash(`⚠️ ${fail} 張全部失敗`);
-      }
-      // Refresh food log so the new entries appear immediately on the
-      // scan tab (Jim OOB 2026-08-10 'just log it right away' — wants
-      // to see the row in the timeline without tab-switching).
-      await this.loadRecentScans();
-      event.target.value = '';  // reset picker so same files can be re-picked later
     },
 
     // v2.3: skip one queue item (mark skipped — purely UI; entry already
@@ -3368,6 +4505,19 @@ function gymApp() {
     clearPhotosQueue() {
       this.scanPhotosQueue = [];
       this.scanPhotosQueueDone = 0;
+      // v3.3.24e (Torres): 清 queue 就收埋進度面板,唔好留住舊 bar
+      this.scanPhase = 'idle';
+      this.scanUploadPct = 0;
+      this.scanUploadCurrent = 0;
+      this.scanUploadTotal = 0;
+      this.scanUploadBytesLabel = '';
+      this.scanAiPct = 0;
+      this.scanAiCurrent = 0;
+      this.scanAiTotal = 0;
+      this.scanAiElapsed = 0;
+      this.scanAiJobId = null;
+      this.scanAiIndeterminate = false;
+      this.scanAiStageLabel = '';
       this.flash('已清空相簿 queue');
     },
 
@@ -3694,6 +4844,10 @@ function gymApp() {
           body: JSON.stringify({
             text: text,
             user_hints: hintsForReq,
+            // v3.3.20 (Jim OOB 2026-09-10): explicit image-search flag. Default
+            // server-side is True; pass True here for clarity. Set to false
+            // to skip the Brave image fetch (faster, no network call).
+            with_image: true,
           }),
         });
         const data = await r.json();
@@ -3702,7 +4856,16 @@ function gymApp() {
           return;
         }
         this.scanTextPreview = data.preview;
-        // Init edit form from suggested entry (Jim can override)
+        // v3.3.20: surface image-search status in the flash so Jim sees
+        // whether a real food photo was downloaded (or no result found).
+        const imgInfo = data.preview.image_search || {};
+        if (imgInfo.downloaded) {
+          this.flash(`✨ 已估算 + 從 ${imgInfo.source} 搵到食物相 (檢查再 ✓ log)`);
+        } else if (imgInfo.attempted) {
+          this.flash(`✨ 已估算（搵唔到食物相: ${imgInfo.error || 'no_results'}，照樣可以 ✓ log）`);
+        } else {
+          this.flash('✨ 已估算 — 檢查再 ✓ 確認 log');
+        }
         const s = data.preview.suggested_entry;
         this.scanTextEditForm = {
           name: s.name || '',
@@ -3764,12 +4927,17 @@ function gymApp() {
       };
       this.scanTextCommitting = true;
       try {
+        // v3.3.20 (Jim OOB 2026-09-10): use the actual image_path from
+        // scanTextPreview (populated by Brave image search in
+        // /api/scan_preview_text). If empty (image fetch failed), fall back
+        // to legacy text-only behavior (no image in Sheet).
+        const previewImgPath = (this.scanTextPreview && this.scanTextPreview.image_path) || '';
         const r = await fetch('/api/scan_commit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             entry: entry,
-            image_path: '',  // empty = text-direct entry, server skips image rename
+            image_path: previewImgPath,  // v3.3.20: was hardcoded ''
             user_hints: this.scanTextHints || [],
           }),
         });
@@ -3778,8 +4946,9 @@ function gymApp() {
           this.flash('Log 失敗：' + (data.error || '未知'));
           return;
         }
+        const hasImg = !!previewImgPath;
         this.flash(
-          `✓ 已 log 落 nutrition + Sheet (${data.is_text_only ? '文字模式' : 'image'}, row ${data.scan_index})`
+          `✓ 已 log 落 nutrition + Sheet (${hasImg ? '自動搵到食物相' : '純文字'}, row ${data.scan_index})`
         );
         // Refresh recent scans + reset UI (also close text-input mode so the panel
         // collapses, otherwise user sees an empty box with no feedback)
@@ -3797,6 +4966,182 @@ function gymApp() {
       } finally {
         this.scanTextCommitting = false;
       }
+    },
+
+    // v3.3.23 (Jim OOB 2026-09-11 'The export is loading an html instead
+    // of a jpg'): fetch the day-summary JPG as a Blob, then show a
+    // PWA-native preview modal. v3.3.23b fix: instead of triggering
+    // <a download> (which on iOS PWA standalone mode rendered the JPG
+    // in the current tab, leaving a blank page with no back button),
+    // the JPG is now shown inside an in-PWA modal with explicit 下載 +
+    // 關閉 buttons. User always has a way back.
+    async showFoodCardPreview(date) {
+      if (!date) return;
+      // v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all
+      // record. Make it multiple jpg if overflow'): query /card_url
+      // first to detect whether the day spans multiple pages. If so,
+      // show the first page + a page indicator, and let user download
+      // each page separately. For single-page days, behavior is
+      // unchanged.
+      const fileName = `gymbro_foodlog_${date}.jpg`;
+      this.foodCardPreview = {
+        visible: true, date, url: '', fileName,
+        sizeKb: 0, loading: true,
+        fallbackUrl: '', imageLoaded: false,
+        pageNum: 1, pageTotal: 1, pages: [],
+      };
+      try {
+        // First check page count
+        const meta = await fetch(`/api/nutrition/card_url?date=${encodeURIComponent(date)}`, {
+          cache: 'no-store',
+        });
+        const metaData = meta.ok ? await meta.json() : { page_total: 1, pages: [] };
+        const pageTotal = metaData.page_total || 1;
+        const pages = metaData.pages || [];
+
+        // Fetch page 1 (or the only page) for preview
+        const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=1`, {
+          headers: { 'Accept': 'image/jpeg' },
+          cache: 'no-store',
+        });
+        if (!r.ok) {
+          this.flash('生成失敗：' + r.status);
+          this.closeFoodCardPreview();
+          return;
+        }
+        const blob = await r.blob();
+        if ((r.headers.get('Content-Type') || 'image/jpeg').indexOf('html') !== -1) {
+          this.flash('Server returned HTML instead of JPG — check endpoint');
+          this.closeFoodCardPreview();
+          return;
+        }
+        const cacheBuster = Date.now();
+        // v3.3.23ax: URL pattern depends on page count
+        // single page: nutrition_{date}.jpg (legacy compat)
+        // multi page: nutrition_{date}_p1.jpg
+        const page1File = pageTotal > 1 ? `nutrition_${date}_p1.jpg` : `nutrition_${date}.jpg`;
+        const serverUrl = `/nutrition_card/${page1File}?t=${cacheBuster}`;
+        this.foodCardPreview = {
+          visible: true, date, url: serverUrl, fileName,
+          sizeKb: Math.round(blob.size / 1024),
+          loading: false,
+          fallbackUrl: '', imageLoaded: false,
+          pageNum: 1, pageTotal, pages,
+        };
+        if (pageTotal > 1) {
+          this.flash(`✓ ${pageTotal} 頁 (${this.foodCardPreview.sizeKb} KB 第 1 頁) · 「下載全部」儲存所有頁`);
+        } else {
+          this.flash(`✓ JPG ready — ${this.foodCardPreview.sizeKb} KB · 撳「下載」或「關閉」`);
+        }
+      } catch (e) {
+        this.flash('生成失敗：' + e.message);
+        this.closeFoodCardPreview();
+      }
+    },
+
+    // v3.3.23ax: navigate between pages in multi-page preview
+    async switchFoodCardPage(delta) {
+      const p = this.foodCardPreview;
+      if (!p || p.pageTotal <= 1) return;
+      const newPage = (p.pageNum || 1) + delta;
+      if (newPage < 1 || newPage > p.pageTotal) return;
+      p.loading = true;
+      p.imageLoaded = false;
+      try {
+        const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(p.date)}&page=${newPage}`, {
+          headers: { 'Accept': 'image/jpeg' },
+          cache: 'no-store',
+        });
+        if (!r.ok) return;
+        const blob = await r.blob();
+        const cacheBuster = Date.now();
+        const fname = `nutrition_${p.date}_p${newPage}.jpg`;
+        p.url = `/nutrition_card/${fname}?t=${cacheBuster}`;
+        p.sizeKb = Math.round(blob.size / 1024);
+        p.pageNum = newPage;
+        p.fileName = `gymbro_foodlog_${p.date}_p${newPage}.jpg`;
+        p.loading = false;
+      } catch (e) {
+        this.flash('切頁失敗：' + e.message);
+        p.loading = false;
+      }
+    },
+
+    // v3.3.23b: download the in-memory blob to device. v3.3.23ax: for
+    // multi-page days, download all pages sequentially with a small
+    // delay between each so browser doesn't drop simultaneous downloads.
+    async downloadFoodCardFromModal() {
+      if (!this.foodCardPreview.date) return;
+      const date = this.foodCardPreview.date;
+      const pageTotal = this.foodCardPreview.pageTotal || 1;
+      const currentPage = this.foodCardPreview.pageNum || 1;
+      try {
+        if (pageTotal === 1) {
+          // Single page — original behavior
+          const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}`, {
+            headers: { 'Accept': 'image/jpeg' },
+            cache: 'no-store',
+          });
+          if (!r.ok) { this.flash('下載失敗：' + r.status); return; }
+          const blob = await r.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `gymbro_foodlog_${date}.jpg`;
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            URL.revokeObjectURL(url);
+          }, 2000);
+          this.flash(`✓ 已下載 gymbro_foodlog_${date}.jpg (${Math.round(blob.size/1024)} KB) · 撳「關閉」返回 app`);
+        } else {
+          // Multi-page — download all pages. Each page is a separate file.
+          this.flash(`開始下載 ${pageTotal} 頁...`);
+          for (let p = 1; p <= pageTotal; p++) {
+            const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=${p}`, {
+              headers: { 'Accept': 'image/jpeg' },
+              cache: 'no-store',
+            });
+            if (!r.ok) {
+              this.flash(`第 ${p} 頁下載失敗：${r.status}`);
+              continue;
+            }
+            const blob = await r.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `gymbro_foodlog_${date}_p${p}.jpg`;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+              if (a.parentNode) a.parentNode.removeChild(a);
+              URL.revokeObjectURL(url);
+            }, 2500);
+            // Small delay so browser can start each download
+            if (p < pageTotal) await new Promise(r => setTimeout(r, 500));
+          }
+          this.flash(`✓ 已下載 ${pageTotal} 頁 JPG · 撳「關閉」返回 app`);
+        }
+      } catch (e) {
+        this.flash('下載失敗：' + e.message);
+      }
+    },
+
+    // v3.3.23b: close the modal and release the blob URL. User is back
+    // in the main PWA UI (no browser navigation involved, so no stuck
+    // blank page).
+    closeFoodCardPreview() {
+      if (this.foodCardPreview.url) {
+        try { URL.revokeObjectURL(this.foodCardPreview.url); } catch (e) {}
+      }
+      this.foodCardPreview = {
+        visible: false, date: null, url: '', fileName: '',
+        sizeKb: 0, loading: false,
+        fallbackUrl: '', imageLoaded: false,
+      };
     },
 
     async suggestLogFromPhoto(item) {
@@ -3881,6 +5226,48 @@ function gymApp() {
       this.editingScanNewName = '';
       this.editingScanOldName = '';
       this.renameSubmitMsg = '';
+      this.aiRewriting = false;
+      this.aiRewritePreview = null;
+    },
+    // v3.3.23ad (Jim OOB 2026-09-16 'use ai to help rewrite the food
+    // name in a better way'): AI rewrite user-typed name to canonical
+    // HK/Cantonese name. Preserves explicit macros (30g protein → P=30).
+    async aiRewriteName() {
+      const rawName = (this.editingScanNewName || '').trim();
+      if (!rawName) return;
+      this.aiRewriting = true;
+      this.aiRewritePreview = null;
+      try {
+        // Need restaurant context — get it from the scan being edited
+        const scan = this.recentScans.find(s => s.scan_index === this.editingScanIndex);
+        const restaurant = scan?.restaurant_chain || scan?.restaurant || '';
+        const r = await fetch('/api/scan_rewrite_name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: rawName,
+            restaurant: restaurant,
+          }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          this.aiRewritePreview = {
+            rewritten: data.rewritten,
+            source: data.source,
+            macros: data.macros || {},
+            restaurant_chain: data.restaurant_chain || restaurant,
+          };
+          // Auto-fill the input with rewritten name (user can still edit)
+          this.editingScanNewName = data.rewritten;
+          this.haptic(20);
+        } else {
+          this.renameSubmitMsg = 'AI 改寫失敗：' + (data.error || '未知');
+        }
+      } catch(e) {
+        this.renameSubmitMsg = 'Error：' + e.message;
+      } finally {
+        this.aiRewriting = false;
+      }
     },
     async submitRename() {
       if (this.editingScanIndex == null) return;
@@ -4234,6 +5621,74 @@ setTimeout(checkLandscapeFood, 500);
     </div>
 
     <!-- ============ MONTHLY CALENDAR (current month, enriched) ============ -->
+    <!-- v3.3.23an (Jim OOB 2026-09-28 'add this chart putting strain and recovery
+         for the whole month'): SVG chart showing Strain + Recovery for the
+         entire month. Two y-axes (strain 0-21 left blue, recovery 0-100% right
+         green). X-axis = days 1-31. Data points are circles on the lines.
+         Sits between month nav and calendar grid. -->
+    <div class="px-2 py-2 mx-auto w-full max-w-sm"
+         x-show="!scheduleLoading && scheduleHasAny && scheduleMonth && scheduleMonth.length > 0">
+      <div class="rounded-lg bg-black/30 ring-1 ring-white/10 p-2">
+        <div class="flex items-center justify-between text-[10px] text-gray-400 mb-1">
+          <span class="font-bold text-gray-200">月度 Strain &amp; Recovery</span>
+          <div class="flex items-center gap-2">
+            <span class="flex items-center gap-1">
+              <span class="inline-block w-2 h-2 rounded-full bg-blue-400"></span>
+              <span>Strain</span>
+            </span>
+            <span class="flex items-center gap-1">
+              <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+              <span>Recovery %</span>
+            </span>
+          </div>
+        </div>
+        <svg viewBox="0 0 360 130" class="w-full h-32"
+             preserveAspectRatio="none"
+             xmlns="http://www.w3.org/2000/svg">
+          <!-- Background grid lines -->
+          <line x1="40" y1="10" x2="350" y2="10" stroke="#374151" stroke-width="0.5"/>
+          <line x1="40" y1="50" x2="350" y2="50" stroke="#374151" stroke-width="0.5"/>
+          <line x1="40" y1="90" x2="350" y2="90" stroke="#374151" stroke-width="0.5"/>
+          <!-- Y-axis labels (left = strain, right = recovery) -->
+          <text x="36" y="13" text-anchor="end" font-size="9" fill="#60a5fa">21</text>
+          <text x="36" y="53" text-anchor="end" font-size="9" fill="#60a5fa">14</text>
+          <text x="36" y="93" text-anchor="end" font-size="9" fill="#60a5fa">7</text>
+          <text x="36" y="113" text-anchor="end" font-size="9" fill="#60a5fa">0</text>
+          <text x="354" y="13" font-size="9" fill="#34d399">100</text>
+          <text x="354" y="53" font-size="9" fill="#34d399">67</text>
+          <text x="354" y="93" font-size="9" fill="#34d399">33</text>
+          <text x="354" y="113" font-size="9" fill="#34d399">0</text>
+          <!-- Recovery line (green, right axis 0-100%) -->
+          <polyline
+            x-show="scheduleChartRecoveryPoints"
+            :points="scheduleChartRecoveryPoints"
+            fill="none" stroke="#34d399" stroke-width="1.5"/>
+          <!-- Strain line (blue, left axis 0-21) -->
+          <polyline
+            x-show="scheduleChartStrainPoints"
+            :points="scheduleChartStrainPoints"
+            fill="none" stroke="#60a5fa" stroke-width="1.5"/>
+          <!-- Recovery dots -->
+          <!-- v3.3.24e fix (Isak QA): these dots USED to be a
+               <template x-for> with :cx / :cy bindings. Alpine evaluates the
+               bindings against the template's own scope BEFORE the x-for
+               scope exists, so `d` / `i` were undefined → ReferenceError →
+               Alpine left cx="" / cy="" in the template content → the SVG
+               parser logged 4x "<circle> attribute cx: Unexpected end of
+               attribute" plus 10 "d is not defined" PAGEERRs.
+               Fix = build the SVG markup as a STRING (same pattern as the
+               :points polylines above) and inject it with x-html. No Alpine
+               expression ever references d / i outside a real scope. -->
+          <g x-html="scheduleRecoveryDotsHtml"></g>
+          <!-- Strain dots -->
+          <g x-html="scheduleStrainDotsHtml"></g>
+        </svg>
+        <div class="text-[9px] text-gray-500 text-center mt-0.5">
+          雙軸: 左 Strain 0-21 / 右 Recovery 0-100%
+        </div>
+      </div>
+    </div>
+
     <!-- v3.2.7: cells now show gym volume + sets + recovery %, enriched
          via /api/whoop_activities_calendar. (Jim OOB 2026-08-07 23:40 HKT
          'beatify the month view with enriched data'.) -->
@@ -4291,6 +5746,9 @@ setTimeout(checkLandscapeFood, 500);
            fills the viewport. -->
 
     </div>
+
+
+
     <!-- v3.2.5: Day detail popover (Jim OOB 2026-08-07 18:40 HKT 'need to
          put the info on the calendar beautifully'). Tap a day in the
          calendar to see full activity list with sport + strain + time. -->

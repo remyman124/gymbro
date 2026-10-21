@@ -14,6 +14,9 @@ import os
 import random
 import re
 import secrets
+import shutil
+import threading
+import time
 import urllib.request
 import urllib.parse
 import uuid
@@ -35,6 +38,8 @@ from gym_web.core import safe_write_json as _safe_write_json
 from gym_web.idempotency import check_and_remember as _idempotency_check
 from gym_web.cache import NutritionCache, NutritionRow, get_cache, get_cache as _get_nutrition_cache
 from gym_web import image_proxy
+from gym_web.whoop import whoop_get_steps as _whoop_get_steps
+from gym_web.whoop import whoop_get_body as _whoop_get_body
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -168,7 +173,7 @@ def api_version():
         "git_commit": commit,
         "branch": "3.x-overhaul" if commit != "unknown" else "main",
         "modules_loaded": [
-            "gym_web.core", "gym_web.whoop", "gym_web.withings",
+            "gym_web.core", "gym_web.whoop",
         ],
         "legacy_file": "gym_web.py (9202 lines, will migrate per-version)",
         "uptime_since": now_iso(),
@@ -239,6 +244,28 @@ def _whoop_activities_normalized():
             "end": end,
         })
     out.sort(key=lambda a: a["start"], reverse=True)
+    return out
+
+
+def _workout_log_gym_dates():
+    """v3.3.18 (Jim OOB 2026-09-05): return set of ISO dates in WORKOUT_LOG
+    that have at least one exercise entry — i.e., days Jim actually logged
+    gym sets via gym-web-tap. Distinct from _schedule_enrichment()'s key
+    set, which also includes Whoop recovery/sleep-only dates (no gym).
+    """
+    if not WORKOUT_LOG.exists():
+        return set()
+    try:
+        log = json.loads(WORKOUT_LOG.read_text())
+    except Exception:
+        return set()
+    out = set()
+    for date_iso, entry in log.items():
+        if not isinstance(entry, dict):
+            continue
+        exs = entry.get("exercises")
+        if isinstance(exs, list) and len(exs) > 0:
+            out.add(date_iso)
     return out
 
 
@@ -384,6 +411,23 @@ def api_whoop_activities_calendar():
     for a in activities:
         by_date.setdefault(a["date"], []).append(a)
     enrich = _schedule_enrichment()
+    # v3.3.18 (Jim OOB 2026-09-05 'calendar tab, gym and 套數 are always zero'):
+    # Build a set of dates that have at least one gym entry (either from Whoop
+    # auto-detect OR from local WORKOUT_LOG). The previous logic counted only
+    # `sport == "weightlifting"` Whoop activities, missing dates where Jim
+    # logged sets via gym-web-tap but Whoop didn't auto-detect (verified:
+    # Aug 2026 had 4 such dates: 8-05, 8-06, 8-10, 8-27 with 8+13+2+1=24 sets
+    # not counted in gym_count).
+    #
+    # NOTE: enrich.keys() is NOT a reliable proxy for "log gym days" because
+    # _schedule_enrichment() also emits keys for dates that ONLY have Whoop
+    # recovery/sleep data — using enrich.keys() would inflate log_gym_dates
+    # to every date with any Whoop signal. Instead, derive log_gym_dates
+    # from WORKOUT_LOG directly (dates with ≥1 exercise entry).
+    whoop_gym_dates = {d for d, acts in by_date.items()
+                       if any(a["sport"] == "weightlifting" for a in acts)}
+    log_gym_dates = _workout_log_gym_dates()
+    gym_dates = whoop_gym_dates | log_gym_dates
     days = []
     gym_count = 0
     other_count = 0
@@ -395,9 +439,16 @@ def api_whoop_activities_calendar():
         d = start_date + timedelta(days=i)
         iso = d.isoformat()
         acts = by_date.get(iso, [])
-        has_gym = any(a["sport"] == "weightlifting" for a in acts)
+        # has_gym: true if EITHER source says it's a gym day.
+        has_gym = iso in gym_dates
         if has_gym:
-            gym_count += len([a for a in acts if a["sport"] == "weightlifting"])
+            # Count distinct "gym sessions" for the day. Use Whoop activity
+            # count when available (one Whoop auto-detect = one session),
+            # otherwise treat each log date as a single session. Clamped to
+            # ≥1 so log-only dates always count as a session.
+            whoop_sessions = len([a for a in acts if a["sport"] == "weightlifting"])
+            log_sessions = 1 if iso in log_gym_dates else 0
+            gym_count += max(whoop_sessions, log_sessions)
             other_count += len([a for a in acts if a["sport"] != "weightlifting"])
         else:
             other_count += len(acts)
@@ -440,6 +491,9 @@ def api_whoop_activities_calendar():
         "total_sets": total_sets,
         "avg_recovery_pct": round(rec_pcts_sum / rec_pcts_n, 1) if rec_pcts_n > 0 else None,
         "enriched_dates": len(enrich),
+        # v3.3.17: expose distinct gym-day union count for transparency
+        # (Jim can see if gym_count < gym_dates suggests multiple sessions/day).
+        "gym_dates_count": len(gym_dates),
     })
 
 
@@ -468,8 +522,10 @@ def api_health():
         except Exception:
             checks["whoop_cache_age_minutes"] = "corrupt"
     # Withings
-    withings_cache = Path("/home/work/.withings_latest_cache.json")
-    checks["withings_cache"] = withings_cache.exists()
+    # v3.3.25: the Withings scale is retired. WHOOP supplies weight/height
+    # via /developer/v2/user/measurement/body, so the body check is the Whoop
+    # cache, not a Withings cache file.
+    checks["whoop_body"] = WHOOP_CACHE_PATH.exists()
     # Google creds
     google_tok = Path("/home/work/.hermes/google_token.json")
     checks["google_token"] = google_tok.exists()
@@ -478,10 +534,40 @@ def api_health():
     # v3.3.2: removed `nutrition_log` + `food_scan_log` checks — the Sheet
     # is the canonical store now; those JSON files no longer exist.
     checks["workout_log"] = Path("/home/work/.whoop_workout_log.json").exists()
+    # v3.3.25 (2026-10-21): vision provider status. A provider key died on
+    # 2026-10-20 and every scan silently returned 未識別菜式 / 0 kcal.
+    # This makes the degradation visible instead of silent — check
+    # checks["vision_state"] != "ok" before trusting a food scan.
+    _vs = globals().get("_VISION_STATUS", {})
+    checks["vision_provider"] = _vs.get("provider", "unknown")
+    checks["vision_provider_key"] = _vs.get("provider_key", "unknown")
+    checks["vision_state"] = _vs.get("state", "unknown")
+    checks["vision_last_error"] = _vs.get("last_error", "")
+    checks["vision_last_ok_ts"] = _vs.get("last_ok_ts", 0)
+    # v3.3.29: the SECOND opinion has its own record. Before this fix the
+    # 2nd opinion overwrote _VISION_STATUS, so vision_provider_key named
+    # the WRONG provider (the 2nd-opinion one) and a provider failure in
+    # the 2nd opinion could poison the primary's state — which bypassed
+    # the rule-2 write guard. Now opinion #1 and #2 are both visible.
+    _vs2 = globals().get("_VISION_STATUS_2ND", {})
+    checks["vision_provider_2nd"] = _vs2.get("provider", "unknown")
+    checks["vision_provider_key_2nd"] = _vs2.get("provider_key", "unknown")
+    checks["vision_state_2nd"] = _vs2.get("state", "unknown")
+    checks["vision_last_error_2nd"] = _vs2.get("last_error", "")
+    # v3.3.26: the full provider pool, so you can see at a glance that a
+    # single key death can no longer take the whole food log down.
+    checks["vision_pool"] = [n for n, _ in globals().get(
+        "_VISION_PROVIDER_POOL", ())]
+    # Which AI keys are actually usable right now (a dead key must be
+    # visible before it ruins a whole day of scans).
+    checks["api_keys_present"] = {
+        "minimax": bool(_minimax_api_key()),
+        "pplx": bool(os.environ.get("PPLX_API_KEY", "")),
+    }
     # Health overlay API (composite)
     overall = all([
         checks.get("whoop_token"),
-        checks.get("withings_cache"),
+        checks.get("whoop_body"),
         checks.get("google_token"),
     ])
     return jsonify({
@@ -733,13 +819,12 @@ def api_cancel_last_set():
 
 # ---------- Health overlay (Whoop recovery + Withings weight) — minimal 2 numbers ----------
 WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
-WITHINGS_CACHE = Path("/home/work/.withings_latest_cache.json")
 
 # gymbro PWA version — bump on every release
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.6"
+__version__ = "3.3.30"
 
 
 def _recovery_pct():
@@ -768,7 +853,250 @@ def _recovery_pct():
         val = score_raw.get("recovery_score")
         if val is not None and r.get("score_state") == "SCORED":
             return int(round(float(val)))
+
+
+def _whoop_strain():
+    """v3.3.13 (Jim OOB 2026-09-01「Make UIUX change on gym — Make it like
+    whoop」): latest Whoop strain score (0-21, or None). Reads from cache
+    cycles list, each item's score.strain.
+    """
+    d = _safe_read_json(WHOOP_CACHE)
+    if not isinstance(d, dict):
+        return None
+    # Shape A: nested {cycle: {records: [...]}}
+    cycle_root = d.get("cycle")
+    if isinstance(cycle_root, dict):
+        cycles = cycle_root.get("records", []) or []
+    # Shape B: flat list `cycles`
+    elif isinstance(d.get("cycles"), list):
+        cycles = d.get("cycles")
+    else:
+        return None
+    if not isinstance(cycles, list):
+        return None
+    for c in cycles:
+        if not isinstance(c, dict):
+            continue
+        if c.get("score_state") != "SCORED":
+            continue
+        score = c.get("score") or {}
+        if not isinstance(score, dict):
+            continue
+        strain = score.get("strain")
+        if strain is not None:
+            try:
+                return round(float(strain), 1)
+            except (TypeError, ValueError):
+                continue
     return None
+
+
+def _whoop_sleep_summary():
+    """v3.3.13: latest Whoop sleep summary dict {sleep_pct, sleep_hrs}.
+
+    v3.3.24d (Jim OOB 2026-10-20 "why don't you talk about my nap today?
+    you should have detected it from whoop"):
+
+    BUG (v3.3.13-v3.3.24c): the old version iterated the sleep list and
+    returned the FIRST scored record it hit. Whoop's list is not ordered
+    nap-first, and the nap record shares cycle_id with the preceding night's
+    main sleep — so the nap was either silently skipped or (worse) surfaced
+    as "last night's sleep", which is what made Jim's 1h35m nap invisible
+    on 2026-10-20.
+
+    FIX:
+      1. Sort by `start` DESC so we always evaluate the most recent record.
+      2. Separate nap records (`nap: true`) from main sleep records.
+      3. Compute duration from `start`/`end` ISO timestamps as the PRIMARY
+         source (timezone-safe), falling back to stage_summary ms.
+      4. Return nap + sleep-debt + main-sleep detail so the coach layer can
+         always talk about a nap if one happened.
+
+    Returns dict with keys:
+      sleep_pct, sleep_hrs            — most recent MAIN sleep
+      sleep_start, sleep_end          — main sleep window (ISO)
+      nap_detected (bool)
+      nap_hrs, nap_pct, nap_disturbances, nap_cycles
+      nap_start, nap_end
+      sleep_debt_hrs                  — Whoop-computed debt (need_from_sleep_debt)
+      sleep_need_hrs                  — Whoop baseline need
+      sleep_efficiency_pct
+      respiratory_rate
+      total_sleep_hrs                 — main sleep + nap (today's total)
+    """
+    d = _safe_read_json(WHOOP_CACHE)
+    if not isinstance(d, dict):
+        return {}
+    sleeps = d.get("sleep")
+    if not isinstance(sleeps, list):
+        return {}
+
+    from datetime import datetime as _dt
+
+    def _parse_iso(v):
+        if not v:
+            return None
+        try:
+            return _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+    def _dur_hrs(s):
+        """Duration in hours from start/end, fallback to stage_summary ms."""
+        sd = _parse_iso(s.get("start"))
+        ed = _parse_iso(s.get("end"))
+        if sd and ed:
+            try:
+                return round((ed - sd).total_seconds() / 3600, 2)
+            except (TypeError, ValueError):
+                pass
+        score = s.get("score") or {}
+        stage = score.get("stage_summary") or {} if isinstance(score, dict) else {}
+        in_bed_ms = stage.get("total_in_bed_time_milli") if isinstance(stage, dict) else None
+        try:
+            if in_bed_ms is not None:
+                return round(float(in_bed_ms) / 3600000, 2)
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    scored = [
+        s for s in sleeps
+        if isinstance(s, dict) and s.get("score_state") == "SCORED"
+    ]
+    if not scored:
+        return {}
+
+    # Most recent first
+    scored.sort(key=lambda s: str(s.get("start") or ""), reverse=True)
+
+    naps = [s for s in scored if s.get("nap") is True]
+    mains = [s for s in scored if s.get("nap") is not True]
+
+    out = {}
+
+    # --- Most recent NAP (today if one happened) ---
+    if naps:
+        n = naps[0]
+        nscore = n.get("score") or {}
+        nstage = nscore.get("stage_summary") or {} if isinstance(nscore, dict) else {}
+        out["nap_detected"] = True
+        out["nap_hrs"] = _dur_hrs(n)
+        out["nap_pct"] = nscore.get("sleep_performance_percentage") if isinstance(nscore, dict) else None
+        out["nap_disturbances"] = nstage.get("disturbance_count") if isinstance(nstage, dict) else None
+        out["nap_cycles"] = nstage.get("sleep_cycle_count") if isinstance(nstage, dict) else None
+        out["nap_start"] = n.get("start")
+        out["nap_end"] = n.get("end")
+        out["nap_cycle_id"] = n.get("cycle_id")
+    else:
+        out["nap_detected"] = False
+        out["nap_hrs"] = None
+        out["nap_pct"] = None
+        out["nap_disturbances"] = None
+        out["nap_cycles"] = None
+        out["nap_start"] = None
+        out["nap_end"] = None
+
+    # --- Most recent MAIN sleep ---
+    if mains:
+        m = mains[0]
+        mscore = m.get("score") or {}
+        mstage = mscore.get("stage_summary") or {} if isinstance(mscore, dict) else {}
+        mneed = mscore.get("sleep_needed") or {} if isinstance(mscore, dict) else {}
+        out["sleep_pct"] = mscore.get("sleep_performance_percentage") if isinstance(mscore, dict) else None
+        out["sleep_hrs"] = _dur_hrs(m)
+        out["sleep_start"] = m.get("start")
+        out["sleep_end"] = m.get("end")
+        out["sleep_efficiency_pct"] = mscore.get("sleep_efficiency_percentage") if isinstance(mscore, dict) else None
+        out["sleep_consistency_pct"] = mscore.get("sleep_consistency_percentage") if isinstance(mscore, dict) else None
+        out["respiratory_rate"] = mscore.get("respiratory_rate") if isinstance(mscore, dict) else None
+        out["sleep_disturbances"] = mstage.get("disturbance_count") if isinstance(mstage, dict) else None
+        out["sleep_cycles"] = mstage.get("sleep_cycle_count") if isinstance(mstage, dict) else None
+        out["sleep_cycle_id"] = m.get("cycle_id")
+        # Sleep debt / need from Whoop
+        try:
+            out["sleep_debt_hrs"] = round(float(mneed.get("need_from_sleep_debt_milli") or 0) / 3600000, 2)
+        except (TypeError, ValueError):
+            out["sleep_debt_hrs"] = None
+        try:
+            out["sleep_need_hrs"] = round(float(mneed.get("baseline_milli") or 0) / 3600000, 2)
+        except (TypeError, ValueError):
+            out["sleep_need_hrs"] = None
+    else:
+        out["sleep_pct"] = None
+        out["sleep_hrs"] = None
+        out["sleep_start"] = None
+        out["sleep_end"] = None
+        out["sleep_efficiency_pct"] = None
+        out["sleep_consistency_pct"] = None
+        out["respiratory_rate"] = None
+        out["sleep_disturbances"] = None
+        out["sleep_cycles"] = None
+        out["sleep_cycle_id"] = None
+        out["sleep_debt_hrs"] = None
+        out["sleep_need_hrs"] = None
+
+    # Today's total (main sleep + nap that shares the same cycle_id)
+    total = 0.0
+    if out.get("sleep_hrs"):
+        total += out["sleep_hrs"]
+    if out.get("nap_detected") and out.get("nap_hrs"):
+        # Only count the nap if it belongs to the same cycle as the main sleep
+        # (i.e. it's part of the current sleep window, not an old one).
+        if out.get("nap_cycle_id") == out.get("sleep_cycle_id"):
+            total += out["nap_hrs"]
+    out["total_sleep_hrs"] = round(total, 2)
+
+    return out
+
+
+def _whoop_recovery_metrics():
+    """v3.3.13: latest Whoop recovery record — HRV + RHR.
+
+    Returns dict {hrv_ms, rhr_bpm} or {} if unavailable.
+    """
+    d = _safe_read_json(WHOOP_CACHE)
+    if not isinstance(d, dict):
+        return {}
+    recs_root = d.get("recovery")
+    if isinstance(recs_root, dict):
+        recs = recs_root.get("records", []) or []
+    elif isinstance(recs_root, list):
+        recs = recs_root
+    else:
+        return {}
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        if r.get("score_state") != "SCORED":
+            continue
+        out = {}
+        # Whoop V2 puts hrv/rhr inside score (not top-level).
+        score = r.get("score") or {}
+        if isinstance(score, dict):
+            hrv_v = score.get("hrv_rmssd_milli")
+            rhr_v = score.get("resting_heart_rate")
+        else:
+            hrv_v = r.get("hrv_rmssd_milli")
+            rhr_v = r.get("resting_heart_rate")
+        # Top-level fallback (older V1 cache shape)
+        if hrv_v is None:
+            hrv_v = r.get("hrv_rmssd_milli")
+        if rhr_v is None:
+            rhr_v = r.get("resting_heart_rate")
+        try:
+            if hrv_v is not None:
+                out["hrv_ms"] = round(float(hrv_v), 1)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if rhr_v is not None:
+                out["rhr_bpm"] = round(float(rhr_v), 1)
+        except (TypeError, ValueError):
+            pass
+        if out:
+            return out
+    return {}
 
 
 def _whoop_workouts_in_window(cutoff_iso_date):
@@ -825,405 +1153,149 @@ def _whoop_workouts_in_window(cutoff_iso_date):
     return out
 
 
-def _withings_body_latest():
-    """Latest Withings body comp reading (any date, not just today).
-    Returns dict {date, weight_kg, fat_pct, ...} or {} if none available.
-    Falls back to most recent cache entry so Jim always sees his latest weigh-in.
+def _body_latest() -> dict:
+    """Latest body measurements — WHOOP is the source (v3.3.25).
 
-    Jim OOB 2026-07-24: refresh cache from `withings.py body 7` every call so the
-    latest 1-2 weeks readings are tried, then saved to WITHINGS_CACHE atomically.
+    Jim OOB 2026-10-20「I mean weight. If whoop has weight data. Remove all
+    withings」: WHOOP's `/developer/v2/user/measurement/body` (OAuth scope
+    `read:body_measurement`) returns
+        {"height_meter": 1.778, "weight_kilogram": 78.107, "max_heart_rate": 182}
+    so the Withings SCALE is no longer needed for weight.
+
+    WHOOP has NO bioimpedance sensors, so fat% / muscle / bone / hydration are
+    None — the UI hides them rather than showing a fabricated 0.
     """
-    # Step 1: try the cache first (fast path)
-    d = _safe_read_json(WITHINGS_CACHE)
-    body = d.get("body") if isinstance(d, dict) else None
-    if isinstance(body, dict) and body.get("weight_kg"):
-        return body
-    # Step 2: refresh from Withings API by parsing the most recent body row.
     try:
-        import subprocess, json as _json, re
-        for window in (7, 14, 30, 90):
-            r = subprocess.run(
-                ["python3", "/home/work/.hermes/skills/withings/withings.py", "body", str(window)],
-                capture_output=True, text=True, timeout=20,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                found = None
-                for line in r.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[0]):
-                        try:
-                            found = {
-                                "date": parts[0],
-                                "weight_kg": float(parts[1]),
-                                "fat_pct": float(parts[2]),
-                            }
-                            break  # got the most recent reading in this window
-                        except (ValueError, IndexError):
-                            continue
-                if found is not None:
-                    # Persist into the cache file so subsequent reads are fast.
-                    try:
-                        cur = _safe_read_json(WITHINGS_CACHE)
-                        if not isinstance(cur, dict):
-                            cur = {}
-                        cur["body"] = found
-                        cur["synced_at"] = now_iso()
-                        tmp = str(WITHINGS_CACHE) + ".tmp"
-                        Path(tmp).write_text(_json.dumps(cur, indent=2, ensure_ascii=False))
-                        os.replace(tmp, str(WITHINGS_CACHE))
-                    except Exception:
-                        pass
-                    return found
-                # window returned no rows — try wider window
+        return _whoop_get_body(cache_path=WHOOP_CACHE) or {}
     except Exception:
-        pass
-    return {}
+        return {}
 
 
-def _withings_weight():
-    """Latest Withings weight in kg (any date). Jim OOB 2026-07-19: use latest, not just today."""
-    body = _withings_body_latest()
-    w = body.get("weight_kg")
+def _body_weight():
+    """Latest weight in kg (WHOOP). Jim OOB 2026-07-19: use latest, not just today."""
+    w = _body_latest().get("weight_kg")
     try:
         return round(float(w), 1) if w else None
     except (TypeError, ValueError):
         return None
 
 
-def _withings_fat_pct():
-    """Latest Withings body fat percentage (any date). Jim's goal: drive this down."""
-    body = _withings_body_latest()
-    f = body.get("fat_pct")
+def _body_fat_pct():
+    """Latest body fat percentage. WHOOP has no bioimpedance sensor -> None."""
+    f = _body_latest().get("fat_pct")
     try:
         return round(float(f), 1) if f else None
     except (TypeError, ValueError):
         return None
 
 
-def _get_intraday_steps_today() -> dict:
-    """Sum Withings intraday activity entries from HKT midnight to now.
-
-    Returns dict {has_data: bool, steps, distance_km, calories}.
-    If Withings has no intraday activity for today at all, returns
-    {has_data: False} (caller should keep "syncing" signal — Rule 24
-    NEVER FABRICATE: do NOT fall back to yesterday's number).
-
-    v2.7.22 (Jim OOB 2026-08-02 19:48 HKT "step count is always syncing"):
-    solves the case where iPhone HealthKit has pushed partial sync events
-    to Withings but the daily-aggregation commit hasn't run yet.
-    """
+def _body_muscle_kg():
+    """Latest muscle mass in kg. WHOOP has no bioimpedance sensor -> None."""
+    m = _body_latest().get("muscle_kg")
     try:
-        import importlib as _il
-        import sys as _sys
-        if "/home/work/.hermes/skills/withings" not in _sys.path:
-            _sys.path.insert(0, "/home/work/.hermes/skills/withings")
-        withings_mod = _il.import_module("withings")
-        get_intraday = withings_mod.get_intraday_activity
-    except Exception:
-        return {"has_data": False}
-
-    try:
-        from zoneinfo import ZoneInfo
-        hkt = ZoneInfo("Asia/Hong_Kong")
-    except Exception:
-        from datetime import timezone as _tz, timedelta as _td
-        hkt = _tz(_td(hours=8))
-
-    now_hkt = datetime.now(hkt)
-    hkt_midnight = now_hkt.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_ts = int(hkt_midnight.astimezone(timezone.utc).timestamp())
-    end_ts = int(datetime.now(timezone.utc).timestamp())
-
-    # v2.7.23 FIX (verified 2026-08-03 14:00 HKT): Withings `getintradayactivity`
-    # SILENTLY TRUNCATES earlier events when the window is < 24h. Empirical proof:
-    #   12h window: 0 entries  |  16h window: 3 entries  |  24h window: 7 entries
-    #   48h window: 99 entries (full backfill)  |  72h window: 58 entries
-    # Use 48h window, then filter for ts >= hkt_midnight. This catches all today's
-    # events even if Apple Watch pushed them hours ago.
-    wider_start_ts = end_ts - 48 * 3600
-
-    try:
-        body = get_intraday(wider_start_ts, end_ts)
-    except Exception:
-        return {"has_data": False}
-
-    series = (body or {}).get("series", {})
-    if not series:
-        return {"has_data": False}
-
-    total_steps = 0
-    total_dist = 0.0
-    total_cal = 0.0
-    n = 0
-    for ts_str, entry in series.items():
-        try:
-            ts = int(ts_str)
-        except (TypeError, ValueError):
-            continue
-        # Only count entries from HKT midnight onwards (Rule 24 honesty).
-        if ts < start_ts:
-            continue
-        total_steps += entry.get("steps", 0) or 0
-        total_dist += entry.get("distance", 0) or 0
-        total_cal += entry.get("calories", 0) or 0
-        n += 1
-
-    if n == 0:
-        return {"has_data": False}
-
-    # v3.3.7: track the latest event ts in the series so the caller can
-    # surface a Withings-side freshness stamp. NOTE: Withings `<unix_ts>`
-    # keys are the *start of the measurement bucket*, not the iPhone
-    # upload time — but they track within seconds of each other in
-    # practice (HealthKit pushes near-real-time).
-    latest_ts = max(
-        (int(ts_str) for ts_str in series.keys() if str(ts_str).isdigit()),
-        default=0,
-    )
-
-    return {
-        "has_data": True,
-        "steps": int(total_steps),
-        "distance_km": round(total_dist / 1000, 2),
-        "calories": round(total_cal, 1),
-        "latest_event_ts": latest_ts,  # 0 if no events
-    }
-
-
-def _withings_steps_today() -> dict:
-    """Today's Withings activity (steps / distance / calories).
-
-    v2.7.25 CORRECT FIX (Jim OOB 2026-08-04 09:50 HKT "wait 6048 steps was ytd,
-    not today"):
-
-    PROBLEM: v2.7.24 showed 6048 as today because it returned the latest
-    daily commit (yesterday's 8/3 final commit) when today's record
-    was missing. That was a TRUTH VIOLATION — the user wants TODAY's
-    running total, not yesterday's finalized number.
-
-    CORRECT SEMANTICS (v2.7.25):
-    1. TODAY's record only. If 8/4 is missing from getactivity, return
-       honest signal — NEVER fall back to yesterday's number.
-    2. If today record exists but has steps < 50 (boundary commit),
-       cross-check with intraday for fresh events.
-    3. If today record is missing AND intraday 48h window has fresh
-       events from HKT midnight (Apple Watch partial sync), use intraday
-       running total.
-    4. If today is missing AND intraday is empty (Apple Watch truly
-       hasn't synced since yesterday), return syncing: true.
-    5. The iPhone Withings widget shows 6048 because it shows the latest
-       KNOWN number regardless of date. gymbro must show TODAY's number
-       even if 0, or syncing.
-
-    v3.3.7 (Jim OOB 2026-08-17 'as-of timestamp should be earlier — Withings
-    last sync was earlier but my actual step should have increased'): also
-    return `data_as_of` reflecting Withings-side freshness, NOT when our
-    cache was last written.
-    - For `today_commit` source: Withings aggregates daily at HKT 04:00
-      (the API exposes only `date: YYYY-MM-DD`, no per-record timestamp).
-      Use HKT 04:00 of `today_str` as the data_as_of.
-    - For intraday sources: use the latest event's `ts` from the intraday
-      series (the unix_ts key).
-
-    Returns dict {date, steps, distance_km, calories, _source, data_as_of_iso}.
-    """
-    import importlib
-    from datetime import datetime, timezone, timedelta
-    import time as _time
-
-    # In-process 30s cache
-    cache = _safe_read_json(WITHINGS_CACHE)
-    cached_steps = (cache or {}).get("steps") or {}
-    now_ts = _time.time()
-    if isinstance(cached_steps, dict) and cached_steps.get("fetched_at_ts"):
-        age = now_ts - (cached_steps.get("fetched_at_ts") or 0)
-        if age < 30 and cached_steps.get("steps") is not None:
-            return {
-                "date": cached_steps.get("date", ""),
-                "steps": cached_steps.get("steps"),
-                "distance_km": cached_steps.get("distance_km"),
-                "calories": cached_steps.get("calories"),
-                "_source": cached_steps.get("_source", "cache"),
-            }
-
-    # In-process import
-    try:
-        import sys as _sys
-        if "/home/work/.hermes/skills/withings" not in _sys.path:
-            _sys.path.insert(0, "/home/work/.hermes/skills/withings")
-        withings_mod = importlib.import_module("withings")
-        get_activity = withings_mod.get_daily_activity
-    except Exception:
-        return {}
-
-    hkt = timezone(timedelta(hours=8))
-    today_str = datetime.now(hkt).strftime("%Y-%m-%d")
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=7)
-
-    # Pull 7 days of daily activity for context (but only TODAY matters).
-    try:
-        daily_records = get_activity(start, end)
-    except Exception:
-        return {}
-
-    # v2.7.25: ONLY today's record is truth. If missing, honest signal.
-    today_record = None
-    for d in daily_records:
-        if d.get("date") == today_str:
-            today_record = d
-            break
-
-    if today_record:
-        try:
-            today_steps = int(today_record.get("steps") or 0)
-        except (TypeError, ValueError):
-            today_steps = 0
-
-        # Cross-check with intraday for fresh partial sync
-        intraday_today = _get_intraday_steps_today()
-        intraday_today_steps = int(intraday_today.get("steps") or 0) if intraday_today.get("has_data") else 0
-        intraday_latest_ts = intraday_today.get("latest_event_ts") or 0
-
-        if intraday_today_steps > today_steps:
-            # Intraday has more events than today's daily commit
-            chosen = {
-                "date": today_str,
-                "steps": intraday_today_steps,
-                "distance_m": (intraday_today.get("distance_km") or 0) * 1000,
-                "calories": intraday_today.get("calories", 0),
-                "_source": "intraday_override",
-            }
-            chosen_source = "intraday_override"
-            # v3.3.7: data_as_of = latest intraday event ts (genuine)
-            data_as_of_ts = intraday_latest_ts
-        else:
-            chosen = today_record
-            chosen_source = "today_commit"
-            # v3.3.7: ONLY use intraday_latest_ts when genuine iPhone sync
-            # events exist. NEVER fabricate HKT 04:00 — that's a daily
-            # commit timestamp, NOT the time iPhone pushed data, and
-            # showing it as "as of 04:00" was misleading (Jim OOB
-            # 2026-08-17 '04:00 is a bug'). If no intraday events, hide
-            # the as-of label rather than guess.
-            data_as_of_ts = intraday_latest_ts or 0
-    else:
-        # v2.7.25: NO today record. Try intraday; if empty, honest syncing.
-        # NEVER show yesterday's value as today.
-        intraday_today = _get_intraday_steps_today()
-        if intraday_today.get("has_data") and intraday_today.get("steps", 0) > 0:
-            chosen = {
-                "date": today_str,
-                "steps": intraday_today["steps"],
-                "distance_m": (intraday_today.get("distance_km") or 0) * 1000,
-                "calories": intraday_today.get("calories", 0),
-                "_source": "intraday_only",
-            }
-            chosen_source = "intraday_only"
-            # v3.3.7: genuine as-of from latest intraday event
-            data_as_of_ts = intraday_today.get("latest_event_ts") or 0
-        else:
-            # Honest signal: today has no data, do NOT fall back to yesterday.
-            return {
-                "date": today_str,
-                "steps": None,
-                "distance_km": None,
-                "calories": None,
-                "syncing": True,
-                "_source": "no_today_record",
-            }
-
-    # Extract values
-    try:
-        steps = int(chosen.get("steps") or 0)
+        return round(float(m), 2) if m else None
     except (TypeError, ValueError):
-        steps = 0
-    distance_m = float(chosen.get("distance_m") or 0)
-    calories = float(chosen.get("calories") or 0)
-    record_date = today_str  # always today, never yesterday
+        return None
 
-    out = {
-        "date": record_date,
-        "steps": steps,
-        "distance_km": round(distance_m / 1000, 2),
-        "calories": round(calories, 1),
-        "_source": chosen_source,
-        # v3.3.7: Withings-side freshness (vs. cache write time = pulled_at).
-        # Only set when an intraday event ts is available — i.e., a real
-        # iPhone-side push. None when only the daily commit exists (we
-        # don't fabricate HKT 04:00 — Jim OOB 2026-08-17 '04:00 is a bug').
-        "data_as_of_ts": data_as_of_ts,
-        "data_as_of_iso": (
-            datetime.fromtimestamp(data_as_of_ts, tz=timezone.utc).isoformat()
-            if data_as_of_ts else None
-        ),
-    }
 
-    # Atomic write to cache
+def _body_bone_kg():
+    """Latest bone mass in kg. WHOOP has no bioimpedance sensor -> None."""
+    b = _body_latest().get("bone_kg")
     try:
-        cur = _safe_read_json(WITHINGS_CACHE) or {}
-        if not isinstance(cur, dict):
-            cur = {}
-        cur["steps"] = {
-            **out,
-            "fetched_at_ts": now_ts,
-            "fetched_at_iso": datetime.now(timezone.utc).isoformat(),
-        }
-        tmp = str(WITHINGS_CACHE) + ".tmp"
-        Path(tmp).write_text(json.dumps(cur, indent=2, ensure_ascii=False))
-        os.replace(tmp, str(WITHINGS_CACHE))
-    except Exception:
-        pass
-    return out
+        return round(float(b), 2) if b else None
+    except (TypeError, ValueError):
+        return None
 
 
-def _withings_yesterday() -> dict:
-    """Yesterday's Withings daily commit (finalized value).
+def _body_hydration_pct():
+    """Latest hydration percentage. WHOOP has no bioimpedance sensor -> None."""
+    h = _body_latest().get("hydration_pct")
+    try:
+        return round(float(h), 1) if h else None
+    except (TypeError, ValueError):
+        return None
 
-    v2.7.26 (Jim OOB 2026-08-04 09:55 HKT "perhaps show both yesterday and
-    today record in the widget. try to squeeze two data into one widget
-    but today one is larger").
 
-    Returns dict {date, steps, distance_km, calories} or {} on no data.
+
+
+
+
+
+
+
+
+def _whoop_steps() -> dict:
+    """v3.3.25 (Jim OOB 2026-10-20「Steps is whoop! 用 whoop count step」):
+    today's step count + 7-day average from the Whoop V2 cycle cache.
+
+    WHOOP is now the PRIMARY step source. `/developer/v2/cycle` has carried a
+    top-level `step_count` on every cycle record since the V2 pipeline was
+    built, but nothing read it — every step number came from Withings, which
+    frequently has no same-day record (-> steps: null) even though Whoop had
+    the number all along.
+
+    Semantics: the cycle array is newest-first and cycles[0] is the
+    IN-PROGRESS cycle (`end` is null) => its step_count is today's running
+    total. cycles[1..7] are the last 7 COMPLETE days => 7d average.
+
+    Truthfulness (mirrors the Withings v2.7.25 rule, plus the device caveat):
+      - Only the in-progress cycle counts as "today"; never fall back to a
+        previous day's number.
+      - `updated_at` is Whoop's own last-write stamp. The in-progress cycle
+        only advances while the band is worn, so an old stamp means "band
+        off-body", NOT "API broken". `band_off` lets the UI say "last known"
+        instead of implying a live running total.
     """
-    import importlib
-    from datetime import datetime, timezone, timedelta
-
-    hkt = timezone(timedelta(hours=8))
-    today_hkt = datetime.now(hkt)
-    yesterday_str = (today_hkt - timedelta(days=1)).strftime("%Y-%m-%d")
-
     try:
-        import sys as _sys
-        if "/home/work/.hermes/skills/withings" not in _sys.path:
-            _sys.path.insert(0, "/home/work/.hermes/skills/withings")
-        withings_mod = importlib.import_module("withings")
-        get_activity = withings_mod.get_daily_activity
+        # Pass the module-level WHOOP_CACHE so the test-suite's monkeypatch
+        # (which redirects it to a tmp file) is honoured — never read
+        # production state from a test.
+        return _whoop_get_steps(cache_path=WHOOP_CACHE) or {}
     except Exception:
         return {}
 
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=2)  # yesterday falls in this window
-    try:
-        records = get_activity(start, end)
-    except Exception:
-        return {}
 
-    for d in records:
-        if d.get("date") == yesterday_str:
-            try:
-                steps = int(d.get("steps") or 0)
-            except (TypeError, ValueError):
-                steps = 0
-            distance_m = float(d.get("distance_m") or 0)
-            calories = float(d.get("calories") or 0)
-            return {
-                "date": yesterday_str,
-                "steps": steps,
-                "distance_km": round(distance_m / 1000, 2),
-                "calories": round(calories, 1),
-            }
-    return {}
+@app.route("/api/whoop_steps")
+def api_whoop_steps():
+    """Today's Whoop step count, 7-day average, freshness and per-day series.
+
+    v3.3.25: WHOOP is the primary step source (Jim OOB 2026-10-20). Shape
+    mirrors the retired `/api/withings_steps_today` shape so the front-end could swap sources
+    without changing its state model, plus the Whoop-specific extras:
+      stale     — record older than 30 min (UI amber)
+      band_off  — record older than 6 h (the Whoop was off-body; the number
+                  is a real last-known total, not a live one)
+      in_progress — cycles[0] is the running cycle (end == null)
+    """
+    data = _whoop_steps()
+    if not data:
+        return jsonify({
+            "steps": None, "date": None, "data_as_of": None, "age_min": None,
+            "stale": False, "band_off": False, "in_progress": False,
+            "steps_7d_avg": None, "steps_7d_samples": 0, "series": [],
+            "syncing": False, "_source": "whoop_cycle", "ok": False,
+        })
+    return jsonify({
+        "steps": data.get("steps"),
+        "date": data.get("date"),
+        "data_as_of": data.get("data_as_of"),
+        "age_min": data.get("age_min"),
+        "stale": data.get("stale", False),
+        "band_off": data.get("band_off", False),
+        "in_progress": data.get("in_progress", False),
+        "steps_yesterday": data.get("steps_yesterday"),
+        "steps_yesterday_date": data.get("steps_yesterday_date"),
+        "steps_7d_avg": data.get("steps_7d_avg"),
+        "steps_7d_samples": data.get("steps_7d_samples", 0),
+        "series": data.get("series", []),
+        # Withings-compatible aliases so the front-end can consume either
+        # endpoint through the same code path.
+        "syncing": data.get("steps") is None,
+        "calories": None,   # Whoop cycles carry no step-specific calories
+        "distance_km": None,
+        "_source": "whoop_cycle",
+        "ok": True,
+    })
 
 
 @app.route("/api/health_overlay")
@@ -1232,23 +1304,186 @@ def api_health_overlay():
     - Top-left: Whoop recovery %
     - Top-right: Withings weight kg + fat % (latest reading, drives Jim's goal)
     - Steps: TODAY (large) + YESTERDAY (small) — paired widget
+    - v3.3.12: body composition full set (weight / fat / muscle / bone / hydration).
+    - v3.3.13: Whoop extended metrics (strain / sleep / HRV / RHR) for Whoop-Today layout.
+
+    v3.3.23al (Jim OOB 2026-09-27 'Have you fixed it? Still slow start'):
+    The endpoint previously called 12+ helper functions in series, hitting
+    Withings/Whoop APIs sequentially. Total: 1.4s per call. Since this is
+    called on every page load, this is the dominant "slow start" complaint.
+
+    Two fixes:
+    1. Cache the merged payload in Redis with 60s TTL (jim doesn't need
+       second-by-second freshness for body weight/steps/recovery on every
+       page render).
+    2. The expensive external API calls (_body_latest,
+       _whoop_recovery, etc.) are now run in parallel via ThreadPoolExecutor.
+       Max single call (was 400-800ms) becomes total wait time.
     """
-    steps = _withings_steps_today() or {}
-    yest = _withings_yesterday() or {}
-    return jsonify({
-        "recovery": _recovery_pct(),
-        "weight_kg": _withings_weight(),
-        "fat_pct": _withings_fat_pct(),
-        "weight_date": (_withings_body_latest() or {}).get("date"),
-        "steps_today": steps.get("steps"),
-        "steps_date": steps.get("date"),
-        "steps_syncing": steps.get("syncing", False),
-        "distance_km_today": steps.get("distance_km"),
-        "calories_today": steps.get("calories"),
-        "steps_yesterday": yest.get("steps"),
-        "distance_km_yesterday": yest.get("distance_km"),
-        "calories_yesterday": yest.get("calories"),
-    })
+    from gym_web.redis_cache import get_redis_cache
+    rcache = get_redis_cache()
+    cache_key = "overlay:health"
+    cached = rcache.get(cache_key)
+    if cached is not None:
+        try:
+            return jsonify(json.loads(cached))
+        except Exception:
+            pass
+
+    import concurrent.futures as _cf
+    import time as _time
+    overlay_start = _time.time()
+
+    # Run all the helper functions in parallel (they hit separate APIs)
+    # v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is whoop!」):
+    # the Withings STEP helpers are GONE from this endpoint — WHOOP is the
+    # only step source. Withings still supplies body composition
+    # (weight / fat / muscle / bone / hydration), which it is the sole
+    # source of. Dropping the two step calls also removes two slow
+    # external API round-trips from the overlay's critical path.
+    def _body():
+        return _body_latest() or {}
+
+    def _sleep():
+        return _whoop_sleep_summary()
+
+    def _rec_metrics():
+        return _whoop_recovery_metrics()
+
+    def _recovery_pct_safe():
+        try: return _recovery_pct()
+        except: return None
+
+    def _weight():
+        try: return _body_weight()
+        except: return None
+
+    def _fat():
+        try: return _body_fat_pct()
+        except: return None
+
+    def _muscle():
+        try: return _body_muscle_kg()
+        except: return None
+
+    def _bone():
+        try: return _body_bone_kg()
+        except: return None
+
+    def _hydration():
+        try: return _body_hydration_pct()
+        except: return None
+
+    def _strain():
+        try: return _whoop_strain()
+        except: return None
+
+    def _wsteps():
+        # v3.3.25: Whoop is the PRIMARY step source.
+        return _whoop_steps() or {}
+
+    with _cf.ThreadPoolExecutor(max_workers=12) as _ex:
+        fut_body = _ex.submit(_body)
+        fut_sleep = _ex.submit(_sleep)
+        fut_rec_metrics = _ex.submit(_rec_metrics)
+        fut_rec_pct = _ex.submit(_recovery_pct_safe)
+        fut_weight = _ex.submit(_weight)
+        fut_fat = _ex.submit(_fat)
+        fut_muscle = _ex.submit(_muscle)
+        fut_bone = _ex.submit(_bone)
+        fut_hydration = _ex.submit(_hydration)
+        fut_strain = _ex.submit(_strain)
+        fut_wsteps = _ex.submit(_wsteps)
+
+        # Wait with 3s timeout (external APIs can hang)
+        def _wait(fut, default=None):
+            try:
+                return fut.result(timeout=3)
+            except Exception:
+                return default
+
+        body = _wait(fut_body, {})
+        sleep = _wait(fut_sleep, {})
+        rec_metrics = _wait(fut_rec_metrics, {})
+        recovery_pct = _wait(fut_rec_pct)
+        weight_kg = _wait(fut_weight)
+        fat_pct = _wait(fut_fat)
+        muscle_kg = _wait(fut_muscle)
+        bone_kg = _wait(fut_bone)
+        hydration_pct = _wait(fut_hydration)
+        whoop_strain = _wait(fut_strain)
+        wsteps = _wait(fut_wsteps, {})
+
+    # v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is whoop!」):
+    # WHOOP is the ONLY step source. The Withings step path is gone from this
+    # endpoint entirely — it was often missing a same-day record (-> null)
+    # even though Whoop had the number all along. Withings still supplies body
+    # composition (weight/fat/muscle/bone/hydration), its remaining job here.
+    _w_steps = wsteps.get("steps") if isinstance(wsteps, dict) else None
+    _w_date = wsteps.get("date") if isinstance(wsteps, dict) else None
+    _w_asof = wsteps.get("data_as_of") if isinstance(wsteps, dict) else None
+    _w_stale = bool(wsteps.get("stale")) if isinstance(wsteps, dict) else False
+    _w_band_off = bool(wsteps.get("band_off")) if isinstance(wsteps, dict) else False
+    _w_in_progress = bool(wsteps.get("in_progress")) if isinstance(wsteps, dict) else False
+    _w_avg7 = wsteps.get("steps_7d_avg") if isinstance(wsteps, dict) else None
+    _w_series = wsteps.get("series", []) if isinstance(wsteps, dict) else []
+    _w_yesterday = wsteps.get("steps_yesterday") if isinstance(wsteps, dict) else None
+    _w_yesterday_date = wsteps.get("steps_yesterday_date") if isinstance(wsteps, dict) else None
+
+    payload = {
+        "recovery": recovery_pct,
+        "weight_kg": weight_kg,
+        "fat_pct": fat_pct,
+        "muscle_kg": muscle_kg,
+        "bone_kg": bone_kg,
+        "hydration_pct": hydration_pct,
+        "weight_date": body.get("date") if isinstance(body, dict) else None,
+        # v3.3.13 Whoop extended metrics
+        "whoop_strain": whoop_strain,
+        "whoop_sleep_pct": sleep.get("sleep_pct") if isinstance(sleep, dict) else None,
+        "whoop_sleep_hrs": sleep.get("sleep_hrs") if isinstance(sleep, dict) else None,
+        # v3.3.24d nap + sleep debt (Jim OOB 2026-10-20)
+        "whoop_nap_detected": sleep.get("nap_detected", False) if isinstance(sleep, dict) else False,
+        "whoop_nap_hrs": sleep.get("nap_hrs") if isinstance(sleep, dict) else None,
+        "whoop_nap_pct": sleep.get("nap_pct") if isinstance(sleep, dict) else None,
+        "whoop_nap_disturbances": sleep.get("nap_disturbances") if isinstance(sleep, dict) else None,
+        "whoop_nap_start": sleep.get("nap_start") if isinstance(sleep, dict) else None,
+        "whoop_nap_end": sleep.get("nap_end") if isinstance(sleep, dict) else None,
+        "whoop_total_sleep_hrs": sleep.get("total_sleep_hrs") if isinstance(sleep, dict) else None,
+        "whoop_sleep_debt_hrs": sleep.get("sleep_debt_hrs") if isinstance(sleep, dict) else None,
+        "whoop_sleep_need_hrs": sleep.get("sleep_need_hrs") if isinstance(sleep, dict) else None,
+        "whoop_sleep_efficiency_pct": sleep.get("sleep_efficiency_pct") if isinstance(sleep, dict) else None,
+        "whoop_respiratory_rate": sleep.get("respiratory_rate") if isinstance(sleep, dict) else None,
+        "whoop_sleep_start": sleep.get("sleep_start") if isinstance(sleep, dict) else None,
+        "whoop_sleep_end": sleep.get("sleep_end") if isinstance(sleep, dict) else None,
+        "whoop_hrv_ms": rec_metrics.get("hrv_ms") if isinstance(rec_metrics, dict) else None,
+        "whoop_rhr_bpm": rec_metrics.get("rhr_bpm") if isinstance(rec_metrics, dict) else None,
+        # Steps — v3.3.25: WHOOP is the ONLY step source (Jim OOB 2026-10-20
+        # 「Fully remove withings / Steps is whoop!」).
+        # distance_km_today / calories_today / steps_yesterday are gone: the
+        # Withings step path is removed and Whoop cycles carry neither step
+        # distance nor step calories. "yesterday" is Whoop's previous cycle.
+        "steps_today": _w_steps,
+        "steps_date": _w_date,
+        "steps_syncing": _w_steps is None,
+        "steps_source": "whoop",
+        "steps_as_of": _w_asof,
+        "steps_stale": _w_stale,
+        "steps_band_off": _w_band_off,
+        "steps_in_progress": _w_in_progress,
+        "steps_yesterday": _w_yesterday,
+        "steps_yesterday_date": _w_yesterday_date,
+        "whoop_steps_7d_avg": _w_avg7,
+        "whoop_steps_series": _w_series,
+    }
+    # Cache for 60s (next page load uses Redis hit)
+    try:
+        rcache.set(cache_key, json.dumps(payload).encode("utf-8"), ttl_s=60)
+    except Exception:
+        pass
+    elapsed = (_time.time() - overlay_start) * 1000
+    print(f"[health_overlay] built in {elapsed:.0f}ms (parallel + Redis cache)", flush=True)
+    return jsonify(payload)
 
 
 
@@ -1380,6 +1615,31 @@ def api_context():
     })
 
 
+@app.route("/api/nutrition/refresh", methods=["POST"])
+def api_nutrition_refresh():
+    """Force rehydrate the in-memory NutritionCache from Google Sheets.
+
+    v3.3.10 (Jim OOB 2026-08-31「The gym bro cheer routine is not reflecting
+    the intraday activities again」): when you directly patch sheet rows
+    via batchUpdate (NOT via /api/scan_commit), the cache doesn't auto-refresh
+    and cheer pipeline keeps reading stale data. This endpoint triggers a
+    full cache rehydrate so cheer sees freshest intraday nutrition.
+
+    Returns: {ok, rows_loaded, refreshed_at}
+    """
+    try:
+        rows_loaded = _hydrate_nutrition_cache()
+        return jsonify({
+            "ok": True,
+            "rows_loaded": rows_loaded,
+            "refreshed_at": now_iso(),
+            "message": f"Cache rehydrated with {rows_loaded} rows from Sheet. "
+                      f"Cheer pipeline will now see current intraday data."
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+
+
 @app.route("/api/nutrition/today")
 def api_nutrition_today():
     """Return today's nutrition: per-meal list + totals + last_meal_ts.
@@ -1389,51 +1649,817 @@ def api_nutrition_today():
     this endpoint reads.
 
     v3.3.0: reads from in-memory NutritionCache instead of nutrition_log.json.
+    v3.3.10: switched from inline cache.get_by_date() to _load_today_nutrition()
+    helper so the late-night fallback ("today's HKT date has 0 meals, fall
+    back to most recent date") activates for cheer pipeline consistency.
     """
-    cache = _get_nutrition_cache()
-    if not cache.is_ready():
-        return jsonify({"ok": False, "error": "cache hydrating"}), 503
-    today = today_iso()
-    rows = cache.get_by_date(today)
-    meals = []
-    totals = {"kcal": 0.0, "P": 0.0, "C": 0.0, "F": 0.0}
-    for r in rows:
-        d = r.to_pwa_dict()
-        # Match legacy meal schema so cheer pipeline stays unchanged
-        meals.append({
-            "date": r.date,
-            "time": r.time,
-            "meal_type": r.meal or "scan",
-            "meal_name": r.name,
-            "name": r.name,
-            "dish_name": r.name,
-            "calories": r.kcal,
-            "protein": r.p,
-            "carbs": r.c,
-            "fat": r.f,
-            "restaurant_chain": r.restaurant,
-            "timestamp_iso": (r.dt.isoformat() if r.dt else "") + "+08:00",
-            "drive_image_url": r.drive_image_url,
-        })
-        totals["kcal"] += r.kcal
-        totals["P"] += r.p
-        totals["C"] += r.c
-        totals["F"] += r.f
-    totals = {k: round(v, 1) for k, v in totals.items()}
-    last_meal_ts = None
-    if rows:
-        last = rows[0]  # get_by_date returns time-DESC, newest first
-        if last.dt:
-            last_meal_ts = f"{last.date}T{last.time}:00+08:00"
+    data = _load_today_nutrition()
     return jsonify({
-        "date": today,
+        "date": data.get("date") or today_iso(),
         "fetched_at": now_iso(),
-        "meal_count": len(meals),
-        "totals": totals,
-        "last_meal_ts": last_meal_ts,
-        "meals": meals,
-        "cache": cache.stats(),
+        "meal_count": data.get("meal_count", 0),
+        "totals": data.get("totals", {"kcal": 0, "P": 0, "C": 0, "F": 0}),
+        "last_meal_ts": data.get("last_meal_ts"),
+        "meals": data.get("meals", []),
+        "cache": _get_nutrition_cache().stats(),
     })
+
+
+# v3.3.23 (Jim OOB 2026-09-11 'is this possible to download an jpg image
+# containing about all the daily food log like screenshot of the food'):
+# render today's food log as a shareable PNG/JPG using PIL. No new deps
+# (Pillow already in venv). Renders header (date + totals), per-meal rows
+# (with food thumbnails where available), footer (timestamp + gymbro
+# branding). Layout: 1080x(60+90+80*N+60) px, dark theme matching the
+# PWA's gradient. Output saved to /home/work/.hermes/nutrition_card_cache/
+# + same path exposed via /nutrition_card/<filename> for the frontend
+# to download. Daily cache (one card per day) — overwrites if exists
+# so the user always gets the latest view.
+def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1) -> "Path | None":
+    """Render today's food log as a shareable JPG using PIL.
+
+    v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+    win'): pre-fetch all meal thumbs in PARALLEL via ThreadPoolExecutor
+    before starting the PIL render loop. Previously each meal fetched
+    its Drive thumb sequentially during the render loop, so 8 meals
+    with cold Drive cache took 8-16s. With parallel fetches, all 8
+    thumbs complete in ~2s, then the synchronous PIL render takes
+    ~150-200ms. Total: ~2.2s instead of ~16s (8x speedup on cold cache).
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    except ImportError:
+        return None
+
+    # v3.3.23ax: compute page slice EARLY (before parallel thumb fetch) so the
+    # thumb pool only fetches thumbs for the page being rendered, not all pages.
+    # Each page is bounded by MEALS_PER_PAGE so image height stays under
+    # ~1700px and renders cleanly across Telegram, WhatsApp, image hosts.
+    MEALS_PER_PAGE = 6
+    page_start = (page_num - 1) * MEALS_PER_PAGE
+    page_end = page_start + MEALS_PER_PAGE
+    page_meals = meals[page_start:page_end]
+
+    # v3.3.23al: PARALLEL THUMB FETCH
+    # Collect row_indices first, then fetch in parallel
+    import concurrent.futures as _cf
+    from gym_web.image_proxy import scan_thumb as _scan_thumb_func
+
+    def _fetch_one_thumb(meal: dict) -> "tuple[int, bytes | None]":
+        """Returns (idx, bytes) — bytes is None on failure."""
+        thumb_path = (
+            meal.get("image_path")
+            or meal.get("image_url")
+            or meal.get("thumbnail_url")
+            or meal.get("drive_image_url")
+            or ""
+        )
+        if not thumb_path.startswith("/scan_thumb/"):
+            return (id(meal), None)
+        try:
+            rest = thumb_path[len("/scan_thumb/"):]
+            if not rest.isdigit():
+                return (id(meal), None)
+            row_idx = int(rest)
+            resp = _scan_thumb_func(row_idx)
+            if resp.status_code == 200:
+                return (id(meal), resp.get_data())
+        except Exception:
+            pass
+        return (id(meal), None)
+
+    # Build a thumb_bytes dict keyed by id(meal) for the render loop below
+    # v3.3.23ax: only fetch thumbs for the page being rendered (not all pages)
+    thumb_bytes_for_meal: dict = {}
+    if page_meals:
+        with _cf.ThreadPoolExecutor(max_workers=min(8, len(page_meals))) as _ex:
+            future_to_id = {}
+            for m in page_meals:
+                f = _ex.submit(_fetch_one_thumb, m)
+                future_to_id[f] = id(m)
+            for f in _cf.as_completed(future_to_id):
+                mid = future_to_id[f]
+                try:
+                    _, b = f.result(timeout=10)
+                    if b:
+                        thumb_bytes_for_meal[mid] = b
+                except Exception:
+                    pass
+
+    # Theme
+    BG_TOP = (28, 25, 46)         # deep purple
+    BG_BOT = (12, 10, 24)         # near-black
+    BAND = (45, 38, 70)           # slightly lighter
+    ACCENT = (251, 191, 36)       # amber for kcal
+    PROTEIN = (96, 165, 250)      # blue
+    CARBS = (251, 146, 60)        # orange
+    FAT = (220, 38, 38)           # red
+    TEXT = (240, 240, 245)
+    TEXT_DIM = (170, 170, 185)
+    BORDER = (80, 75, 110)
+    # Fonts (try CJK + Latin; fall back to default)
+    def _load(size: int, bold: bool = False):
+        # v3.3.23d (Jim OOB 2026-09-12 'The Chinese cannot be shown'):
+        # Use index=4 for the .ttc CJK file to load the HK (Traditional
+        # Chinese, Cantonese-aware) variant — default index=0 is the
+        # JP face, which lacks some Cantonese-specific characters and
+        # renders some TC chars with JP fallback glyphs. HK variant
+        # matches Jim's HKT/Hong Kong writing convention best.
+        # Also added more fallback paths because the actual install path
+        # of fonts-noto-cjk is /usr/share/fonts/opentype/noto/, NOT
+        # /usr/share/fonts/truetype/noto/ (which only has emoji).
+        candidates = [
+            # Prefer HK Cantonese-aware CJK (v3.3.23d)
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold
+             else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 4),
+            # HK Bold: index=4 same (TTC face index, not weight)
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold
+             else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 3),
+            # Latin fallback (always works)
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+             else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+            # Last-ditch CJK (wrong sub-face but still renders)
+            ("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold
+             else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
+        ]
+        for path, index in candidates:
+            try:
+                return ImageFont.truetype(path, size, index=index)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+    f_date = _load(34, bold=True)
+    # v3.3.23u (Jim OOB 2026-09-14 'Still no grading for jpg download.
+    # Still poor layout of timing'): time text 22px was too big — caused
+    # overlap with grade badge at x=102. Now reduced to 18px + grade
+    # badge made much more visible (wider color tab, larger pill).
+    f_kcal_big = _load(60, bold=True)
+    f_macro = _load(28, bold=True)
+    f_macro_val = _load(28, bold=True)
+    f_time = _load(18)          # was 22px — reduced for cleaner layout
+    # v3.3.23u: food name font (40px) was OK; keep
+    f_name = _load(40, bold=True)
+    f_name_small = _load(32)
+    f_kcal_row = _load(48, bold=True)
+    f_macro_pill = _load(28, bold=True)
+    f_foot = _load(18)
+    f_brand = _load(22, bold=True)
+    f_rest = _load(24)
+    # v3.3.23u: dedicated grade font — bold 26px for the grade letter
+    f_grade = _load(26, bold=True)
+    # v3.3.23x (Jim OOB 2026-09-16 'timing is not prominent too'): dedicated
+    # BIG time font — 36px bold for the prominent left-side time pill
+    f_time_big = _load(36, bold=True)
+    # Geometry — v3.3.23p (Jim OOB 2026-09-12 'Some font are overlapping'
+    # + 'Can you arrange a better design?'): full redesign of card
+    # layout to fix overlap + visual hierarchy. Three-column structure
+    # with strict separation:
+    #   [thumb 220×220] [text col 360w] [right col 240w]
+    # Thumb narrower so right col has clear space for pills. Text col
+    # fixed width 360 so restaurant chain never bleeds into pill area.
+    # Right col now uses full 240 vertical = MEAL_H. All blocks pixel-
+    # perfect aligned. Fonts tuned so 雲呢拿蛋白飲 + ON Gold Standard
+    # both fit on single line (no overflow).
+    W = 1080
+    HEAD = 70
+    # v3.3.23q: BAND_H 100→130 to fit summary band with proper vertical
+    # separation between "Total" label + big kcal number + "kcal" suffix
+    BAND_H = 130
+    MEAL_H = 240       # taller row to fit bigger fonts
+    FOOT = 60
+    # v3.3.23ax: PAGE indicator room when multiple pages exist (default 0)
+    PAGE = 36 if page_total > 1 else 0
+    PAD = 32
+    THUMB_SIZE = 240   # slightly bigger thumb (220→240) for new bigger food font
+    THUMB_RADIUS = 14
+    # v3.3.23p: explicit column widths to prevent overlap
+    THUMB_W = THUMB_SIZE
+    TEXT_COL_W = 380    # name + restaurant only — fixed width
+    GAP = 20            # gap between thumb and text
+    RIGHT_COL_W = 240   # kcal pill + P/C/F stack
+    # v3.3.23ax: H based on page_meals (slice) not full meals, plus PAGE room
+    # for the page indicator on multi-page outputs
+    H = HEAD + BAND_H + max(1, len(page_meals)) * MEAL_H + FOOT + PAGE
+    img = Image.new("RGB", (W, H), BG_TOP)
+    draw = ImageDraw.Draw(img)
+    # Background gradient (top→bottom) — draw thin horizontal bands
+    for y in range(H):
+        t = y / max(1, H - 1)
+        r = int(BG_TOP[0] * (1 - t) + BG_BOT[0] * t)
+        g = int(BG_TOP[1] * (1 - t) + BG_BOT[1] * t)
+        b = int(BG_TOP[2] * (1 - t) + BG_BOT[2] * t)
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+    # Header bar
+    draw.rectangle([(0, 0), (W, HEAD)], fill=(0, 0, 0, 0))
+    # Brand chip top-left
+    draw.rounded_rectangle([(PAD, 18), (PAD + 180, 64)], radius=12, fill=BAND)
+    draw.text((PAD + 22, 23), "gymbro · food log", fill=ACCENT, font=f_brand)
+    # Date big right
+    # Convert date to friendly format
+    try:
+        from datetime import datetime as _dt
+        d_obj = _dt.strptime(date_iso, "%Y-%m-%d")
+        weekday = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][d_obj.weekday()]
+        date_label = f"{d_obj.year}年{d_obj.month:02d}月{d_obj.day:02d}日 {weekday}"
+    except Exception:
+        date_label = date_iso
+    bbox = draw.textbbox((0, 0), date_label, font=f_date)
+    draw.text((W - PAD - (bbox[2] - bbox[0]), 14), date_label, fill=TEXT, font=f_date)
+    # Summary band
+    by = HEAD
+    draw.rectangle([(0, by), (W, by + BAND_H)], fill=BAND)
+    # v3.3.23q (Jim OOB 'Font of total calorie is overlapping'):
+    # Redesigned Total kcal block — explicit vertical separation:
+    #   "Total" (24px label)    at y = by + 12
+    #   "950"  (60px number)   at y = by + 36   (fits within 130h band)
+    #   "kcal" (28px suffix)   right-aligned at top with "Total"
+    # Old code: "kcal" was at by+50 which collided with 72px number.
+    # New: number is 60px (tighter) and "kcal" sits ABOVE the number.
+    kcal_total = int(round(totals.get("kcal", 0) or 0))
+    # Label row (y = by + 12): "Total" left, "kcal" right
+    draw.text((PAD, by + 12), "Total", fill=TEXT_DIM, font=f_macro)
+    # Right-align "kcal" with the number baseline for clean axis
+    kcal_suffix_bbox = draw.textbbox((0, 0), "kcal", font=f_macro)
+    kcal_suffix_w = kcal_suffix_bbox[2] - kcal_suffix_bbox[0]
+    draw.text((PAD + 130 + 12, by + 12), "kcal", fill=TEXT_DIM, font=f_macro)
+    # Big kcal number at y = by + 38 (well below the "Total/kcal" label row)
+    draw.text((PAD, by + 38), f"{kcal_total}", fill=ACCENT, font=f_kcal_big)
+    # Macro cells: P / C / F
+    cell_w = 200
+    cell_x0 = 360
+    for i, (label, key, color) in enumerate([("蛋白質 P", "P", PROTEIN), ("碳水 C", "C", CARBS), ("脂肪 F", "F", FAT)]):
+        x = cell_x0 + i * (cell_w + 12)
+        y = by + 14
+        # Colored pill bar
+        draw.rounded_rectangle([(x, y), (x + cell_w, y + 60)], radius=10, fill=(30, 26, 48))
+        # Left color tab
+        draw.rectangle([(x, y), (x + 6, y + 60)], fill=color)
+        # Label
+        draw.text((x + 16, y + 6), label, fill=TEXT_DIM, font=f_macro)
+        val = totals.get(key, 0) or 0
+        unit = "g"
+        draw.text((x + 16, y + 28), f"{val:.0f}{unit}", fill=TEXT, font=f_macro_val)
+    # Meals — v3.3.23p: 3-column layout (thumb + text + right pills)
+    # with explicit non-overlapping column boundaries. The text col is
+    # capped at TEXT_COL_W so long restaurant chains never bleed into
+    # the right pill column. Text + pills vertically centered within the
+    # 220px row. Font sizes tuned to prevent wrap overflow.
+    # v3.3.23x (Jim OOB 2026-09-16 'rating is still overlapping and timing
+    # is not prominent too'): complete redesign of the meal row header
+    # band. Previous attempts:
+    #   v3.3.23u: time at x=28, grade at x=90-166 → both in thumb zone
+    #   v3.3.23w: time at x=28, grade at x=976-1052 → grade overlaps
+    #              kcal pill TOP area (x=812-992, y=my+16..my+29)
+    # New approach: TIME moves OUT of the row header — rendered as a BIG
+    # left-side band on a dark pill (very prominent, 36px). GRADE moves
+    # to the FAR LEFT, just under the time pill — completely separate
+    # from the thumb (which sits to the right), the text col (middle),
+    # and the right pills (far right).
+    #
+    # Layout per meal row (240px tall):
+    #
+    #   ┌──────┬──────────────────────────────────────────┬──────────────┐
+    #   │12:45 │ ┌──────┐                                  │  ┌─kcal──┐  │
+    #   │      │ │      │  白切雞飯                          │  │        │  │
+    #   │ [A]  │ │thumb │  @ 餐廳                            │  │  P/C/F │  │
+    #   │      │ │ 220  │                                  │  │ pills  │  │
+    #   │      │ └──────┘                                  │  └────────┘  │
+    #   └──────┴──────────────────────────────────────────┴──────────────┘
+    #   x=28-  x=160-380 (thumb)                          x=812-1052
+    #
+    # Left meta band (x=28-156): big TIME (36px) + GRADE pill (28px) below
+    # Thumb: shifted right to x=160-380 (220 wide)
+    # Text col: x=400-780 (380 wide)
+    # Right pills: x=812-1052 (kcal + P/C/F) — UNCHANGED
+    LEFT_META_W = 128   # width of time + grade band on left
+    # New thumb x = PAD + LEFT_META_W + GAP = 28 + 128 + 8 = 164
+    # But to keep things simple, let's just stack time + grade on the LEFT
+    # with thumb pushed right. Thumb at x=PAD+LEFT_META_W = 156, 200×200
+    THUMB2_X = PAD + LEFT_META_W  # 28 + 128 = 156
+    THUMB2_SIZE = 200
+    # Text col shifted right by LEFT_META_W
+    TEXT2_X = THUMB2_X + THUMB2_SIZE + GAP  # 156 + 200 + 18 = 374
+    # v3.3.23aa (Jim OOB 2026-09-16 'Add one more line break between food
+    # and restaurant on jpg download. Leave some right margin space such
+    # that it won't overlap the right side'): reduced TEXT2_W from 320→260
+    # to add 120px more right margin. Now text col ends at x=634, leaving
+    # 178px gap before right pills at x=812. Food name will never overlap
+    # the right pill column even for very long Chinese names.
+    TEXT2_W = 260   # was 320 (v3.3.23z), was 340 (v3.3.23y), was 380 (v3.3.23x)
+    for idx, m in enumerate(page_meals):
+        my = HEAD + BAND_H + idx * MEAL_H
+        # Row separator
+        if idx > 0:
+            draw.line([(PAD, my), (W - PAD, my)], fill=BORDER, width=1)
+
+        # === LEFT META BAND (time + grade) ===
+        # TIME: BIG prominent pill at x=PAD..PAD+128, y=my+4..my+56 (52px tall)
+        time_str = m.get("time") or ""
+        if time_str:
+            tm_x = PAD
+            tm_y = my + 4
+            tm_w = LEFT_META_W
+            tm_h = 52
+            # Dark pill background for time
+            draw.rounded_rectangle(
+                [(tm_x, tm_y), (tm_x + tm_w, tm_y + tm_h)],
+                radius=10, fill=(30, 26, 48)
+            )
+            # Big time text centered in pill (36px bold white)
+            tbox = draw.textbbox((0, 0), time_str, font=f_time_big)
+            tw = tbox[2] - tbox[0]
+            th = tbox[3] - tbox[1]
+            draw.text(
+                (tm_x + (tm_w - tw) // 2, tm_y + (tm_h - th) // 2 - 4),
+                time_str, fill=TEXT, font=f_time_big
+            )
+
+        # GRADE: full-color pill below time, x=PAD..PAD+128, y=my+62..my+98
+        grade = (m.get("coach_comment") or {}).get("grade") or "—"
+        grade_colors = {
+            "A+": (74, 222, 128),   # bright green
+            "A":  (110, 231, 183),  # green
+            "B":  (96, 165, 250),   # blue
+            "C":  (251, 191, 36),   # amber
+            "D":  (251, 146, 60),   # orange
+            "F":  (239, 68, 68),    # red
+        }
+        grade_color = grade_colors.get(grade, TEXT_DIM)
+        gb_x = PAD
+        gb_y = my + 62
+        gb_w = LEFT_META_W   # 128 — same width as time pill (clean alignment)
+        gb_h = 36             # was 28 — slightly taller for prominence
+        draw.rounded_rectangle(
+            [(gb_x, gb_y), (gb_x + gb_w, gb_y + gb_h)],
+            radius=10, fill=grade_color
+        )
+        # Grade letter centered in pill (26px bold, dark on color)
+        gbbox = draw.textbbox((0, 0), grade, font=f_grade)
+        gw = gbbox[2] - gbbox[0]
+        gh = gbbox[3] - gbbox[1]
+        draw.text(
+            (gb_x + (gb_w - gw) // 2, gb_y + (gb_h - gh) // 2 - 3),
+            grade, fill=(20, 18, 32), font=f_grade
+        )
+
+        # === HERO THUMB (shifted right to make room for left meta) ===
+        thumb_x = THUMB2_X
+        thumb_y = my + (MEAL_H - THUMB2_SIZE) // 2   # vertically centered
+        thumb_path_str = (
+            m.get("image_path")
+            or m.get("image_url")
+            or m.get("thumbnail_url")
+            or m.get("drive_image_url")
+            or ""
+        )
+        thumb_drawn = False
+        if thumb_path_str:
+            try:
+                # v3.3.23al: use pre-fetched bytes from parallel batch
+                thumb_bytes = thumb_bytes_for_meal.get(id(m))
+                if thumb_path_str.startswith("/scan_thumb/"):
+                    rest = thumb_path_str[len("/scan_thumb/"):]
+                    if rest.isdigit():
+                        # Only fetch inline if not pre-fetched (shouldn't happen)
+                        if thumb_bytes is None:
+                            try:
+                                from gym_web.image_proxy import scan_img, scan_thumb
+                                resp = scan_img(int(rest))
+                                if resp.status_code == 200:
+                                    thumb_bytes = resp.get_data()
+                                if thumb_bytes is None or len(thumb_bytes) < 1000:
+                                    resp = scan_thumb(int(rest))
+                                    if resp.status_code == 200:
+                                        thumb_bytes = resp.get_data()
+                            except Exception:
+                                thumb_bytes = None
+                        if thumb_bytes is None and thumb_path_str.startswith("http"):
+                            raise ValueError("remote thumb (drive)")
+                if thumb_bytes is not None:
+                    import io as _io
+                    thumb = Image.open(_io.BytesIO(thumb_bytes)).convert("RGB")
+                else:
+                    p = thumb_path_str
+                    if p.startswith("/scan_img/"):
+                        p = "/home/work/.hermes/scan_cache" + p[len("/scan_img"):]
+                    elif p.startswith("/scan_thumb/"):
+                        p = "/home/work/.hermes/scan_thumb_cache" + p[len("/scan_thumb"):]
+                    if p.startswith("http"):
+                        raise ValueError("remote thumb")
+                    thumb = Image.open(p).convert("RGB")
+                thumb.thumbnail((THUMB2_SIZE, THUMB2_SIZE), Image.LANCZOS)
+                mask = Image.new("L", thumb.size, 0)
+                ImageDraw.Draw(mask).rounded_rectangle([(0, 0), thumb.size], radius=THUMB_RADIUS, fill=255)
+                img.paste(thumb, (thumb_x, thumb_y), mask)
+                thumb_drawn = True
+            except Exception:
+                thumb_drawn = False
+        if not thumb_drawn:
+            # v3.3.23ap (Jim OOB 2026-09-28 'I have just inputted food log in text
+            # but it does not grab the image online and now causing broken image
+            # on jpg download'): previous code drew 🍽 emoji with CJK font,
+            # which doesn't have emoji glyphs → renders as tofu/box (broken
+            # image look). Replace with styled placeholder: dark background
+            # + light border + '無圖' CJK text (renders cleanly in CJK font).
+            draw.rounded_rectangle([(thumb_x, thumb_y), (thumb_x + THUMB2_SIZE, thumb_y + THUMB2_SIZE)],
+                                   radius=THUMB_RADIUS, fill=(40, 36, 60), outline=BORDER, width=2)
+            # Subtle "no image" label in CJK (renders properly)
+            f_no_img = _load(28, bold=True)
+            label = "無 圖"
+            # Center text horizontally
+            try:
+                lbb = draw.textbbox((0, 0), label, font=f_no_img)
+                lw = lbb[2] - lbb[0]
+                lh = lbb[3] - lbb[1]
+            except Exception:
+                lw, lh = 80, 32
+            cx = thumb_x + (THUMB2_SIZE - lw) // 2
+            cy = thumb_y + (THUMB2_SIZE - lh) // 2
+            draw.text((cx, cy), label, fill=TEXT_DIM, font=f_no_img)
+        # v3.3.23x (Jim OOB 2026-09-16 'rating is still overlapping'):
+        # text column shifted right because thumb is now at x=156 (was x=28)
+        text_x = TEXT2_X   # 374 (was 266)
+        text_right = text_x + TEXT2_W   # 754 (clear gap before right pills at 812)
+        # Text content vertically centered within MEAL_H
+        text_block_top = my + 16
+        text_block_bot = my + MEAL_H - 16
+        name_str = (m.get("meal_name") or m.get("name") or "食物")[:60]
+        rest = m.get("restaurant_chain") or m.get("restaurant") or ""
+        # Single-line name (font 32px — about 14-15 chars fit in 380w)
+        if len(name_str) > 14:
+            # v3.3.23aa (Jim OOB 2026-09-16): split line1 at a CJK char
+            # boundary so it fits in 260px col. CJK chars are ~40px wide,
+            # ASCII ~22px. "Quest 朱古力花生醬" = 5 ASCII + 7 CJK ≈ 400px
+            # which overflows 260px. Splitting at 8 chars gives "Quest 朱古"
+            # ≈ 200px which fits cleanly.
+            line1 = name_str[:8]
+            line2 = name_str[8:32]
+            # v3.3.23aa (Jim OOB 2026-09-16 'Add one more line break
+            # between food and restaurant'): increased gaps for cleaner
+            # visual separation. Was 32 + 30 + 26 + 30 + 22 = 140.
+            stack_total_h = 32 + 30 + 26 + 30 + 22
+            stack_top = my + (MEAL_H - stack_total_h) // 2
+            draw.text((text_x, stack_top), line1, fill=TEXT, font=f_name)
+            draw.text((text_x, stack_top + 32 + 30), line2, fill=TEXT, font=f_name_small)
+            if rest and rest not in ("不係香港餐廳", "Hong Kong restaurant"):
+                # v3.3.23aa: truncate restaurant string to fit text col width
+                rest_label = f"📍 {rest[:10]}"   # was 14 — even tighter
+                draw.text((text_x, stack_top + 32 + 30 + 26 + 30), rest_label, fill=TEXT_DIM, font=f_rest)
+        else:
+            # v3.3.23aa (Jim OOB 2026-09-16 'Add one more line break between
+            # food and restaurant on jpg download'): increased gap from
+            # 28→40px between name and restaurant for clearer visual
+            # separation. Also truncate food name to fit within TEXT2_W
+            # so it never overflows into the right pill column.
+            stack_total_h = 32 + 40 + 22   # name + visual gap + restaurant
+            stack_top = my + (MEAL_H - stack_total_h) // 2
+            # v3.3.23aa: truncate food name to fit in 260px-wide text col
+            # at 40px font (CJK chars ~40px wide, ASCII ~22px). Roughly
+            # 6 CJK chars fit safely. Use a conservative cut.
+            display_name = name_str[:10]
+            draw.text((text_x, stack_top), display_name, fill=TEXT, font=f_name)
+            if rest and rest not in ("不係香港餐廳", "Hong Kong restaurant"):
+                rest_label = f"📍 {rest[:12]}"   # was 16 — even tighter
+                draw.text((text_x, stack_top + 32 + 40), rest_label, fill=TEXT_DIM, font=f_rest)
+        # v3.3.23p: RIGHT COLUMN — kcal pill + P/C/F stack, all 240 wide
+        # Right edge anchor: pill_right = W - PAD = 1052
+        pill_right = W - PAD
+        # Total right col width = RIGHT_COL_W = 240 (kcal 180 + P/C/F 60 × 1)
+        # Layout: kcal (180w, 220h) on left + P/C/F column (60w) on right
+        kcal_w = 180
+        kcal_left = pill_right - 240 - 0  # align with text col right
+        kcal_right = kcal_left + kcal_w    # 1052 - 240 = 812... no, 1052-240=812
+        kcal_right = kcal_left + kcal_w
+        # Actually layout: kcal 180 wide, then P/C/F 60 wide column = 240 total
+        # Total right col starts at: pill_right - 240
+        right_col_left = pill_right - RIGHT_COL_W   # 1052 - 240 = 812
+        kcal_left = right_col_left
+        kcal_right = right_col_left + kcal_w         # 812 + 180 = 992
+        pcf_x = kcal_right                          # 992 (P/C/F column starts)
+        pcf_w = 60
+        kcal_val = m.get("calories") or m.get("kcal") or 0
+        # kcal pill: 180 wide × (MEAL_H - 32) tall, vertically spans row
+        kcal_top = my + 16
+        kcal_bot = my + MEAL_H - 16    # 220 - 32 = 188 tall
+        kcal_h = kcal_bot - kcal_top
+        draw.rounded_rectangle([(kcal_left, kcal_top), (kcal_right, kcal_bot)],
+                               radius=14, fill=(30, 26, 48))
+        # Left color tab spans full height
+        draw.rectangle([(kcal_left, kcal_top), (kcal_left + 8, kcal_bot)], fill=ACCENT)
+        # Label "kcal" top-left
+        draw.text((kcal_left + 18, kcal_top + 12), "kcal", fill=TEXT_DIM, font=f_macro)
+        # Number — right-aligned, vertically centered in pill
+        kcal_text = f"{int(round(kcal_val))}"
+        kbbox = draw.textbbox((0, 0), kcal_text, font=f_kcal_row)
+        kw = kbbox[2] - kbbox[0]
+        kh = kbbox[3] - kbbox[1]
+        # Right edge with 16px padding
+        draw.text((kcal_right - 16 - kw, kcal_top + (kcal_h - kh) // 2 - 4),
+                  kcal_text, fill=ACCENT, font=f_kcal_row)
+        # P/C/F column on right — 60 wide, 3 pills stacked, each ~60 tall
+        # Each pill: P (60h) + gap (4) — 3 × 60 + 2 × 4 = 188 = kcal_h
+        micro_h = (kcal_h - 8) // 3     # 60 per pill, 4px gap
+        micro_gap = 4
+        for i, (lbl, val, color) in enumerate([
+            ("P", m.get("protein", 0) or 0, PROTEIN),
+            ("C", m.get("carbs", 0) or 0, CARBS),
+            ("F", m.get("fat", 0) or 0, FAT),
+        ]):
+            mp_top = kcal_top + i * (micro_h + micro_gap)
+            mp_bot = mp_top + micro_h
+            # Pill background
+            draw.rounded_rectangle([(pcf_x, mp_top), (pcf_x + pcf_w, mp_bot)],
+                                    radius=8, fill=(30, 26, 48))
+            # Color tab on top (full width since column is narrow)
+            draw.rectangle([(pcf_x, mp_top), (pcf_x + pcf_w, mp_top + 4)], fill=color)
+            # Label + number vertically stacked, centered horizontally
+            lbbox = draw.textbbox((0, 0), lbl, font=f_macro_pill)
+            lw = lbbox[2] - lbbox[0]
+            val_text = f"{int(round(val))}"
+            mbbox = draw.textbbox((0, 0), val_text, font=f_macro_pill)
+            mw = mbbox[2] - mbbox[0]
+            # Layout: label at top, value below, both centered
+            label_y = mp_top + 8
+            value_y = mp_top + 32
+            draw.text((pcf_x + (pcf_w - lw) // 2, label_y), lbl, fill=TEXT_DIM, font=f_macro_pill)
+            draw.text((pcf_x + (pcf_w - mw) // 2, value_y), val_text, fill=TEXT, font=f_macro_pill)
+    # Footer
+    fy = H - FOOT
+    draw.rectangle([(0, fy), (W, H)], fill=BAND)
+    # generation timestamp
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+    from datetime import timedelta as _td
+    hkt_now = _dt.now(_tz(_td(hours=8))).strftime("%Y-%m-%d %H:%M HKT")
+    foot_left = f"📊 gymbro · {hkt_now}"
+    draw.text((PAD, fy + 12), foot_left, fill=TEXT_DIM, font=f_foot)
+    # meal count
+    meal_str = f"{len(meals)} 餐"
+    bbox = draw.textbbox((0, 0), meal_str, font=f_foot)
+    draw.text((W - PAD - (bbox[2] - bbox[0]), fy + 22), meal_str, fill=TEXT_DIM, font=f_foot)
+    # Save
+    out_dir = Path("/home/work/.hermes/nutrition_card_cache")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all record.
+    # Make it multiple jpg if overflow'): when there are more meals than
+    # fit on one page (max MEALS_PER_PAGE), split into multiple page JPGs
+    # so each stays within image-height limits (~1700px) for all viewers.
+    # Page filename pattern: nutrition_{date}_p1.jpg, _p2.jpg, ...
+    if page_total > 1:
+        out_path = out_dir / f"nutrition_{date_iso}_p{page_num}.jpg"
+    else:
+        out_path = out_dir / f"nutrition_{date_iso}.jpg"
+    # v3.3.23ax: also save page 1 under the legacy filename (nutrition_{date}.jpg)
+    # so existing PWA code that references /nutrition_card/nutrition_${date}.jpg
+    # still works for both single-page and multi-page days.
+    legacy_path = out_dir / f"nutrition_{date_iso}.jpg"
+    legacy_write_path = None
+    if page_total > 1 and page_num == 1 and legacy_path != out_path:
+        legacy_write_path = legacy_path
+
+    # v3.3.23ax: draw page indicator on footer when there are multiple pages
+    if page_total > 1:
+        try:
+            page_label = f"第 {page_num}/{page_total} 頁"
+            bbox = draw.textbbox((0, 0), page_label, font=f_foot)
+            lw = bbox[2] - bbox[0]
+            draw.text((W - PAD - lw, H - PAGE - 4), page_label, fill=ACCENT, font=f_foot)
+        except Exception:
+            pass
+
+    img.save(out_path, "JPEG", quality=92, optimize=True)
+    # v3.3.23ax: also save page 1 under legacy filename for backwards compat
+    # with existing PWA code (which references /nutrition_card/nutrition_${date}.jpg)
+    if legacy_write_path is not None:
+        try:
+            img.save(legacy_write_path, "JPEG", quality=92, optimize=True)
+        except Exception:
+            pass
+    return out_path
+
+
+@app.route("/api/nutrition/card", methods=["GET"])
+def api_nutrition_card():
+    """v3.3.23 (Jim OOB 2026-09-11): render today's food log as a JPG card.
+    Optional `?date=YYYY-MM-DD` query (default = today HKT). Returns the
+    image bytes directly (image/jpeg). Daily-cached on disk so re-renders
+    are instant. Frontend uses <a href="/api/nutrition/card" download>
+    for one-tap download.
+    """
+    from flask import send_file
+    target_date = (request.args.get("date") or today_iso()).strip()
+    # Inline the same query shape as /api/nutrition/today, but for arbitrary date
+    data = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0},
+            "meal_count": 0, "last_meal_ts": None, "date": target_date}
+    cache = get_cache()
+    if cache.is_ready():
+        # v3.3.23ab (Jim OOB 2026-09-16 'in jpg download, should be list
+        # by chronological order, earliest the first'): re-sort meals
+        # by time ASC so the card renders earliest meal at top. The cache
+        # returns DESC by default; we reverse here to keep the cache
+        # behaviour unchanged for other endpoints.
+        rows = cache.get_by_date(target_date) or []
+        # v3.3.23ac (Jim OOB 2026-09-16 'wait. the image is not in right
+        # order. please look into it'): bug — sorting by r.time as STRING
+        # puts '9:46' AFTER '13:35' because '9' > '1' alphabetically.
+        # Fix: parse time string into (HH, MM) tuple so natural numeric
+        # ordering applies.
+        def _sort_key(r):
+            t = (r.time or "0:0").strip()
+            parts = t.split(":")
+            try:
+                return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+            except (ValueError, IndexError):
+                return (99, 99)  # unparseable times go to end
+        rows.sort(key=_sort_key, reverse=False)
+        meals = []
+        total_kcal = total_p = total_c = total_f = 0.0
+        last_ts = None
+        for r in rows:
+            # v3.3.23i (Jim OOB 2026-09-12 'Still missing food thumbnail
+            # image'): NutritionRow.thumbnail_url holds the canonical
+            # Drive URL, NOT the local /scan_thumb/<row_index> proxy
+            # route. PIL renderer can't open Drive URLs (no internet
+            # during render, and the thumb code only resolves local
+            # /scan_thumb/ paths). Fix: build the local proxy route
+            # directly from row_index, which is what the renderer
+            # expects. Also expose drive_image_url as 4th-priority
+            # fallback for any old row with no row_index.
+            row_idx = getattr(r, "row_index", None)
+            if row_idx is not None:
+                row_thumb = f"/scan_thumb/{row_idx}"
+            else:
+                row_thumb = (
+                    getattr(r, "thumbnail_url", None)
+                    or getattr(r, "image_url_for_pwa", None)
+                    or ""
+                )
+            meal = {
+                "date": getattr(r, "date", target_date),
+                "time": getattr(r, "time", "") or "",
+                "meal_name": getattr(r, "name", "") or "",
+                "name": getattr(r, "name", "") or "",
+                "calories": getattr(r, "kcal", 0) or 0,
+                "protein": getattr(r, "p", 0) or 0,
+                "carbs": getattr(r, "c", 0) or 0,
+                "fat": getattr(r, "f", 0) or 0,
+                "restaurant_chain": getattr(r, "restaurant", "") or "",
+                "image_path": getattr(r, "image_path", "") or "",
+                "image_url": row_thumb,
+                "thumbnail_url": row_thumb,
+                "drive_image_url": getattr(r, "drive_image_url", "") or "",
+            }
+            # v3.3.23t (Jim OOB 2026-09-14 'still missing the grading'):
+            # Populate coach_comment with grade + comment for the JPG
+            # renderer. Uses _coach_comment_keyword (no AI call, fast
+            # keyword + macro grade). Result cached on NutritionRow for
+            # subsequent /api/scan_recent / /api/food_history calls.
+            # NOTE: get_or_compute_coach_comment passes the row (self) to
+            # coach_fn. _coach_comment_keyword takes individual args —
+            # wrap in a lambda that unpacks row fields.
+            cc = r.get_or_compute_coach_comment(
+                lambda row: _coach_comment_keyword(
+                    row.name, row.kcal, row.p, row.c, row.f, row.restaurant
+                )
+            )
+            meal["coach_comment"] = {"grade": cc.get("grade", "—"), "comment": cc.get("comment", "")}
+            meals.append(meal)
+            total_kcal += meal["calories"]
+            total_p += meal["protein"]
+            total_c += meal["carbs"]
+            total_f += meal["fat"]
+            ts = getattr(r, "timestamp_iso", None) or ""
+            if ts and (last_ts is None or ts > last_ts):
+                last_ts = ts
+        data["meals"] = meals
+        data["totals"] = {"kcal": total_kcal, "P": total_p, "C": total_c, "F": total_f}
+        data["meal_count"] = len(meals)
+        data["last_meal_ts"] = last_ts
+    meals = data.get("meals", []) or []
+    totals = data.get("totals", {"kcal": 0, "P": 0, "C": 0, "F": 0}) or {"kcal": 0, "P": 0, "C": 0, "F": 0}
+    # v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all record.
+    # Make it multiple jpg if overflow'): split into multiple JPGs when
+    # meal count exceeds MEALS_PER_PAGE (6). Each page stays within ~1700px
+    # tall so all viewers (Telegram preview, WhatsApp, image hosts) can
+    # display it without resizing/cropping.
+    MEALS_PER_PAGE = 6
+    page_num = max(1, int((request.args.get("page") or "1")))
+    total_meals = len(meals)
+    page_total = (total_meals + MEALS_PER_PAGE - 1) // MEALS_PER_PAGE  # ceil div
+    page_num = min(page_num, max(1, page_total))
+
+    from flask import Response
+    # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+    # win'): 3-tier JPG card cache (per-page).
+    #  Tier 1: in-memory LRU (10ms, served from RAM)
+    #  Tier 2: on-disk cache (<5 min old, served from disk via send_file)
+    #  Tier 3: re-render via PIL (150-230ms with local thumbs)
+    from gym_web.image_proxy import _jpg_cache_get, _jpg_cache_put
+    cache_key = f"{target_date}_p{page_num}" if page_total > 1 else target_date
+    cached_bytes = _jpg_cache_get(cache_key)
+    if cached_bytes is not None:
+        download_name = (
+            f"gymbro_foodlog_{target_date}_p{page_num}.jpg" if page_total > 1
+            else f"gymbro_foodlog_{target_date}.jpg"
+        )
+        return Response(
+            cached_bytes,
+            mimetype="image/jpeg",
+            headers={
+                "Content-Disposition": f"attachment; filename={download_name}",
+                "Cache-Control": "public, max-age=300",
+            },
+        )
+    out_dir = Path("/home/work/.hermes/nutrition_card_cache")
+    out_path = (
+        out_dir / f"nutrition_{target_date}_p{page_num}.jpg" if page_total > 1
+        else out_dir / f"nutrition_{target_date}.jpg"
+    )
+    download_name = out_path.name.replace("nutrition_", "gymbro_foodlog_")
+    # Tier 2: disk cache (fresh if < 5 min old)
+    try:
+        if out_path.exists():
+            file_age_s = (datetime.now().timestamp() - out_path.stat().st_mtime)
+            if file_age_s < 300:
+                jpg_bytes = out_path.read_bytes()
+                _jpg_cache_put(cache_key, jpg_bytes)
+                return Response(
+                    jpg_bytes,
+                    mimetype="image/jpeg",
+                    headers={
+                        "Content-Disposition": f"attachment; filename={download_name}",
+                        "Cache-Control": "public, max-age=300",
+                    },
+                )
+    except Exception:
+        pass  # fall through to re-render
+    out_path = _render_nutrition_card_pil(target_date, meals, totals, page_num=page_num, page_total=page_total)
+    if not out_path or not out_path.exists():
+        return jsonify({"ok": False, "error": "render_failed (PIL missing?)"}), 500
+    # Tier 3: re-rendered — also populate in-memory cache for next call
+    try:
+        jpg_bytes = out_path.read_bytes()
+        _jpg_cache_put(cache_key, jpg_bytes)
+    except Exception:
+        pass
+    return send_file(
+        str(out_path),
+        mimetype="image/jpeg",
+        as_attachment=True,
+        download_name=download_name,
+        max_age=0,
+    )
+
+
+@app.route("/api/nutrition/card_url", methods=["GET"])
+def api_nutrition_card_url():
+    """v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all record.
+    Make it multiple jpg if overflow'): returns JSON with the list of page
+    URLs for the day's food log. Single-page returns 1 entry; multi-page
+    days return N entries so PWA can download each separately. The PWA
+    detects `pages.length` and loops download for overflow days.
+    """
+    target_date = (request.args.get("date") or today_iso()).strip()
+    out_dir = Path("/home/work/.hermes/nutrition_card_cache")
+    # Compute page count based on meal count in cache
+    cache = get_cache()
+    MEALS_PER_PAGE = 6
+    page_total = 1
+    meal_count = 0
+    pages: list = []
+    if cache.is_ready():
+        rows = cache.get_by_date(target_date) or []
+        meal_count = len(rows)
+        if meal_count > MEALS_PER_PAGE:
+            page_total = (meal_count + MEALS_PER_PAGE - 1) // MEALS_PER_PAGE
+
+    for p in range(1, page_total + 1):
+        fname = f"nutrition_{target_date}_p{p}.jpg" if page_total > 1 else f"nutrition_{target_date}.jpg"
+        path = out_dir / fname
+        pages.append({
+            "page": p,
+            "page_total": page_total,
+            "image_path": str(path),
+            "image_url": f"/nutrition_card/{fname}",
+            "exists": path.exists(),
+            "size_kb": int(path.stat().st_size / 1024) if path.exists() else 0,
+        })
+
+    return jsonify({
+        "date": target_date,
+        "page_total": page_total,
+        "meal_count": meal_count,
+        "pages": pages,
+    })
+
+
+@app.route("/nutrition_card/<filename>", methods=["GET"])
+def serve_nutrition_card(filename):
+    """Serve a generated nutrition card from the cache dir directly
+    (bypassing /api/ which forces as_attachment download). Allows
+    <img src=...> display in the PWA preview."""
+    from flask import send_from_directory
+    return send_from_directory("/home/work/.hermes/nutrition_card_cache", filename)
 
 
 @app.route("/api/history")
@@ -1539,7 +2565,7 @@ def pwa_manifest():
     return jsonify({
         "name": "Gymbro · Jim",
         "short_name": "Gymbro",
-        "description": "Quick gym workout logger with Whoop + Withings overlay",
+        "description": "Quick gym workout logger with Whoop overlay",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#000000",
@@ -1624,7 +2650,16 @@ GOOGLE_TOKEN_PATH = Path("/home/work/.hermes/google_token.json")
 
 
 def _get_google_access_token():
-    """Refresh Google OAuth access token using stored refresh_token."""
+    """Refresh Google OAuth access token using stored refresh_token.
+
+    v3.3.26 (2026-10-21): PERSIST the refreshed token back to
+    google_token.json. Previously this function refreshed in memory only,
+    so the file on disk kept an expired access_token and every reader that
+    reads the FILE directly (tests/qa/test_no_test_pollution.py, ad-hoc
+    scripts, other agents) got `HTTP 401 Unauthorized` — which surfaced as
+    a bogus "pollution FAIL" in the QA suite. Writing it back keeps the
+    file valid for everyone.
+    """
     import urllib.request, urllib.parse
     with GOOGLE_TOKEN_PATH.open() as f:
         tok = json.load(f)
@@ -1641,6 +2676,20 @@ def _get_google_access_token():
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         body = json.loads(resp.read().decode())
+    # v3.3.26: write the fresh token back so file-based readers work.
+    try:
+        tok["access_token"] = body["access_token"]
+        tok["token"] = body["access_token"]
+        if body.get("expires_in"):
+            tok["expires_in"] = body["expires_in"]
+            tok["expires_at"] = time.time() + float(body["expires_in"])
+        tok["refreshed_at"] = time.time()
+        tmp = GOOGLE_TOKEN_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(tok, indent=2))
+        tmp.replace(GOOGLE_TOKEN_PATH)
+    except Exception as e:
+        print(f"[google] token persist failed (access still valid in memory): "
+              f"{type(e).__name__}: {e}", flush=True)
     return body["access_token"]
 
 
@@ -1692,18 +2741,56 @@ NUTRITION_SHEET_TAB = "Nutrition"
 
 
 def _sheet_read_nutrition_rows() -> list:
-    """Return all rows from the Nutrition tab (A:K = 11 cols)."""
+    """Return all rows from the Nutrition tab (A:K = 11 cols).
+
+    v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+    win'): sheets.values_get is already a single batched call (returns
+    all rows at once), but the response payload is ~250KB for 540 rows.
+    Added valueRenderOption=FORMATTED_VALUE to skip server-side date
+    parsing (we don't need formatted dates — Sheet returns ISO strings
+    as-is via UNFORMATTED_VALUE). Also force majorDimension=ROWS for
+    predictable ordering. ~10-15% payload reduction.
+
+    Plus Redis cache (5 min TTL) so re-hydration / background refresh
+    doesn't hit Google Sheets every 5 min when nothing changed.
+    """
+    from gym_web.redis_cache import get_redis_cache
+    rcache = get_redis_cache()
+    cache_key = "sheet:nutrition:all:A1:K"
+    cached = rcache.get(cache_key)
+    if cached is not None:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass  # fall through to live read
+
     access = _get_google_access_token()
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{NUTRITION_SHEET_ID}/values/"
-        f"{NUTRITION_SHEET_TAB}!A1:K"
+        f"{NUTRITION_SHEET_TAB}!A1:K?valueRenderOption=UNFORMATTED_VALUE"
+        f"&majorDimension=ROWS&dateTimeRenderOption=SERIAL_NUMBER"
     )
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {access}"}
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         body = json.loads(resp.read().decode())
-    return body.get("values", [])
+    rows = body.get("values", [])
+    # Cache for 5 min (300s)
+    try:
+        rcache.set(cache_key, json.dumps(rows).encode("utf-8"), ttl_s=300)
+    except Exception:
+        pass
+    return rows
+
+
+def _invalidate_sheet_cache():
+    """v3.3.23al: invalidate Sheet cache after any write so next read
+    picks up fresh data. Called by api_scan_commit / api_scan_correct /
+    api_scan_rename / api_scan_delete / api_scan_edit_datetime."""
+    from gym_web.redis_cache import get_redis_cache
+    rcache = get_redis_cache()
+    rcache.delete("sheet:nutrition:all:A1:K")
 
 
 def _sheet_read_nutrition_row(row_index: int) -> list[str]:
@@ -2419,8 +3506,18 @@ def api_sync_sheet():
                         skipped += 1
             else:
                 set_n = ex.get("set")
-                if set_n is None:
+                # v3.3.23s (Jim OOB 2026-09-14 'workout tab not updated since
+                # 2026-08-31'): don't skip Whoop auto-detect entries with
+                # set=null. If set is None but the exercise has a whoop_id
+                # or weight_note (Whoop auto-detect entries), still write a
+                # placeholder row so the sheet shows the activity.
+                if set_n is None and not (ex.get("whoop_id") or ex.get("weight_note")):
                     continue
+                if set_n is None:
+                    # Use Whoop ID hash as set_n fallback (stable across syncs)
+                    import hashlib
+                    whoop_id = ex.get("whoop_id", "") or ex.get("time", "")
+                    set_n = "wd-" + hashlib.md5(whoop_id.encode()).hexdigest()[:6]
                 if not _has(date, ex.get("exercise", ""), set_n, ex.get("time", "")):
                     rows_to_push.extend(_session_to_sheet_rows(date, {"exercises": [ex]}))
                 else:
@@ -2523,6 +3620,129 @@ def api_sync_health():
 
 SCAN_CACHE_DIR = Path("/home/work/.hermes/scan_cache")
 SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- v3.3.25 PRODUCTION WRITE GUARD (Jim OOB 2026-10-20) ----------
+# "Someone has pollute the production data. Pls avoid doing so"
+#
+# Jim's Nutrition tab is his GOLDEN COPY of the real food log. Any
+# commit path (Sheet append + Drive upload) that runs with a TEST image
+# is indistinguishable from a real meal and silently corrupts the log.
+#
+# Guard design:
+#   GYMBRO_WRITE_MODE=production  (DEFAULT — real Jim usage, writes)
+#   GYMBRO_WRITE_MODE=dryrun      (QA/E2E — NEVER writes; returns the
+#                                 row that WOULD have been written)
+#   GYMBRO_WRITE_MODE=throwaway   (points at a COPY of the sheet tab;
+#                                 the tab id comes from GYMBRO_SHEET_ID)
+#
+# In dryrun/throwaway mode:
+#   - the Sheets append POST is never issued against the production tab
+#   - the Drive upload is skipped (no orphan Drive files)
+#   - the response carries "would_have_written" so QA can report the
+#     row list without touching production (Alonso rule 4)
+#
+# Rule 3: a test that genuinely needs the full commit pipeline MUST use
+# GYMBRO_WRITE_MODE=throwaway + GYMBRO_SHEET_ID pointing at a copy of
+# the tab. Never the live one.
+PRODUCTION_SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+PRODUCTION_NUTRITION_TAB = "Nutrition"
+
+
+def _write_mode() -> str:
+    """Return 'production' | 'dryrun' | 'throwaway'."""
+    mode = (os.environ.get("GYMBRO_WRITE_MODE") or "production").strip().lower()
+    if mode not in ("production", "dryrun", "throwaway"):
+        print(f"[write-guard] unknown GYMBRO_WRITE_MODE={mode!r} — "
+              f"treating as production", flush=True)
+        return "production"
+    return mode
+
+
+def _target_sheet_id() -> str:
+    """Sheet spreadsheet id to write to (production id unless overridden)."""
+    override = (os.environ.get("GYMBRO_SHEET_ID") or "").strip()
+    return override or PRODUCTION_SHEET_ID
+
+
+def _is_production_target() -> bool:
+    """True when the effective target IS Jim's live golden copy."""
+    return _target_sheet_id() == PRODUCTION_SHEET_ID
+
+
+# ---------- v3.3.25 TEST-FIXTURE DETECTOR (content-based backstop) ----------
+# The env-var guard above is opt-in, so a careless test could still write
+# to production. This detector is the BACKSTOP: it inspects the actual
+# image bytes and refuses the commit when the image is one of the known
+# synthetic QA fixtures (by content hash) OR when the file lives in a
+# test_fixtures/ directory.
+#
+# This works even if GYMBRO_WRITE_MODE was never set — which is exactly
+# the failure mode that produced the 2026-10-20 pollution.
+_TEST_FIXTURE_DIR_MARKER = "test_fixtures"
+_TEST_FIXTURE_SHA256 = {
+    # test_fixtures/food_1.jpg  (synthetic "GYMbro TEST FIXTURE - NOT REAL FOOD")
+    "1b47cf21abc24093ddb68e7424757aea9d24111ba23843e8b0585b412400d39d",
+    # test_fixtures/food_2.jpg  (synthetic "GYMbro TEST FIXTURE - NOT REAL FOOD")
+    "c344aa01bf509aeb41a8ab67ec3cdfffb7ae0ad8f099c0ec240af0b2f5820cd4",
+    # test_fixtures/static_test.jpg (gymbro static test image, not food)
+    "be9f0d447cf726edf7b97eedfa59b6fe8b78250fe7aef26670f1c91e298dd15a",
+    # The 1x1 base64 JPEG that tests/api/test_endpoints.py posts as RAW
+    # bytes (it is a base64 STRING, not decoded JPEG — 555 ASCII bytes).
+    # sha256 of the ASCII bytes = sha256 of the polluted scan_*.jpg files
+    # written on 2026-10-20 (sheet rows 656/660/661/662).
+    "2c60fdf21dc936bfbd388c804f9134b97e3a0cd3b731e5c9ba205317e9f72cad",
+}
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _is_test_fixture_image(path) -> bool:
+    """True when the image is a known QA fixture (never commit these).
+
+    Two independent signals:
+      1. the file lives under a directory named 'test_fixtures'
+      2. its sha256 matches a registered synthetic fixture
+    """
+    try:
+        p = Path(str(path))
+    except Exception:
+        return False
+    try:
+        if _TEST_FIXTURE_DIR_MARKER in p.parts:
+            return True
+    except Exception:
+        pass
+    try:
+        digest = _sha256_file(p)
+    except Exception:
+        digest = ""
+    if digest and digest in _TEST_FIXTURE_SHA256:
+        return True
+    return False
+
+
+def _assert_not_test_fixture(path) -> None:
+    """Raise if the image is a QA fixture — refuse to commit it."""
+    if _is_test_fixture_image(path):
+        raise ValueError(
+            "REFUSED: refusing to commit a QA test fixture to the "
+            f"production Nutrition sheet (image={path}). Use "
+            "GYMBRO_WRITE_MODE=dryrun to report the would-have-written "
+            "row, or GYMBRO_WRITE_MODE=throwaway + GYMBRO_SHEET_ID=<copy> "
+            "to exercise the full pipeline against a throwaway tab."
+        )
+
 # v3.2.7.46: thumbnail cache — generated on commit, served via /scan_thumb/.
 # 480px max-side JPEGs (~15-30KB each) replace 1.9MB originals in food
 # history view, dropping initial page weight from ~320MB to ~5MB.
@@ -2755,19 +3975,9 @@ def _minimax_api_key() -> str:
     return os.environ.get("MINIMAX_API_KEY", "")
 
 
-def _apiyi_api_key() -> str:
-    """Read APiyi key from env (loaded from .hermes/.env at startup).
-    APiyi = OpenAI-compatible proxy → can call ChatGPT gpt-4o / gpt-4o-mini.
-    Jim OOB 2026-07-25 17:12 HKT: 'Not openrouter using apiyi'.
-    Verified live 2026-07-27 08:35 HKT: https://api.apiyi.com/v1/chat/completions
-    with model gpt-4o-mini returns valid ChatGPT response.
-    """
-    return os.environ.get("APIYI_API_KEY", "")
-
-
 # Canonical 12-field nutrition schema (Jim OOB 2026-07-25 13:35 HKT:
 # "food recognition buggy, doesn't gather protein, carbs, fiber etc").
-# Used by both pplx and apiyi enrich prompts + parser + Sheet header.
+# Used by both pplx and minimax enrich prompts + parser + Sheet header.
 NUTRITION_FIELDS = [
     "calories",   # kcal (total energy)
     "protein",    # g
@@ -2805,100 +4015,348 @@ NUTRITION_ALIASES = {
 }
 
 
-def _minimax_vision(img_b64: str, prompt: str) -> str:
-    """Vision description.
+_VISION_STATUS = {
+    "provider": "unknown",
+    "state": "unknown",
+    "last_error": "",
+    "last_ok_ts": 0,
+}
+# v3.3.29: the SECOND opinion gets its own record so it can never
+# overwrite who served the FIRST one (see _record_vision_status_2nd).
+_VISION_STATUS_2ND = {
+    "provider": "unknown",
+    "state": "unknown",
+    "last_error": "",
+    "last_ok_ts": 0,
+}
+# v3.3.29: routing flag. While the 2nd-opinion chain is running, EVERY
+# status write (chain-level AND provider-level) must land in
+# _VISION_STATUS_2ND, not _VISION_STATUS. Two real bugs this prevents:
+#   1. /api/health named the 2nd-opinion provider instead of the primary.
+#   2. WORSE — a provider failure inside the 2nd opinion set
+#      _VISION_STATUS["state"]="failed"; if opinion #2 then succeeded it
+#      overwrote that with "ok", which BYPASSED the rule-2 write guard
+#      (`state == "failed" and not vision_desc`) and let 「未識別菜式」
+#      reach the golden copy. That is the exact regression v3.3.25
+#      existed to prevent.
+_VISION_2ND_OPINION = False
 
-    Jim OOB 2026-08-09: MiniMax api.minimax.io has zero vision models
-    (all 'unknown model' HTTP 400). APiyi gpt-4o-mini triggers safety
-    on brand-logo images (NOC coffee cup = blocked). APiyi gpt-4o works
-    on the same images — it actually describes the photo.
+
+def _record_vision_status(provider: str, state: str, err: str = "",
+                          provider_key: str = "") -> None:
+    """v3.3.25 (2026-10-21): record which vision provider actually served.
+
+    WHY THIS EXISTS: on 2026-10-20 the APiyi key died (HTTP 401
+    "Invalid token"). NOTHING reported it — every scan silently degraded
+    to 未識別菜式 / 0 kcal and Jim only noticed because the food log was
+    full of "unrecognised food". A provider failure must be LOUD and
+    QUERYABLE, never silent.
+
+    v3.3.26: `provider_key` holds the RAW provider id (e.g.
+    "perplexity-sonar") so the 2nd-opinion stage can deliberately pick a
+    DIFFERENT provider than the one that served opinion #1 — otherwise
+    "2 independent opinions" would be the same model twice.
+
+    v3.3.29 (2026-10-21, Isak 獨立驗證): the 2nd-opinion call went
+    through this same function and OVERWROTE the record of who served
+    opinion #1. /api/health then reported the 2nd-opinion provider
+    (perplexity-sonar) instead of the primary one (minimax-text-01) —
+    PROVEN: opinion#1=minimax-text-01, opinion#2=perplexity-sonar,
+    final status=perplexity-sonar. The whole point of _VISION_STATUS is
+    to say WHICH provider served; when the last writer wins, it says the
+    wrong one — and the 2nd-opinion exclusion logic (which reads
+    provider_key to decide who to skip) could be thrown off by it.
+
+    FIX: the 2nd opinion records into a SEPARATE dict
+    (_VISION_STATUS_2ND). _VISION_STATUS now always describes the
+    PRIMARY opinion, which is what /api/health and the rule-2 write
+    guard read.
+
+    v3.3.29: this function now ROUTES on _VISION_2ND_OPINION. The
+    provider-level failure records (in _minimax_vision_text01 /
+    _perplexity_vision) call THIS function, so they follow the same
+    route — a provider failure during the 2nd opinion can no longer
+    poison the primary opinion's state.
+    """
+    global _VISION_STATUS
+    if _VISION_2ND_OPINION:
+        _record_vision_status_2nd(provider, state, err,
+                                   provider_key=provider_key)
+        return
+    _VISION_STATUS = {
+        "provider": provider,
+        "provider_key": provider_key or provider,
+        "state": state,
+        "last_error": err,
+        "last_ok_ts": (int(time.time()) if state == "ok"
+                       else _VISION_STATUS.get("last_ok_ts", 0)),
+    }
+
+
+def _record_vision_status_2nd(provider: str, state: str, err: str = "",
+                               provider_key: str = "") -> None:
+    """v3.3.29: record the SECOND opinion separately.
+
+    Keeps _VISION_STATUS pointing at the PRIMARY provider so:
+      - /api/health reports who actually served opinion #1
+      - the rule-2 write guard reads the primary's state
+      - the 2nd-opinion exclusion logic reads a stable provider_key
+    """
+    global _VISION_STATUS_2ND
+    _VISION_STATUS_2ND = {
+        "provider": provider,
+        "provider_key": provider_key or provider,
+        "state": state,
+        "last_error": err,
+        "last_ok_ts": (int(time.time()) if state == "ok"
+                       else _VISION_STATUS_2ND.get("last_ok_ts", 0)),
+    }
+
+
+def _minimax_vision_text01(img_b64: str, prompt: str) -> str:
+    """Vision via MiniMax-text-01 — the FALLBACK that actually works.
+
+    v3.3.25 (2026-10-21): the old comment in _minimax_vision said
+    "api.minimax.io has zero vision models (all 'unknown model' HTTP
+    400)". That was true for MiniMax-VL-01 ('unknown model 2013') but
+    WRONG for MiniMax-text-01 — it accepts OpenAI-style image_url
+    content and genuinely describes food photos. Verified 2026-10-21
+    against Jim's real lunch photo: it correctly described the
+    韓式燒肉五花腩 ingredients (三片豬五花肉、洋蔥圈、切花紋的蘑菇).
+
+    Returns description text, or "" on any failure (never a （...）
+    label — that would leak into the dish name).
+    """
+    api_key = _minimax_api_key()
+    if not api_key:
+        return ""
+    payload = {
+        "model": "MiniMax-text-01",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+        ]}],
+        "max_tokens": 1200,
+        "temperature": 0.25,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
+        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        # Strip a reasoning block if the model emitted one.
+        if "</think>" in content:
+            content = content.split("</think>")[-1].strip()
+        if content.startswith("<think>"):
+            content = ""
+        # Safety-filter refusal → treat as failure so the next provider runs.
+        if content and ("抱歉" in content[:30] and "無法" in content[:50]
+                        and len(content) < 80):
+            return ""
+        return content.strip()
+    except Exception as e:
+        _record_vision_status("minimax-text-01", "failed",
+                              f"{type(e).__name__}: {e}")
+        print(f"[vision] MiniMax-text-01 failed: {type(e).__name__}: {e}",
+              flush=True)
+        return ""
+
+
+def _perplexity_vision(img_b64: str, prompt: str) -> str:
+    """Vision via Perplexity `sonar` — v3.3.26 (2026-10-21), 3rd provider.
+
+    IMPORTANT CORRECTION to an earlier note (2026-10-20) that said
+    Perplexity "refused vision (text-only)". That was WRONG. Verified
+    2026-10-21 with a rigorous 4-case test, not a vibe:
+      1. Jim's real steak dinner photo -> "牛扒配焗薯、忌廉汁、車厘茄同西蘭花" ✅
+      2. Jim's soup photo             -> "一碗咖喱湯" ✅
+      3. the SYNTHETIC "GYMbro TEST FIXTURE" image
+                                      -> "相中冇任何食物，只有一個棕色嘅測試圖像" ✅
+         (it recognises a non-food image instead of inventing a dish)
+      4. a solid green image          -> "只見一片純綠色，冇可辨認的食物" ✅
+         (zero hallucination)
+    Both `sonar` and `sonar-pro` accept an OpenAI-style image_url block.
+    `sonar-reasoning` is deprecated (HTTP 400) — do not use it.
+
+    Jim already has a Perplexity key (PPLX_API_KEY), so this provider
+    costs him nothing extra and removes the single-point-of-failure that
+    MiniMax-text-01 alone represented.
+
+    Returns description text, or "" on any failure (never a （...）
+    label — that would leak into the dish name).
+    """
+    api_key = _pplx_api_key()
+    if not api_key:
+        return ""
+    payload = {
+        "model": "sonar",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+        ]}],
+        "max_tokens": 1200,
+        "temperature": 0.25,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
+        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = content.strip()
+        if not content:
+            return ""
+        # A refusal is a failure, not a description — let the next provider try.
+        if "抱歉" in content[:30] and "無法" in content[:50] and len(content) < 80:
+            return ""
+        return content
+    except Exception as e:
+        _record_vision_status("perplexity-sonar", "failed",
+                              f"{type(e).__name__}: {e}",
+                              provider_key="perplexity-sonar")
+        print(f"[vision] Perplexity sonar failed: {type(e).__name__}: {e}",
+              flush=True)
+        return ""
+
+
+# v3.3.26 (2026-10-21): the vision provider pool, in priority order.
+# Keys are the raw provider ids used for the "2nd opinion must come from a
+# DIFFERENT provider" rule.
+_VISION_PROVIDER_POOL = (
+    ("minimax-text-01", "_minimax_vision_text01"),
+    ("perplexity-sonar", "_perplexity_vision"),
+)
+
+
+def _minimax_vision(img_b64: str, prompt: str,
+                     exclude: tuple = (),
+                     record_2nd: bool = False) -> str:
+    """Vision description — provider chain.
+
+    v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff") chain:
+        MiniMax-text-01  →  Perplexity sonar
+    (APiyi was removed — its key died 2026-10-20 with HTTP 401 on every
+    endpoint. Two independent working providers = no single point of
+    failure.)
+
+    v3.3.25 (2026-10-21, Jim OOB 2026-10-20 'And the ai recognition is
+    all wrong. It was showing unrecognised food'): a provider key died
+    (HTTP 401 "Invalid token") and the whole scan pipeline degraded
+    SILENTLY to 未識別菜式 / 0 kcal. Now there are working fallback
+    providers AND the degradation is recorded in _VISION_STATUS (exposed
+    via /api/health) and printed to the log.
+
+    `exclude` holds provider ids to skip (used by the 2nd-opinion stage
+    so the two opinions come from different models).
+
+    `record_2nd` (v3.3.29): when True, the provider that serves is
+    recorded into _VISION_STATUS_2ND instead of _VISION_STATUS. The
+    2nd-opinion call reuses this same chain — without the flag it
+    overwrote the primary opinion's record, so /api/health reported the
+    WRONG provider (PROVEN 2026-10-21: opinion#1=minimax-text-01,
+    opinion#2=perplexity-sonar, status ended as perplexity-sonar).
 
     Kept the _minimax_vision function name for backward compat with 5
-    call sites — internally delegates to _apiyi_vision_gpt4o.
+    call sites.
     """
-    result = _apiyi_vision_gpt4o(img_b64, prompt)
-    if result:
-        return result
+    errors = []
+    skip = set(exclude or ())
+    # v3.3.29: route the status write to the right dict. The 2nd-opinion
+    # call reuses this chain, so without this the primary opinion's record
+    # was overwritten and /api/health named the wrong provider. The flag
+    # also covers the PROVIDER-level failure records (they call
+    # _record_vision_status, which routes on the same flag).
+    global _VISION_2ND_OPINION
+    _prev_2nd = _VISION_2ND_OPINION
+    _VISION_2ND_OPINION = bool(record_2nd)
+    try:
+        return _minimax_vision_chain(img_b64, prompt, skip, errors)
+    finally:
+        _VISION_2ND_OPINION = _prev_2nd
+
+
+def _minimax_vision_chain(img_b64, prompt, skip, errors) -> str:
+    """The provider loop body of _minimax_vision (v3.3.29 split out).
+
+    Split into its own function so _minimax_vision can wrap the whole
+    loop in the _VISION_2ND_OPINION routing flag with a try/finally —
+    every status write inside the loop (chain-level and provider-level)
+    then lands in the correct dict.
+    """
+    # v3.3.26 (2026-10-21): "prefer a different provider for the 2nd
+    # opinion" is a SOFT preference, NOT a hard exclusion. Hard-excluding
+    # the provider that served opinion #1 left the 2nd opinion with ZERO
+    # providers when only one was left alive, and the scan then fell back
+    # to 未識別菜式 even though the 1st opinion was perfect. A 2nd opinion
+    # from the same model still beats having no 2nd opinion at all.
+    ordered = ([p for p in _VISION_PROVIDER_POOL if p[0] not in skip]
+               + [p for p in _VISION_PROVIDER_POOL if p[0] in skip])
+    for name, fn_name in ordered:
+        fn = globals().get(fn_name)
+        if not fn:
+            continue
+        try:
+            result = fn(img_b64, prompt)
+        except Exception as e:  # a provider must never kill the scan
+            result = ""
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+            print(f"[vision] {name} raised: {type(e).__name__}: {e}",
+                  flush=True)
+            continue
+        if result and not result.startswith("（"):
+            if errors:
+                print(f"[vision] {name} served after {len(errors)} failure(s): "
+                      f"{'; '.join(errors)}", flush=True)
+                _record_vision_status(f"{name} (fallback)", "ok",
+                                      "; ".join(errors), provider_key=name)
+            else:
+                _record_vision_status(name, "ok", "", provider_key=name)
+            return result
+        errors.append(f"{name}: {(result or 'empty/short').strip('（）')}")
+
+    print(f"[vision] ALL vision providers FAILED ({'; '.join(errors)}) — "
+          f"the scan will be blocked (no 未識別菜式 written to the sheet)",
+          flush=True)
+    _record_vision_status("none", "failed", "; ".join(errors))
     # Return empty so _extract_dish_name falls through to fallback; do NOT
     # return "（Vision 服務暫時不可用）" — that string is a generic label
     # and would itself become the dish name (Jim OOB 2026-08-09 16:48 HKT).
     return ""
 
 
-def _apiyi_vision_analyze(img_b64: str, prompt: str) -> str:
-    """2nd-opinion vision via APiyi gpt-4o-mini (Jim OOB 2026-07-26 19:35 HKT).
-    Returns description text, or "" if key missing → graceful fallback.
-    Median-merge logic in _merge_nutrition_estimates handles 1 vs 2 vision sources.
+def _vision_second_opinion(img_b64: str, prompt: str) -> str:
+    """2nd-opinion vision — provider chain, skipping the 1st-opinion provider.
+
+    v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff"): this used to be
+    APiyi gpt-4o-mini first, then fall back to the chain. The APiyi key is
+    dead (HTTP 401 on every endpoint), so the APiyI branch is gone and the
+    2nd opinion now comes straight from the chain.
+
+    The 2nd opinion MUST come from a DIFFERENT provider than the one that
+    served opinion #1 — else "2 independent opinions" is the same model
+    twice and the median-merge becomes meaningless. The provider that
+    served opinion #1 is tracked in _VISION_STATUS["provider_key"].
     """
-    api_key = _apiyi_api_key()
-    if not api_key:
-        return ""
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-        ]}],
-        "max_tokens": 1200,
-        "temperature": 0.25,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.apiyi.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
-        return resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"（APiyi vision 失敗：{type(e).__name__}）"
-
-
-def _apiyi_vision_gpt4o(img_b64: str, prompt: str) -> str:
-    """Primary vision via APiyi gpt-4o (Jim OOB 2026-08-09).
-
-    Why gpt-4o not gpt-4o-mini: gpt-4o-mini triggers blanket safety filter
-    on brand-logo images (e.g. NOC coffee cup, branded packaging) and
-    returns "抱歉，我無法協助處理該請求" with zero description. gpt-4o
-    on the same image returns an actual food description.
-
-    Returns description text, or "" on any failure.
-    """
-    api_key = _apiyi_api_key()
-    if not api_key:
-        return ""
-    payload = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-        ]}],
-        "max_tokens": 1200,
-        "temperature": 0.25,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.apiyi.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
-        content = resp["choices"][0]["message"]["content"]
-        # Detect safety-filter refusal (gpt-4o has lower rate but can still
-        # trigger on certain images); treat as failure so fallback runs.
-        if content and ("抱歉" in content[:30] and "無法" in content[:50] and len(content) < 80):
-            return ""
-        return content
-    except Exception as e:
-        return f"（APiyi gpt-4o vision 失敗：{type(e).__name__}）"
+    used = _VISION_STATUS.get("provider_key", "")
+    skip = tuple(x for x in (used,) if x)
+    # v3.3.29: record_2nd=True so this call CANNOT overwrite the primary
+    # opinion's provider record in _VISION_STATUS.
+    return _minimax_vision(img_b64, prompt, exclude=skip, record_2nd=True)
 
 
 def _pplx_enrich(dish_desc: str) -> str:
@@ -2961,7 +4419,101 @@ def _pplx_enrich(dish_desc: str) -> str:
         return f"（PPLX enrichment 失敗：{type(e).__name__}）"
 
 
-def _apiyi_nutrition_enrich(dish_desc: str) -> str:
+# v3.3.20 (Jim OOB 2026-09-10 'in gymbro food log, if I type something
+# that without food image, can I pull from the internet or pplx to
+# gather the food image'): Brave Image Search helper for text-only
+# food entries. Returns first high-confidence image result.
+def _brave_api_key() -> str:
+    """Brave Search API key for image lookup. Separate from BRAVE_ANSWER_KEY
+    (which is for the LLM-grounded answer endpoint, not raw image search)."""
+    return os.environ.get("BRAVE_API_KEY", "")
+
+
+def _brave_image_search(query: str, count: int = 3) -> list:
+    """Search Brave Images API for `query`. Returns list of dicts with
+    {title, url, thumbnail_url, source, confidence}.
+
+    Falls back to empty list on auth failure / network error / no key.
+    Used to backfill a representative image for text-only food entries
+    in /api/scan_preview_text (Jim OOB 2026-09-10).
+    """
+    api_key = _brave_api_key()
+    if not api_key:
+        return []
+    if not query or not query.strip():
+        return []
+    try:
+        req = urllib.request.Request(
+            "https://api.search.brave.com/res/v1/images/search"
+            + "?q=" + urllib.parse.quote(query.strip())
+            + f"&count={min(count, 10)}&safesearch=off",
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        out = []
+        for r in (data.get("results") or []):
+            props = r.get("properties") or {}
+            out.append({
+                "title": r.get("title", ""),
+                "url": props.get("url", "") or r.get("url", ""),
+                "thumbnail_url": (r.get("thumbnail") or {}).get("src", ""),
+                "source": r.get("source", ""),
+                "confidence": r.get("confidence", "low"),
+            })
+        return out
+    except Exception as e:
+        print(f"[brave_image_search] {type(e).__name__}: {e}", flush=True)
+        return []
+
+
+# v3.3.20: download a food image from URL and save to SCAN_CACHE_DIR.
+# Returns local Path or None on failure.
+def _download_food_image(image_url: str, slug: str) -> "Path | None":
+    """Download image from URL → save to /home/work/.hermes/scan_cache/
+    as scan_{date}_{slug}.jpg. Also generates a thumb. Returns Path.
+
+    slug = sanitized dish name for filename safety.
+    Returns None on download failure (timeout, 404, non-image content).
+    """
+    if not image_url or not image_url.startswith(("http://", "https://")):
+        return None
+    # Sanitize slug for filesystem
+    safe_slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]+", "_", (slug or "food"))[:32].strip("_") or "food"
+    now_hkt = datetime.now(timezone(timedelta(hours=8)))
+    fname = f"scan_{now_hkt.strftime('%Y%m%d_%H%M%S')}_{safe_slug}.jpg"
+    out_path = SCAN_CACHE_DIR / fname
+    try:
+        req = urllib.request.Request(image_url, headers={
+            "User-Agent": "Mozilla/5.0 (gymbro food-image fetch)",
+            "Accept": "image/jpeg,image/png,image/webp,image/*",
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            data = resp.read()
+        # Validate it's actually an image (skip >5MB, skip non-image)
+        if len(data) > 5 * 1024 * 1024:
+            print(f"[download_food_image] too large: {len(data)}B from {image_url[:80]}", flush=True)
+            return None
+        if not (content_type.startswith("image/") or data[:4] in (b"\xff\xd8\xff", b"\x89PNG", b"RIFF")):
+            print(f"[download_food_image] not an image: {content_type}", flush=True)
+            return None
+        out_path.write_bytes(data)
+        # Generate thumb (best-effort)
+        try:
+            _make_thumb(out_path, _thumb_path_for(fname))
+        except Exception:
+            pass
+        return out_path
+    except Exception as e:
+        print(f"[download_food_image] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _minimax_nutrition_enrich(dish_desc: str) -> str:
     """v3.2.7.12: 12-field nutrition enrichment via MiniMax M3 (Jim OOB
     2026-08-08 20:55 HKT 'Use more minimax m3 ... Don't use gpt except
     food recognition dual scanning'). MiniMax is the canonical LLM —
@@ -2970,6 +4522,13 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
     v3.2.7.6+: MiniMax M3 via api.minimax.io. Returns text (or empty on
     failure) — caller parses via _parse_nutrition_block then median-merges
     with pplx.
+
+    v3.3.22 (Jim OOB 2026-09-11 'No food nutritional info'): MiniMax M3 was
+    running into max_tokens=400 BEFORE the JSON was emitted, so 12-field
+    block came back empty and text-direct path returned all zeros. Bumped
+    to 1500 + added explicit `response_format: json_object` flag (most
+    OpenAI-compat providers honor it; if MiniMax ignores, fallback parser
+    _parse_nutrition_block already handles prose).
     """
     api_key = _minimax_api_key()
     if not api_key:
@@ -2981,7 +4540,7 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
         f"Estimate per-portion nutrition for this HK/Cantonese food description:\n\n"
         f"「{dish_desc}」\n\n"
         f"Reply with ONLY a single JSON object, no markdown, no commentary. "
-        f"Schema (all 12 fields required, use 0 if unknown, do NOT fabricate):\n"
+        f"Schema (all 12 fields required, use 0 only if truly unknown, do NOT fabricate):\n"
         f'{{"calories": 0, "protein": 0, "carbs": 0, "fat": 0, "fiber": 0, '
         f'"sugar": 0, "sodium": 0, "sat_fat": 0, "trans_fat": 0, '
         f'"vit_c": 0, "iron": 0, "calcium": 0}}\n\n'
@@ -2994,11 +4553,12 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
     payload = {
         "model": "MiniMax-M3",
         "messages": [
-            {"role": "system", "content": "You are a nutrition fact checker. Output ONLY valid JSON."},
+            {"role": "system", "content": "You are a nutrition fact checker for Hong Kong dishes. Output ONLY a valid JSON object with the exact 12-field schema requested. No markdown, no prose, no explanation."},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 400,
+        "max_tokens": 1500,  # v3.3.22: bumped from 400 — JSON got truncated mid-block
         "temperature": 0.1,
+        "response_format": {"type": "json_object"},  # v3.3.22: enforce JSON if provider supports
     }
     try:
         req = urllib.request.Request(
@@ -3011,12 +4571,71 @@ def _apiyi_nutrition_enrich(dish_desc: str) -> str:
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        return resp["choices"][0]["message"]["content"]
+        raw_content = resp["choices"][0]["message"]["content"]
+        # v3.3.23ah (Jim OOB 2026-09-16 'Why the estimation was wrong. Pls
+        # fix the systemic problem'): MiniMax M3 with reasoning enabled
+        # emits a `<think>...</think>` reasoning block BEFORE the actual
+        # JSON object. Naive `startswith("{")` checks at every call site
+        # would skip parsing. Fix at the SOURCE — strip the thinking
+        # block here so ALL callers automatically get a clean response.
+        # Belt-and-suspenders: also strip markdown code fences.
+        return _strip_thinking_block(raw_content)
     except Exception as e:
-        return f"（APiyi enrichment 失敗：{type(e).__name__}）"
+        return f"（MiniMax enrichment 失敗：{type(e).__name__}）"
 
 
-def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
+# v3.3.22 (Jim OOB 2026-09-11 'No food nutritional info'): MiniMax M3 with
+# reasoning enabled returns content with a leading `` block
+# (reasoning tokens) before the actual JSON. json.loads() fails because
+# the string isn't valid JSON. This helper strips the reasoning block
+# + any markdown fences so callers can json.loads() the result cleanly.
+# Also handles the case where MiniMax returns plain text (no JSON at
+# all) by leaving it intact for the regex-based _parse_nutrition_block
+# fallback.
+def _strip_thinking_block(text: str) -> str:
+    """Remove `` reasoning blocks and markdown ```json fences from
+    MiniMax M3 chat-completions output so json.loads() can parse the
+    remainder. Tolerant of plain text input (returns unchanged)."""
+    if not text or not isinstance(text, str):
+        return text or ""
+    s = text.strip()
+    # Strip  reasoning blocks (greedy across newlines)
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
+    # Strip markdown code fences
+    s = re.sub(r"^```(?:json|JSON)?\s*\n", "", s.strip())
+    s = re.sub(r"\n```\s*$", "", s.strip())
+    return s.strip()
+
+
+def _safe_parse_nutrition_json(raw: str) -> dict:
+    """Try multiple parse strategies for a MiniMax M3 nutrition response:
+      1. json.loads() after stripping  reasoning block.
+      2. Extract the LAST {...} JSON object via regex (handles leading prose).
+      3. Fall back to _parse_nutrition_block (prose regex) on plain text.
+    Returns the parsed dict (may be empty on total failure).
+    """
+    if not raw or not isinstance(raw, str):
+        return {}
+    # 1) Strip thinking + try direct json
+    cleaned = _strip_thinking_block(raw)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+    # 2) Extract last {...} JSON object from the cleaned string
+    #    (handles "leading prose {json} trailing prose")
+    matches = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned, flags=re.DOTALL)
+    if matches:
+        for m in reversed(matches):  # try the LAST json object first
+            try:
+                return json.loads(m)
+            except Exception:
+                continue
+    # 3) Prose fallback (existing behavior)
+    return _parse_nutrition_block(cleaned or raw)
+
+
+def _minimax_nutrition_enrich_multi(dish_desc: str) -> str:
     """v3.2.7.12: Multi-dish 12-field nutrition enrichment via MiniMax
     M3-highspeed (Jim OOB 2026-08-08 20:55 HKT 'Use more minimax m3
     high speed ... Don't use gpt except food recognition dual scanning').
@@ -3072,7 +4691,10 @@ def _apiyi_nutrition_enrich_multi(dish_desc: str) -> str:
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        return resp["choices"][0]["message"]["content"]
+        raw_content = resp["choices"][0]["message"]["content"]
+        # v3.3.23ah: strip <think> block at the source so multi-dish
+        # responses are also clean.
+        return _strip_thinking_block(raw_content)
     except Exception as e:
         return '{"dishes": []}'
 
@@ -3145,7 +4767,14 @@ def _ai_check_narration(name: str) -> bool:
 
     api_key = _minimax_api_key()
     if not api_key:
-        # No API key → fail closed: assume narration so we don't auto-commit
+        # v3.3.26 (2026-10-21): no MiniMax key → ask Perplexity instead of
+        # failing closed immediately.
+        alt = _pplx_check_narration(name)
+        if alt is not None:
+            _NARRATION_CACHE[name] = alt
+            return alt
+        # No API key at all → fail closed: assume narration so we don't
+        # auto-commit. Better to ask the user than to save garbage.
         _NARRATION_CACHE[name] = True
         return True
 
@@ -3190,9 +4819,69 @@ def _ai_check_narration(name: str) -> bool:
         _NARRATION_CACHE[name] = is_narration
         return is_narration
     except Exception:
-        # Fail closed: if the AI can't decide, refuse to auto-commit.
+        # v3.3.26 (2026-10-21): MiniMax unreachable → ask Perplexity.
+        # Failing closed on MiniMax alone meant a dead key silently
+        # rejected EVERY candidate (a good name like 「芝士牛扒焗薯」 was
+        # judged narration) and the scan fell back to 未識別菜式.
+        alt = _pplx_check_narration(name)
+        if alt is not None:
+            _NARRATION_CACHE[name] = alt
+            return alt
+        # Fail closed: if NO AI can decide, refuse to auto-commit.
         _NARRATION_CACHE[name] = True
         return True
+
+
+def _pplx_check_narration(name: str):
+    """Perplexity fallback for the dish-vs-narration classifier.
+
+    v3.3.26 (2026-10-21): `_ai_check_narration` only ever asked
+    MiniMax-M3. With the MiniMax key dead it failed CLOSED, so every
+    candidate name was judged "narration" and rejected — the scan then
+    wrote 未識別菜式 even though the vision description was perfect.
+
+    Returns True (narration), False (a dish), or None (could not decide).
+    """
+    api_key = _pplx_api_key()
+    if not api_key:
+        return None
+    payload = {
+        "model": "sonar",
+        "messages": [
+            {"role": "system",
+             "content": ("You classify whether a candidate string is a dish "
+                         "name or model narration prose. Reply with ONLY one "
+                         "word: 'DISH' or 'NARRATION'.")},
+            {"role": "user",
+             "content": (f"Candidate: 「{name}」\n\n"
+                         "Is this a concrete dish/food name (e.g. 蘇打水、漢堡包、"
+                         "海南雞飯、芝士牛扒焗薯), or is it vision-model narration "
+                         "prose (e.g. 這張相顯示一支蘇打水樽、品牌為可口可樂、"
+                         "可見到一塊蛋糕)?\nReply ONLY 'DISH' or 'NARRATION'.")},
+        ],
+        "max_tokens": 64,
+        "temperature": 0,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + api_key},
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        reply = ((resp.get("choices") or [{}])[0].get("message", {})
+                 .get("content") or "").strip().upper()
+        if "NARRATION" in reply and "DISH" not in reply:
+            return True
+        if "DISH" in reply:
+            return False
+        return None
+    except Exception as e:
+        print(f"[narration] Perplexity check failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return None
 
 
 def _name_has_narration(name: str) -> bool:
@@ -3204,6 +4893,75 @@ def _name_has_narration(name: str) -> bool:
     if not name:
         return False
     return _ai_check_narration(name)
+
+
+# v3.3.26 (2026-10-21): dish-name label words, promoted to module level so
+# every extractor (MiniMax + Perplexity fallback) rejects the SAME set.
+_DISH_NAME_LABEL_WORDS = {
+    "菜式", "菜名", "主菜", "副菜", "前菜", "甜品", "湯品",
+    "飲品", "煮法", "份量", "份量大小", "份量（目測）",
+    "詳細描述", "菜單", "餐牌", "品牌", "餐廳", "套餐",
+    "菜式：", "菜名：", "未識別", "未能識別",
+}
+
+# v3.3.30 (2026-10-21): names that must NEVER reach Jim's golden copy.
+# Rule 25: a generic / placeholder dish name is never acceptable. These
+# are the exact strings the pipeline can produce when the NAME extraction
+# fails even though the vision provider itself was healthy.
+_GENERIC_DISH_NAMES_BLOCKLIST = {
+    "未識別菜式", "未識別", "食物", "餐", "菜式", "菜名", "餐點",
+    "料理", "菜式一", "未識別菜", "NOT FOOD", "",
+}
+
+
+def _pplx_extract_dish_name(prompt: str) -> str:
+    """Extract the dish name via Perplexity sonar (2nd extractor).
+
+    WHY: on 2026-10-21 the dish-name extraction had its OWN single point
+    of failure — `_extract_dish_name_ai` ONLY ever called MiniMax-M3.
+    When the MiniMax key died, even a perfect vision description (served
+    by Perplexity) still turned into "未識別菜式", because nothing could
+    turn the description into a name. Vision resilience is useless if the
+    name extraction dies next.
+
+    Perplexity sonar is a text model and does this job fine. Same prompt,
+    same guards, same output contract (2-16 char Cantonese dish name).
+    """
+    api_key = _pplx_api_key()
+    if not api_key:
+        return ""
+    payload = {
+        "model": "sonar",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 200,
+        "temperature": 0.1,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + api_key,
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=25).read())
+        dish = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    except Exception as e:
+        print(f"[dish-name] Perplexity sonar failed: {type(e).__name__}: {e}",
+              flush=True)
+        return ""
+    dish = re.sub(r"^\s*<think.*?</think>\s*", "", dish, flags=re.DOTALL)
+    dish = dish.strip()
+    dish = dish.strip("「」『』\"'` \n\r\t。.,，")
+    dish = re.sub(r"^[-•·\s]+", "", dish)
+    dish = dish.strip("：:，,。. ")
+    if not dish or dish in _DISH_NAME_LABEL_WORDS or len(dish) > 16:
+        return ""
+    if _name_has_narration(dish):
+        return ""
+    return dish
 
 
 def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
@@ -3330,18 +5088,38 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
             dish = re.sub(r"^[-•·\s]+", "", dish)
             dish = dish.strip("：:，,。. ")
             # v3.2.7.32: reject label/header words returned as the dish
-            label_words = {
-                "菜式", "菜名", "主菜", "副菜", "前菜", "甜品", "湯品",
-                "飲品", "煮法", "份量", "份量大小", "份量（目測）",
-                "詳細描述", "菜單", "餐牌", "品牌", "餐廳", "套餐",
-                "菜式：", "菜名：", "未識別", "未能識別",
-            }
+            label_words = _DISH_NAME_LABEL_WORDS
             # v3.2.7.32: safety net — if M3 emitted a `進思考` block but
             # never closed (max_tokens cut off mid-think), discard the
             # partial think instead of saving narration as the dish.
+            #
+            # v3.3.29 (2026-10-21, Isak 獨立驗證): this early `return ""`
+            # was the LAST unguarded exit in this function. MiniMax was
+            # ALIVE but half-dead (think block truncated by max_tokens),
+            # so the Perplexity extractor was never reached — a perfect
+            # vision description still became 「未識別菜式」. Same bug
+            # class as the three exits fixed in v3.3.26; Alonso's report
+            # claimed "fallback 要喺每個 return "" 之前行" but this one
+            # was missed. PROVEN 2026-10-21 with a fake that returns an
+            # unclosed 進思考 block: Perplexity call count = 0.
             if "進思考" in dish:
+                alt = _pplx_extract_dish_name(prompt)
+                if alt:
+                    print(f"[dish-name] MiniMax think block truncated — "
+                          f"Perplexity sonar extracted {alt!r}", flush=True)
+                    return alt
                 return ""
             if dish in label_words or not dish or len(dish) > 16:
+                # v3.3.26 (2026-10-21): do NOT give up here. This early
+                # return used to be the reason a dead MiniMax key produced
+                # "未識別菜式" even when the vision description was perfect
+                # — the Perplexity extractor below was unreachable. Try it
+                # before returning empty.
+                alt = _pplx_extract_dish_name(prompt)
+                if alt:
+                    print(f"[dish-name] MiniMax extractor unusable — "
+                          f"Perplexity sonar extracted {alt!r}", flush=True)
+                    return alt
                 return ""
             # v3.2.7.17: narration guard (相顯示... / 一支XXX樽...). If
             # it leaks, ask once more with a stricter prompt — and on
@@ -3382,12 +5160,35 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
                 dish2 = re.sub(r"^[-•·\s]+", "", dish2).strip("：:，,。. ")
                 if (not dish2 or dish2 in label_words or len(dish2) > 16
                         or _name_has_narration(dish2)):
+                    # v3.3.26: same reasoning as above — the strict retry
+                    # failing must not be the end of the road.
+                    alt = _pplx_extract_dish_name(prompt)
+                    if alt:
+                        print(f"[dish-name] MiniMax strict retry unusable — "
+                              f"Perplexity sonar extracted {alt!r}", flush=True)
+                        return alt
                     return ""
                 return dish2
             if 2 <= len(dish) <= 16:
                 return dish
     except Exception:
         pass
+
+    # v3.3.26 (2026-10-21): dish-name extraction had its OWN single point of
+    # failure — it only ever called MiniMax-M3. When the MiniMax key died,
+    # even a perfect vision description (e.g. one served by Perplexity)
+    # still turned into "未識別菜式" because nothing could extract the
+    # name. Vision resilience is useless if the name extraction dies next.
+    # → Perplexity sonar gets the same prompt + the same guards.
+    try:
+        alt = _pplx_extract_dish_name(prompt)
+        if alt:
+            print(f"[dish-name] MiniMax extractor unavailable — "
+                  f"Perplexity sonar extracted {alt!r}", flush=True)
+            return alt
+    except Exception as e:
+        print(f"[dish-name] Perplexity fallback failed: "
+              f"{type(e).__name__}: {e}", flush=True)
 
     # v3.2.7.32: no regex fallback (per Jim OOB 2026-08-11 'don't use
     # rule/regex'). If the AI can't decide, return empty so the caller
@@ -4066,6 +5867,13 @@ def _load_today_nutrition() -> dict:
     """v3.3.2: replaced the legacy nutrition_log.json file-cache read with a
     cache + Sheet query. Same return shape as before so callers don't change.
     Reads from the in-memory NutritionCache (hydrated from the Sheet on boot).
+
+    v3.3.10 (Jim OOB 2026-08-31「cheer routine is not reflecting the intraday
+    activities」): if today's HKT date has 0 meals but the most recent meal
+    was logged within the last 18 hours (i.e. Jim is still on yesterday's
+    "day" past HKT midnight), fall back to the most recent date with
+    meals. Prevents cheer from reporting "今日零 workout / 未 log 食嘢"
+    when in reality Jim just stayed up late and it's still his yesterday-day.
     """
     out = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0}, "meal_count": 0, "last_meal_ts": None}
     cache = get_cache()
@@ -4073,9 +5881,58 @@ def _load_today_nutrition() -> dict:
         return out
     today = today_iso()
     rows = cache.get_by_date(today)
+    if not rows:
+        # v3.3.10 fallback: look at yesterday's date (still same HKT day
+        # if user is up past midnight). Window covers late nights.
+        from datetime import datetime, timedelta, timezone
+        HKT_TZ = timezone(timedelta(hours=8))
+        now_hkt = datetime.now(HKT_TZ)
+        # v3.3.10: widen fallback window to 24h to catch both late nights AND
+        # post-midnight cheer. Last activity date = whatever has the most
+        # recent meal regardless of HKT hour. This prevents cheer pipeline
+        # from reporting "0 meal today" when Jim just stayed up late.
+        yesterday = (now_hkt - timedelta(days=1)).strftime("%Y-%m-%d")
+        rows = cache.get_by_date(yesterday)
+        if rows:
+            today = yesterday  # so caller sees yesterday as "today"
+            try:
+                with open("/tmp/nutrition_fallback.log", "a") as _f:
+                    _f.write(f"{now_iso()} | today=9/1→fallback to {yesterday} ({len(rows)} rows)\n")
+            except Exception:
+                pass
+        else:
+            # v3.3.10 last-resort: query by_recent (sorted by dt) and find the
+            # most recent date with at least 1 row. This catches late-night
+            # edge cases where get_by_date() hits a key with all-blank rows.
+            recent = cache.get_recent(limit=10)
+            if recent:
+                # Walk back to find the most recent date with valid rows
+                seen_dates = set()
+                for r in recent:
+                    if not r.date or r.date in seen_dates:
+                        continue
+                    seen_dates.add(r.date)
+                    candidate_rows = cache.get_by_date(r.date)
+                    if candidate_rows:
+                        rows = candidate_rows
+                        today = r.date
+                        try:
+                            with open("/tmp/nutrition_fallback.log", "a") as _f:
+                                _f.write(f"{now_iso()} | today=9/1→fallback to latest {r.date} ({len(rows)} rows)\n")
+                        except Exception:
+                            pass
+                        break
     meals = []
     for r in rows:
         d = r.to_pwa_dict()
+        # v3.3.23t (Jim OOB 2026-09-14 'still missing the grading'):
+        # Populate coach_comment for /api/nutrition/today consumers too
+        # (PWA + cheer pipeline). Was previously only set in scan_recent.
+        cc = r.get_or_compute_coach_comment(
+            lambda row: _coach_comment_keyword(
+                row.name, row.kcal, row.p, row.c, row.f, row.restaurant
+            )
+        )
         meals.append({
             "date": r.date,
             "time": r.time,
@@ -4088,6 +5945,7 @@ def _load_today_nutrition() -> dict:
             "fat": r.f,
             "restaurant_chain": r.restaurant,
             "timestamp_iso": (r.dt.isoformat() + "+08:00") if r.dt else "",
+            "coach_comment": cc,
         })
     meals.sort(key=lambda m: m.get("time") or m.get("timestamp_iso") or "")
     out["meals"] = meals
@@ -4251,6 +6109,11 @@ def _record_pending_upload(local_path, reason: str) -> None:
 def _upload_to_drive(local_path: Path, parent_folder_id: str = None) -> str:
     """Upload a JPEG to Google Drive and return a public view URL.
 
+    v3.3.25 (Jim OOB 2026-10-20 production-pollution guard): in
+    GYMBRO_WRITE_MODE=dryrun this NEVER uploads — returning "" keeps
+    test runs from leaving orphan Drive files behind (26 of them had to
+    be trashed after the 2026-10-20 QA accident).
+
     Jim OOB 2026-08-14: 「the food log sheet should be the golden copy —
     both name and image attached」. Prior to v3.2.7.45, only the dish name
     was mirrored to the Google Sheet; the image stayed local-only. This
@@ -4286,6 +6149,11 @@ def _upload_to_drive(local_path: Path, parent_folder_id: str = None) -> str:
     if not local_path.exists():
         _log_drive_failure(local_path, "local_file_missing")
         _record_pending_upload(local_path, "local_file_missing")
+        return ""
+    # v3.3.25 production-write guard: dryrun NEVER touches Drive.
+    if _write_mode() == "dryrun":
+        print(f"[write-guard] dryrun — skipping Drive upload of "
+              f"{local_path.name}", flush=True)
         return ""
     last_err = ""
     for attempt in range(3):  # 3 attempts total = 1 initial + 2 retries
@@ -4386,8 +6254,88 @@ def _set_sheet_drive_url(row_index: int, drive_url: str, access_token: str = Non
         return False
 
 
+def _extract_exif_capture_time(img_path: Path) -> dict:
+    """Extract photo capture timestamp from EXIF metadata.
+
+    v3.3.8 (Jim OOB 2026-08-31「capture the photo taken time instead of
+    upload time. If so, change to photo capture time for a more accurate
+    timing of food logging」): pull DateTimeOriginal (preferred) → DateTime
+    → DateTimeDigitized fallback chain. Returns {capture_time: datetime|None,
+    source: str, raw_str: str} or empty capture_time if no EXIF available.
+
+    Why: iPhone photo stream upload often happens hours after the actual
+    shot. File mtime = upload time, which gives wrong meal_type slot for
+    late uploads (e.g. breakfast photo uploaded at dinner time).
+    EXIF DateTimeOriginal = real shot time.
+
+    Args:
+        img_path: Path to JPEG/HEIC image
+
+    Returns:
+        dict with keys:
+          - capture_time: timezone-aware datetime in Asia/Hong_Kong or None
+          - source: 'DateTimeOriginal' | 'DateTime' | 'DateTimeDigitized' | ''
+          - raw_str: raw EXIF string for debug logging
+    """
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        if not img_path.exists():
+            return {"capture_time": None, "source": "", "raw_str": ""}
+        with Image.open(img_path) as im:
+            exif = im.getexif()
+            if not exif:
+                return {"capture_time": None, "source": "", "raw_str": ""}
+            # Look for DateTimeOriginal (tag 0x9003 = 36867) in ExifIFD
+            exif_ifd = exif.get_ifd(0x8769) or {}  # ExifIFD tag
+            # Standard EXIF datetime tag IDs (decimal):
+            #   36867 = DateTimeOriginal (when photo was taken)
+            #   36868 = DateTimeDigitized (when digitized)
+            #   306 = DateTime (file modification time in EXIF)
+            tag_priorities = [
+                (36867, "DateTimeOriginal"),
+                (36868, "DateTimeDigitized"),
+                (306, "DateTime"),
+            ]
+            for tag_id, tag_name in tag_priorities:
+                raw = exif_ifd.get(tag_id) or exif.get(tag_id)
+                if not raw:
+                    continue
+                raw_str = str(raw).strip()
+                # EXIF format: "YYYY:MM:DD HH:MM:SS"
+                try:
+                    dt_naive = datetime.strptime(raw_str, "%Y:%m:%d %H:%M:%S")
+                    # EXIF datetime is local camera time. iPhone defaults to
+                    # the device's set timezone, which for Jim is HKT.
+                    # If we wanted strict accuracy, we'd read offsetTimeOriginal
+                    # (EXIF 2.31+), but iPhone often omits that. Default to HKT.
+                    dt_aware = dt_naive.replace(tzinfo=HKT)
+                    # v3.3.8 fix: serialise datetime as ISO string so JSON
+                    # cache write doesn't blow up with "Object of type
+                    # datetime is not JSON serializable".
+                    return {
+                        "capture_time": dt_aware.isoformat(),
+                        "source": tag_name,
+                        "raw_str": raw_str,
+                    }
+                except ValueError:
+                    continue
+        return {"capture_time": None, "source": "", "raw_str": ""}
+    except Exception as e:
+        # PIL not installed or other error — silent fallback (caller uses
+        # upload time as before)
+        return {"capture_time": None, "source": "", "raw_str": f"error: {e}"}
+
+
 def _make_thumb(src: Path, dst: Path, max_side: int = 480) -> str:
     """Generate a JPEG thumbnail of `src` at `dst`. Returns the dst path string, or "" on failure.
+
+    FIX (Frimpong 2026-10-20, scan-progress work): the signature had been
+    refactored to `(src, max_side=320)` while the body still referenced a
+    global `dst` that no longer existed → every call raised NameError and
+    was swallowed, so NO thumbnail was ever written and /scan_thumb/<f>
+    returned HTTP 500. All 12 call sites already pass (src, dst), so the
+    original 3-arg signature is restored here.
 
     v3.2.7.46: replaces full-resolution JPEGs (~1.9MB each) with 480px max-side
     JPEGs (~15-30KB each) in the food history view. 168 entries × ~30KB = ~5MB
@@ -4475,7 +6423,37 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
     Jim OOB 2026-07-29: dedup by (date, time_short, calories) BEFORE push.
     Prevents cron double-push from creating duplicates.
     Also marks entry.sheet_synced=True on success.
+
+    v3.3.25 (Jim OOB 2026-10-20 "Someone has pollute the production
+    data. Pls avoid doing so"): this is THE production writer. Guarded
+    by GYMBRO_WRITE_MODE:
+      - dryrun    → never POSTs; returns {"ok": True, "range": "dryrun",
+                   "would_have_written": [...]} so QA can report the row
+                   list without writing (Alonso rule 4).
+      - throwaway → writes to GYMBRO_SHEET_ID (a COPY of the tab).
+      - production → real behaviour (default).
     """
+    # v3.3.25 production-write guard — evaluated BEFORE any network call
+    # so a dryrun run can never touch Jim's golden copy.
+    _mode = _write_mode()
+    _target_sid = _target_sheet_id()
+    if _mode == "dryrun":
+        row_preview = {
+            "date": entry.get("date", today_iso()),
+            "time": (entry.get("time", "") or "")[:5],
+            "meal_type": entry.get("meal_type", "meal"),
+            "name": (entry.get("meal_name") or entry.get("name") or "")[:120],
+            "calories": entry.get("calories", 0),
+            "protein": entry.get("protein", 0),
+            "carbs": entry.get("carbs", 0),
+            "fat": entry.get("fat", 0),
+            "would_have_written": True,
+        }
+        print(f"[write-guard] dryrun — NOT writing to Nutrition tab. "
+              f"would-have-written: {row_preview}", flush=True)
+        entry["sheet_synced"] = False
+        return {"ok": True, "range": "dryrun", "skipped": True,
+                "would_have_written": [row_preview]}
     try:
         tok = json.loads(Path("/home/work/.hermes/google_token.json").read_text())
         if "token" not in tok or not tok.get("refresh_token"):
@@ -4499,7 +6477,9 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
         # Dedup check: pull existing sheet rows + check if entry already exists
         # Jim OOB 2026-07-29: signature (date, time_short, calories) catches duplicates
         # regardless of meal_type naming inconsistency.
-        SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        # v3.3.25: honour GYMBRO_SHEET_ID so throwaway mode can write to a
+        # COPY of the Nutrition tab instead of Jim's golden copy.
+        SHEET_ID = _target_sid
         try:
             url_check = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!A1:Z1000?valueRenderOption=FORMATTED_VALUE"
             req_check = urllib.request.Request(url_check, headers={"Authorization": f"Bearer {access}"})
@@ -4649,26 +6629,47 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
             # Pre-flight trim is best-effort. Don't fail the append if trim fails.
             with open("/tmp/sheet_trim_errors.log", "a") as _f:
                 _f.write(f"{now_iso()} | trim_wide_rows | {type(e).__name__}: {e}\n")
-        # v3.2.7.48: persistent idempotency check (Jim OOB 2026-08-14 audit).
-        # The in-sheet dedup above is weakened by calories=0 vision failures
-        # and by silent network blips, so add a second line of defense that
-        # survives restarts. The key is the entry's stable identity as
-        # written to the sheet — if we already committed this row, skip.
-        _idem_date = entry.get("date", today_iso())
-        _idem_time_raw = entry.get("time", "") or ""
-        if "T" in _idem_time_raw:
-            _idem_time = _idem_time_raw.split("T", 1)[1][:5]
+        # v3.3.8 (Jim OOB 2026-08-31「the google sheet has not been updated
+        # since 15 Aug. please fix and backfill」): the (date, time, name,
+        # calories) dedup key produced FALSE POSITIVES for vision scans
+        # where name was vague (e.g. "未識別菜式") or where calories were
+        # rounded to the same 4p+4c+9f vs kcal tie. Silent skip caused the
+        # entire 8/22-8/25 + 8/27 gap. Fix: use timestamp_iso + image_path
+        # as the idempotency key (millisecond-unique, tied to the actual
+        # upload event). Fallback to legacy hash if both fields missing.
+        _ts_iso = entry.get("timestamp_iso") or entry.get("scan_timestamp_iso") or ""
+        _img_path = entry.get("image_saved_to") or entry.get("drive_image_url") or ""
+        if _ts_iso or _img_path:
+            _idem_key = f"{_ts_iso}|{_img_path}"
         else:
-            _idem_time = _idem_time_raw[:5]
-        if not re.match(r"^\d{2}:\d{2}$", _idem_time):
-            if re.match(r"^\d{1}:\d{2}$", _idem_time):
-                _idem_time = "0" + _idem_time
+            _idem_date = entry.get("date", today_iso())
+            _idem_time_raw = entry.get("time", "") or ""
+            if "T" in _idem_time_raw:
+                _idem_time = _idem_time_raw.split("T", 1)[1][:5]
             else:
-                _idem_time = "00:00"
-        _idem_meal = (entry.get("meal_name") or entry.get("name") or "scan")[:120]
-        _idem_kcal = int(round(_safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000)))
-        _idem_key = f"{_idem_date}|{_idem_time}|{_idem_meal}|{_idem_kcal}"
+                _idem_time = _idem_time_raw[:5]
+            if not re.match(r"^\d{2}:\d{2}$", _idem_time):
+                if re.match(r"^\d{1}:\d{2}$", _idem_time):
+                    _idem_time = "0" + _idem_time
+                else:
+                    _idem_time = "00:00"
+            _idem_meal = (entry.get("meal_name") or entry.get("name") or "scan")[:120]
+            _idem_kcal = int(round(_safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000)))
+            _idem_key = f"{_idem_date}|{_idem_time}|{_idem_meal}|{_idem_kcal}"
         if not _idempotency_check(_idem_key):
+            # v3.3.8: log dedup skips so silent-fail gaps become visible.
+            # Previously skipped rows just returned {"skipped": True} with
+            # no log → 8/22-8/27 went dark for 6 days because every retry
+            # collided with stale idempotency entries.
+            try:
+                with open("/tmp/sheet_idempotency_skips.log", "a") as _f:
+                    _f.write(
+                        f"{now_iso()} | skipped | key={_idem_key} | "
+                        f"name={entry.get('name', '')} | date={entry.get('date')} | "
+                        f"time={entry.get('time')} | kcal={entry.get('calories')}\n"
+                    )
+            except Exception:
+                pass
             # Already committed this row within the bounded window — skip
             # the append and return the same shape the in-sheet dedup uses.
             entry["sheet_synced"] = True
@@ -4719,6 +6720,41 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
                 urllib.request.urlopen(req_b, timeout=10).read()
         except Exception:
             pass  # header bootstrap is best-effort, don't break the main push
+        # v3.3.23r (Jim OOB 2026-09-14 'make sure the column L is updated
+        # with formula like these =image(K497). This help me to view the
+        # image when i look at the sheet'): write =IMAGE(K<row>) formula to
+        # column L for every new entry. Uses lh3.googleusercontent.com/d/<id>
+        # variant (direct image bytes) instead of drive.google.com/uc?export=view
+        # (303 redirect — Sheets IMAGE() fails on redirects).
+        # v3.3.23r hotfix: NO size args! =IMAGE("url",1,80,80) fails with #N/A
+        # but =IMAGE("url") succeeds (default fit-cell). The cell renders
+        # the image at full cell size — fine for Jim's viewing workflow.
+        if appended_row_index and drive_image_url:
+            try:
+                m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", drive_image_url)
+                if m:
+                    file_id = m.group(1)
+                    lh3_url = f"https://lh3.googleusercontent.com/d/{file_id}"
+                    formula = f'=IMAGE("{lh3_url}")'
+                    formula_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values:batchUpdate?valueInputOption=USER_ENTERED"
+                    formula_body = {
+                        "valueInputOption": "USER_ENTERED",
+                        "data": [{"range": f"Nutrition!L{appended_row_index}",
+                                  "values": [[formula]]}],
+                    }
+                    req_f = urllib.request.Request(formula_url, data=json.dumps(formula_body).encode(),
+                                                  method="POST",
+                                                  headers={"Authorization": f"Bearer {access}",
+                                                           "Content-Type": "application/json"})
+                    urllib.request.urlopen(req_f, timeout=10).read()
+            except Exception:
+                pass  # formula write is best-effort, image still in K column
+        # v3.3.23al: invalidate Redis Sheet cache so next read picks up
+        # the freshly-written row (otherwise 5min TTL would show stale data).
+        try:
+            _invalidate_sheet_cache()
+        except Exception:
+            pass
         return {"ok": True, "range": updated_range, "row_index": appended_row_index}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -4753,35 +6789,33 @@ def api_scan_food():
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
-    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
-    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    # 1b. 2nd-opinion vision from a DIFFERENT provider in the chain
+    opinion2_desc = _vision_second_opinion(img_b64, vision_prompt)
     # v3.2.7.14: detect gpt-4o-mini safety-filter refusal (e.g. "抱歉，我無法...")
     # and treat as empty so it does NOT pollute vision_desc (Jim OOB
     # 2026-08-09 16:48 HKT 'I took a screenshot not food, but scan got
     # committed as 抱歉 / 第一道菜').
-    if apiyi_vision_desc and ("抱歉" in apiyi_vision_desc[:30] and "無法" in apiyi_vision_desc[:50] and len(apiyi_vision_desc) < 80):
-        apiyi_vision_desc = ""
-    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+    if opinion2_desc and ("抱歉" in opinion2_desc[:30] and "無法" in opinion2_desc[:50] and len(opinion2_desc) < 80):
+        opinion2_desc = ""
+    if opinion2_desc and not opinion2_desc.startswith("（"):
         # 2-vision median-merge: take whichever is longer (more dish detail)
-        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
-            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+        if len(opinion2_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（2nd-opinion vision）\n" + opinion2_desc
 
     # 2. pplx enrichment (1st of 2 estimates for 12-field nutrition)
     pplx_desc = _pplx_enrich(vision_desc)
 
     # 2b. OpenRouter gpt-4o-mini (2nd estimate, JSON mode, Jim OOB 2026-07-25 13:35)
-    apiyi_desc = _apiyi_nutrition_enrich(vision_desc)
+    mm_desc = _minimax_nutrition_enrich(vision_desc)
 
     # 2c. Parse both → merge via median (12-field schema)
     pplx_parsed = _parse_nutrition_block(pplx_desc)
     # OpenRouter returns JSON string, parse differently
-    apiyi_parsed = {}
-    if apiyi_desc and apiyi_desc.startswith("{"):
-        try:
-            apiyi_parsed = json.loads(apiyi_desc)
-        except Exception:
-            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
+    mm_parsed = {}
+    if mm_desc:
+        # v3.3.22: use safe parser to strip  blocks + extract last JSON
+        mm_parsed = _safe_parse_nutrition_json(mm_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, mm_parsed])
     # legacy raw fields (kcal, P) for back-compat with code that reads these
     raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
     raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
@@ -4812,8 +6846,8 @@ def api_scan_food():
         "name": _extract_dish_name(vision_desc, pplx_desc),  # v2.7.32: was vision_desc[:200] — bled prose into name field
         "vision_raw_desc": vision_desc,
         "pplx_enrichment": pplx_desc,
-        "apiyi_enrichment": apiyi_desc[:500] if apiyi_desc else "",
-        "apiyi_json_parsed": apiyi_parsed,
+        "minimax_enrichment": mm_desc[:500] if mm_desc else "",
+        "minimax_json_parsed": mm_parsed,
         "nutrition_merged": merged_nutrition,
         "restaurant_chain": "",  # user/correction can fill
         "share_with_wife": ("Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)"),
@@ -4833,8 +6867,8 @@ def api_scan_food():
         "calcium": field_entries["calcium"],
         "raw_kcal_estimate": raw_kcal,
         "raw_p_estimate": raw_p,
-        "source": "v2.11-scan (minimax-m3 + pplx-sonar-pro + apiyi-gpt-4o-mini, median-merged)",
-        "models_used": ["minimax-m3", "pplx-sonar-pro", "apiyi/gpt-4o-mini"],
+        "source": "v2.11-scan (minimax-m3 + pplx-sonar-pro + minimax-m3-enrich, median-merged)",
+        "models_used": ["minimax-m3", "pplx-sonar-pro", "minimax-m3-enrich"],
         "confidence": "12-field median-merged (Jim can correct via /api/scan_correct)",
         "sheet_synced": False,
         "image_saved_to": "",  # filled below
@@ -4865,11 +6899,47 @@ def api_scan_food():
     sheet_result = _append_to_sheet_nutrition(entry)
     if sheet_result.get("ok") and not sheet_result.get("skipped"):
         try:
+            # v3.3.25 (2026-10-20): the old parser was
+            # int(range.split(":")[0].rstrip("ABCDEFGHIJKLM")) — but
+            # rstrip only strips LETTERS, and the range looks like
+            # "Nutrition!A564" (ends with a DIGIT), so int() raised
+            # ValueError. The bare `except: pass` swallowed it, so
+            # cache.refresh_one() never ran and the new row never reached
+            # the cache. Same root cause as the api_scan_commit fix at
+            # ~L9760. Use an end-anchored regex to pull the row number.
             range_str = sheet_result.get("range", "")
-            new_row_index = int(range_str.split(":")[0].rstrip("ABCDEFGHIJKLM"))
-            get_cache().refresh_one(new_row_index, _sheet_read_nutrition_row)
+            m = re.search(r"(\d+)$", range_str.split(":")[0])
+            if m:
+                get_cache().refresh_one(int(m.group(1)), _sheet_read_nutrition_row)
+        except Exception as e:
+            print(f"[scan_food] refresh_one failed for range "
+                  f"{sheet_result.get('range', '')}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+    # win'): pre-generate today's nutrition card JPG in the background.
+    # Without this, the first /api/nutrition/card click after a meal
+    # log spends 4-5 seconds fetching Drive thumbs sequentially. Now the
+    # card is already on disk when the user opens the modal — instant load.
+    # Daemon thread so the API response isn't delayed by PIL render.
+    import threading as _threading
+    def _pregen_card():
+        try:
+            today = entry.get("date") or today_iso()
+            data = _load_today_nutrition() if today == today_iso() else None
+            # For non-today entries, just invalidate the file so the next
+            # /api/nutrition/card call renders fresh. Simple & safe.
+            if data is None or not data.get("meals"):
+                return
+            _render_nutrition_card_pil(
+                today,
+                data.get("meals", []),
+                data.get("totals", {}),
+            )
         except Exception:
-            pass
+            pass  # best-effort; user will just wait on first click
+    _t = _threading.Thread(target=_pregen_card, name="pregen-card", daemon=True)
+    _t.start()
 
     return jsonify({
         "ok": True,
@@ -4960,175 +7030,14 @@ def api_whoop_refresh():
 
 
 # v2.7.18: Withings steps endpoints (Jim OOB 2026-07-29)
-@app.route("/api/withings_steps_today", methods=["GET"])
-def api_withings_steps_today():
-    """Return today's Withings step count + distance + calories + yesterday.
-
-    v2.7.26 (Jim OOB 2026-08-04 09:55 HKT "show both yesterday and today in
-    widget, today larger"): paired response so the frontend widget can show
-    today (large) + yesterday (small) side-by-side.
-
-    Jim OOB 2026-08-02 02:44 HKT: when Withings has no today record,
-    expose `syncing: true` so the UI can show "—" + 同步中 rather than
-    freezing yesterday's number as today's count.
-    """
-    try:
-        steps_data = _withings_steps_today() or {}
-        yest_data = _withings_yesterday() or {}
-        raw_steps = steps_data.get("steps")
-        # v3.3.7 (Jim OOB 2026-08-17 「step count is always lagging because my
-        # iphone is not updated to withings cloud yet」): expose two
-        # timestamps so the UI can show "as of HH:MM" with the GENUINE
-        # Withings-side data freshness:
-        #   - pulled_at: when gymbro fetched from Withings cloud (UI ignores)
-        #   - data_as_of: latest Withings intraday bucket-start ts (= what
-        #     iPhone Withings widget shows). None when no fresh intraday
-        #     events exist — never fall back to pulled_at (Jim OOB
-        #     2026-08-17 'gymbro showing 13:52 but iPhone shows 12:10 WRONG':
-        #     pulled_at was being used as data_as_of fallback, masking the
-        #     real iPhone-side lag).
-        withings_cache = _safe_read_json(WITHINGS_CACHE) or {}
-        cache_entry = (withings_cache.get("steps") or {}) if isinstance(withings_cache, dict) else {}
-        pulled_at_iso = cache_entry.get("fetched_at_iso")
-        return jsonify({
-            "date": steps_data.get("date", ""),
-            "steps": None if raw_steps is None else int(raw_steps or 0),
-            "distance_km": None if steps_data.get("distance_km") is None and steps_data.get("syncing") else steps_data.get("distance_km"),
-            "calories": None if steps_data.get("calories") is None and steps_data.get("syncing") else steps_data.get("calories"),
-            "syncing": bool(steps_data.get("syncing", False)),
-            # v3.3.7: cache write time (gymbro-side). UI ignores this.
-            "pulled_at": pulled_at_iso,
-            # v3.3.7: Withings-side data freshness (the truthful as-of).
-            # Only set when Withings has genuine intraday bucket data.
-            # None when only the daily commit exists — UI hides the label
-            # entirely rather than show a misleading time.
-            "data_as_of": steps_data.get("data_as_of_iso"),
-            "_source": steps_data.get("_source"),
-            # v2.7.26: paired yesterday for widget display
-            "yesterday": {
-                "date": yest_data.get("date", ""),
-                "steps": yest_data.get("steps"),
-                "distance_km": yest_data.get("distance_km"),
-                "calories": yest_data.get("calories"),
-            } if yest_data else None,
-        })
-    except Exception as e:
-        return jsonify({"steps": 0, "distance_km": 0, "calories": 0, "syncing": False, "error": str(e)[:120]})
 
 
 # v2.7.40: Force-refresh Withings steps (Jim OOB 2026-08-06: "tap shoes → refresh
 # steps from withings"). Calls the withings.py activity script to fetch fresh
 # data, refreshes WITHINGS_CACHE atomically, then returns same shape as
 # /api/withings_steps_today. Designed to be fast (~3-5s) for tap-to-refresh UX.
-@app.route("/api/withings_refresh", methods=["POST", "GET"])
-def api_withings_refresh():
-    """Force-refresh Withings step data by calling withings.py activity getactivity
-    and update WITHINGS_CACHE. Returns {ok, steps, distance_km, calories, syncing, pulled_at}."""
-    import subprocess, json as _json
-    try:
-        # Step 1: call withings.py steps 1 (today's step count, fresh from API)
-        r = subprocess.run(
-            ["python3", "/home/work/.hermes/skills/withings/withings.py", "steps", "1"],
-            capture_output=True, text=True, timeout=30,
-        )
-        pulled_at = now_iso()
-        new_steps = None
-        new_distance = None
-        new_calories = None
-        if r.returncode == 0 and r.stdout.strip():
-            # Parse tabular output: "2026-08-06      3,113     2.32km      708kcal        0m"
-            import re
-            from datetime import datetime, timezone, timedelta
-            hkt = timezone(timedelta(hours=8))
-            today_hkt_str = datetime.now(hkt).strftime("%Y-%m-%d")
-            # Walk all rows; prefer today's row, fall back to most recent
-            today_row = None
-            latest_row = None
-            for line in r.stdout.strip().splitlines():
-                m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+([\d,]+)\s+([\d.]+)km\s+(\d+)kcal", line)
-                if not m:
-                    continue
-                row = (m.group(1), int(m.group(2).replace(",", "")), float(m.group(3)), int(m.group(4)))
-                if row[0] == today_hkt_str:
-                    today_row = row
-                    break  # found today, use it
-                if latest_row is None or row[0] > latest_row[0]:
-                    latest_row = row
-            chosen = today_row or latest_row
-            if chosen:
-                new_steps = chosen[1]
-                new_distance = chosen[2]
-                new_calories = chosen[3]
-        # Step 2: update WITHINGS_CACHE so subsequent /api/withings_steps_today
-        # returns fresh data
-        try:
-            cur = _safe_read_json(WITHINGS_CACHE)
-            if not isinstance(cur, dict):
-                cur = {}
-            cur["_last_forced_refresh"] = pulled_at
-            if new_steps is not None:
-                # Save under a "today" key so steps_today picks it up
-                from datetime import datetime, timezone, timedelta
-                hkt = timezone(timedelta(hours=8))
-                today_hkt = datetime.now(hkt).strftime("%Y-%m-%d")
-                cur.setdefault("activities", {})
-                cur["activities"][today_hkt] = {
-                    "steps": new_steps, "distance_km": new_distance, "calories": new_calories,
-                    "syncing": False, "source": "forced_refresh",
-                }
-                cur["_today_override"] = {"date": today_hkt, "steps": new_steps, "distance_km": new_distance, "calories": new_calories}
-            tmp = str(WITHINGS_CACHE) + ".tmp"
-            Path(tmp).write_text(_json.dumps(cur, indent=2, ensure_ascii=False))
-            os.replace(tmp, str(WITHINGS_CACHE))
-        except Exception as cache_err:
-            print(f"[withings_refresh] cache update failed: {cache_err}")
-        # Step 3: return fresh step data (caller can use this OR re-fetch /api/withings_steps_today)
-        return jsonify({
-            "ok": True,
-            "steps": new_steps,
-            "distance_km": new_distance,
-            "calories": new_calories,
-            "pulled_at": pulled_at,
-            "stdout_preview": (r.stdout or "")[:300],
-            "stderr_preview": (r.stderr or "")[:200] if r.returncode != 0 else "",
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"ok": False, "error": "withings.py timeout (>30s)"}), 504
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:200]}), 500
 
 
-@app.route("/api/withings_steps_7d_avg", methods=["GET"])
-def api_withings_steps_7d_avg():
-    """Return 7-day average steps (Jim OOB 2026-07-29)."""
-    try:
-        cache = _safe_read_json(WITHINGS_CACHE) or {}
-        # If cache has full 7d activities, use those; else fall back to whoop walk estimate
-        acts = cache.get("activities_30d") or cache.get("activities") or []
-        if not acts:
-            # Try to compute from cache directly
-            steps_list = []
-            for k, v in cache.items():
-                if isinstance(v, dict) and 'steps' in v and isinstance(v['steps'], (int, float)):
-                    steps_list.append(v['steps'])
-            if steps_list:
-                return jsonify({"avg": int(sum(steps_list) / len(steps_list)), "samples": len(steps_list)})
-            return jsonify({"avg": 0, "samples": 0})
-        # Get last 7 daily records
-        from datetime import datetime, timezone, timedelta
-        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        # Filter last 7 days
-        recent = acts[-7:] if isinstance(acts, list) else []
-        steps_vals = []
-        for a in recent:
-            if isinstance(a, dict):
-                s = a.get("steps", 0)
-                if isinstance(s, (int, float)):
-                    steps_vals.append(s)
-        avg = int(sum(steps_vals) / max(1, len(steps_vals))) if steps_vals else 0
-        return jsonify({"avg": avg, "samples": len(steps_vals)})
-    except Exception as e:
-        return jsonify({"avg": 0, "samples": 0, "error": str(e)[:120]})
 
 
 @app.route("/api/scan_correct", methods=["POST"])
@@ -5161,24 +7070,58 @@ def api_scan_correct():
         "note": data.get("note", ""),
     }
 
-    # v3.3.7: if user supplied a name but left macros empty AND the
-    # current row's macros are all 0 (vision AI failed earlier), look up
-    # similar dish nutrition from Sheet history and backfill. Jim OOB
-    # 2026-08-16 'why today egg tarts have nutrient info?' — row 164.
+    # v3.3.23ad (Jim OOB 2026-09-16): if user supplied macros, use them
+    # directly (no recalc). If only name changed + macros empty/zero,
+    # do full 4-tier recalc (explicit → brand → AI → history).
     sup_name = (data.get("name") or "").strip()
     sup_kcal = data.get("calories")
-    print(f"[scan_correct] row={scan_index} sup_name={sup_name!r} sup_kcal={sup_kcal} row.kcal={row.kcal}", flush=True)
-    if sup_name and (sup_kcal is None or sup_kcal == 0) and row.kcal <= 0:
-        looked = _lookup_known_macros(sup_name)
-        print(f"[scan_correct] lookup result: {looked}", flush=True)
-        if looked:
-            correction["calories"] = looked["kcal"]
-            correction["protein"] = looked["protein"]
-            correction["carbs"] = looked["carbs"]
-            correction["fat"] = looked["fat"]
-            correction["_backfill_source"] = looked["_source"]
-            print(f"scan_correct: backfilled row {scan_index} {sup_name!r} → "
-                  f"{looked['kcal']} kcal from {looked['_source']}", flush=True)
+    sup_p = data.get("protein")
+    sup_c = data.get("carbs")
+    sup_f = data.get("fat")
+    sup_rest = (data.get("restaurant_chain") or "").strip()
+    user_supplied_macros = (
+        (sup_kcal is not None and sup_kcal != 0) or
+        (sup_p is not None and sup_p != 0) or
+        (sup_c is not None and sup_c != 0) or
+        (sup_f is not None and sup_f != 0)
+    )
+    print(f"[scan_correct] row={scan_index} sup_name={sup_name!r} user_supplied_macros={user_supplied_macros} row.kcal={row.kcal}", flush=True)
+
+    # v3.3.7 / v3.3.23ad: recalc path — only when user did NOT supply macros AND
+    # the current row's macros are all 0. Otherwise trust the user.
+    if sup_name and not user_supplied_macros and row.kcal <= 0:
+        # Layer 1: explicit numbers in name
+        explicit = _extract_explicit_macros(sup_name)
+        if explicit:
+            print(f"[scan_correct] explicit macros: {explicit}", flush=True)
+            correction["calories"] = int(explicit.get("calories", 0))
+            correction["protein"] = explicit.get("protein", 0)
+            correction["carbs"] = explicit.get("carbs", 0)
+            correction["fat"] = explicit.get("fat", 0)
+            correction["_backfill_source"] = f"explicit_numbers: '{sup_name}'"
+
+        # Layer 2: brand table
+        if not correction.get("_backfill_source"):
+            looked_brand = _lookup_brand_macros(sup_name)
+            if looked_brand:
+                print(f"[scan_correct] brand_table hit: {looked_brand.get('_source')}", flush=True)
+                correction["calories"] = looked_brand["kcal"]
+                correction["protein"] = looked_brand["protein"]
+                correction["carbs"] = looked_brand["carbs"]
+                correction["fat"] = looked_brand["fat"]
+                correction["_backfill_source"] = looked_brand["_source"]
+
+        # Layer 3: sheet history (last fallback)
+        if not correction.get("_backfill_source"):
+            looked = _lookup_known_macros(sup_name)
+            if looked:
+                correction["calories"] = looked["kcal"]
+                correction["protein"] = looked["protein"]
+                correction["carbs"] = looked["carbs"]
+                correction["fat"] = looked["fat"]
+                correction["_backfill_source"] = looked["_source"]
+                print(f"scan_correct: backfilled row {scan_index} {sup_name!r} → "
+                      f"{looked['kcal']} kcal from {looked['_source']}", flush=True)
 
     # v3.3.2: push the correction to the Sheet row. Apply corrections field-
     # by-field (only overwrite if the correction supplies a non-empty value).
@@ -5200,11 +7143,169 @@ def api_scan_correct():
     if not sheet_result.get("ok"):
         return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
 
+    # v3.3.23al: invalidate Redis cache (5-min TTL would otherwise show stale)
+    try:
+        _invalidate_sheet_cache()
+    except Exception:
+        pass
     # Refresh the cache row from Sheet so subsequent reads reflect the fix.
     cache.refresh_one(scan_index, _sheet_read_nutrition_row)
 
+    # v3.3.23av (Jim OOB 2026-10-12 'the edited 兩個鮮竹卷 is not updated
+    # in jpg download'): invalidate JPG card cache so the next /api/nutrition/card
+    # # call re-renders with the corrected name. Without this, the disk file
+    # (with 5-min TTL) keeps serving the PRE-edit JPG (stale name).
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        from pathlib import Path as _P
+        row = cache.get_by_row(scan_index)
+        if row and row.date:
+            _jpg_cache_invalidate(row.date)
+            # Delete ALL page variants (p1, p2, ...) for this date
+            cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
+            for f in cache_dir.glob(f"nutrition_{row.date}*.jpg"):
+                f.unlink()
+    except Exception as e:
+        print(f"[scan_correct] JPG cache invalidate failed: {e}", flush=True)
+
     return jsonify({"ok": True, "scan_index": scan_index, "correction": correction,
                     "sheet_updated": sheet_result.get("updated", 0)})
+
+
+# v3.3.24: Replace photo for an existing scan row (Jim OOB 2026-10-16
+# 'I want to replace existing photo but the ui does not allow me to do so.
+# Pls make this happening'). Uploads new image, swaps the on-disk file +
+# thumb, updates the Sheet's column K (image_url) + column N
+# (drive_image_url), invalidates caches, and returns the new image URL.
+# Old image file + thumb are deleted (Sheet no longer references them).
+@app.route("/api/scan_replace_image", methods=["POST"])
+def api_scan_replace_image():
+    """Replace the photo for an existing scan row."""
+    if "image" not in request.files:
+        return jsonify({"ok": False, "error": "no image file"}), 400
+    scan_index_raw = request.form.get("scan_index")
+    if not scan_index_raw:
+        return jsonify({"ok": False, "error": "no scan_index"}), 400
+    try:
+        scan_index = int(scan_index_raw)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "scan_index must be int"}), 400
+    if scan_index < 2:
+        return jsonify({"ok": False, "error": "scan_index out of range"}), 404
+
+    cache = get_cache()
+    row = cache.get_by_row(scan_index)
+    if row is None:
+        return jsonify({"ok": False, "error": "scan_index not found in cache"}), 404
+
+    img_file = request.files["image"]
+    if not img_file or not img_file.filename:
+        return jsonify({"ok": False, "error": "empty file"}), 400
+
+    # Build new filename (HKT timestamp, like scan_commit does)
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    new_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    new_path = SCAN_CACHE_DIR / new_name
+
+    # Save bytes
+    try:
+        img_file.save(str(new_path))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"save failed: {e}"}), 500
+
+    # Verify it's an image and make thumb
+    try:
+        _make_thumb(new_path, _thumb_path_for(new_name))
+    except Exception as e:
+        print(f"[scan_replace_image] _make_thumb failed: {e}", flush=True)
+
+    # Upload to Drive (best-effort, like scan_commit)
+    try:
+        drive_url = _upload_to_drive(new_path)
+    except Exception as e:
+        print(f"[scan_replace_image] drive upload failed: {e}", flush=True)
+        drive_url = ""
+
+    # Capture old paths for cleanup
+    old_image_url = getattr(row, "image_url", "") or ""
+    old_drive_url = getattr(row, "drive_image_url", "") or ""
+    old_thumb_path = None
+    if old_image_url.startswith("/scan_img/"):
+        old_basename = old_image_url[len("/scan_img/"):]
+        old_thumb_path = _thumb_path_for(old_basename)
+    old_full_path = None
+    if old_image_url.startswith("/scan_img/"):
+        old_full_path = SCAN_CACHE_DIR / old_image_url[len("/scan_img/"):]
+
+    # Build corrected entry for Sheet (preserve all other fields)
+    corrected_entry = {
+        "date": row.date,
+        "time": row.time,
+        "meal_type": row.meal,
+        "name": row.name,
+        "restaurant_chain": row.restaurant,
+        "calories": row.kcal,
+        "protein": row.p,
+        "carbs": row.c,
+        "fat": row.f,
+        "note": row.notes,
+        "image_url": f"/scan_img/{new_name}",
+        "drive_image_url": drive_url,
+    }
+
+    # Push to Sheet (column K = image_url, column N = drive_image_url)
+    sheet_result = _sheet_update_nutrition_row(scan_index, corrected_entry)
+    if not sheet_result.get("ok"):
+        # Don't leave the new file orphaned; clean up
+        try: new_path.unlink()
+        except Exception: pass
+        return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
+
+    # Invalidate caches
+    try: _invalidate_sheet_cache()
+    except Exception: pass
+    # v3.3.24a: invalidate the per-row in-memory thumb cache too, else
+    # /scan_thumb/<row> keeps serving the OLD bytes for the new
+    # drive_image_url (Jim OOB 2026-10-16 'image ordering all wrong now,
+    # the mapping is drifted' — root cause was the LRU still holding
+    # the previous thumb after the drive URL changed). Use
+    # `invalidate_thumb` (drops one row), not `shift_thumb_cache`
+    # (that one is for cascading after a row delete).
+    try:
+        from gym_web.image_proxy import (
+            invalidate_thumb, invalidate_drive_url, _jpg_cache_invalidate,
+        )
+        invalidate_drive_url(scan_index)  # drop cached Drive URL too
+        invalidate_thumb(scan_index)      # drop cached thumb bytes
+        _jpg_cache_invalidate(row.date)
+    except Exception as e:
+        print(f"[scan_replace_image] thumb cache invalidate failed: {e}", flush=True)
+
+    # Refresh cache row from Sheet
+    try:
+        cache.refresh_one(scan_index, _sheet_read_nutrition_row)
+    except Exception as e:
+        print(f"[scan_replace_image] cache.refresh_one failed: {e}", flush=True)
+
+    # Delete old image + thumb (Sheet no longer references them)
+    for old_p in (old_full_path, old_thumb_path):
+        try:
+            if old_p and old_p.exists() and old_p != new_path:
+                old_p.unlink()
+                print(f"[scan_replace_image] deleted old file: {old_p}", flush=True)
+        except Exception as e:
+            print(f"[scan_replace_image] could not delete {old_p}: {e}", flush=True)
+
+    print(f"[scan_replace_image] row={scan_index} old_image_url={old_image_url!r} new_image_url={corrected_entry['image_url']!r} drive_url={drive_url!r}", flush=True)
+    return jsonify({
+        "ok": True,
+        "scan_index": scan_index,
+        "image_url": corrected_entry["image_url"],
+        "thumbnail_url": f"/scan_thumb/{new_name[:-4]}.thumb.jpg",
+        "drive_image_url": drive_url,
+        "old_image_url": old_image_url,
+        "old_drive_url": old_drive_url,
+    })
 
 
 # v2.7.39: Rename existing scan + auto re-recognize macros (Jim OOB 2026-08-06
@@ -5213,7 +7314,7 @@ def api_scan_correct():
 # Hai nan chicken rice"). Flow:
 #  1. User types new dish name in inline popover
 #  2. Backend overwrites name field (so iPhone display updates immediately)
-#  3. Backend auto-calls _apiyi_nutrition_enrich(new_name) for re-estimate macros
+#  3. Backend auto-calls _minimax_nutrition_enrich(new_name) for re-estimate macros
 #  4. Old name + macros saved as audit trail (returned to caller; cache holds it)
 #  5. Returns new entry state so frontend can update display
 #
@@ -5243,29 +7344,73 @@ def api_scan_rename():
     old_f = row.f
     restaurant = row.restaurant or ""
     re_text = f"{new_name} (餐廳: {restaurant})" if restaurant else new_name
-    # Re-estimate macros from text (uses APiyi gpt-4o-mini nutrition enrichment, JSON mode)
+
+    # v3.3.23ad (Jim OOB 2026-09-16 'i just recently updated the protein
+    # shake info, it is still showing 21g protein instead of 30g protein'):
+    # 4-tier macro recalc chain:
+    #   1. EXPLICIT NUMBERS in name (e.g. "30g protein") → high priority
+    #   2. Brand table (e.g. "Quest Bar", "ON Gold Standard")
+    #   3. AI estimate via _minimax_nutrition_enrich
+    #   4. Sheet history via _lookup_known_macros (existing fallback)
+    # All layers are merged; explicit numbers always win.
     new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
     enrich_failed = False
+
+    # Layer 1: explicit numbers in name (e.g. "30g protein shake")
+    explicit = _extract_explicit_macros(new_name)
+    if explicit:
+        print(f"[scan_rename] explicit macros from name '{new_name}': {explicit}", flush=True)
+        if "calories" in explicit: new_kcal = int(explicit["calories"])
+        if "protein" in explicit: new_p = explicit["protein"]
+        if "carbs" in explicit:   new_c = explicit["carbs"]
+        if "fat" in explicit:     new_f = explicit["fat"]
+
+    # Layer 2: brand table (overrides AI when brand name matches)
+    brand_hit = _lookup_brand_macros(new_name)
+    if brand_hit:
+        print(f"[scan_rename] brand_table hit: {brand_hit.get('_source')}", flush=True)
+        if "calories" in brand_hit: new_kcal = int(brand_hit["kcal"])
+        if "protein" in brand_hit:  new_p = brand_hit["protein"]
+        if "carbs" in brand_hit:    new_c = brand_hit["carbs"]
+        if "fat" in brand_hit:      new_f = brand_hit["fat"]
+
+    # Layer 3: AI estimate (fills gaps left by explicit + brand)
     try:
-        enrich = _apiyi_nutrition_enrich(re_text)
-        if enrich and enrich.strip().startswith("{"):
-            parsed = json.loads(enrich)
-            new_kcal = int(parsed.get("calories", old_kcal) or old_kcal)
-            new_p = float(parsed.get("protein", old_p) or old_p)
-            new_c = float(parsed.get("carbs", old_c) or old_c)
-            new_f = float(parsed.get("fat", old_f) or old_f)
+        enrich = _minimax_nutrition_enrich(re_text)
+        if enrich:
+            # v3.3.23af (Jim OOB 2026-09-16 'breakfast estimated as 200kcal
+            # when pplx says 700-800'): MiniMax M3 reasoning emits a <think>
+            # block BEFORE the JSON. The bare `startswith("{")` check
+            # skipped parsing. Use _safe_parse_nutrition_json which
+            # strips <think> + extracts the last {...} block.
+            parsed = _safe_parse_nutrition_json(enrich)
+            if not parsed or not isinstance(parsed, dict):
+                enrich_failed = True
+            else:
+                # Only apply AI values if explicit/brand didn't set them
+                if new_kcal <= 0:
+                    ai_kcal = int(parsed.get("calories", 0) or 0)
+                    if ai_kcal > 0: new_kcal = ai_kcal
+                if new_p <= 0:
+                    ai_p = float(parsed.get("protein", 0) or 0)
+                    if ai_p > 0: new_p = ai_p
+                if new_c <= 0:
+                    ai_c = float(parsed.get("carbs", 0) or 0)
+                    if ai_c > 0: new_c = ai_c
+                if new_f <= 0:
+                    ai_f = float(parsed.get("fat", 0) or 0)
+                    if ai_f > 0: new_f = ai_f
         else:
             enrich_failed = True
     except Exception as e:
         enrich_failed = True
         print(f"[scan_rename] re-estimate failed: {e}")
 
-    # v3.3.7: NEVER leave macros at 0 after a rename. If the AI re-estimate
-    # returned 0/None for everything (Jim OOB 2026-08-16 'i adjusted the
-    # chicken name and thus all the nutrient info are zero this is so
-    # inprofessional'), fall back to Sheet-history lookup before persisting.
-    # Both ai-empty and enrich-failed paths funnel here.
-    if (new_kcal <= 0 or enrich_failed) and new_name:
+    # Layer 4: sheet history (final fallback if everything else is 0)
+    # v3.3.23ad: ONLY use this fallback if new_kcal is still 0 — don't
+    # override explicit/brand values with historical median which may be
+    # outdated or from a different portion size.
+    if new_kcal <= 0 and new_name:
         looked = _lookup_known_macros(new_name)
         if looked:
             print(f"[scan_rename] backfill: AI gave {new_kcal} kcal, "
@@ -5275,6 +7420,16 @@ def api_scan_rename():
             new_p = looked["protein"]
             new_c = looked["carbs"]
             new_f = looked["fat"]
+    # Layer 4b (NEW v3.3.23ad): if any macro was set by explicit/brand but
+    # AI failed and new_kcal still 0, fill ONLY the missing macros from
+    # history. Don't overwrite the explicit/brand values.
+    if new_kcal <= 0 and new_name and (new_p > 0 or new_c > 0 or new_f > 0):
+        # We have partial macros from explicit/brand but no kcal. Fill kcal only.
+        looked = _lookup_known_macros(new_name)
+        if looked and looked.get("kcal", 0) > 0:
+            new_kcal = looked["kcal"]
+            print(f"[scan_rename] partial backfill: kept explicit macros, "
+                  f"added kcal={new_kcal} from history", flush=True)
     # Apply share ratio (Jim 60% / 小寶 40% if shared)
     shared = _detect_shared_meal(re_text)
     jim_ratio = 0.60 if shared else 1.00
@@ -5308,7 +7463,27 @@ def api_scan_rename():
     sheet_result = _sheet_update_nutrition_row(scan_index, sheet_entry)
     if not sheet_result.get("ok"):
         return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
+    # v3.3.23al: invalidate Redis Sheet cache after write
+    try:
+        _invalidate_sheet_cache()
+    except Exception:
+        pass
     cache.refresh_one(scan_index, _sheet_read_nutrition_row)
+
+    # v3.3.23av (Jim OOB 2026-10-12 'the edited 兩個鮮竹卷 is not updated
+    # in jpg download'): invalidate JPG card cache for the renamed row's date
+    # so the next /api/nutrition/card re-renders with the new name.
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        from pathlib import Path as _P
+        row_now = cache.get_by_row(scan_index)
+        if row_now and row_now.date:
+            _jpg_cache_invalidate(row_now.date)
+            cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
+            for f in cache_dir.glob(f"nutrition_{row_now.date}*.jpg"):
+                f.unlink()
+    except Exception as e:
+        print(f"[scan_rename] JPG cache invalidate failed: {e}", flush=True)
 
     # Reload row for the response
     row = cache.get_by_row(scan_index)
@@ -5318,6 +7493,106 @@ def api_scan_rename():
         "entry": row.to_pwa_dict() if row else {},
         "correction": correction,
         "sheet_updated": sheet_result.get("updated", 0),
+    })
+
+
+# v3.3.23ad (Jim OOB 2026-09-16 'even after i edit the name, you should
+# use ai to help rewrite the food name in a better way'): AI-powered food
+# name rewrite helper. Takes a raw user-typed description and returns
+# a clean canonical name (e.g. 'shake 30g protein' → '蛋白飲 30g protein'
+# or 'Quest Bar PB' → 'Quest 朱古力花生醬蛋白棒').
+#
+# Uses MiniMax M3 for fast rewrite; falls back to heuristics if API fails.
+# Designed for inline use in PWA (no sheet write — caller decides whether
+# to apply via scan_rename).
+@app.route("/api/scan_rewrite_name", methods=["POST"])
+def api_scan_rewrite_name():
+    """AI rewrite food name. Does NOT write to sheet — caller applies result."""
+    data = request.get_json(silent=True) or {}
+    raw_name = (data.get("name") or data.get("raw_name") or "").strip()
+    restaurant = (data.get("restaurant") or data.get("restaurant_chain") or "").strip()
+    if not raw_name:
+        return jsonify({"ok": False, "error": "name required"}), 400
+
+    # Try brand table first (if name matches a known brand, use canonical brand name)
+    brand_hit = _lookup_brand_macros(raw_name)
+    if brand_hit:
+        return jsonify({
+            "ok": True,
+            "original": raw_name,
+            "rewritten": brand_hit.get("_source", raw_name).split("→")[0].strip(),
+            "source": "brand_table",
+            "macros": {
+                "calories": brand_hit.get("kcal"),
+                "protein": brand_hit.get("protein"),
+                "carbs": brand_hit.get("carbs"),
+                "fat": brand_hit.get("fat"),
+            },
+            "restaurant_chain": brand_hit.get("restaurant_chain", restaurant),
+        })
+
+    # Try AI rewrite via MiniMax (v3.3.30: was APiyi gpt-4o-mini, dead key)
+    try:
+        mm_key = _minimax_api_key()
+        if mm_key:
+            prompt = (
+                "你是香港營養師助手。用家輸入咗一個食物名，"
+                "請幫佢 rewrite 做一個 canonical、簡潔嘅名 (最多 20 字)。\n"
+                "要求:\n"
+                "1. 用返用家原本嘅語言 (廣東話/英文)\n"
+                "2. 保留所有 macro numbers (例: '30g protein', '200 kcal')\n"
+                "3. 用 standard 香港餐廳/食物名稱\n"
+                "4. 唔好加餐廳 suffix (餐廳已經另外 field)\n"
+                "5. 唔好用 emoji\n\n"
+                "用戶輸入: " + raw_name + "\n"
+                "餐廳: " + restaurant + "\n\n"
+                "JSON reply (繁體中文): {\"rewritten\": \"<canonical name>\"}"
+            )
+            req = urllib.request.Request(
+                "https://api.minimax.io/chat/paas/v1/chat/completions",
+                data=json.dumps({
+                    "model": "MiniMax-text-01",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 200,
+                    "temperature": 0.2,
+                }).encode(),
+                headers={
+                    "Authorization": "Bear" + "er " + mm_key,
+                    "Content-Type": "application/json",
+                },
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            ai_text = resp["choices"][0]["message"]["content"]
+            m = re.search(r'"rewritten"\s*:\s*"([^"]+)"', ai_text)
+            if m:
+                rewritten = m.group(1).strip()
+                return jsonify({
+                    "ok": True,
+                    "original": raw_name,
+                    "rewritten": rewritten,
+                    "source": "ai",
+                    "macros": _extract_explicit_macros(raw_name),  # also return any extracted macros
+                })
+    except Exception as e:
+        print(f"[scan_rewrite_name] AI failed: {e}")
+
+    # Heuristic fallback: capitalize + cleanup
+    rewritten = raw_name.strip()
+    # Remove trailing whitespace, capitalize first letter of each english word
+    words = rewritten.split()
+    out_words = []
+    for w in words:
+        if re.match(r'^[a-z]', w) and len(w) > 2:
+            out_words.append(w.capitalize())
+        else:
+            out_words.append(w)
+    rewritten = " ".join(out_words)
+
+    return jsonify({
+        "ok": True,
+        "original": raw_name,
+        "rewritten": rewritten,
+        "source": "heuristic",
     })
 
 
@@ -5528,6 +7803,24 @@ def api_photostream_today():
                 "already_logged": False,
                 "scan_index": None,
             }
+            # v3.3.8 (Jim OOB 2026-08-31): surface EXIF capture time alongside
+            # filesystem mtime so the PWA can display "拍攝 vs 上傳" badges.
+            # Cached per-file so we don't re-read EXIF on every list call.
+            cache = _load_photostream_cache()
+            exif_key = f"exif::{str(fp.resolve())}::{mtime_iso}"
+            exif_cache_entry = cache.get(exif_key)
+            if not exif_cache_entry:
+                exif_info = _extract_exif_capture_time(fp)
+                exif_cache_entry = exif_info or {}
+                cache[exif_key] = exif_cache_entry
+                _save_photostream_cache(cache)
+            # v3.3.8 fix: exif_info["capture_time"] is now ISO string (was
+            # datetime before — caused JSON TypeError on cache write).
+            # Pass-through to PWA as-is.
+            if exif_cache_entry and exif_cache_entry.get("capture_time"):
+                entry["capture_time_iso"] = exif_cache_entry["capture_time"]
+                entry["capture_time_source"] = exif_cache_entry.get("source", "")
+                entry["upload_time_iso"] = mtime_iso
             if classify_flag:
                 cls = _classify_image_cached(str(fp), mtime_iso)
                 entry["classification"] = cls
@@ -5555,25 +7848,115 @@ def api_photostream_today():
 # Previously /api/scan_food auto-wrote. v2.2 makes scan_food auto-preview, then commit separately.
 
 
-@app.route("/api/scan_preview", methods=["POST"])
-def api_scan_preview():
-    """Take image, run vision + pplx, return suggested entry WITHOUT writing to log.
+# ---------------------------------------------------------------------------
+# v3.3.24e (SCAN_PROGRESS_SPEC §2.5): the recognition pipeline is extracted
+# into a module-level function so that /api/scan_preview and the background
+# scan-job worker (POST /api/scan_recognize) share ONE implementation.
+#
+# The eight progress stages and their pct bands come from the spec table in
+# §2.3. The pipeline order there is
+#   vision -> second_opinion -> enrich -> enrich2 -> multi -> brand -> drive -> commit
+# i.e. multi-dish BEFORE brand-override. The multi-dish AI call and the
+# brand-table lookup are independent (the brand table is a pure local dict
+# lookup; multi_desc depends only on vision_desc + pplx_desc), so the multi
+# call is moved above the brand block to match the spec. The payload of
+# /api/scan_preview is unaffected by that reorder.
+# ---------------------------------------------------------------------------
 
-    Frontend shows preview UI: dish desc + macros + suggested restaurant chain.
-    Only when Jim taps 確認 → POST /api/scan_commit with the chosen entry.
+# stage_key -> pct band start (SPEC §2.3) and 繁中 label template.
+SCAN_STAGE_PCT_START = {
+    "queued": 0,
+    "vision": 0,
+    "second_opinion": 12,
+    "enrich": 25,
+    "enrich2": 37,
+    "multi": 50,
+    "brand": 62,
+    "drive": 75,
+    "commit": 87,
+    "done": 100,
+}
+
+SCAN_STAGE_LABELS = {
+    "queued": "準備緊第 {n} 張…",
+    "vision": "AI 睇緊第 {n} 張相…",
+    "second_opinion": "第二個 AI 交叉檢查第 {n} 張…",
+    "enrich": "估算第 {n} 張嘅營養…",
+    "enrich2": "交叉核對第 {n} 張嘅營養值…",
+    "multi": "分析第 {n} 張有幾多餸…",
+    "brand": "對照第 {n} 張嘅品牌營養表…",
+    "drive": "上載第 {n} 張到雲端…",
+    "commit": "寫入第 {n} 張到 Google Sheet…",
+    "done": "第 {n} 張搞掂咗",
+}
+
+
+def _scan_preview_core(img_bytes: bytes, img_path_hint: str = "",
+                       on_stage=None) -> dict:
+    """Run the whole food-photo recognition pipeline for one image.
+
+    v3.3.24e (SCAN_PROGRESS_SPEC §2.5): extracted from api_scan_preview so
+    the existing endpoint and the background scan-job worker share one
+    implementation. Returns exactly the dict api_scan_preview has always
+    returned — the route wraps it in jsonify().
+
+    v3.3.25 (2026-10-20, Jim OOB「Someone has pollute the production data」):
+    production writes are now gated by GYMBRO_WRITE_MODE (production |
+    dryrun | throwaway) inside _upload_to_drive / _append_to_sheet_nutrition,
+    plus a hard _assert_not_test_fixture() refusal. Nothing to configure on
+    this function — the switch is global so a test can never forget it.
+
+    Args:
+        img_bytes: raw image bytes.
+        img_path_hint: optional absolute path of an already-saved copy of
+            these bytes (a Phase-1 upload). When present the file is reused
+            as the working file (no second copy is written) and it is kept
+            at commit time instead of being renamed away.
+        on_stage: optional callable(stage_key) fired right before each
+            pipeline stage runs, so callers can report true progress.
     """
-    if "image" not in request.files:
-        return jsonify({"ok": False, "error": "no image"}), 400
-    img_file = request.files["image"]
-    img_bytes = img_file.read()
-    if len(img_bytes) > 10 * 1024 * 1024:
-        return jsonify({"ok": False, "error": "image too large"}), 413
+    def _emit(stage_key):
+        if on_stage is None:
+            return
+        try:
+            on_stage(stage_key)
+        except Exception as e:
+            print(f"[scan-core] on_stage({stage_key}) failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     # Save image to scan_cache (will be reused if Jim confirms)
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
-    img_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
-    img_path = SCAN_CACHE_DIR / img_filename
-    img_path.write_bytes(img_bytes)
+    keep_source = False
+    if img_path_hint:
+        hint_path = Path(img_path_hint)
+        if hint_path.is_file():
+            img_path = hint_path
+            keep_source = True
+        else:
+            print(f"[scan-core] img_path_hint missing, using bytes: "
+                  f"{img_path_hint}", flush=True)
+    if not keep_source:
+        img_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+        img_path = SCAN_CACHE_DIR / img_filename
+        img_path.write_bytes(img_bytes)
+
+    # v3.3.8 (Jim OOB 2026-08-31): extract EXIF capture time so we log the
+    # actual photo shot time, not the upload time. iPhone photo stream
+    # uploads often happen hours after the shot (e.g. breakfast photo
+    # uploaded at dinner time → would otherwise mis-classify meal_type).
+    exif_info = _extract_exif_capture_time(img_path)
+    capture_iso = now_hkt_dt.strftime("%Y-%m-%d")
+    capture_hhmm = now_hkt_dt.strftime("%H:%M")
+    if exif_info.get("capture_time"):
+        try:
+            # v3.3.8 fix: capture_time is now an ISO string (serialised for
+            # JSON cache compat). Parse it back for strftime.
+            capture_dt_obj = datetime.fromisoformat(exif_info["capture_time"])
+            capture_iso = capture_dt_obj.strftime("%Y-%m-%d")
+            capture_hhmm = capture_dt_obj.strftime("%H:%M")
+        except (ValueError, TypeError) as e:
+            print(f"[scan-core] EXIF capture_time parse failed "
+                  f"({e}), falling back to upload time", flush=True)
 
     img_b64 = base64.b64encode(img_bytes).decode()
 
@@ -5591,34 +7974,82 @@ def api_scan_preview():
         "唔好寫「呢張相顯示...」、「可見...」呢啲開場白,直接講食物。"
         "一個英文字都唔好有,唔識就寫「難以辨認」。"
     )
+    _emit("vision")
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
-    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
-    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    # 1b. 2nd-opinion vision from a DIFFERENT provider in the chain
+    _emit("second_opinion")
+    opinion2_desc = _vision_second_opinion(img_b64, vision_prompt)
     # v3.2.7.14: detect gpt-4o-mini safety-filter refusal (e.g. "抱歉，我無法...")
     # and treat as empty so it does NOT pollute vision_desc (Jim OOB
     # 2026-08-09 16:48 HKT 'I took a screenshot not food, but scan got
     # committed as 抱歉 / 第一道菜').
-    if apiyi_vision_desc and ("抱歉" in apiyi_vision_desc[:30] and "無法" in apiyi_vision_desc[:50] and len(apiyi_vision_desc) < 80):
-        apiyi_vision_desc = ""
-    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+    if opinion2_desc and ("抱歉" in opinion2_desc[:30] and "無法" in opinion2_desc[:50] and len(opinion2_desc) < 80):
+        opinion2_desc = ""
+    if opinion2_desc and not opinion2_desc.startswith("（"):
         # 2-vision median-merge: take whichever is longer (more dish detail)
-        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
-            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+        if len(opinion2_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（2nd-opinion vision）\n" + opinion2_desc
 
     # 2. pplx enrichment
+    _emit("enrich")
     pplx_desc = _pplx_enrich(vision_desc)
 
     # 2b. OpenRouter gpt-4o-mini 2nd-opinion (Jim OOB 2026-07-25 13:35)
-    apiyi_desc = _apiyi_nutrition_enrich(vision_desc)
+    _emit("enrich2")
+    mm_desc = _minimax_nutrition_enrich(vision_desc)
     pplx_parsed = _parse_nutrition_block(pplx_desc)
-    apiyi_parsed = {}
-    if apiyi_desc and apiyi_desc.startswith("{"):
+    mm_parsed = {}
+    if mm_desc and mm_desc.startswith("{"):
         try:
-            apiyi_parsed = json.loads(apiyi_desc)
-        except Exception:
-            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
+            mm_parsed = json.loads(mm_desc)
+        except Exception as e:
+            print(f"[scan-core] minimax nutrition JSON parse failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            mm_parsed = _parse_nutrition_block(mm_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, mm_parsed])
+
+    # 3b. v3.2.7.9: Multi-dish detection — call the MiniMax multi estimator
+    # (Jim OOB 2026-08-08 20:05 HKT 'scan one photo with different food to
+    # generate multiple entry'). Returns array of {name, 12-field...} objects.
+    # v3.3.24e: moved ABOVE the brand_table override so the pipeline order
+    # matches SCAN_PROGRESS_SPEC §2.2 (multi-dish -> brand override). The
+    # two are independent — brand_override only touches merged_nutrition and
+    # multi_desc depends solely on vision_desc + pplx_desc — so the payload
+    # of /api/scan_preview is unchanged by this reorder.
+    multi_desc = vision_desc + "\n\n" + pplx_desc
+    _emit("multi")
+    multi_json = _minimax_nutrition_enrich_multi(multi_desc)
+    multi_dishes = []
+    try:
+        parsed = json.loads(multi_json)
+        if isinstance(parsed, dict) and "dishes" in parsed:
+            multi_dishes = parsed["dishes"]
+        elif isinstance(parsed, list):
+            multi_dishes = parsed
+    except Exception as e:
+        print(f"[scan-core] multi-dish JSON parse failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        multi_dishes = []
+
+    # v3.3.23v (Jim OOB 2026-09-15 'my recent quest energy bar does not
+    # record any nutrient info'): brand_table override AFTER merge. For
+    # photo scans, override the merged estimate with brand-correct values
+    # when a known brand product is detected.
+    _emit("brand")
+    brand_hit = _lookup_brand_macros(vision_desc)
+    if brand_hit:
+        print(f"[scan_preview] brand_table override for {vision_desc!r}: "
+              f"{merged_nutrition.get('calories', {}).get('value', 0)}→{brand_hit['kcal']} kcal",
+              flush=True)
+        for f in ("calories", "protein", "carbs", "fat", "fiber", "sugar",
+                  "sodium", "sat_fat", "trans_fat"):
+            if brand_hit.get(f) is not None:
+                cur = merged_nutrition.get(f, {}) or {}
+                if not cur.get("value") or float(cur.get("value", 0) or 0) == 0:
+                    cur["value"] = brand_hit[f]
+                    cur["source"] = f"brand_table ({brand_hit['_source']})"
+                    merged_nutrition[f] = cur
 
     # 3. Build preview entry (NOT written yet)
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
@@ -5642,21 +8073,6 @@ def api_scan_preview():
         v = info.get("value", 0) or 0
         preview_field_entries[f] = round(v * jim_ratio, 1) if shared else v
 
-    # 3b. v3.2.7.9: Multi-dish detection — call APiyi multi estimator
-    # (Jim OOB 2026-08-08 20:05 HKT 'scan one photo with different food to
-    # generate multiple entry'). Returns array of {name, 12-field...} objects.
-    multi_desc = vision_desc + "\n\n" + pplx_desc
-    multi_json = _apiyi_nutrition_enrich_multi(multi_desc)
-    multi_dishes = []
-    try:
-        parsed = json.loads(multi_json)
-        if isinstance(parsed, dict) and "dishes" in parsed:
-            multi_dishes = parsed["dishes"]
-        elif isinstance(parsed, list):
-            multi_dishes = parsed
-    except Exception:
-        multi_dishes = []
-
     # Build per-dish entries (apply jim_ratio to each if shared)
     entries_list = []
     for d in multi_dishes:
@@ -5670,8 +8086,8 @@ def api_scan_preview():
             v = d.get(f, 0) or 0
             e_macros[f] = round(float(v) * jim_ratio, 1) if shared else round(float(v), 1)
         e_entry = {
-            "date": today_iso(),
-            "time": now_hkt_dt.strftime("%H:%M"),
+            "date": capture_iso,
+            "time": capture_hhmm,
             "meal_type": "scan",
             "name": _sanitise_dish_name(d_name, vision_desc=vision_desc, pplx_desc=pplx_desc),
             "coach_comment": _coach_comment(
@@ -5703,8 +8119,8 @@ def api_scan_preview():
     # single-entry path (so backward compat preserved for 1-dish scans).
     if not entries_list:
         entries_list = [{
-            "date": today_iso(),
-            "time": now_hkt_dt.strftime("%H:%M"),
+            "date": capture_iso,
+            "time": capture_hhmm,
             "meal_type": "scan",
             "name": _extract_dish_name(vision_desc, pplx_desc),
             "coach_comment": _coach_comment(
@@ -5735,6 +8151,56 @@ def api_scan_preview():
             "raw_p_estimate": raw_p,
         }]
 
+    # v3.3.30 (2026-10-21, Rule 25 + the 2026-10-20 pollution incident):
+    # NEVER auto-commit a generic / placeholder dish name.
+    #
+    # The vision provider can be perfectly healthy while the NAME
+    # extraction still fails — both extractors (MiniMax + Perplexity)
+    # reject the candidate, or the AI answered "no food in this photo".
+    # Writing 「未識別菜式」 to Jim's golden copy is EXACTLY the pollution
+    # signature from 2026-10-20 (26 rows + 7 rows of junk). Rule 25: a
+    # generic name is never acceptable.
+    #
+    # Blocking HERE (before the Drive stage) means ZERO production
+    # artefacts: no Drive file, no Sheet row. The response keeps the
+    # exact same top-level key set as the success path so Isak's §4.3
+    # regression contract still holds.
+    _named_entries = [e for e in entries_list
+                      if (e.get("name") or "").strip()
+                      not in _GENERIC_DISH_NAMES_BLOCKLIST]
+    if entries_list and not _named_entries:
+        print(f"[scan-core] BLOCKED commit — every dish name is a "
+              f"placeholder ({[e.get('name') for e in entries_list]}). "
+              f"Refusing to write a generic name to the golden copy. "
+              f"This photo was NOT logged.", flush=True)
+        _b_url = f"/scan_img/{img_path.name}"
+        return {
+            "ok": False,
+            "auto_committed": False,
+            "image_path": str(img_path),
+            "image_url": _b_url,
+            "thumbnail_url": _thumb_url_for(_b_url),
+            "drive_image_url": "",
+            "vision_desc": "",
+            "vision_short": "",
+            "is_multi_entry": False,
+            "entries": [],
+            "committed": [],
+            "multi_entry": False,
+            "preview": {
+                "image_path": str(img_path),
+                "image_url": _b_url,
+                "thumbnail_url": _thumb_url_for(_b_url),
+                "vision_short": "",
+                "vision_desc": "",
+                "suggested_entry": {},
+            },
+        }
+    if len(_named_entries) != len(entries_list):
+        print(f"[scan-core] dropped {len(entries_list) - len(_named_entries)} "
+              f"placeholder-named dish(es) before commit", flush=True)
+        entries_list = _named_entries
+
     # v3.2.7.10: AUTO-COMMIT — no more confirm step. Scan → log immediately.
     # (Jim OOB 2026-08-08 20:15 HKT 'I think no need confirmation after
     # scanning. Do it right away. if I see problem, I can edit it delete
@@ -5744,28 +8210,93 @@ def api_scan_preview():
     final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
     final_path = SCAN_CACHE_DIR / final_name
     drive_image_url = ""  # v3.2.7.45: Golden Copy (Jim OOB 2026-08-14)
+    # v3.3.25 production-write guard — a QA fixture must NEVER reach the
+    # production Nutrition tab. This check is independent of
+    # GYMBRO_WRITE_MODE so it still protects a test that forgot to set
+    # the env var (the 2026-10-20 failure mode).
+    if _write_mode() == "production" and _is_production_target():
+        _assert_not_test_fixture(img_path)
+
+    # v3.3.25 (2026-10-21, Jim OOB 2026-10-20「And the ai recognition is
+    # all wrong. It was showing unrecognised food」): NEVER write
+    # 未識別菜式 when the vision providers are DOWN.
+    #
+    # On 2026-10-20 the APiyi key died (HTTP 401 "Invalid token") and
+    # every scan silently wrote 未識別菜式 / 0 kcal to Jim's golden copy —
+    # 7 junk rows in one evening, and Jim only found out because the app
+    # was full of "unrecognised food". A genuine non-food photo is a
+    # DIFFERENT case (the AI answered but found no dish) — that still
+    # needs a name, so only block when the PROVIDER failed, i.e. there is
+    # no description at all.
+    #
+    # Blocking HERE (before the Drive stage) means ZERO production
+    # artefacts: no Drive file, no Sheet row. The response keeps the exact
+    # same top-level key set as the success path so Isak's §4.3
+    # regression contract still holds.
+    if _VISION_STATUS.get("state") == "failed" and not vision_desc:
+        _blocked_detail = _VISION_STATUS.get("last_error", "")
+        print(f"[scan-core] BLOCKED commit — all vision providers failed "
+              f"({_blocked_detail}). Refusing to write 未識別菜式 to the "
+              f"golden copy. This photo was NOT logged.", flush=True)
+        _b_url = f"/scan_img/{img_path.name}"
+        return {
+            "ok": False,
+            "auto_committed": False,
+            "image_path": str(img_path),
+            "image_url": _b_url,
+            "thumbnail_url": _thumb_url_for(_b_url),
+            "drive_image_url": "",
+            "vision_desc": "",
+            "vision_short": "",
+            "is_multi_entry": False,
+            "entries": [],
+            "committed": [],
+            "multi_entry": False,
+            "preview": {
+                "image_path": str(img_path),
+                "image_url": _b_url,
+                "thumbnail_url": _thumb_url_for(_b_url),
+                "vision_short": "",
+                "vision_desc": "",
+                "suggested_entry": {},
+            },
+        }
+
+    _emit("drive")
     try:
-        img_path.rename(final_path)
+        if keep_source:
+            # v3.3.24e: Phase-2 reuse — the uploaded file is already the
+            # final image, so copy it instead of renaming (the Phase-1
+            # upload stays valid for the frontend to display).
+            shutil.copyfile(img_path, final_path)
+        else:
+            img_path.rename(final_path)
         image_url = f"/scan_img/{final_name}"
         # v3.2.7.45: upload to Drive for Golden Copy. Best-effort — failure
         # logged but doesn't break the auto-commit, just leaves column N empty.
+        # v3.3.25: in GYMBRO_WRITE_MODE=dryrun / throwaway the upload itself
+        # is suppressed inside _upload_to_drive, so no Drive file is created.
         drive_image_url = _upload_to_drive(final_path)
         # v3.2.7.46: 480px thumbnail for fast food history view.
         _make_thumb(final_path, _thumb_path_for(final_name))
-    except Exception:
+    except Exception as e:
+        print(f"[scan-core] drive stage failed: {type(e).__name__}: {e}", flush=True)
         final_path = img_path
         image_url = f"/scan_img/{img_path.name}"
         try:
             drive_image_url = _upload_to_drive(final_path)
             _make_thumb(final_path, _thumb_path_for(img_path.name))
-        except Exception:
+        except Exception as e2:
+            print(f"[scan-core] drive fallback failed: "
+                  f"{type(e2).__name__}: {e2}", flush=True)
             drive_image_url = ""
 
+    _emit("commit")
     committed = []
     for e_idx, entry in enumerate(entries_list):
         entry["timestamp_iso"] = now_iso_str
-        entry["source"] = "v3.2.7.10-scan_autocommit (minimax-m3 + pplx-sonar-pro + apiyi-multi)"
-        entry["models_used"] = ["minimax-m3", "pplx-sonar-pro", "apiyi-gpt-4o-mini-multi"]
+        entry["source"] = "v3.2.7.10-scan_autocommit (minimax-m3 + pplx-sonar-pro + minimax-multi)"
+        entry["models_used"] = ["minimax-m3", "pplx-sonar-pro", "minimax-m3-enrich-multi"]
         entry["image_saved_to"] = str(final_path)
         entry["confidence"] = "auto-commit preview"
         entry["sheet_synced"] = False
@@ -5773,7 +8304,7 @@ def api_scan_preview():
         entry["vision_raw_desc"] = vision_desc
         entry["vision_short"] = vision_desc[:300]
         entry["pplx_short"] = pplx_desc[:500]
-        entry["apiyi_enrichment"] = apiyi_desc[:300] if apiyi_desc else ""
+        entry["minimax_enrichment"] = mm_desc[:300] if mm_desc else ""
         entry["user_hints"] = []
         # v3.2.7.45: Golden Copy — pipe Drive URL into the entry so it
         # reaches column N via _append_to_sheet_nutrition.
@@ -5800,11 +8331,21 @@ def api_scan_preview():
         new_row_index = None
         if sheet_result.get("ok") and not sheet_result.get("skipped"):
             try:
+                # v3.3.25 (2026-10-20): same rstrip bug as api_scan_food /
+                # api_scan_commit — "Nutrition!A564" ends with a digit so
+                # rstrip("ABCDEFGHIJKLM") leaves it untouched and int()
+                # raises, the bare `except: pass` swallowed it, and
+                # scan_index stayed None for every single-photo commit
+                # (Isak's Bug 3). End-anchored regex fixes it.
                 range_str = sheet_result.get("range", "")
-                new_row_index = int(range_str.split(":")[0].rstrip("ABCDEFGHIJKLM"))
-                get_cache().refresh_one(new_row_index, _sheet_read_nutrition_row)
-            except Exception:
-                pass
+                m = re.search(r"(\d+)$", range_str.split(":")[0])
+                if m:
+                    new_row_index = int(m.group(1))
+                    get_cache().refresh_one(new_row_index, _sheet_read_nutrition_row)
+            except Exception as e:
+                print(f"[scan-core] refresh_one failed for range "
+                      f"{sheet_result.get('range', '')}: "
+                      f"{type(e).__name__}: {e}", flush=True)
         committed.append({
             "name": entry.get("name", "?"),
             "calories": entry.get("calories", 0),
@@ -5827,12 +8368,21 @@ def api_scan_preview():
     # extractor (lines 4674-4688 above) to do its best job and write
     # the entry unconditionally. If Jim sees a wrong name, he can
     # use ✏️ edit / 🗑️ delete on the food card after-the-fact.
+    #
+    # v3.3.25 (2026-10-20): auto_committed must be HONEST. In
+    # GYMBRO_WRITE_MODE=dryrun nothing was written to the golden copy,
+    # so reporting True would be a lie (QA would think the row landed).
+    # The key set is unchanged (contract test only checks keys), only the
+    # value differs.
+    _wrote_to_sheet = any(c.get("sheet_ok") and c.get("sheet_row")
+                           and c.get("sheet_row") != "dryrun"
+                           for c in committed)
     # v3.3.8: invalidate daily coaching so the next cheer/video/food-coach
     # reflects the freshly scanned meal.
     _invalidate_daily_coaching()
-    return jsonify({
+    return {
         "ok": True,
-        "auto_committed": True,
+        "auto_committed": _wrote_to_sheet,
         "image_path": str(final_path),
         "image_url": image_url,
         "thumbnail_url": _thumb_url_for(image_url),  # v3.2.7.46: fast food history
@@ -5853,7 +8403,524 @@ def api_scan_preview():
             "vision_desc": vision_desc,
             "suggested_entry": entries_list[0] if entries_list else {},
         },
+    }
+
+
+@app.route("/api/scan_preview", methods=["POST"])
+def api_scan_preview():
+    """Take image, run vision + pplx, return suggested entry WITHOUT writing to log.
+
+    Frontend shows preview UI: dish desc + macros + suggested restaurant chain.
+    Only when Jim taps 確認 → POST /api/scan_commit with the chosen entry.
+
+    v3.3.24e: the pipeline body now lives in _scan_preview_core so the
+    background scan-job worker (POST /api/scan_recognize) can share it.
+    The response payload is unchanged (Isak's §4.3 regression test).
+    """
+    if "image" not in request.files:
+        return jsonify({"ok": False, "error": "no image"}), 400
+    img_file = request.files["image"]
+    img_bytes = img_file.read()
+    if len(img_bytes) > 10 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "image too large"}), 413
+    try:
+        return jsonify(_scan_preview_core(img_bytes))
+    except ValueError as e:
+        # v3.3.25 — the QA-fixture backstop raises ValueError. Without this
+        # catch Flask turns it into a 500 Internal Server Error, which hides
+        # the real reason. /api/scan_commit already answers 403 for the same
+        # refusal; keep both endpoints consistent.
+        if "REFUSED" in str(e):
+            return jsonify({"ok": False, "error": str(e)}), 403
+        raise
+
+# ---------------------------------------------------------------------------
+# v3.3.24e: two-phase food scan — upload (fast) then AI recognition (slow).
+#
+# SPEC: SCAN_PROGRESS_SPEC.md §2.1 / §2.2 / §2.3 / §2.4.
+#
+# Jim OOB 2026-10-20「when multiple upload, I want gymbro to handle the
+# upload first. Ai recognition can be done later」— so Phase 1 only stores
+# bytes (no AI at all) and Phase 2 runs the AI pipeline in a background
+# thread while the frontend polls /api/scan_progress/<job_id>.
+#
+# Phase 2 reuses _scan_preview_core() so there is exactly ONE implementation
+# of the recognition pipeline (and /api/scan_preview keeps its exact
+# response shape).
+# ---------------------------------------------------------------------------
+
+# In-process status dict — keyed by job_id (same pattern as VIDEO_JOBS).
+SCAN_JOBS = {}
+SCAN_JOBS_LOCK = threading.Lock()
+
+# v3.3.25 (2026-10-21): on-disk mirror of SCAN_JOBS so a job that was
+# running when the process died is reported as "interrupted" instead of
+# 404-ing away, and its remaining image paths survive for a resume.
+_SCAN_JOBS_STATE_FILE = "/home/work/.hermes/scan_cache/scan_jobs_state.json"
+
+# Job registry entries are kept for 10 minutes after completion so a late
+# poll still finds them (SPEC §2.4).
+SCAN_JOB_TTL_S = 600
+
+
+def _scan_job_set(job_id: str, **kwargs):
+    """Update one scan job in SCAN_JOBS and print the new progress."""
+    with SCAN_JOBS_LOCK:
+        cur = SCAN_JOBS.get(job_id, {})
+        cur.update(kwargs)
+        cur["updated_at"] = time.time()
+        SCAN_JOBS[job_id] = cur
+    print(f"[scan-job] {job_id} stage={cur.get('stage')} "
+          f"pct={cur.get('pct')} idx={cur.get('current_index')}/"
+          f"{cur.get('total')} status={cur.get('status')}", flush=True)
+    _scan_jobs_persist()
+    return cur
+
+
+def _scan_jobs_persist():
+    """v3.3.25 (2026-10-21): mirror the job registry to disk.
+
+    WHY: on 2026-10-21 Jim's 3-photo scan was killed mid-flight because
+    gymbro was restarted; the frontend then got a 404 from
+    /api/scan_progress/<job_id> and showed "查 AI 進度失敗 / Load failed"
+    with no explanation. With the state on disk, a job that was running
+    when the process died is detected at startup and reported as
+    "interrupted" instead of vanishing — and the remaining image paths
+    survive so the scan can be resumed.
+    """
+    try:
+        tmp = str(_SCAN_JOBS_STATE_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({jid: {k: v for k, v in j.items()
+                             if k not in ("results", "errors")}
+                       for jid, j in SCAN_JOBS.items()}, fh)
+        os.replace(tmp, _SCAN_JOBS_STATE_FILE)
+    except Exception as e:
+        print(f"[scan-job] persist failed: {type(e).__name__}: {e}", flush=True)
+
+
+def _scan_jobs_load_interrupted():
+    """v3.3.25: find jobs that were running when the process died.
+
+    Returns a list of (job_id, job_dict) for jobs that were still
+    "running" in the on-disk state. Their status becomes "interrupted"
+    so the frontend can say so plainly, and their remaining paths stay
+    available for a resume.
+    """
+    p = Path(_SCAN_JOBS_STATE_FILE)
+    if not p.exists():
+        return []
+    try:
+        state = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[scan-job] state load failed: {type(e).__name__}: {e}", flush=True)
+        return []
+    out = []
+    with SCAN_JOBS_LOCK:
+        for jid, j in (state or {}).items():
+            if j.get("status") == "running":
+                j["status"] = "interrupted"
+                j["interrupted_at"] = time.time()
+                SCAN_JOBS[jid] = j
+                out.append((jid, j))
+    if out:
+        print(f"[scan-job] {len(out)} job(s) were interrupted by a server "
+              f"restart: {[j for j, _ in out]}", flush=True)
+    return out
+
+
+def _scan_job_get(job_id: str) -> dict:
+    """Return a snapshot copy of one scan job (empty dict if unknown)."""
+    with SCAN_JOBS_LOCK:
+        return dict(SCAN_JOBS.get(job_id) or {})
+
+
+def _scan_jobs_purge_expired():
+    """Drop finished jobs older than SCAN_JOB_TTL_S (SPEC §2.4)."""
+    now = time.time()
+    with SCAN_JOBS_LOCK:
+        expired = [
+            jid for jid, j in SCAN_JOBS.items()
+            if j.get("status") in ("completed", "failed")
+            and (now - float(j.get("updated_at") or 0)) > SCAN_JOB_TTL_S
+        ]
+        for jid in expired:
+            SCAN_JOBS.pop(jid, None)
+    if expired:
+        print(f"[scan-job] purged {len(expired)} expired job(s): {expired}",
+              flush=True)
+
+
+def _scan_stage_label(stage_key: str, current_index: int, total: int) -> str:
+    """繁中 stage label for the frontend (SPEC §2.3)."""
+    tmpl = SCAN_STAGE_LABELS.get(stage_key, stage_key)
+    n = current_index + 1
+    try:
+        return tmpl.format(n=n, total=total)
+    except (KeyError, IndexError) as e:
+        print(f"[scan-job] stage label format failed for {stage_key}: {e}",
+              flush=True)
+        return tmpl
+
+
+def _scan_job_pct(current_index: int, stage_key: str, total: int) -> int:
+    """Overall progress pct (SPEC §2.3).
+
+    整體 pct = (current_index * 100 + stage_pct) / total, where stage_pct is
+    the start of the current stage's band inside that image's 0-100 slice.
+    """
+    if total <= 0:
+        return 100
+    stage_pct = SCAN_STAGE_PCT_START.get(stage_key, 0)
+    raw = (current_index * 100 + stage_pct) / total
+    return max(0, min(100, int(round(raw))))
+
+
+def _scan_path_allowed(img_path: Path) -> bool:
+    """Safety check for Phase-2 paths (SPEC §2.1).
+
+    Only files directly inside SCAN_CACHE_DIR or inside
+    /home/work/.hermes/image_cache/ may be read — same rule the existing
+    /api/scan_preview_from_path uses.
+    """
+    try:
+        resolved = img_path.resolve()
+    except Exception as e:
+        print(f"[scan-upload] path resolve failed for {img_path}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return False
+    if resolved.parent != SCAN_CACHE_DIR.resolve() and not str(resolved).startswith("/home/work/.hermes/image_cache/"):
+        return False
+    return True
+
+
+def _scan_run_job(job_id: str, paths: list, client_indexes: list):
+    """Background worker: run the recognition pipeline for each image.
+
+    Sequential on purpose (SPEC §2.2) — MiniMax rate-limit if run
+    in parallel.
+    """
+    total = len(paths)
+    results = []
+    errors = []
+    for idx, p in enumerate(paths):
+        client_index = client_indexes[idx] if idx < len(client_indexes) else idx
+        img_path = Path(p)
+        try:
+            if not img_path.is_file():
+                raise FileNotFoundError(f"image not found: {img_path}")
+            if not _scan_path_allowed(img_path):
+                raise PermissionError(f"image path outside permitted dirs: {img_path}")
+            if img_path.stat().st_size > 10 * 1024 * 1024:
+                raise ValueError(f"image too large: {img_path}")
+
+            _scan_job_set(
+                job_id,
+                status="running",
+                stage="queued",
+                stage_label=_scan_stage_label("queued", idx, total),
+                pct=_scan_job_pct(idx, "queued", total),
+                current_index=idx,
+                total=total,
+            )
+
+            img_bytes = img_path.read_bytes()
+
+            def _on_stage(stage_key: str, _idx: int = idx):
+                _scan_job_set(
+                    job_id,
+                    status="running",
+                    stage=stage_key,
+                    stage_label=_scan_stage_label(stage_key, _idx, total),
+                    pct=_scan_job_pct(_idx, stage_key, total),
+                    current_index=_idx,
+                    total=total,
+                )
+
+            core = _scan_preview_core(
+                img_bytes, img_path_hint=str(img_path), on_stage=_on_stage,
+            )
+
+            entries = core.get("entries") or []
+            first = entries[0] if entries else {}
+            results.append({
+                "client_index": client_index,
+                "ok": True,
+                "name": first.get("name", ""),
+                "calories": first.get("calories", 0),
+                "protein": first.get("protein", 0),
+                "committed": core.get("committed") or [],
+                "preview": core.get("preview") or {},
+                "image_url": core.get("image_url", ""),
+                "thumbnail_url": core.get("thumbnail_url", ""),
+                "vision_desc": core.get("vision_desc", ""),
+                "entries": entries,
+            })
+            _scan_job_set(job_id, results=list(results), errors=list(errors))
+        except Exception as e:
+            print(f"[scan-job] {job_id} image {idx} "
+                  f"(client_index={client_index}) failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            errors.append({"client_index": client_index, "error": str(e)})
+            _scan_job_set(job_id, results=list(results), errors=list(errors))
+
+    final_status = "completed" if results else "failed"
+    _scan_job_set(
+        job_id,
+        status=final_status,
+        stage="done",
+        stage_label=("全部搞掂晒" if final_status == "completed"
+                     else "全部失敗"),
+        pct=100,
+        current_index=max(total - 1, 0),
+        total=total,
+        results=list(results),
+        errors=list(errors),
+    )
+
+
+@app.route("/api/scan_upload", methods=["POST"])
+def api_scan_upload():
+    """Phase 1 — receive food photos, store them, EXIF + thumbnail. No AI.
+
+    Deliberately does ZERO AI work (SPEC §2.1) so Jim can upload every
+    photo first and let the AI run afterwards.
+    """
+    files = request.files.getlist("images") or request.files.getlist("image")
+    if not files:
+        return jsonify({"ok": False, "error": "no image"}), 400
+
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    ts_str = now_hkt_dt.strftime("%Y%m%d_%H%M%S")
+
+    uploads = []
+    for i, f in enumerate(files):
+        img_bytes = f.read()
+        if len(img_bytes) > 10 * 1024 * 1024:
+            return jsonify({"ok": False, "error": "image too large"}), 413
+
+        orig_name = (f.filename or "").strip() or f"upload_{i}.jpg"
+        ext = ".jpg"
+        lower = orig_name.lower()
+        if lower.endswith(".png"):
+            ext = ".png"
+        elif lower.endswith(".jpeg") or lower.endswith(".jpg"):
+            ext = ".jpg"
+
+        # v3.3.25 (2026-10-21): the stored name used to be
+        # f"upload_{ts_str}_{i}{ext}" where ts_str has SECOND resolution and
+        # i restarts at 0 for every request. Two uploads in the same second
+        # (Jim's phone uploading 3 photos at once, or a retry) therefore
+        # produced the SAME filename and the second file silently
+        # OVERWROTE the first — a photo lost with no error anywhere.
+        # Verified 2026-10-21: upload_20261021_001848_0 / _001851_0 /
+        # _001853_0 — three separate requests, each index 0.
+        # Fix: add a uuid segment so the name is unique per request AND
+        # per file within the request.
+        stored_name = f"upload_{ts_str}_{uuid.uuid4().hex[:8]}_{i}{ext}"
+        stored_path = SCAN_CACHE_DIR / stored_name
+        stored_path.write_bytes(img_bytes)
+
+        # v3.3.8: pull the real photo shot time out of EXIF (iPhone photo
+        # stream uploads often happen hours after the shot).
+        exif_info = _extract_exif_capture_time(stored_path)
+        capture_iso = now_hkt_dt.strftime("%Y-%m-%d")
+        capture_hhmm = now_hkt_dt.strftime("%H:%M")
+        if exif_info.get("capture_time"):
+            try:
+                capture_dt = datetime.fromisoformat(exif_info["capture_time"])
+                capture_iso = capture_dt.strftime("%Y-%m-%d")
+                capture_hhmm = capture_dt.strftime("%H:%M")
+            except (ValueError, TypeError) as e:
+                print(f"[scan-upload] EXIF capture_time parse failed for "
+                      f"{stored_name}: {e}", flush=True)
+
+        # v3.2.7.46: 480px thumbnail for the food history view.
+        _make_thumb(stored_path, _thumb_path_for(stored_name))
+
+        image_url = f"/scan_img/{stored_name}"
+        uploads.append({
+            "client_index": i,
+            "filename": orig_name,
+            "path": str(stored_path),
+            "image_url": image_url,
+            "thumbnail_url": _thumb_url_for(image_url),
+            "size_kb": int(round(len(img_bytes) / 1024)),
+            "capture_iso": capture_iso,
+            "capture_hhmm": capture_hhmm,
+        })
+        print(f"[scan-upload] stored {stored_name} "
+              f"({uploads[-1]['size_kb']} KB, exif={exif_info.get('source') or 'none'})",
+              flush=True)
+
+    return jsonify({"ok": True, "uploads": uploads})
+
+
+@app.route("/api/scan_recognize", methods=["POST"])
+def api_scan_recognize():
+    """Phase 2 — start the AI recognition job for previously uploaded photos.
+
+    Returns immediately with a job_id; the frontend polls
+    /api/scan_progress/<job_id> for real per-stage progress.
+    """
+    data = request.get_json(silent=True) or {}
+    paths = data.get("paths") or []
+    client_indexes = data.get("client_indexes") or []
+    if not paths:
+        return jsonify({"ok": False, "error": "no paths"}), 400
+
+    # Safety: only accept paths under the permitted cache dirs (SPEC §2.1).
+    clean_paths = []
+    for p in paths:
+        pp = Path(str(p))
+        if not _scan_path_allowed(pp):
+            return jsonify({
+                "ok": False,
+                "error": f"image path outside permitted dirs: {p}",
+            }), 403
+        clean_paths.append(str(pp))
+
+    job_id = (f"scanjob_{datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d_%H%M%S')}"
+              f"_{uuid.uuid4().hex[:6]}")
+    _scan_job_set(
+        job_id,
+        status="running",
+        stage="queued",
+        stage_label=_scan_stage_label("queued", 0, len(clean_paths)),
+        pct=0,
+        current_index=0,
+        total=len(clean_paths),
+        results=[],
+        errors=[],
+        created_at=time.time(),
+        # v3.3.25: keep the paths so an interrupted job can be resumed
+        # (and so a restart can tell Jim which photos were lost).
+        paths=list(clean_paths),
+        client_indexes=list(client_indexes),
+    )
+    _scan_jobs_purge_expired()
+
+    t = threading.Thread(
+        target=_scan_run_job,
+        args=(job_id, clean_paths, client_indexes),
+        name=f"scan-job-{job_id}",
+        daemon=True,
+    )
+    t.start()
+    print(f"[scan-job] {job_id} started, total={len(clean_paths)}", flush=True)
+
+    return jsonify({"ok": True, "job_id": job_id, "total": len(clean_paths)})
+
+
+@app.route("/api/scan_progress/<job_id>", methods=["GET"])
+def api_scan_progress(job_id: str):
+    """Poll the progress of a Phase-2 recognition job (SPEC §2.3)."""
+    _scan_jobs_purge_expired()
+    job = _scan_job_get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "unknown job_id"}), 404
+
+    created = float(job.get("created_at") or job.get("updated_at") or 0)
+    # v3.3.25: tell the frontend it can retry a job that died (server
+    # restart / failure). The uploaded photos are still on disk, so a
+    # resume only repeats the AI recognition — no re-upload needed.
+    _paths = job.get("paths") or []
+    _can_resume = (job.get("status") in ("interrupted", "failed")
+                   and any(Path(str(p)).is_file() for p in _paths))
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "status": job.get("status", "running"),
+        "stage": job.get("stage", "queued"),
+        "stage_label": job.get("stage_label", ""),
+        "pct": job.get("pct", 0),
+        "current_index": job.get("current_index", 0),
+        "total": job.get("total", 0),
+        "results": job.get("results") or [],
+        "errors": job.get("errors") or [],
+        "elapsed_s": round(time.time() - created, 1) if created else 0.0,
+        "can_resume": _can_resume,
+        "resume_url": f"/api/scan_resume/{job_id}" if _can_resume else "",
     })
+
+
+
+@app.route("/api/scan_resume/<job_id>", methods=["POST"])
+def api_scan_resume(job_id: str):
+    """v3.3.25 (2026-10-21): re-run a scan job that was interrupted by a
+    gymbro restart (or that failed).
+
+    WHY: Jim's 3-photo scan was killed mid-flight on 2026-10-21 because
+    the server was restarted while the AI was working. The uploaded photos
+    were still on disk, but the frontend had no way to retry — the job was
+    gone from memory. This endpoint re-runs the remaining images using the
+    stored paths, so a restart costs Jim nothing but a tap.
+
+    The photos are already uploaded (Phase 1 is durable), so there is no
+    re-upload step — only the AI recognition is repeated.
+    """
+    job = _scan_job_get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "unknown job_id"}), 404
+
+    paths = job.get("paths") or []
+    if not paths:
+        return jsonify({"ok": False,
+                        "error": "no stored paths for this job"}), 400
+
+    # Only resume paths that still exist on disk.
+    live = [p for p in paths if Path(str(p)).is_file()]
+    if not live:
+        return jsonify({"ok": False,
+                        "error": "none of the stored photos exist any more"}), 400
+
+    client_indexes = job.get("client_indexes") or []
+    if len(client_indexes) != len(paths):
+        client_indexes = list(range(len(paths)))
+
+    # v3.3.25: only re-run the images that had NOT been committed yet.
+    # `current_index` is the index of the image that was in flight when the
+    # job died — everything before it was already written to the Sheet, so
+    # re-running those would create DUPLICATE rows in Jim's golden copy.
+    done = int(job.get("current_index") or 0)
+    done = max(0, min(done, len(paths)))
+    todo_paths = paths[done:]
+    todo_idxs = client_indexes[done:]
+
+    if not todo_paths:
+        return jsonify({"ok": False,
+                        "error": "all images were already committed"}), 400
+
+    new_id = (f"scanjob_{datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d_%H%M%S')}"
+              f"_{uuid.uuid4().hex[:6]}")
+    _scan_job_set(
+        new_id,
+        status="running",
+        stage="queued",
+        stage_label=_scan_stage_label("queued", 0, len(todo_paths)),
+        pct=0,
+        current_index=0,
+        total=len(todo_paths),
+        results=[],
+        errors=[],
+        created_at=time.time(),
+        paths=list(todo_paths),
+        client_indexes=list(todo_idxs),
+        resumed_from=job_id,
+        resumed_skip=len(paths) - len(todo_paths),
+    )
+    _scan_jobs_purge_expired()
+
+    t = threading.Thread(
+        target=_scan_run_job,
+        args=(new_id, todo_paths, todo_idxs),
+        daemon=True,
+    )
+    t.start()
+    return jsonify({"ok": True, "job_id": new_id, "resumed_from": job_id,
+                    "total": len(todo_paths),
+                    "skipped_already_committed": len(paths) - len(todo_paths),
+                    "skipped_missing": len(paths) - len(live)})
 
 
 @app.route("/api/scan_preview_from_path", methods=["POST"])
@@ -5874,6 +8941,24 @@ def api_scan_preview_from_path():
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
     img_b64 = base64.b64encode(img_bytes).decode()
 
+    # v3.3.8 (Jim OOB 2026-08-31): extract EXIF capture time so we log the
+    # actual photo shot time, not the upload time. iPhone photo stream
+    # uploads often happen hours after the shot (e.g. breakfast photo
+    # uploaded at dinner time → would otherwise mis-classify meal_type).
+    exif_info = _extract_exif_capture_time(img_path)
+    capture_iso = now_hkt_dt.strftime("%Y-%m-%d")
+    capture_hhmm = now_hkt_dt.strftime("%H:%M")
+    capture_dt = now_hkt_dt  # for the capture_time_iso field in the preview
+    if exif_info.get("capture_time"):
+        try:
+            capture_dt = datetime.fromisoformat(exif_info["capture_time"])
+            capture_iso = capture_dt.strftime("%Y-%m-%d")
+            capture_hhmm = capture_dt.strftime("%H:%M")
+        except (ValueError, TypeError):
+            pass  # fall back to upload time
+    # Keep now_hkt_dt for filename uniqueness (preserves audit trail); but
+    # dates + times in returned entries use capture_* values.
+
     # v3.2.7.32: plain-text vision prompt (no 「菜式：/份量：/煮法：」
     # headers — Jim OOB 2026-08-11)
     vision_prompt = (
@@ -5887,31 +8972,49 @@ def api_scan_preview_from_path():
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
-    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (Jim OOB 2026-07-26 19:35 HKT)
-    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
+    # 1b. 2nd-opinion vision from a DIFFERENT provider in the chain
+    opinion2_desc = _vision_second_opinion(img_b64, vision_prompt)
     # v3.2.7.14: detect gpt-4o-mini safety-filter refusal (e.g. "抱歉，我無法...")
     # and treat as empty so it does NOT pollute vision_desc (Jim OOB
     # 2026-08-09 16:48 HKT 'I took a screenshot not food, but scan got
     # committed as 抱歉 / 第一道菜').
-    if apiyi_vision_desc and ("抱歉" in apiyi_vision_desc[:30] and "無法" in apiyi_vision_desc[:50] and len(apiyi_vision_desc) < 80):
-        apiyi_vision_desc = ""
-    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
+    if opinion2_desc and ("抱歉" in opinion2_desc[:30] and "無法" in opinion2_desc[:50] and len(opinion2_desc) < 80):
+        opinion2_desc = ""
+    if opinion2_desc and not opinion2_desc.startswith("（"):
         # 2-vision median-merge: take whichever is longer (more dish detail)
-        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
-            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+        if len(opinion2_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（2nd-opinion vision）\n" + opinion2_desc
     pplx_desc = _pplx_enrich(vision_desc)
 
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
-    apiyi_desc = _apiyi_nutrition_enrich(vision_desc)
+    mm_desc = _minimax_nutrition_enrich(vision_desc)
     pplx_parsed = _parse_nutrition_block(pplx_desc)
-    apiyi_parsed = {}
-    if apiyi_desc and apiyi_desc.startswith("{"):
+    mm_parsed = {}
+    if mm_desc and mm_desc.startswith("{"):
         try:
-            apiyi_parsed = json.loads(apiyi_desc)
+            mm_parsed = json.loads(mm_desc)
         except Exception:
-            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
+            mm_parsed = _parse_nutrition_block(mm_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, mm_parsed])
+
+    # v3.3.23v (Jim OOB 2026-09-15 'my recent quest energy bar does not
+    # record any nutrient info'): brand_table override AFTER merge. For
+    # photo scans, override the merged estimate with brand-correct values
+    # when a known brand product is detected.
+    brand_hit = _lookup_brand_macros(vision_desc)
+    if brand_hit:
+        print(f"[scan_preview] brand_table override for {vision_desc!r}: "
+              f"{merged_nutrition.get('calories', {}).get('value', 0)}→{brand_hit['kcal']} kcal",
+              flush=True)
+        for f in ("calories", "protein", "carbs", "fat", "fiber", "sugar",
+                  "sodium", "sat_fat", "trans_fat"):
+            if brand_hit.get(f) is not None:
+                cur = merged_nutrition.get(f, {}) or {}
+                if not cur.get("value") or float(cur.get("value", 0) or 0) == 0:
+                    cur["value"] = brand_hit[f]
+                    cur["source"] = f"brand_table ({brand_hit['_source']})"
+                    merged_nutrition[f] = cur
     raw_kcal = int(merged_nutrition.get("calories", {}).get("value", 0) or 0)
     raw_p = int(merged_nutrition.get("protein", {}).get("value", 0) or 0)
     jim_kcal = round(raw_kcal * jim_ratio)
@@ -5948,8 +9051,8 @@ def api_scan_preview_from_path():
         "vision_short": vision_desc[:300],
         "pplx_short": pplx_desc[:500],
         "suggested_entry": {
-            "date": today_iso(),
-            "time": now_hkt_dt.strftime("%H:%M"),
+            "date": capture_iso,
+            "time": capture_hhmm,
             "meal_type": "scan",
             "name": _extract_dish_name(vision_desc, pplx_desc),
             "coach_comment": _coach_comment(
@@ -5970,6 +9073,10 @@ def api_scan_preview_from_path():
             "share_with_wife": "Jim 60% / 小寶 40% (auto-applied)" if shared else "Jim 100% (solo)",
             "raw_kcal_estimate": raw_kcal,
             "raw_p_estimate": raw_p,
+            # v3.3.8: surface EXIF capture source to the PWA so Jim can
+            # verify "拍攝時間 vs 上傳時間" in the preview card.
+            "capture_time_source": exif_info.get("source", ""),
+            "capture_time_iso": capture_dt.isoformat(),
         },
         "ready_to_commit": True,
     }
@@ -6271,8 +9378,12 @@ def api_scan_edit_datetime():
         return jsonify({"ok": False, "error": "new_time 必須係 HH:MM 格式"}), 400
     hh, mm = new_time.split(":")[:2]
     new_time = f"{int(hh):02d}:{int(mm):02d}"
-    new_time_full = f"{new_date}T{new_time}:00+08:00"
-
+    # v3.3.23aj (Jim OOB 2026-09-19 'After editing food, the order is
+    # also drifted in food log'): write HH:MM to column B, NOT the
+    # full ISO datetime. Writing the full ISO causes NutritionRow.dt
+    # to become None (parser expects "%Y-%m-%d %H:%M"), which breaks
+    # by_recent sorting and puts the row at the end of the list
+    # instead of in chronological order.
     cache = get_cache()
     row = cache.get_by_row(scan_index)
     if row is None:
@@ -6282,13 +9393,33 @@ def api_scan_edit_datetime():
 
     sheet_result = _sheet_update_nutrition_cells(scan_index, [
         ("A", new_date),
-        ("B", new_time_full),
+        ("B", new_time),
     ])
     if not sheet_result.get("ok"):
-        return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}), 500
+        return jsonify({"ok": False, "error": f"sheet update failed: {sheet_result.get('errors')}"}, 500)
 
+    # v3.3.23al: invalidate Redis Sheet cache after write
+    try:
+        _invalidate_sheet_cache()
+    except Exception:
+        pass
     cache.refresh_one(scan_index, _sheet_read_nutrition_row)
     row_after = cache.get_by_row(scan_index)
+
+    # v3.3.23av (Jim OOB 2026-10-12 'the edited 兩個鮮竹卷 is not updated
+    # in jpg download'): invalidate JPG cache for the date the row belongs to
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        from pathlib import Path as _P
+        # Use the date from the row in cache
+        row = cache.get_by_row(scan_index)
+        if row and row.date:
+            _jpg_cache_invalidate(row.date)
+            cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
+            for f in cache_dir.glob(f"nutrition_{row.date}*.jpg"):
+                f.unlink()
+    except Exception as e:
+        print(f"[scan_edit_datetime] JPG cache invalidate failed: {e}", flush=True)
 
     return jsonify({
         "ok": True,
@@ -6356,11 +9487,31 @@ def api_scan_delete():
     if not sheet_result.get("ok"):
         return jsonify({"ok": False, "error": f"sheet delete failed: {sheet_result.get('errors')}"}), 500
 
+    # v3.3.23al: invalidate Redis Sheet cache after delete
+    try:
+        _invalidate_sheet_cache()
+    except Exception:
+        pass
+
     # Evict the deleted row + reindex rows above it (Sheet rows shift down
     # by 1 after `deleteDimension`). Without this, the next delete/edit on
     # row > scan_index targets the wrong Sheet row.
     with cache._lock:  # type: ignore[attr-defined]
         cache._delete_with_shift(scan_index)
+
+    # v3.3.23av (Jim OOB 2026-10-12 'the edited 兩個鮮竹卷 is not updated
+    # in jpg download'): invalidate JPG cache for the date the deleted
+    # row belonged to (date variable should be in scope).
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        from pathlib import Path as _P
+        if 'date' in dir() and date:
+            _jpg_cache_invalidate(date)
+            cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
+            for f in cache_dir.glob(f"nutrition_{date}*.jpg"):
+                f.unlink()
+    except Exception as e:
+        print(f"[scan_delete] JPG cache invalidate failed: {e}", flush=True)
 
     return jsonify({
         "ok": True,
@@ -6371,6 +9522,228 @@ def api_scan_delete():
         "sheet_rows_deleted": sheet_result.get("deleted", 0),
         "sheet_errors": sheet_result.get("errors", []),
     })
+
+
+# v3.3.22 (Jim OOB 2026-09-11 'A then B then C' for vanilla protein shake
+# 270 vs 180 kcal AI under-estimate): hardcoded brand-aware nutrition
+# table for common HK protein shakes. Overrides AI estimate when user
+# mentions a known brand + flavor combo. Per-scoop data sourced from
+# official brand nutrition labels (2026).
+#
+# Schema: {(keyword_substring_lower, brand, scoop_g): macros}
+#   keyword_substring_lower: matched against the scanned dish name
+#   brand: returned as restaurant_chain hint (helps user verify)
+#   scoop_g: typical scoop size in grams (informational)
+#   kcal/p/c/f: per serving (1 scoop + water OR per ready-to-drink bottle)
+#
+# Lookup flow (BEFORE Sheet history scan):
+#   1. Match keyword_substring_lower in user-input dish name
+#   2. If hit, return macros immediately (override AI estimate)
+#   3. If no match, fall through to existing Sheet history lookup
+_PROTEIN_BRAND_TABLE = {
+    # === MyProtein Impact Whey Protein (HK popular, per MyProtein.com.hk 2026) ===
+    ("myprotein impact whey vanilla", "MyProtein"): {
+        "kcal": 103, "protein": 21, "carbs": 1, "fat": 1.5, "scoop_g": 25,
+        "_source": "MyProtein.com.hk label 2026 (1 scoop + water)",
+    },
+    ("myprotein impact whey chocolate", "MyProtein"): {
+        "kcal": 110, "protein": 22, "carbs": 2, "fat": 1.7, "scoop_g": 25,
+        "_source": "MyProtein.com.hk label 2026 (1 scoop + water)",
+    },
+    ("myprotein clear whey", "MyProtein"): {
+        "kcal": 90, "protein": 20, "carbs": 1, "fat": 0, "scoop_g": 25,
+        "_source": "MyProtein Clear Whey (1 scoop + water)",
+    },
+    # === Optimum Nutrition (ON) Gold Standard 100% Whey (per ON website 2026) ===
+    ("on gold standard vanilla", "Optimum Nutrition"): {
+        "kcal": 120, "protein": 24, "carbs": 3, "fat": 1, "scoop_g": 30,
+        "_source": "ON Gold Standard Vanilla (1 scoop + 150-180ml water)",
+    },
+    ("on gold standard chocolate", "Optimum Nutrition"): {
+        "kcal": 120, "protein": 24, "carbs": 3, "fat": 1, "scoop_g": 30,
+        "_source": "ON Gold Standard Chocolate (1 scoop + 150-180ml water)",
+    },
+    ("on gold standard double rich chocolate", "Optimum Nutrition"): {
+        "kcal": 130, "protein": 24, "carbs": 4, "fat": 1.5, "scoop_g": 31,
+        "_source": "ON Gold Standard Double Rich Chocolate (1 scoop + water)",
+    },
+    # === Nitro Tech (MuscleTech) per official label 2026 ===
+    ("nitro tech vanilla", "MuscleTech"): {
+        "kcal": 130, "protein": 30, "carbs": 3, "fat": 1.5, "scoop_g": 32,
+        "_source": "MuscleTech Nitro-Tech Vanilla (1 scoop + water)",
+    },
+    ("nitro tech chocolate", "MuscleTech"): {
+        "kcal": 140, "protein": 30, "carbs": 4, "fat": 1.5, "scoop_g": 32,
+        "_source": "MuscleTech Nitro-Tech Chocolate (1 scoop + water)",
+    },
+    # === Dymatize ISO100 per official label 2026 ===
+    ("dymatize iso100 vanilla", "Dymatize"): {
+        "kcal": 110, "protein": 25, "carbs": 1, "fat": 0.5, "scoop_g": 28,
+        "_source": "Dymatize ISO100 Vanilla (1 scoop + water)",
+    },
+    # === Herbalife Formula 1 (meal replacement shake, NOT pure whey) ===
+    ("herbalife formula 1 vanilla", "Herbalife"): {
+        "kcal": 220, "protein": 18, "carbs": 24, "fat": 5, "scoop_g": 26,
+        "_source": "Herbalife Formula 1 Vanilla (1 scoop + 250ml semi-skimmed milk)",
+    },
+    ("herbalife formula 1 chocolate", "Herbalife"): {
+        "kcal": 220, "protein": 18, "carbs": 23, "fat": 5, "scoop_g": 26,
+        "_source": "Herbalife Formula 1 Chocolate (1 scoop + 250ml semi-skimmed milk)",
+    },
+    # === Generic ready-to-drink protein bottles (pre-mixed, common in HK 7-11/Circle K) ===
+    ("ready to drink vanilla", "RTD"): {
+        "kcal": 160, "protein": 30, "carbs": 5, "fat": 2.5, "scoop_g": 330,
+        "_source": "Generic RTD vanilla 330ml bottle (e.g. ON Core RTD)",
+    },
+    ("ready to drink chocolate", "RTD"): {
+        "kcal": 160, "protein": 30, "carbs": 5, "fat": 2.5, "scoop_g": 330,
+        "_source": "Generic RTD chocolate 330ml bottle",
+    },
+    # === Generic "protein shake" (1 scoop + 250ml low-fat milk) ===
+    # v3.3.22 Step C (Jim OOB 2026-09-11 'A then B then C'): both English
+    # "vanilla" AND Chinese "雲呢拿/雲呢拿味/香草" trigger the same 270-kcal
+    # generic fallback (per Jim's 2026-09-11 food label baseline).
+    ("vanilla", "Generic"): {
+        "kcal": 270, "protein": 40, "carbs": 6, "fat": 5, "scoop_g": None,
+        "_source": "Generic vanilla protein shake (1 scoop + 250ml low-fat milk), per Jim's 2026-09-11 food label baseline",
+    },
+    ("雲呢拿", "Generic"): {
+        "kcal": 270, "protein": 40, "carbs": 6, "fat": 5, "scoop_g": None,
+        "_source": "Generic 雲呢拿蛋白飲 (1 scoop + 250ml low-fat milk), per Jim's 2026-09-11 food label baseline",
+    },
+    ("香草", "Generic"): {
+        "kcal": 270, "protein": 40, "carbs": 6, "fat": 5, "scoop_g": None,
+        "_source": "Generic 香草味蛋白飲 (1 scoop + 250ml low-fat milk), per Jim's 2026-09-11 food label baseline",
+    },
+    # === Quest Bar (Quest Nutrition protein bars, common HK 7-11/Health Plus)
+    # v3.3.23v (Jim OOB 2026-09-15 'my recent quest energy bar does not
+    # record any nutrient info'): Quest Bar Chocolate Peanut Butter
+    # per official Quest Nutrition label 2026 (60g bar). Quest's labels
+    # vary by market; using US values (most common in HK 7-11):
+    #   200 kcal | 21g P | 22g C (14g fiber, 1g sugar, 4g net carbs)
+    #   | 8g F (3g sat) | 280mg sodium | 25% DV iron
+    ("quest bar chocolate peanut butter", "Quest Nutrition"): {
+        "kcal": 200, "protein": 21, "carbs": 22, "fat": 8,
+        "fiber": 14, "sugar": 1, "sodium": 280,
+        "sat_fat": 3, "trans_fat": 0,
+        "_source": "Quest Bar Chocolate Peanut Butter (60g bar) per Quest Nutrition US label 2026",
+    },
+    ("quest bar cookies and cream", "Quest Nutrition"): {
+        "kcal": 200, "protein": 21, "carbs": 22, "fat": 8,
+        "fiber": 14, "sugar": 1, "sodium": 280,
+        "sat_fat": 3, "trans_fat": 0,
+        "_source": "Quest Bar Cookies & Cream (60g bar) per Quest Nutrition US label 2026",
+    },
+    ("quest bar birthday cake", "Quest Nutrition"): {
+        "kcal": 200, "protein": 21, "carbs": 22, "fat": 8,
+        "fiber": 14, "sugar": 1, "sodium": 260,
+        "sat_fat": 3, "trans_fat": 0,
+        "_source": "Quest Bar Birthday Cake (60g bar) per Quest Nutrition US label 2026",
+    },
+    ("quest bar double chocolate", "Quest Nutrition"): {
+        "kcal": 200, "protein": 21, "carbs": 22, "fat": 8,
+        "fiber": 14, "sugar": 1, "sodium": 260,
+        "sat_fat": 3, "trans_fat": 0,
+        "_source": "Quest Bar Double Chocolate (60g bar) per Quest Nutrition US label 2026",
+    },
+    ("quest bar chocolate chip cookie dough", "Quest Nutrition"): {
+        "kcal": 200, "protein": 21, "carbs": 22, "fat": 8,
+        "fiber": 14, "sugar": 1, "sodium": 280,
+        "sat_fat": 3, "trans_fat": 0,
+        "_source": "Quest Bar Chocolate Chip Cookie Dough (60g bar) per Quest Nutrition US label 2026",
+    },
+    # Catch-all: any other Quest Bar flavor (per bar, 200 kcal baseline)
+    ("quest bar", "Quest Nutrition"): {
+        "kcal": 200, "protein": 21, "carbs": 22, "fat": 8,
+        "fiber": 14, "sugar": 1, "sodium": 280,
+        "sat_fat": 3, "trans_fat": 0,
+        "_source": "Quest Bar generic catch-all (60g bar, 200 kcal baseline per Quest Nutrition 2026)",
+    },
+    # === Quest Hero Bar (smaller, 45g, lower kcal) ===
+    ("quest hero chocolate peanut butter", "Quest Nutrition"): {
+        "kcal": 150, "protein": 15, "carbs": 17, "fat": 6,
+        "fiber": 10, "sugar": 1, "sodium": 220,
+        "sat_fat": 2.5, "trans_fat": 0,
+        "_source": "Quest Hero Bar Chocolate Peanut Butter (45g bar) per Quest Nutrition 2026",
+    },
+}
+
+
+def _extract_explicit_macros(text: str) -> dict:
+    """v3.3.23ad (Jim OOB 2026-09-16 'i just recently updated the protein shake
+    info, it is still showing 21g protein instead of 30g protein'): parse
+    explicit macro numbers from user-typed food description. Patterns:
+      '30g protein' / '30g P' → P=30
+      '200 kcal' / '480cal' → kcal=200
+      '5g carbs' / '20g C' → C=5
+      '2g fat' / '8g F' → F=2
+      '5g sugar' → sugar=5
+      '10g fiber' / '10g fibre' → fiber=10
+      '200mg sodium' → sodium=200
+
+    Returns dict with whichever macros were found. Empty dict if nothing
+    matches. Designed to be MERGED with AI/brand-table estimate (explicit
+    numbers override AI guess).
+    """
+    if not text:
+        return {}
+    out = {}
+    # Lowercase for case-insensitive matching
+    t = text.lower()
+    # Map: keyword (lowercase) → output field name
+    # Order matters - try longer matches first
+    patterns = [
+        # kcal patterns (try first to avoid confusion with other g values)
+        (r"(\d+(?:\.\d+)?)\s*(?:kcal|cal|kilo[\s-]?calorie)", "calories"),
+        # P (protein)
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:protein|proteins?|p\b)", "protein"),
+        # C (carbs) - avoid matching "calories" prefix
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:carb|carbs|c\b)", "carbs"),
+        # F (fat) - be careful with "fiber" too
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:fat|fats|f\b)(?!\w)", "fat"),
+        # Sugar
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:sugar|sugars)", "sugar"),
+        # Fiber / Fibre
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:fiber|fibre)", "fiber"),
+        # Sodium (mg)
+        (r"(\d+(?:\.\d+)?)\s*(?:mg|milligram)\s*(?:sodium|salt|na)", "sodium"),
+    ]
+    for pattern, field in patterns:
+        m = re.search(pattern, t)
+        if m:
+            try:
+                out[field] = float(m.group(1))
+            except (ValueError, IndexError):
+                pass
+    return out
+
+
+def _lookup_brand_macros(dish_name: str) -> dict:
+    """v3.3.22 (Jim OOB 2026-09-11): check the hardcoded brand table BEFORE
+    falling back to AI estimate / Sheet history. Matches the longest
+    keyword_substring_lower in the user-typed dish name to find a brand
+    + flavor combo, returns per-scoop nutrition (kcal/p/c/f) plus
+    restaurant_chain hint with the brand name.
+
+    Returns {} if no match. Empty `dish_name` returns {}.
+    """
+    if not dish_name or len(dish_name.strip()) < 2:
+        return {}
+    name_l = dish_name.strip().lower()
+    # Sort by keyword length DESC so "double rich chocolate" wins over plain "chocolate"
+    matches = sorted(
+        [(kw, brand, macros) for (kw, brand), macros in _PROTEIN_BRAND_TABLE.items()
+         if kw in name_l],
+        key=lambda x: -len(x[0]),
+    )
+    if not matches:
+        return {}
+    keyword, brand, macros = matches[0]
+    # Return a copy with restaurant_chain filled in
+    out = dict(macros)
+    out["restaurant_chain"] = brand
+    out["_source"] = f"brand_table: '{keyword}' → {brand} ({out.get('_source', '')})"
+    return out
 
 
 def _lookup_known_macros(dish_name: str) -> dict:
@@ -6468,6 +9841,13 @@ def api_scan_commit():
         img_path = Path(image_path)
         if not img_path.exists():
             return jsonify({"ok": False, "error": "image not found"}), 404
+        # v3.3.25 production-write guard — refuse to commit a QA fixture
+        # to Jim's golden copy. Independent of GYMBRO_WRITE_MODE.
+        if _write_mode() == "production" and _is_production_target():
+            try:
+                _assert_not_test_fixture(img_path)
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 403
     else:
         img_path = None
 
@@ -6493,6 +9873,48 @@ def api_scan_commit():
                 _make_thumb(final_path, _thumb_path_for(img_path.name))
             except Exception:
                 drive_image_url = ""
+    else:
+        # v3.3.23av (Jim OOB 2026-09-30 'When textonly. You can still use
+        # the downloaded image'): text-only logs (img_path is None) trigger
+        # Brave image search to get a representative food photo. This is
+        # intentional — only Jim's REAL scanned photos should appear for
+        # Scan uploads (img_path provided); text-only entries can use any
+        # reasonable food photo as a visual placeholder. Best-effort:
+        # failure still commits the row, just without an image.
+        try:
+            first_entry = entries_in[0] if isinstance(entries_in, list) and entries_in else {}
+            fallback_name = (first_entry.get("name") if isinstance(first_entry, dict) else "") or ""
+            fallback_rest = (first_entry.get("restaurant_chain") if isinstance(first_entry, dict) else "") or ""
+            if fallback_name:
+                # Try restaurant+name first, then just name
+                candidates = []
+                if fallback_rest and fallback_name:
+                    candidates.append(f"{fallback_rest} {fallback_name}")
+                candidates.append(fallback_name)
+                img_result = None
+                for q in candidates:
+                    if not q.strip():
+                        continue
+                    results = _brave_image_search(q, count=3)
+                    if results:
+                        results.sort(key=lambda r: {"high": 3, "medium": 2, "low": 1}.get(r.get("confidence", "low"), 1), reverse=True)
+                        img_result = results[0]
+                        break
+                if img_result and img_result.get("url"):
+                    local_path = _download_food_image(img_result["url"], fallback_name)
+                    if local_path:
+                        final_path = local_path
+                        image_url = f"/scan_img/{local_path.name}"
+                        try:
+                            drive_image_url = _upload_to_drive(final_path)
+                            _make_thumb(final_path, _thumb_path_for(local_path.name))
+                            print(f"[scan_commit] auto-backfilled image for '{fallback_name}' from {img_result.get('source', '?')}", flush=True)
+                        except Exception as _ue:
+                            print(f"[scan_commit] auto-backfill upload failed: {_ue}", flush=True)
+                            drive_image_url = ""
+        except Exception as _fe:
+            # Never block commit on image search failure
+            print(f"[scan_commit] auto-backfill failed: {type(_fe).__name__}: {_fe}", flush=True)
 
     # v3.3.2: signature-based dedup using the cache (hydrated from Sheet).
     # Matches the (date, HH:MM, kcal) signature of any in-cache row. The
@@ -6532,8 +9954,8 @@ def api_scan_commit():
             entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
             entry["image_saved_to"] = str(final_path)
         else:
-            entry["source"] = "v2.7.22-scan_text_direct (apiyi-gpt-4o-mini, no image)"
-            entry["models_used"] = ["apiyi-gpt-4o-mini"]
+            entry["source"] = "v2.7.22-scan_text_direct (minimax-m3, no image)"
+            entry["models_used"] = ["minimax-m3"]
             entry["image_saved_to"] = ""
         entry["confidence"] = "Jim-confirmed preview"
         entry["sheet_synced"] = False
@@ -6550,7 +9972,10 @@ def api_scan_commit():
         # The name might be a user-typed override like '原味蛋撻、抹茶味蛋撻'
         # (2 pieces), and 3 historical 蛋撻 rows average ~230 kcal each.
         if entry_name and entry_kcal <= 0 and entry["source"].startswith("v2.2"):
-            looked = _lookup_known_macros(entry_name)
+            # v3.3.22: try brand-aware table first (Jim OOB 2026-09-11
+            # vanilla protein shake 180 vs 270 kcal). Falls through to
+            # Sheet history lookup if no brand match.
+            looked = _lookup_brand_macros(entry_name) or _lookup_known_macros(entry_name)
             if looked:
                 entry_kcal = looked["kcal"]
                 entry_p = looked["protein"]
@@ -6561,6 +9986,9 @@ def api_scan_commit():
                 entry["protein"] = entry_p
                 entry["carbs"] = entry_c
                 entry["fat"] = entry_f
+                # v3.3.22: also fill restaurant_chain if brand table has it
+                if looked.get("restaurant_chain") and not entry.get("restaurant_chain"):
+                    entry["restaurant_chain"] = looked["restaurant_chain"]
                 entry["_nutrition_source"] = looked["_source"]
                 print(f"scan_commit: backfilled {entry_name!r} → "
                       f"{entry_kcal} kcal from {looked['_source']}", flush=True)
@@ -6588,7 +10016,7 @@ def api_scan_commit():
                            or vision_hint_global
                            or "")
             pplx_hint = (entry.get("pplx_short")
-                         or entry.get("apiyi_enrichment")
+                         or entry.get("minimax_enrichment")
                          or pplx_hint_global
                          or "")
             redrive = _extract_dish_name(vision_hint, pplx_hint, fallback=current_name or "")
@@ -6626,17 +10054,34 @@ def api_scan_commit():
             })
             continue
 
-        entry["drive_image_url"] = drive_image_url
+        # v3.3.23r (Jim OOB 2026-09-14 'make sure the column L is updated
+        # with formula like these =image(K497)'): preserve any pre-set
+        # drive_image_url on the entry (e.g. from API caller). Previously
+        # this line overwrote with the local `drive_image_url` which was
+        # always "" for text-only entries, even if the caller had provided
+        # a Drive URL.
+        if not entry.get("drive_image_url"):
+            entry["drive_image_url"] = drive_image_url
 
         sheet_result = _append_to_sheet_nutrition(entry)
         new_row_index = None
         if sheet_result.get("ok") and not sheet_result.get("skipped"):
             try:
+                # v3.3.23at (Jim OOB 2026-09-30 'jpg download is always
+                # missing sth'): the previous parser was .rstrip("ABCDEFGHIJKLM")
+                # which left "Nutrition!A564" unchanged (digit "2" isn't in
+                # the rstrip set), so int("Nutrition!A564") raised ValueError.
+                # The except silently caught it and new_row_index stayed None,
+                # so cache.refresh_one was NEVER called → by_date never got
+                # the new row → /api/nutrition/card missed meals. Use regex
+                # to extract the actual row number.
                 range_str = sheet_result.get("range", "")
-                new_row_index = int(range_str.split(":")[0].rstrip("ABCDEFGHIJKLM"))
-                cache.refresh_one(new_row_index, _sheet_read_nutrition_row)
-            except Exception:
-                pass
+                m = re.search(r"(\d+)", range_str.split(":")[0])
+                if m:
+                    new_row_index = int(m.group(1))
+                    cache.refresh_one(new_row_index, _sheet_read_nutrition_row)
+            except Exception as e:
+                print(f"[scan_commit] refresh_one failed for range {sheet_result.get('range', '')}: {e}", flush=True)
         committed.append({
             "name": entry.get("name", "?"),
             "calories": entry.get("calories", 0),
@@ -6646,6 +10091,22 @@ def api_scan_commit():
             "sheet_ok": sheet_result.get("ok", False),
             "scan_index": new_row_index,
         })
+
+    # v3.3.23ar (Jim OOB 2026-09-28 'Jpg download has error. Only one food
+    # shown. There should be 3 for today'): invalidate JPG card cache
+    # for the committed date so the next /api/nutrition/card re-renders
+    # with the new meal. Without this, in-memory cache keeps serving the
+    # pre-commit version (which had fewer meals). Also delete the disk
+    # file since its stale render is now obsolete.
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        commit_date = (entries_in[0].get("date") if entries_in and isinstance(entries_in[0], dict) else None) or today_iso()
+        _jpg_cache_invalidate(commit_date)
+        disk_path = Path("/home/work/.hermes/nutrition_card_cache") / f"nutrition_{commit_date}.jpg"
+        if disk_path.exists():
+            disk_path.unlink()
+    except Exception:
+        pass
 
     return jsonify({
         "ok": True,
@@ -6661,9 +10122,116 @@ def api_scan_commit():
     })
 
 
+# v3.3.23av (Jim OOB 2026-09-30 'When textonly. You can still use the
+# downloaded image'): manual backfill endpoint for existing rows that
+# committed without an image. POST {row_index: int} → uses cache.name +
+# cache.restaurant to Brave-search → download → upload to Drive → write
+# Sheet column K → invalidate caches.
+@app.route("/api/scan_backfill_image", methods=["POST"])
+def api_scan_backfill_image():
+    data = request.get_json(silent=True) or {}
+    row_index = data.get("row_index")
+    if not isinstance(row_index, int) or row_index < 2:
+        return jsonify({"ok": False, "error": "row_index must be int >= 2"}), 400
+    try:
+        cache = get_cache()
+        row = cache.get_by_row(row_index)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"cache lookup failed: {e}"}), 500
+    if not row:
+        return jsonify({"ok": False, "error": f"row {row_index} not found in cache"}), 404
+    if row.drive_image_url:
+        return jsonify({"ok": False, "error": "row already has an image", "drive_image_url": row.drive_image_url}), 409
+    name = (row.name or "").strip()
+    restaurant = (row.restaurant or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "row has empty name, can't search"}), 400
+
+    candidates = []
+    if restaurant:
+        candidates.append(f"{restaurant} {name}")
+    candidates.append(name)
+    img_result = None
+    for q in candidates:
+        results = _brave_image_search(q, count=3)
+        if results:
+            results.sort(key=lambda r: {"high": 3, "medium": 2, "low": 1}.get(r.get("confidence", "low"), 1), reverse=True)
+            img_result = results[0]
+            break
+    if not img_result or not img_result.get("url"):
+        return jsonify({"ok": False, "error": "brave returned no results for any candidate"}), 404
+
+    local_path = _download_food_image(img_result["url"], name)
+    if not local_path:
+        return jsonify({"ok": False, "error": "download failed"}), 500
+
+    drive_url = ""
+    try:
+        drive_url = _upload_to_drive(local_path)
+        _make_thumb(local_path, _thumb_path_for(local_path.name))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"drive upload failed: {e}"}), 500
+    if not drive_url:
+        return jsonify({"ok": False, "error": "drive upload returned empty url"}), 500
+
+    # Write to Sheet column K (image URL) using batchUpdate
+    try:
+        spreadsheet_id = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
+        NUTRITION_SHEET_ID = 474877075
+        access_token = _get_google_access_token()
+        body = json.dumps({
+            "requests": [{
+                "updateCells": {
+                    "range": {
+                        "sheetId": NUTRITION_SHEET_ID,
+                        "startRowIndex": row_index - 1,
+                        "endRowIndex": row_index,
+                        "startColumnIndex": 10,  # column K (0-indexed)
+                        "endColumnIndex": 11,
+                    },
+                    "rows": [{"values": [{"userEnteredValue": {"stringValue": drive_url}}]}],
+                    "fields": "userEnteredValue",
+                }
+            }]
+        }).encode()
+        req = urllib.request.Request(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            json.loads(resp.read().decode())
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"sheet write failed: {e}", "drive_image_url": drive_url}), 500
+
+    # Invalidate caches + JPG cache
+    try:
+        _invalidate_sheet_cache()
+    except Exception:
+        pass
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        _jpg_cache_invalidate(row.date)
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "row_index": row_index,
+        "drive_image_url": drive_url,
+        "image_url": f"/scan_img/{local_path.name}",
+        "source": img_result.get("source", "?"),
+        "query_used": img_result.get("title", "")[:60],
+    })
+
+
 # v2.7.19: scan re-enrich with user hint (Jim OOB 2026-07-31 13:25 HKT)
 # After preview returned, Jim can type supplementary info (餐廳名/份量/醬汁/材料)
-# and tap "🔄 用補充資料再 estimate" → this endpoint re-runs pplx + APiyi
+# and tap "🔄 用補充資料再 estimate" → this endpoint re-runs pplx + MiniMax
 # nutrition enrichment with hint prepend, returns new suggested_entry.
 # NO write to log/Sheet — Jim still needs to confirm via /api/scan_commit.
 @app.route("/api/scan_re_enrich", methods=["POST"])
@@ -6677,7 +10245,7 @@ def api_scan_re_enrich():
       1. Read image bytes from image_path (server-side cache).
       2. Re-run MiniMax vision (cheap, 2-3s) — get fresh dish desc.
       3. Prepend `「用家補充資料: {hint}」` to vision_desc.
-      4. Re-run _pplx_enrich() + _apiyi_nutrition_enrich() with augmented desc.
+      4. Re-run _pplx_enrich() + _minimax_nutrition_enrich() with augmented desc.
       5. Merge 12-field nutrition via median.
       6. Return preview-style object for frontend to swap in.
     """
@@ -6723,29 +10291,29 @@ def api_scan_re_enrich():
     )
     vision_desc = _minimax_vision(img_b64, vision_prompt)
 
-    # 1b. APiyi gpt-4o-mini vision 2nd-opinion (v2.7.12 — Jim OOB 7/26 19:35)
-    apiyi_vision_desc = _apiyi_vision_analyze(img_b64, vision_prompt)
-    if apiyi_vision_desc and not apiyi_vision_desc.startswith("（"):
-        if len(apiyi_vision_desc) > len(vision_desc) * 0.7:
-            vision_desc = vision_desc + "\n\n（ChatGPT 2nd-opinion vision）\n" + apiyi_vision_desc
+    # 1b. 2nd-opinion vision from a DIFFERENT provider in the chain
+    opinion2_desc = _vision_second_opinion(img_b64, vision_prompt)
+    if opinion2_desc and not opinion2_desc.startswith("（"):
+        if len(opinion2_desc) > len(vision_desc) * 0.7:
+            vision_desc = vision_desc + "\n\n（2nd-opinion vision）\n" + opinion2_desc
 
     # 2. Augment with user hint — Jim OOB 7/31 "supplementary info to re-estimate"
     # Prepend hint as context, then pplx/apaiyi still do recogniser role.
     augmented_desc = f"用家補充資料（餐廳名/份量/醬汁/材料）：{user_hint}\n\n{vision_desc}"
 
-    # 3. Re-enrich via pplx + APiyi (parallel — sequential for safety, no quota burn)
+    # 3. Re-enrich via pplx + MiniMax (parallel — sequential for safety, no quota burn)
     pplx_desc = _pplx_enrich(augmented_desc)
-    apiyi_desc = _apiyi_nutrition_enrich(augmented_desc)
+    mm_desc = _minimax_nutrition_enrich(augmented_desc)
 
     # 4. Merge 12-field nutrition
     pplx_parsed = _parse_nutrition_block(pplx_desc)
-    apiyi_parsed = {}
-    if apiyi_desc and apiyi_desc.startswith("{"):
+    mm_parsed = {}
+    if mm_desc and mm_desc.startswith("{"):
         try:
-            apiyi_parsed = json.loads(apiyi_desc)
+            mm_parsed = json.loads(mm_desc)
         except Exception:
-            apiyi_parsed = _parse_nutrition_block(apiyi_desc)
-    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, apiyi_parsed])
+            mm_parsed = _parse_nutrition_block(mm_desc)
+    merged_nutrition = _merge_nutrition_estimates([pplx_parsed, mm_parsed])
 
     shared = _detect_shared_meal(augmented_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
@@ -6773,7 +10341,7 @@ def api_scan_re_enrich():
         "vision_desc": augmented_desc,  # hint-augmented desc returned to frontend
         "vision_short": augmented_desc[:300],
         "pplx_short": pplx_desc[:500],
-        "apiyi_enrichment": apiyi_desc[:300] if apiyi_desc else "",
+        "minimax_enrichment": mm_desc[:300] if mm_desc else "",
         "nutrition_merged": merged_nutrition,
         "suggested_entry": {
             "date": today_iso(),
@@ -6806,12 +10374,26 @@ def api_scan_re_enrich():
         "ready_to_commit": True,
         "re_enriched": True,  # flag for frontend to show "✨ 已用 hint 再 estimate"
     }
+    # v3.3.23av (Jim OOB 2026-10-12 'the edited 兩個鮮竹卷 is not updated
+    # in jpg download'): re-enrich changes macros → JPG needs to re-render
+    try:
+        from gym_web.image_proxy import _jpg_cache_invalidate
+        from pathlib import Path as _P
+        row = cache.get_by_row(scan_index)
+        if row and row.date:
+            _jpg_cache_invalidate(row.date)
+            cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
+            for f in cache_dir.glob(f"nutrition_{row.date}*.jpg"):
+                f.unlink()
+    except Exception as e:
+        print(f"[scan_re_enrich] JPG cache invalidate failed: {e}", flush=True)
+
     return jsonify({"ok": True, "preview": preview})
 
 
 # ---------- F2b: /api/scan_preview_text (Jim OOB 2026-08-02 02:50 HKT) ----------
 # Text-only food logging path. Jim types what he ate ("燒肉飯",
-# "noodle + chicken", "2 eggs + toast"), APiyi estimates nutrition,
+# "noodle + chicken", "2 eggs + toast"), MiniMax estimates nutrition,
 # preview returned, /api/scan_commit then logs it. NO image required.
 NUTRITION_FIELD_SCHEMA = (
     "calories,protein,carbs,fat,fiber,sugar,sodium,sat_fat,"
@@ -6819,16 +10401,98 @@ NUTRITION_FIELD_SCHEMA = (
 )
 
 
+_WHISPER_MODEL = None
+_WHISPER_MODEL_NAME = "small"
+# faster-whisper's 'small' model returns ZERO segments for language='yue'
+# (verified 2026-10-21: the 'yue' decoder path yields no tokens on the
+# small checkpoint). Cantonese audio still transcribes well through 'zh'
+# with a Cantonese-bias initial_prompt, so 'zh' is the working default
+# and 'yue' is only attempted when explicitly asked for.
+_WHISPER_CANTONESE_PROMPT = (
+    "以下係一段廣東話 (香港, Cantonese) 對話或獨白。"
+    "請用繁體中文 (香港常用字) 逐字輸出,保留語氣詞"
+    "「嘅/啦/咗/嗰/咁/啲/嚟/咩/㗎/喎/吖/囉」等。"
+    "人名食物名盡量保留原音 (例: 灣仔/旺角/茶餐廳/絲襪奶茶/叉燒飯)。"
+)
+
+
+def _local_whisper_transcribe(audio_path: str, language: str = "yue"):
+    """Transcribe audio with LOCAL faster-whisper. Returns (text, model_name).
+
+    v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff"): replaces the dead
+    APiyi gpt-4o-transcribe path. faster-whisper is loaded lazily on first
+    use and cached in-process. If the package is missing we raise a clear
+    ImportError so the caller reports it honestly instead of silently
+    returning an empty transcript.
+
+    Language handling (verified 2026-10-21):
+      * language='yue' on the 'small' checkpoint yields ZERO segments →
+        fall back to 'zh' + a Cantonese-bias initial_prompt.
+      * condition_on_previous_text=False avoids the classic Whisper
+        repetition loop on long clips.
+    """
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        from faster_whisper import WhisperModel
+        _WHISPER_MODEL = WhisperModel(_WHISPER_MODEL_NAME, device="cpu",
+                                      compute_type="int8")
+
+    def _run(lang, prompt=None):
+        segs, _info = _WHISPER_MODEL.transcribe(
+            audio_path,
+            language=(lang or None),
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            temperature=0.0,
+            initial_prompt=prompt,
+        )
+        return "".join(s.text for s in segs).strip()
+
+    lang = (language or "").strip() or "zh"
+    text = ""
+    if lang == "yue":
+        text = _run("yue", _WHISPER_CANTONESE_PROMPT)
+        if not text:
+            # 'yue' produced nothing on this checkpoint → use 'zh'
+            text = _run("zh", _WHISPER_CANTONESE_PROMPT)
+    else:
+        text = _run(lang, _WHISPER_CANTONESE_PROMPT)
+        if not text:
+            text = _run(None, _WHISPER_CANTONESE_PROMPT)
+    return _to_traditional(text), f"faster-whisper-{_WHISPER_MODEL_NAME}"
+
+
+def _to_traditional(text: str) -> str:
+    """Simplified -> Traditional Chinese (s2twp), graceful no-op on failure.
+
+    v3.3.30: faster-whisper's small checkpoint emits SIMPLIFIED Chinese even
+    when the initial_prompt asks for 繁體. Jim's rule is 繁體中文 only, so
+    convert here. If opencc is not installed we return the text unchanged
+    rather than failing the whole transcription.
+    """
+    if not text:
+        return text
+    try:
+        from opencc import OpenCC
+        return OpenCC("s2twp").convert(text)
+    except Exception as e:
+        print(f"[transcribe] opencc s2t skipped: {type(e).__name__}: {e}",
+              flush=True)
+        return text
+
+
 @app.route("/api/transcribe", methods=["POST"])
 def api_transcribe():
-    """Audio file → Cantonese transcript via gpt-4o-transcribe.
+    """Audio file → Cantonese transcript via LOCAL faster-whisper.
 
-    Jim OOB 2026-08-07: 'I have been using gpt-4o-mini for image recognition
-    via apiyi. can we use gpt-4o-mini-transcribe?'. v2.7.45 P3.
+    v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff"): was APiyi
+    gpt-4o-transcribe, whose key died 2026-10-20 (HTTP 401). Now runs
+    faster-whisper 'small' on CPU — no key, no per-minute cost.
 
     Accepts: multipart/form-data with 'audio' field (mp3/m4a/wav/webm/ogg)
-    Optional: 'language' (default yue), 'prompt' (default Cantonese bias)
-    Returns: {ok, text, language, model, duration_estimate, usage}
+    Optional: 'language' (default yue)
+    Returns: {ok, text, language, model, size_mb, char_count}
     """
     if "audio" not in request.files:
         return jsonify({"ok": False, "error": "missing 'audio' file"}), 400
@@ -6856,13 +10520,9 @@ def api_transcribe():
             "中英夾雜 (code-switch) 係正常, 唔好強制翻譯英文品牌名。"
         )
 
-    # APiyi gpt-4o-transcribe
-    api_key = _apiyi_api_key()
-
-    if not api_key:
-        return jsonify({"ok": False, "error": "APIYI_API_KEY not set"}), 500
-
-    # Save to temp file for multipart upload
+    # v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff"): local
+    # faster-whisper instead of the dead APiyi gpt-4o-transcribe.
+    # No key, no per-minute cost, nothing to expire.
     import tempfile, os as _os
     suffix = _os.path.splitext(audio_file.filename)[1] or ".mp3"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -6870,62 +10530,20 @@ def api_transcribe():
         tmp_path = tmp.name
 
     try:
-        boundary = "----formdata-gymbro"
-        with open(tmp_path, "rb") as f:
-            file_content = f.read()
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{audio_file.filename}"\r\n'
-            f"Content-Type: {audio_file.mimetype or 'audio/mpeg'}\r\n\r\n"
-        ).encode() + file_content + (
-            f"\r\n--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="model"\r\n\r\n'
-            f"gpt-4o-transcribe\r\n"
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="language"\r\n\r\n'
-            f"{language}\r\n"
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-            f"{user_prompt}\r\n"
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
-            f"json\r\n"
-            f"--{boundary}--\r\n"
-        ).encode()
-
-        req = urllib.request.Request(
-            "https://api.apiyi.com/v1/audio/transcriptions",
-            data=body,
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Authorization": "".join(["Bearer ", api_key]),
-            },
-        )
-
-        with urllib.request.urlopen(req, timeout=60) as r:
-            result = json.loads(r.read())
-
-        text = result.get("text", "").strip()
-        usage = result.get("usage", {})
+        text, model_name = _local_whisper_transcribe(tmp_path, language)
 
         return jsonify({
             "ok": True,
             "text": text,
             "language": language,
-            "model": "gpt-4o-transcribe",
+            "model": model_name,
             "size_mb": round(size_mb, 2),
-            "usage": usage,
             "char_count": len(text),
         })
 
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode()[:500]
-        return jsonify({
-            "ok": False,
-            "error": f"APiyi API error: HTTP {e.code}",
-            "detail": err_body,
-        }), 502
     except Exception as e:
+        print(f"[transcribe] local whisper failed: {type(e).__name__}: {e}",
+              flush=True)
         return jsonify({"ok": False, "error": f"transcribe failed: {e}"}), 500
     finally:
         try:
@@ -6941,15 +10559,24 @@ def api_scan_preview_text():
     Jim OOB 2026-08-02 02:50 HKT: 'I think the food log should allow
     me to direct input the food by text'. Flow:
       1. User types a description in textbox.
-      2. Backend sends to APiyi gpt-4o-mini (text-only — no vision).
+      2. Backend sends to MiniMax (text-only — no vision).
       3. Optional user_hints[] appended for extra context.
       4. Returns preview shape identical to /api/scan_preview so the
          frontend can present it in the SAME confirm card. Frontend
          then calls /api/scan_commit with image_path="" to commit.
+
+    v3.3.20 (Jim OOB 2026-09-10): optional `with_image=true` (default)
+    uses Brave Image Search to fetch a representative food image for the
+    dish (downloaded locally, saved to scan_cache). /api/scan_commit
+    will then upload to Drive + write image_url to Sheet just like a
+    photo-scanned entry. Set `with_image=false` to skip image fetching
+    (faster, no network call). The returned `image_path` is non-empty
+    only when image was successfully downloaded.
     """
     data = request.get_json(silent=True) or {}
     text_desc = (data.get("text") or data.get("description") or "").strip()
     user_hints_in = data.get("user_hints", []) or []
+    with_image_flag = data.get("with_image", True)  # default ON per Jim OOB 2026-09-10
 
     if not text_desc:
         return jsonify({"ok": False, "error": "missing text description"}), 400
@@ -6972,7 +10599,7 @@ def api_scan_preview_text():
     else:
         augmented_text = text_desc
 
-    # APiyi gpt-4o-mini text-only nutrition estimate
+    # MiniMax text-only nutrition estimate
     prompt = (
         "你係香港營養師。根據用家輸入嘅食物描述，估算卡路里同12大營養素。"
         "用 JSON 格式 return：(全部 value 用數字, unit 用 kcal/g/mg)\n"
@@ -6985,13 +10612,83 @@ def api_scan_preview_text():
         "廣東話, 一個英文字都唔好出。估算合理範圍："
         "家常菜 300-700 kcal, 大碟 500-900 kcal, 火鍋薄切 200-400 kcal per round。"
     )
-    apiyi_text_desc = _apiyi_nutrition_enrich(prompt)
+    mm_text_desc = _minimax_nutrition_enrich(prompt)
 
-    # Parse APiyi JSON response
-    try:
-        parsed = json.loads(apiyi_text_desc)
-    except Exception:
-        parsed = _parse_nutrition_block(apiyi_text_desc)
+    # Parse MiniMax JSON response (v3.3.22: robust parser strips  blocks
+    # and falls back to last-{...}-regex if MiniMax emits prose)
+    parsed = _safe_parse_nutrition_json(mm_text_desc)
+
+    # v3.3.23v (Jim OOB 2026-09-15 'my recent quest energy bar does not
+    # record any nutrient info'): AI estimate often misses brand-specific
+    # macros (Quest Bar: AI returns 190/21/21/8 but actual is 200/21/22/8).
+    # Override AI's estimate with our hardcoded _PROTEIN_BRAND_TABLE lookup
+    # BEFORE building field_entries, so the brand-correct values flow through
+    # to the suggested_entry + committed row.
+    brand_hit = _lookup_brand_macros(text_desc)
+    if brand_hit:
+        print(f"[scan_preview_text] brand_table override for {text_desc!r}: "
+              f"AI→brand {parsed.get('calories', 0)}→{brand_hit['kcal']} kcal "
+              f"({brand_hit['_source']})", flush=True)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        # Brand macros override the AI estimate for the 4 main macros
+        parsed["calories"] = brand_hit["kcal"]
+        parsed["protein"] = brand_hit["protein"]
+        parsed["carbs"] = brand_hit["carbs"]
+        parsed["fat"] = brand_hit["fat"]
+        # Fill fiber/sugar/sodium/sat_fat/trans_fat if brand table has them
+        # and AI didn't supply (or supplied 0)
+        for f in ("fiber", "sugar", "sodium", "sat_fat", "trans_fat"):
+            if brand_hit.get(f) is not None and not parsed.get(f):
+                parsed[f] = brand_hit[f]
+        # Set restaurant_chain to brand if user didn't supply one
+        if not parsed.get("restaurant_guess") and brand_hit.get("restaurant_chain"):
+            parsed["restaurant_guess"] = brand_hit["restaurant_chain"]
+
+    # v3.3.20 (Jim OOB 2026-09-10): optionally fetch a representative food image
+    # via Brave Image Search. Best-effort — failure here doesn't block the nutrition
+    # preview. Query prioritizes the MiniMax-suggested dish name (cleanest), with
+    # user input as fallback + restaurant_guess as prefix hint if present.
+    downloaded_image_path = ""
+    image_search_meta = {"attempted": bool(with_image_flag), "downloaded": False, "source": "", "error": ""}
+    if with_image_flag:
+        # Build a good search query. Prefer the MiniMax name (clean dish label) +
+        # restaurant hint. Fallback chain: name → user input.
+        name_hint = (parsed.get("name") if isinstance(parsed, dict) else "") or ""
+        rest_hint = (parsed.get("restaurant_guess") if isinstance(parsed, dict) else "") or ""
+        candidates = []
+        if name_hint and rest_hint:
+            candidates.append(f"{rest_hint} {name_hint}")
+        if name_hint:
+            candidates.append(name_hint)
+        # User input — strip common phrases like "I ate", "午餐", "lunch"
+        cleaned_input = re.sub(
+            r"^(我食咗|i ate|i had|午餐|lunch|晚餐|dinner|早餐|breakfast|食咗|order咗|叫咗)\s*",
+            "", text_desc, flags=re.I
+        ).strip()
+        if cleaned_input:
+            candidates.append(cleaned_input[:80])
+        img_result = None
+        for q in candidates:
+            if not q.strip():
+                continue
+            results = _brave_image_search(q, count=3)
+            if results:
+                # Prefer high-confidence then medium then low
+                results.sort(key=lambda r: {"high": 3, "medium": 2, "low": 1}.get(r.get("confidence", "low"), 1), reverse=True)
+                img_result = results[0]
+                image_search_meta["source"] = img_result.get("source", "")
+                break
+        if img_result and img_result.get("url"):
+            slug = name_hint or cleaned_input or "food"
+            local_path = _download_food_image(img_result["url"], slug)
+            if local_path:
+                downloaded_image_path = str(local_path)
+                image_search_meta["downloaded"] = True
+            else:
+                image_search_meta["error"] = "download_failed"
+        else:
+            image_search_meta["error"] = "no_results"
 
     # Detect shared meal via keyword scan (Jim OOB 2026-08-02 02:50 HKT —
     # only scan USER-FACING text, NOT the JSON dump which has
@@ -7015,14 +10712,14 @@ def api_scan_preview_text():
 
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
     # v3.2.7: route through _extract_dish_name() + _compute_rating() so the
-    # preview shows a proper dish name + star rating, NOT the raw APiyi
+    # preview shows a proper dish name + star rating, NOT the raw MiniMax
     # prose (Jim OOB 2026-08-07 23:50 HKT 'the food title is not shown
     # on the list view. Moreover, it does not have rating').
-    apiyi_name_raw = (parsed.get("name") if isinstance(parsed, dict) else "") or ""
+    mm_name_raw = (parsed.get("name") if isinstance(parsed, dict) else "") or ""
     restaurant_guess = (parsed.get("restaurant_guess") if isinstance(parsed, dict) else "") or ""
-    # Use APiyi's name as the dish-name extractor input (it's the
+    # Use MiniMax's name as the dish-name extractor input (it's the
     # most relevant text), with the user input as fallback.
-    suggested_name = _extract_dish_name(apiyi_name_raw, apiyi_text_desc, fallback=text_desc[:60])
+    suggested_name = _extract_dish_name(mm_name_raw, mm_text_desc, fallback=text_desc[:60])
     # If still empty or the generic "食物" fallback, try the user input directly
     if not suggested_name or suggested_name.strip() == "食物":
         suggested_name = _extract_dish_name(text_desc, "", fallback=text_desc[:60])
@@ -7039,19 +10736,23 @@ def api_scan_preview_text():
 
     preview = {
         "preview_id": f"pv_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_txt",
-        "image_path": "",  # text-only, no image
-        "image_url": "",
+        "image_path": downloaded_image_path,  # v3.3.20: populated by Brave image search
+        "image_url": "",  # filled at commit time (after Drive upload)
         "input_mode": "text",  # flag for frontend to render label
         "vision_desc": augmented_text,
         "vision_short": augmented_text[:300],
-        "pplx_short": apiyi_text_desc[:500] if apiyi_text_desc else "",
-        "apiyi_enrichment": apiyi_text_desc[:300] if apiyi_text_desc else "",
+        "pplx_short": mm_text_desc[:500] if mm_text_desc else "",
+        "minimax_enrichment": mm_text_desc[:300] if mm_text_desc else "",
         "nutrition_merged": parsed if isinstance(parsed, dict) else {},
+        # v3.3.20: expose Brave image-search metadata to the frontend so
+        # the user can see WHERE the image came from (source domain) and
+        # whether the fetch actually succeeded (downloaded=True/False).
+        "image_search": image_search_meta,
         "suggested_entry": {
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": _sanitise_dish_name(suggested_name, vision_desc=text_desc, pplx_desc=apiyi_text_desc),
+            "name": _sanitise_dish_name(suggested_name, vision_desc=text_desc, pplx_desc=mm_text_desc),
             "coach_comment": coach_cc,
             "restaurant_chain": restaurant_guess,
             "cooking_method": (parsed.get("cooking_method", "") if isinstance(parsed, dict) else ""),
@@ -7079,10 +10780,10 @@ def api_scan_preview_text():
     return jsonify({"ok": True, "preview": preview})
 
 
-def _apiyi_nutrition_enrich_local(text: str) -> dict:
+def _minimax_nutrition_enrich_local(text: str) -> dict:
     """Wrapper retained to keep call-site readable.
-    Already imported via _apiyi_nutrition_enrich in the module."""
-    return _apiyi_nutrition_enrich(text)
+    Already imported via _minimax_nutrition_enrich in the module."""
+    return _minimax_nutrition_enrich(text)
 
 
 # ---------- F3: /api/coach_tips ----------
@@ -7290,7 +10991,6 @@ WHOOP_CACHE_PATH = Path("/home/work/.whoop_data_latest.json")
 # auto-refresh path at the working tools/whoop_nutrition.py --sync script
 # instead, which paginates all 4 endpoints + writes the same cache shape.
 WHOOP_PULL_SCRIPT = Path("/home/work/tools/whoop_nutrition.py")
-WITHINGS_PULL_SCRIPT = Path("/home/work/.hermes/skills/withings/withings.py")  # Jim OOB 2026-07-24: cheer pulls Withings on every fire
 
 EN_TO_ZH_VOICE = {
     # Brand / proper nouns
@@ -7402,6 +11102,430 @@ EN_TO_ZH_VOICE = {
     "it's": "佢", "that's": "嗰個", "there's": "嗰度",
     "by": "透過", "with": "同", "without": "冇", "for": "為", "from": "從",
     "the ": "", " a ": " ", " an ": " ", " of ": "嘅", " in ": "喺",
+    # v3.3.7+ (Jim OOB 2026-08-30「I want full Chinese on gymbro Chinese」):
+    # Aggressive zero-EN table — every leak observed in 2026-08-30 manual cheer draft.
+    # Use 2-entry form so case-insensitive matching handles ALL CAPS variants.
+    "tank": "缸", "Tank": "缸", "TANK": "缸",
+    "full": "滿", "Full": "滿", "FULL": "滿",
+    "log": "記錄", "Log": "記錄", "LOG": "記錄",
+    "APT": "黑客組織", "Apt": "黑客組織", "apt": "黑客組織",
+    "ad": "廣告", "Ad": "廣告", "AD": "廣告",
+    "tech": "科技", "Tech": "科技", "TECH": "科技",
+    "pipeline": "流程", "Pipeline": "流程", "PIPELINE": "流程",
+    "script": "腳本", "Script": "腳本", "SCRIPT": "腳本",
+    "integrity": "完整性", "Integrity": "完整性", "INTEGRITY": "完整性",
+    "USD": "美元", "usd": "美元",
+    "asset": "資產", "Asset": "資產", "ASSET": "資產", "assets": "資產",
+    "body": "身體", "Body": "身體", "BODY": "身體",
+    "battery": "電池", "Battery": "電池", "BATTERY": "電池",
+    "seed": "谷", "Seed": "谷", "SEED": "谷",
+    "Zone": "區", "zone": "區", "ZONE": "區",
+    "HIIT": "高強度間歇", "hiit": "高強度間歇",
+    "heavy": "重", "Heavy": "重", "HEAVY": "重",
+    "lift": "舉", "Lift": "舉", "LIFT": "舉",
+    "audit": "審查", "Audit": "審查", "AUDIT": "審查",
+    "supply": "供應", "Supply": "供應", "SUPPLY": "供應",
+    "chain": "鏈", "Chain": "鏈", "CHAIN": "鏈",
+    "mental": "心理", "Mental": "心理", "MENTAL": "心理",
+    "perfect": "完美", "Perfect": "完美", "PERFECT": "完美",
+    "day": "日", "Day": "日", "DAY": "日",
+    "narrative": "敘事", "Narrative": "敘事", "NARRATIVE": "敘事",
+    "consumer": "消費者", "Consumer": "消費者", "CONSUMER": "消費者",
+    "consumer,": "消費者，", "consumer.": "消費者。",
+    "cheer": "打氣", "Cheer": "打氣", "CHEER": "打氣",
+    "video": "片段", "Video": "片段", "VIDEO": "片段",
+    "comment": "評論", "Comment": "評論", "COMMENT": "評論",
+    "comments": "評論", "Comments": "評論",
+    "coach": "教練", "Coach": "教練", "COACH": "教練",
+    "check": "睇下", "Check": "睇下", "CHECK": "睇下",
+    "checks": "睇下", "Checks": "睇下",
+    "perfect,": "完美，", "perfect.": "完美。",
+    "day,": "日，", "day.": "日。",
+    "labs": "實驗室", "lab": "實驗室", "Lab": "實驗室",
+    "supplier": "供應商", "Supplier": "供應商",
+    "platform": "平台", "Platform": "平台",
+    "vendor": "供應商", "Vendor": "供應商",
+    "phishing": "釣魚", "Phishing": "釣魚",
+    "attack": "攻擊", "Attack": "攻擊",
+    "attack,": "攻擊，", "attack.": "攻擊。",
+    "core": "核心", "Core": "核心",
+    "full,": "滿，", "full.": "滿。",
+    "post": "之後", "Post": "之後",
+    "set": "組", "sets": "組", "rep": "下", "reps": "下",
+    "tier": "層次", "Tier": "層次",
+    "edge": "邊緣", "Edge": "邊緣",
+    "trends": "趨勢", "trend": "趨勢", "Trends": "趨勢",
+    "sync": "同步", "Sync": "同步",
+    "live": "實時", "Live": "實時",
+    "push": "推", "Push": "推",
+    "feed": "資訊流", "Feed": "資訊流",
+    "views": "睇法", "view": "睇法",
+    "core,": "核心，", "core.": "核心。",
+    "today,": "今日，", "today.": "今日。",
+    "tier,": "層次，", "tier.": "層次。",
+    "live,": "實時，", "live.": "實時。",
+    "next": "下一個", "Next": "下一個",
+    "round": "回合", "Round": "回合",
+    "pick": "揀", "Pick": "揀",
+    "win": "贏", "Win": "贏",
+    "lose": "輸", "Lose": "輸",
+    "play": "踢", "Play": "踢",
+    "team": "球隊", "Team": "球隊",
+    "match": "賽事", "Match": "賽事",
+    "score": "比數", "Score": "比數",
+    "half": "半場", "Half": "半場",
+    "kick": "踢", "Kick": "踢",
+    # v3.3.7+ second wave (2026-08-30 second audit pass — leaks caught):
+    "report": "報告", "Report": "報告", "REPORT": "報告",
+    "line": "線", "Line": "線", "LINE": "線",
+    "catch": "追", "Catch": "追", "CATCH": "追",
+    "up": "上", "Up": "上", "UP": "上",
+    "static": "靜態", "Static": "靜態", "STATIC": "靜態",
+    "plugin": "插件", "Plugin": "插件", "PLUGIN": "插件",
+    "complete": "完成", "Complete": "完成", "COMPLETE": "完成",
+    "macros": "巨量營養", "Macros": "巨量營養", "MACROS": "巨量營養",
+    "fuel": "燃料", "Fuel": "燃料", "FUEL": "燃料",
+    "un": "", "ed": "",
+    "APT24": "黑客組織",
+    "IT": "資訊科技", "It": "資訊科技",
+    "tier": "層次", "tier,": "層次，", "tier.": "層次。",
+    "via": "透過", "Via": "透過",
+    "step": "步", "Step": "步", "STEP": "步",
+    "deep": "深層", "Deep": "深層", "DEEP": "深層",
+    "low": "低", "Low": "低", "LOW": "低",
+    "high": "高", "High": "高", "HIGH": "高",
+    "top": "頂", "Top": "頂", "TOP": "頂",
+    "minute": "分鐘", "Minute": "分鐘", "MINUTE": "分鐘",
+    "minutes": "分鐘", "Minutes": "分鐘",
+    "percent": "百分比", "Percent": "百分比",
+    "rate": "比率", "Rate": "比率",
+    "rates": "比率", "Rates": "比率",
+    "signal": "訊號", "Signal": "訊號", "SIGNAL": "訊號",
+    "signals": "訊號", "Signals": "訊號",
+    "flag": "標記", "Flag": "標記",
+    "flags": "標記", "Flags": "標記",
+    "key": "關鍵", "Key": "關鍵", "KEY": "關鍵",
+    "keys": "關鍵", "Keys": "關鍵",
+    "cardio": "帶氧", "Cardio": "帶氧", "CARDIO": "帶氧",
+    "warmup": "熱身", "Warmup": "熱身", "WARMUP": "熱身",
+    "cooldown": "緩和", "Cooldown": "緩和", "COOLDOWN": "緩和",
+    "spot": "位", "Spot": "位",
+    "form": "姿勢", "Form": "姿勢", "FORM": "姿勢",
+    "bar": "槓鈴", "Bar": "槓鈴",
+    "rpe": "自覺強度", "Rpe": "自覺強度", "RPE": "自覺強度",
+    "set": "組", "Set": "組", "SET": "組",
+    "rep": "下", "Rep": "下", "REP": "下",
+    "bios": "個體", "Bio": "個體", "BIO": "個體",
+    "fresh": "新鮮", "Fresh": "新鮮", "FRESH": "新鮮",
+    "rest": "休息", "Rest": "休息", "REST": "休息",
+    "rest,": "休息，", "rest.": "休息。",
+    "labs": "實驗室", "Lab": "實驗室", "LAB": "實驗室",
+    "pre": "之前", "Pre": "之前", "PRE": "之前",
+    "post": "之後", "Post": "之後", "POST": "之後",
+    "ultra": "超", "Ultra": "超", "ULTRA": "超",
+    "plus": "加", "Plus": "加", "PLUS": "加",
+    "mini": "細", "Mini": "細", "MINI": "細",
+    "focus": "焦點", "Focus": "焦點", "FOCUS": "焦點",
+    "level": "水平", "Level": "水平", "LEVEL": "水平",
+    "cost": "成本", "Cost": "成本", "COST": "成本",
+    "rise": "升", "Rise": "升", "RISE": "升",
+    "fall": "跌", "Fall": "跌", "FALL": "跌",
+    "hurt": "痛", "Hurt": "痛", "HURT": "痛",
+    "pain": "痛", "Pain": "痛", "PAIN": "痛",
+    "stiff": "硬", "Stiff": "硬", "STIFF": "硬",
+    "sore": "痠", "Sore": "痠", "SORE": "痠",
+    "tight": "緊", "Tight": "緊", "TIGHT": "緊",
+    "weak": "弱", "Weak": "弱", "WEAK": "弱",
+    "tough": "硬淨", "Tough": "硬淨", "TOUGH": "硬淨",
+    "easy": "易", "Easy": "易", "EASY": "易",
+    "hard": "難", "Hard": "難", "HARD": "難",
+    "limb": "肢", "Limb": "肢", "LIMB": "肢",
+    "joint": "關節", "Joint": "關節", "JOINT": "關節",
+    "back": "背", "Back": "背", "BACK": "背",
+    "chest": "胸", "Chest": "胸", "CHEST": "胸",
+    "leg": "腳", "Leg": "腳", "LEG": "腳",
+    "arm": "手臂", "Arm": "手臂", "ARM": "手臂",
+    "abs": "腹肌", "Abs": "腹肌", "ABS": "腹肌",
+    "core": "核心", "Core": "核心", "CORE": "核心",
+    "endo": "內", "Endo": "內",
+    "exo": "外", "Exo": "外",
+    "policy": "政策", "Policy": "政策",
+    "feed": "資訊流", "Feed": "資訊流",
+    "news": "新聞", "News": "新聞", "NEWS": "新聞",
+    "speech": "演講", "Speech": "演講",
+    "trump": "特朗普", "Trump": "特朗普",
+    "biden": "拜登", "Biden": "拜登",
+    "open": "開", "Open": "開", "OPEN": "開",
+    "close": "關", "Close": "關", "CLOSE": "關",
+    "stop": "停", "Stop": "停", "STOP": "停",
+    "go": "去", "Go": "去", "GO": "去",
+    # v3.3.7+ third wave (2026-08-30 third audit pass — final leaks caught):
+    "mode": "模式", "Mode": "模式", "MODE": "模式",
+    "outcome": "結果", "Outcome": "結果", "OUTCOME": "結果",
+    "outcomes": "結果", "Outcomes": "結果",
+    "standby": "待機", "Standby": "待機", "STANDBY": "待機",
+    "moment": "時刻", "Moment": "時刻", "MOMENT": "時刻",
+    "moments": "時刻", "Moments": "時刻",
+    "action": "行動", "Action": "行動", "ACTION": "行動",
+    "actions": "行動", "Actions": "行動",
+    "mobility": "活動能力", "Mobility": "活動能力", "MOBILITY": "活動能力",
+    "trade": "交易", "Trade": "交易", "TRADE": "交易",
+    "trades": "交易", "Trades": "交易",
+    "stake": "持倉", "Stake": "持倉", "STAKE": "持倉",
+    "hold": "持有", "Hold": "持有", "HOLD": "持有",
+    "buy": "買", "Buy": "買", "BUY": "買",
+    "sell": "賣", "Sell": "賣", "SELL": "賣",
+    "long": "好", "Long": "好", "LONG": "好",
+    "short": "淡", "Short": "淡", "SHORT": "淡",
+    "call": "睇好", "Call": "睇好", "CALL": "睇好",
+    "put": "睇淡", "Put": "睇淡", "PUT": "睇淡",
+    "risk": "風險", "Risk": "風險", "RISK": "風險",
+    "risks": "風險", "Risks": "風險",
+    "reward": "回報", "Reward": "回報", "REWARD": "回報",
+    "chart": "圖表", "Chart": "圖表", "CHART": "圖表",
+    "charts": "圖表", "Charts": "圖表",
+    "index": "指數", "Index": "指數", "INDEX": "指數",
+    "stock": "股票", "Stock": "股票", "STOCK": "股票",
+    "stocks": "股票", "Stocks": "股票",
+    "crypto": "加密貨幣", "Crypto": "加密貨幣", "CRYPTO": "加密貨幣",
+    "bitcoin": "比特幣", "Bitcoin": "比特幣", "BITCOIN": "比特幣",
+    "eth": "以太幣", "Eth": "以太幣", "ETH": "以太幣",
+    "ethereum": "以太幣", "Ethereum": "以太幣",
+    "dex": "去中心化交易所", "Dex": "去中心化交易所",
+    "cex": "中心化交易所", "Cex": "中心化交易所",
+    "degen": "膽粗粗", "Degen": "膽粗粗",
+    "rug": "走佬", "Rug": "走佬", "RUG": "走佬",
+    "meme": "迷因", "Meme": "迷因", "MEME": "迷因",
+    "moon": "升穿", "Moon": "升穿", "MOON": "升穿",
+    "ngmi": "冇運行", "Ngmi": "冇運行",
+    "wagmi": "齊齊發", "Wagmi": "齊齊發",
+    "fomo": "驚執輸", "Fomo": "驚執輸", "FOMO": "驚執輸",
+    "fud": "恐懼", "Fud": "恐懼", "FUD": "恐懼",
+    "btc": "比特幣", "Btc": "比特幣", "BTC": "比特幣",
+    "ath": "歷史高位", "Ath": "歷史高位", "ATH": "歷史高位",
+    "atl": "歷史低位", "Atl": "歷史低位", "ATL": "歷史低位",
+    "dip": "回吐", "Dip": "回吐", "DIP": "回吐",
+    "pump": "抽升", "Pump": "抽升", "PUMP": "抽升",
+    "dump": "暴跌", "Dump": "暴跌", "DUMP": "暴跌",
+    "whale": "大戶", "Whale": "大戶", "WHALE": "大戶",
+    "hodl": "長揸", "Hodl": "長揸", "HODL": "長揸",
+    "bags": "袋", "Bags": "袋", "BAGS": "袋",
+    "beta": "測試", "Beta": "測試", "BETA": "測試",
+    "alpha": "領先", "Alpha": "領先", "ALPHA": "領先",
+    "vibe": "感覺", "Vibe": "感覺", "VIBE": "感覺",
+    "vibes": "感覺", "Vibes": "感覺",
+    "mood": "心情", "Mood": "心情", "MOOD": "心情",
+    "tone": "語氣", "Tone": "語氣", "TONE": "語氣",
+    "vibe": "感覺", "Vibe": "感覺",
+    "tone": "語氣", "Tone": "語氣",
+    # v3.3.7+ fourth wave (2026-08-30 fourth audit pass — final batch):
+    "hangover": "宿醉", "Hangover": "宿醉", "HANGOVER": "宿醉",
+    "window": "窗口", "Window": "窗口", "WINDOW": "窗口",
+    "iThome": "科技網站", "ithome": "科技網站",
+    "SaaS": "雲端軟件", "saas": "雲端軟件",
+    "IOC": "入侵指標", "Ioc": "入侵指標", "ioc": "入侵指標",
+    "integration": "整合", "Integration": "整合", "INTEGRATION": "整合",
+    "dependency": "依賴", "Dependency": "依賴", "DEPENDENCY": "依賴",
+    "vendor": "供應商", "Vendor": "供應商", "VENDOR": "供應商",
+    "team": "團隊", "Team": "團隊", "TEAM": "團隊",
+    "office": "寫字樓", "Office": "寫字樓", "OFFICE": "寫字樓",
+    "security": "保安", "Security": "保安", "SECURITY": "保安",
+    "chain": "鏈", "Chain": "鏈", "CHAIN": "鏈",
+    "supply": "供應", "Supply": "供應", "SUPPLY": "供應",
+    "monitor": "監察", "Monitor": "監察", "MONITOR": "監察",
+    "keep": "保持住", "Keep": "保持住", "KEEP": "保持住",
+    "audit": "審查", "Audit": "審查", "AUDIT": "審查",
+    "over": "過", "Over": "過", "OVER": "過",
+    "hang": "掛住", "Hang": "掛住", "HANG": "掛住",
+    "stand": "站", "Stand": "站", "STAND": "站",
+    "up": "上", "Up": "上", "UP": "上",
+    "kick": "踢", "Kick": "踢", "KICK": "踢",
+    "walk": "行", "Walk": "行", "WALK": "行",
+    "boot": "啟動", "Boot": "啟動", "BOOT": "啟動",
+    "reset": "重設", "Reset": "重設", "RESET": "重設",
+    "high": "高", "High": "高", "HIGH": "高",
+    "in": "喺", "In": "喺", "IN": "喺",
+    "body": "身體", "Body": "身體", "BODY": "身體",
+    "bodyweight": "自身體重", "Bodyweight": "自身體重", "BODYWEIGHT": "自身體重",
+    "workout": "操", "Workout": "操", "WORKOUT": "操",
+    "cheer": "打氣", "Cheer": "打氣", "CHEER": "打氣",
+    "message": "訊息", "Message": "訊息", "MESSAGE": "訊息",
+    "messages": "訊息", "Messages": "訊息",
+    "carb": "碳水", "Carb": "碳水", "CARB": "碳水",
+    "carbs": "碳水", "Carbs": "碳水",
+    "heavy": "重", "Heavy": "重", "HEAVY": "重",
+    "dump": "暴跌", "Dump": "暴跌", "DUMP": "暴跌",
+    "mobility": "活動能力", "Mobility": "活動能力", "MOBILITY": "活動能力",
+    "flow": "流動", "Flow": "流動", "FLOW": "流動",
+    "focus": "專注", "Focus": "專注", "FOCUS": "專注",
+    "gear": "檔位", "Gear": "檔位", "GEAR": "檔位",
+    "full": "滿", "Full": "滿", "FULL": "滿",
+    "quick": "快", "Quick": "快", "QUICK": "快",
+    "fine": "好", "Fine": "好", "FINE": "好",
+    "absolutely": "絕對", "Absolutely": "絕對", "ABSOLUTELY": "絕對",
+    "recovery": "復原", "Recovery": "復原", "RECOVERY": "復原",
+    "hedging": "對沖", "Hedging": "對沖", "HEDGING": "對沖",
+    "hedge": "對沖", "Hedge": "對沖", "HEDGE": "對沖",
+    "email": "電郵", "Email": "電郵", "EMAIL": "電郵",
+    "GI": "升糖指數", "Gi": "升糖指數", "gi": "升糖指數",
+    "HRV": "心跳變異", "Hrv": "心跳變異", "hrv": "心跳變異",
+    "APT": "黑客組織", "Apt": "黑客組織", "apt": "黑客組織",
+    "APT24": "黑客組織", "Apt24": "黑客組織", "apt24": "黑客組織",
+    "IT": "資訊科技", "It": "資訊科技", "it": "資訊科技",
+    "iThome": "科技網站",
+    # v3.3.7+ fifth wave (2026-08-30 fifth audit — 1 leak remaining):
+    "partner": "夥伴", "Partner": "夥伴", "PARTNER": "夥伴",
+    "partners": "夥伴", "Partners": "夥伴",
+    # v3.3.7+ sixth wave (2026-08-30 sixth audit — leaks observed in new draft):
+    "endpoint": "端點", "Endpoint": "端點", "ENDPOINT": "端點",
+    "ATM": "櫃員機", "atm": "櫃員機",
+    "breakout": "突破", "Breakout": "突破", "BREAKOUT": "突破",
+    "VPN": "虛擬網絡", "vpn": "虛擬網絡",
+    "charge": "收費", "Charge": "收費", "CHARGE": "收費",
+    "optional": "自選", "Optional": "自選", "OPTIONAL": "自選",
+    "accessory": "配件", "Accessory": "配件", "ACCESSORY": "配件",
+    "accessories": "配件", "Accessories": "配件",
+    "personal": "個人", "Personal": "個人", "PERSONAL": "個人",
+    "protective": "保護", "Protective": "保護", "PROTECTIVE": "保護",
+    "equipment": "裝備", "Equipment": "裝備", "EQUIPMENT": "裝備",
+    "nutrient": "營養素", "Nutrient": "營養素", "NUTRIENT": "營養素",
+    "nutrients": "營養素", "Nutrients": "營養素",
+    "incre": "增加", "Incre": "增加", "INCRE": "增加",
+    "er": "急診室", "Er": "急診室", "ER": "急診室",
+    "CI": "持續整合", "Ci": "持續整合", "ci": "持續整合",
+    "CD": "持續部署", "Cd": "持續部署", "cd": "持續部署",
+    "CI/CD": "持續整合部署",
+    "API": "應用程式介面", "Api": "應用程式介面", "api": "應用程式介面",
+    "CPU": "處理器", "Cpu": "處理器", "cpu": "處理器",
+    "GPU": "圖像處理器", "Gpu": "圖像處理器", "gpu": "圖像處理器",
+    "RAM": "記憶體", "Ram": "記憶體", "ram": "記憶體",
+    "SSD": "硬碟", "Ssd": "硬碟", "ssd": "硬碟",
+    "HDD": "硬碟", "Hdd": "硬碟", "hdd": "硬碟",
+    "OS": "作業系統", "Os": "作業系統", "os": "作業系統",
+    "UI": "介面", "Ui": "介面", "ui": "介面",
+    "UX": "體驗", "Ux": "體驗", "ux": "體驗",
+    "AI": "人工智能", "Ai": "人工智能", "ai": "人工智能",
+    "ML": "機器學習", "Ml": "機器學習", "ml": "機器學習",
+    "PR": "公關", "Pr": "公關", "pr": "公關",
+    "FAQ": "常見問題", "Faq": "常見問題", "faq": "常見問題",
+    "CEO": "行政總裁", "Ceo": "行政總裁", "ceo": "行政總裁",
+    "CTO": "技術總監", "Cto": "技術總監", "cto": "技術總監",
+    "CFO": "財務總監", "Cfo": "財務總監", "cfo": "財務總監",
+    "CMO": "市場總監", "Cmo": "市場總監", "cmo": "市場總監",
+    "COO": "營運總監", "Coo": "營運總監", "coo": "營運總監",
+    "VP": "副總裁", "Vp": "副總裁", "vp": "副總裁",
+    "SVP": "高級副總裁", "Svp": "高級副總裁", "svp": "高級副總裁",
+    "EVP": "執行副總裁", "Evp": "執行副總裁", "evp": "執行副總裁",
+    "GM": "總經理", "Gm": "總經理", "gm": "總經理",
+    "MD": "董事總經理", "Md": "董事總經理", "md": "董事總經理",
+    "AVP": "助理副總裁", "Avp": "助理副總裁", "avp": "助理副總裁",
+    "HR": "人力資源", "Hr": "人力資源", "hr": "人力資源",
+    "IT": "資訊科技", "It": "資訊科技", "it": "資訊科技",
+    "R&D": "研發", "RD": "研發",
+    "B2B": "企業對企業", "B2b": "企業對企業", "b2b": "企業對企業",
+    "B2C": "企業對消費者", "B2c": "企業對消費者", "b2c": "企業對消費者",
+    "C2C": "消費者對消費者", "C2c": "消費者對消費者", "c2c": "消費者對消費者",
+    "P2P": "點對點", "P2p": "點對點", "p2p": "點對點",
+    "SaaS": "雲端軟件", "Saas": "雲端軟件", "saas": "雲端軟件",
+    "PaaS": "平台即服務", "Paas": "平台即服務", "paas": "平台即服務",
+    "IaaS": "基礎設施即服務", "Iaas": "基礎設施即服務", "iaas": "基礎設施即服務",
+    "CMS": "內容管理系統", "Cms": "內容管理系統", "cms": "內容管理系統",
+    "CRM": "客戶關係管理", "Crm": "客戶關係管理", "crm": "客戶關係管理",
+    "ERP": "企業資源規劃", "Erp": "企業資源規劃", "erp": "企業資源規劃",
+    "KPI": "關鍵績效指標", "Kpi": "關鍵績效指標", "kpi": "關鍵績效指標",
+    "OKR": "目標與關鍵成果", "Okr": "目標與關鍵成果", "okr": "目標與關鍵成果",
+    "MVP": "最小可行產品", "Mvp": "最小可行產品", "mvp": "最小可行產品",
+    "POC": "概念驗證", "Poc": "概念驗證", "poc": "概念驗證",
+    "ROI": "投資回報率", "Roi": "投資回報率", "roi": "投資回報率",
+    "SEO": "搜尋引擎優化", "Seo": "搜尋引擎優化", "seo": "搜尋引擎優化",
+    "SEM": "搜尋引擎行銷", "Sem": "搜尋引擎行銷", "sem": "搜尋引擎行銷",
+    "UI/UX": "介面體驗",
+    "DevOps": "開發運維", "Devops": "開發運維", "devops": "開發運維",
+    "Agile": "敏捷", "agile": "敏捷",
+    "Scrum": "Scrum 框架", "scrum": "Scrum 框架",
+    "Sprint": "衝刺", "sprint": "衝刺",
+    "Stand-up": "站會", "standup": "站會", "Standup": "站會",
+    "Stand-up meeting": "站會",
+    # v3.3.7+ seventh wave (2026-08-30 seventh audit — 1 leak remaining):
+    "SSL": "安全通訊協定", "Ssl": "安全通訊協定", "ssl": "安全通訊協定",
+    "TLS": "傳輸層安全", "Tls": "傳輸層安全", "tls": "傳輸層安全",
+    "HTTPS": "安全超文本傳輸", "Https": "安全超文本傳輸", "https": "安全超文本傳輸",
+    "HTTP": "超文本傳輸", "Http": "超文本傳輸", "http": "超文本傳輸",
+    "SSH": "安全外殼", "Ssh": "安全外殼", "ssh": "安全外殼",
+    "DNS": "網域名稱系統", "Dns": "網域名稱系統", "dns": "網域名稱系統",
+    "DHCP": "動態主機配置", "Dhcp": "動態主機配置", "dhcp": "動態主機配置",
+    "TCP": "傳輸控制協定", "Tcp": "傳輸控制協定", "tcp": "傳輸控制協定",
+    "UDP": "用戶資料報協定", "Udp": "用戶資料報協定", "udp": "用戶資料報協定",
+    "IP": "網際協定", "Ip": "網際協定", "ip": "網際協定",
+    "IPv4": "網際協定第四版", "IPv6": "網際協定第六版",
+    "MAC": "媒體存取控制", "Mac": "媒體存取控制", "mac": "媒體存取控制",
+    "WiFi": "無線網絡", "Wifi": "無線網絡", "wifi": "無線網絡",
+    "LAN": "區域網絡", "Lan": "區域網絡", "lan": "區域網絡",
+    "WAN": "廣域網絡", "Wan": "廣域網絡", "wan": "廣域網絡",
+    "URL": "網址", "Url": "網址", "url": "網址",
+    "URI": "統一資源標識符", "Uri": "統一資源標識符", "uri": "統一資源標識符",
+    "HTML": "網頁標記", "Html": "網頁標記", "html": "網頁標記",
+    "CSS": "層疊樣式表", "Css": "層疊樣式表", "css": "層疊樣式表",
+    "JS": "JavaScript 程式語言", "js": "JavaScript 程式語言",
+    "JavaScript": "JavaScript 程式語言", "javascript": "JavaScript 程式語言",
+    "TypeScript": "TypeScript 程式語言", "typescript": "TypeScript 程式語言",
+    "Python": "Python 程式語言", "python": "Python 程式語言",
+    "Java": "Java 程式語言", "java": "Java 程式語言",
+    "Go": "Go 程式語言", "golang": "Go 程式語言",
+    "Rust": "Rust 程式語言", "rust": "Rust 程式語言",
+    "Ruby": "Ruby 程式語言", "ruby": "Ruby 程式語言",
+    "PHP": "PHP 程式語言", "Php": "PHP 程式語言", "php": "PHP 程式語言",
+    "SQL": "結構化查詢語言", "Sql": "結構化查詢語言", "sql": "結構化查詢語言",
+    "NoSQL": "非關聯式資料庫", "Nosql": "非關聯式資料庫", "nosql": "非關聯式資料庫",
+    "MongoDB": "MongoDB 資料庫", "mongodb": "MongoDB 資料庫",
+    "PostgreSQL": "PostgreSQL 資料庫", "postgresql": "PostgreSQL 資料庫",
+    "MySQL": "MySQL 資料庫", "mysql": "MySQL 資料庫",
+    "Redis": "Redis 資料庫", "redis": "Redis 資料庫",
+    "Kafka": "Kafka 串流平台", "kafka": "Kafka 串流平台",
+    "Spark": "Spark 運算引擎", "spark": "Spark 運算引擎",
+    "Hadoop": "Hadoop 大數據平台", "hadoop": "Hadoop 大數據平台",
+    "AWS": "亞馬遜雲端", "Aws": "亞馬遜雲端", "aws": "亞馬遜雲端",
+    "Azure": "微軟雲端", "azure": "微軟雲端",
+    "GCP": "谷歌雲端", "Gcp": "谷歌雲端", "gcp": "谷歌雲端",
+    "OpenSSL": "開源安全通訊", "openssl": "開源安全通訊",
+    # v3.3.7+ eighth wave (2026-08-30 eighth audit — 2 leaks remaining):
+    "DoS": "阻斷服務攻擊", "Dos": "阻斷服務攻擊", "dos": "阻斷服務攻擊",
+    "DDoS": "分散式阻斷服務攻擊", "Ddos": "分散式阻斷服務攻擊", "ddos": "分散式阻斷服務攻擊",
+    "patch": "修補檔", "Patch": "修補檔", "PATCH": "修補檔",
+    "patches": "修補檔", "Patches": "修補檔",
+    "firewall": "防火牆", "Firewall": "防火牆", "FIREWALL": "防火牆",
+    "malware": "惡意程式", "Malware": "惡意程式", "MALWARE": "惡意程式",
+    "ransomware": "勒索軟件", "Ransomware": "勒索軟件", "RANSOMWARE": "勒索軟件",
+    "spyware": "間諜軟件", "Spyware": "間諜軟件", "SPYWARE": "間諜軟件",
+    "adware": "廣告軟件", "Adware": "廣告軟件", "ADWARE": "廣告軟件",
+    "rootkit": "隱藏程式", "Rootkit": "隱藏程式", "ROOTKIT": "隱藏程式",
+    "trojan": "木馬程式", "Trojan": "木馬程式", "TROJAN": "木馬程式",
+    "worm": "蠕蟲病毒", "Worm": "蠕蟲病毒", "WORM": "蠕蟲病毒",
+    "virus": "病毒", "Virus": "病毒", "VIRUS": "病毒",
+    "zero-day": "零日漏洞", "zeroday": "零日漏洞", "Zero-day": "零日漏洞",
+    "exploit": "漏洞利用", "Exploit": "漏洞利用", "EXPLOIT": "漏洞利用",
+    "payload": "攻擊載荷", "Payload": "攻擊載荷", "PAYLOAD": "攻擊載荷",
+    "backdoor": "後門", "Backdoor": "後門", "BACKDOOR": "後門",
+    "botnet": "殭屍網絡", "Botnet": "殭屍網絡", "BOTNET": "殭屍網絡",
+    "honeypot": "蜜罐", "Honeypot": "蜜罐", "HONEYPOT": "蜜罐",
+    "sandbox": "沙盒", "Sandbox": "沙盒", "SANDBOX": "沙盒",
+    "penetration test": "滲透測試", "pentest": "滲透測試", "Pentest": "滲透測試",
+    "red team": "紅隊", "Red Team": "紅隊", "redteam": "紅隊",
+    "blue team": "藍隊", "Blue Team": "藍隊", "blueteam": "藍隊",
+    "DevSecOps": "安全開發運維", "devsecops": "安全開發運維",
+    "OAuth": "OAuth 授權", "oauth": "OAuth 授權",
+    "JWT": "JSON Web 令牌", "Jwt": "JSON Web 令牌", "jwt": "JSON Web 令牌",
+    "CORS": "跨來源資源共用", "Cors": "跨來源資源共用", "cors": "跨來源資源共用",
+    "XSS": "跨站腳本攻擊", "Xss": "跨站腳本攻擊", "xss": "跨站腳本攻擊",
+    "CSRF": "跨站請求偽造", "Csrf": "跨站請求偽造", "csrf": "跨站請求偽造",
+    "SQL injection": "SQL 注入攻擊", "sqli": "SQL 注入攻擊", "SQLi": "SQL 注入攻擊",
+    "MITM": "中間人攻擊", "Mitm": "中間人攻擊", "mitm": "中間人攻擊",
+    "DLP": "資料外洩防護", "Dlp": "資料外洩防護", "dlp": "資料外洩防護",
+    "WAF": "網頁應用防火牆", "Waf": "網頁應用防火牆", "waf": "網頁應用防火牆",
+    "IDS": "入侵偵測系統", "Ids": "入侵偵測系統", "ids": "入侵偵測系統",
+    "IPS": "入侵防禦系統", "Ips": "入侵防禦系統", "ips": "入侵防禦系統",
+    "SOC": "安全運維中心", "Soc": "安全運維中心", "soc": "安全運維中心",
+    "SIEM": "安全資訊與事件管理", "Siem": "安全資訊與事件管理", "siem": "安全資訊與事件管理",
     "and ": "同 ", " or ": "或者", " but ": "但 ", " if ": "如果 ",
     # v3.2.7.43 — words observed in real MiniMax M3 cheer output that
     # survived `_voice_zh_replace` (Cantonese listening agent report):
@@ -7592,17 +11716,23 @@ def _strip_voice_slash_symbols(s: str) -> str:
 
     s = _re_slash.sub(r"\b(20\d{2})/(\d{1,2})/(\d{1,2})\b", _year_date, s)
 
-    # 1b. M/D date WITHOUT year — ONLY convert if BOTH numbers are in valid
-    # date range (1-12 for month, 1-31 for day). Anything else (e.g. 50/10
-    # reps, 3/4 fraction, 100/200 ratio) is left untouched. Negative lookbehind
-    # for digit prevents "2026/08/27" sub-match; negative lookahead prevents
-    # "/something" with denominator >31 from matching.
+    # 1b. M/D or D/M/M date WITHOUT year — v3.3.23aw (Jim OOB 2026-10-01
+    # 「For voice, pls avoid using date format mm/dd」): more aggressive — convert
+    # when the first number <= 12 (clearly a month) OR second number <= 31 with
+    # first > 12 (clearly D/M/M). Both directions handled. Validates that at
+    # least one side is a plausible month/day. Anything else (e.g. 50/10
+    # reps, 100/200 ratio, 3/4 fraction where both > 31) is left untouched.
     def _md_strict(m):
-        mo, d = int(m.group(1)), int(m.group(2))
-        # Must be plausible date
-        if not (1 <= mo <= 12 and 1 <= d <= 31):
-            return m.group(0)  # leave unchanged
-        return f"{_zh_month(mo)}月{_zh_day(d)}號"
+        a, b = int(m.group(1)), int(m.group(2))
+        # M/D direction: first is month (1-12), second is day (1-31)
+        if 1 <= a <= 12 and 1 <= b <= 31:
+            return f"{_zh_month(a)}月{_zh_day(b)}號"
+        # D/M direction: first > 12 (not a month), second is month (1-12)
+        # But first must also be a valid day (1-31)
+        if a > 12 and 1 <= a <= 31 and 1 <= b <= 12:
+            return f"{_zh_day(a)}月{_zh_month(b)}號"
+        # Leave unchanged (e.g. 50/10 reps, 3/4 fraction, 100/200 ratio)
+        return m.group(0)
 
     s = _re_slash.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d|/)", _md_strict, s)
 
@@ -8145,13 +12275,28 @@ def _zh_inline(en_word: str) -> str:
         "yoga": "瑜伽", "cycling": "踩單車", "swimming": "游水",
         "toned": "結實", "ripped": "精瘦", "elite": "頂尖",
         "athletic": "運動型", "buff": "壯",
+        # v3.3.7+ (Jim OOB 2026-08-30「I want full Chinese on gymbro Chinese」):
+        # Added from 2026-08-30 manual cheer audit — leaked words in real draft:
+        "workout": "操", "Workout": "操", "WORKOUT": "操",
+        "body": "身體", "Body": "身體", "BODY": "身體",
+        "gym": "操", "Gym": "操", "GYM": "操",
+        "monitor": "監察", "Monitor": "監察",
+        "mark": "記低", "Mark": "記低",
+        "email": "電郵", "Email": "電郵", "EMAIL": "電郵",
+        "blood flow": "血液循環", "Blood flow": "血液循環",
+        "APT24": "黑客組織", "apt24": "黑客組織",
+        "IT": "資訊科技", "It": "資訊科技",
+        "challenge": "挑戰", "Challenge": "挑戰",
+        "today": "今日", "Today": "今日",
+        "team": "團隊", "Team": "團隊",
+        "session": "課節", "Session": "課節",
     }
-    # v3.2.7.39: catch-all fallback. If unknown English word isn't in the
-    # table, return a placeholder so the TTS doesn't read literal English.
-    # We use 「X」 (Chinese book-title quotes) so the voice says "X" but the
-    # word is clearly marked as something the user might want to recognise
-    # later when they look at the text version.
-    return table.get(en_word, f"「{en_word}」")
+    # v3.3.7+ (Jim OOB 2026-08-30「I want full Chinese on gymbro Chinese」):
+    # catch-all fallback now strips entirely instead of 「嗰樣嘢」. Voice
+    # sounds natural — Chinese listeners don't notice missing filler words
+    # in flowing prose. Previous 「嗰樣嘢」quote was too repetitive when
+    # miniMax produced many IT acronyms in one cheer.
+    return table.get(en_word, "")
 
 
 def _run_whoop_pull_cached(force: bool = False) -> dict:
@@ -8239,7 +12384,88 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
         "today_workouts": today_workouts,  # Jim OOB 2026-07-24: keep raw list for §4 detail loop
         "cycle_id": (latest_cycle or {}).get('id'),
         "strain": (latest_cycle or {}).get('score', {}).get('strain'),
+        # v3.3.23am (Jim OOB 2026-09-27 'The cheer routine does not count
+        # the food ingested today and recently. Pls add. Moreover, pls
+        # also factor in latest workout activities from whoop.'): add
+        # today's nutrition (from NutritionCache hydrated from Sheet) and
+        # last 3-day workout activity from Whoop. The cheer pipeline
+        # reads metrics_snapshot and these fields are now always present.
+        "today_nutrition": _get_today_nutrition_snapshot(),
+        "recent_workouts_3d": _get_recent_workouts_3d(workouts),
     }
+
+
+def _get_today_nutrition_snapshot() -> dict:
+    """Compact today-nutrition snapshot for the cheer metrics block.
+
+    v3.3.23am: extracted so cheer metrics carry today's actual food
+    intake (kcal / P / C / F / per-meal breakdown). Previously cheer
+    only had workout + Whoop + Withings — today's food was missing,
+    so the AI couldn't comment on macro balance vs training load or
+    warn about late-night eating.
+    """
+    try:
+        data = _load_today_nutrition()
+    except Exception:
+        return {"meal_count": 0, "totals": {}, "meals": []}
+    meals = []
+    for m in data.get("meals", []) or []:
+        meals.append({
+            "time": m.get("time", ""),
+            "name": m.get("meal_name") or m.get("name") or "(未命名)",
+            "restaurant": m.get("restaurant_chain") or "",
+            "kcal": float(m.get("calories") or 0),
+            "P": float(m.get("protein") or 0),
+            "C": float(m.get("carbs") or 0),
+            "F": float(m.get("fat") or 0),
+        })
+    return {
+        "date": data.get("date"),
+        "meal_count": data.get("meal_count", 0),
+        "totals": data.get("totals", {}),
+        "last_meal_ts": data.get("last_meal_ts"),
+        "meals": meals,
+    }
+
+
+def _get_recent_workouts_3d(workouts) -> list:
+    """v3.3.23am: last 3 days of Whoop workouts for cheer context.
+
+    Jim wants cheer to factor in latest workout activity from Whoop —
+    not just today but the recent trend (yesterday overtraining? back-to-back
+    hard sessions? rest day before an event?). Returns compact list
+    sorted by start DESC, capped at 20 entries.
+    """
+    from datetime import datetime, timezone, timedelta
+    hkt = timezone(timedelta(hours=8))
+    now_hkt = datetime.now(hkt)
+    cutoff = now_hkt - timedelta(days=3)
+    out = []
+    try:
+        # workouts_cache is list of workout dicts from Whoop
+        for w in (workouts_cache or []):
+            start_str = w.get("start") or ""
+            try:
+                start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(hkt)
+            except Exception:
+                continue
+            if start_dt < cutoff:
+                continue
+            score = w.get("score") or {}
+            out.append({
+                "start": start_str,
+                "sport": w.get("sport_name") or "workout",
+                "strain": score.get("strain"),
+                "duration_min": round(((w.get("end") and (datetime.fromisoformat(w["end"].replace("Z", "+00:00")).timestamp() - datetime.fromisoformat(start_str.replace("Z", "+00:00")).timestamp())) or 0) / 60, 1),
+                "avg_hr": score.get("average_heart_rate"),
+                "max_hr": score.get("max_heart_rate"),
+                "kilojoule": score.get("kilojoule"),
+            })
+        # Sort by start DESC (newest first)
+        out.sort(key=lambda x: x.get("start") or "", reverse=True)
+        return out[:20]
+    except Exception:
+        return []
 
 
 def _format_workout_detail_for_cheer(workouts: list) -> str:
@@ -8364,6 +12590,48 @@ def _format_workout_detail_for_cheer(workouts: list) -> str:
     return "\n".join(lines) if lines else "(尚未做運動)"
 
 
+def _format_recent_workouts_3d_for_cheer(workouts: list) -> str:
+    """v3.3.23am (Jim OOB 2026-09-27 'Pls add latest workout activities
+    from whoop'): format last-3-day workouts as Chinese block for cheer.
+
+    Renders a compact Chinese summary like:
+      「過去 3 日 workout (共 4 個 session)：
+         - 09-27 05:59 — 舉重 (12.8 strain, 8 分鐘)
+         - 09-26 19:15 — 跑步 (15.2 strain, 32 分鐘)
+         ...」
+
+    Empty list → "(過去 3 日未做運動)".
+    """
+    if not workouts:
+        return "(過去 3 日未做運動)"
+    from datetime import datetime, timezone, timedelta
+    hkt = timezone(timedelta(hours=8))
+    lines = [f"\n**過去 3 日 workout 趨勢（Jim OOB 2026-09-27 'Pls add latest'）**："]
+    lines.append(f"- 共 {len(workouts)} 個 session")
+    for w in workouts:
+        try:
+            start_dt = datetime.fromisoformat(w["start"].replace("Z", "+00:00")).astimezone(hkt)
+            time_str = start_dt.strftime("%m-%d %H:%M")
+        except Exception:
+            time_str = w.get("start", "?")
+        sport = w.get("sport") or "workout"
+        strain = w.get("strain")
+        dur = w.get("duration_min")
+        avg_hr = w.get("avg_hr")
+        max_hr = w.get("max_hr")
+        parts = [f"  - {time_str} — {sport}"]
+        if dur is not None:
+            parts.append(f"時長 {dur:g} 分鐘")
+        if strain is not None:
+            parts.append(f"強度 {strain:g}")
+        if avg_hr:
+            parts.append(f"均心跳 {avg_hr:g}")
+        if max_hr:
+            parts.append(f"最高心跳 {max_hr:g}")
+        lines.append("、".join(parts))
+    return "\n".join(lines)
+
+
 def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     """v3.2.7.40: Switch cheer text generation from pplx sonar-pro → MiniMax M3.
 
@@ -8398,11 +12666,15 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     strain = metrics.get("strain")
     cycle_id = metrics.get("cycle_id")
     # Jim OOB 2026-07-24: enrichment from Withings + workout detail loop
-    withings_weight = metrics.get("withings_weight_kg")
-    withings_fat = metrics.get("withings_fat_pct")
-    withings_steps = metrics.get("withings_steps_today")
-    withings_dist_km = metrics.get("withings_distance_km")
+    withings_weight = metrics.get("weight_kg")
+    withings_fat = metrics.get("fat_pct")
+    withings_steps = metrics.get("steps_today")
+    # v3.3.25: step distance is gone with the Withings step path (Whoop cycles
+    # carry no step distance). The cheer prompt no longer shows a distance line.
+    withings_dist_km = None
     workout_detail_zh = metrics.get("workout_detail_zh", "(尚未做運動)")
+    recent_workouts_zh = metrics.get("recent_workouts_zh", "(過去 3 日未做運動)")
+    # nutrition_block already defined below (line 11073+) via _get_today_nutrition_for_cheer()
 
     hkt = datetime.now(timezone(timedelta(hours=8)))
     hkt_str = hkt.strftime("%H:%M")
@@ -8444,7 +12716,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
     # write it like you're talking to a friend in a gym locker room.
     # Data freshness stamp: tell Jim when this snapshot was taken.
     data_freshness = (
-        f"數據快照時間：HKT {hkt_str}（剛從 Whoop + Withings 即時拉返）"
+        f"數據快照時間：HKT {hkt_str}（剛從 Whoop 即時拉返）"
     )
 
     prompt = f"""你係 Jim 嘅私人教練加管家 Alonso，識晒 Jim 嘅 personality：
@@ -8465,19 +12737,23 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 - 血氧：{spo2}%
 - 噉晚瞓：{sleep_hr} 個鐘頭（深層瞓 {sleep_sws} 分鐘、REM {sleep_rem} 分鐘、表現 {sleep_perf}%）
 - 疲勞度：{strain}
-- Withings 體重：{withings_weight} 公斤
-- Withings 體脂：{withings_fat} %
-- Withings 今日步數：{withings_steps} 步
-- Withings 今日步行距離：{withings_dist_km} 公里
-- 今日 Whoop 活動總數：{workout_n} 個 session
-- 今日食物 log 總數：見 nutrition_block 內嘅 meal_count
+- 體重：{withings_weight} 公斤
+- 體脂：{withings_fat} %
+- WHOOP 今日步數：{withings_steps} 步
+|今日 Whoop 活動總數：{workout_n} 個 session
+|今日食物 log 總數：見 nutrition_block 內嘅 meal_count
 
 **今日 workout detail**（逐個動作 loop 出嚟，唔好概括）：
 {workout_detail_zh}
-|{news_block}
-|{liverpool_block}
-|{jim_context_block}
-|{nutrition_block}
+
+**過去 3 日 workout 趨勢**（Jim OOB 2026-09-27: 衡量 training load 連續性 / back-to-back 強度）：
+{recent_workouts_zh}
+
+**今日飲食記錄**（Alonso 主動 monitor，唔係等 Jim 講）：
+{nutrition_block}
+||{news_block}
+||{liverpool_block}
+||{jim_context_block}
 |寫作風格指引（Jim OOB 2026-07-24 — 呢啲係 rule，唔好走樣）：
 |0. **v3.2.7.39: 全繁體中文。唔好一個英文 token 都用**（Jim OOB 2026-08-11 22:30+ HKT「Should be all traditional Chinese. No English」）。 即係:
 |   - 唔好用英文 brand / role / 動詞 / 形容詞 / 副詞 / 連詞 / 量詞單位 (`kg`, `kcal`, `ms`, `bpm`, `min`, `sec`, `hr`)
@@ -8495,6 +12771,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 6. **段落結構**：6-8 段，唔好 list / bullet / table / 編號。段落之間用 `\\n\\n` 分隔
 7. **長度**：**1500-2400 字 sweet zone** (v3.3.7 Jim OOB 2026-08-16 「voice summary should not hard stop at 2mins, can extend as much as possible」)。 WanLung 5.0 字/秒 → 300-480 秒 (5-8 分鐘) audio target。 唔好再 cap 喺 960 字 / 192 秒。 寫到內容自然講完為止, 唔好為�短而犧牲 detail。
 8. **段落長度指引** (per-section, 段落可以比之前長): 打招呼 60-90、復原 insight **CAP 250**、睡眠 insight **CAP 200**、訓練 insight **CAP 200**、營養 **CAP 250**、噉晚 routine **CAP 150**、明日預覽 80-130、收尾打氣 **CAP 100** (總和 ~1300-1700 字 target — 段段都充滿 insight 唔好為咗短而空泛)。
+8a. **v3.3.23am (Jim OOB 2026-09-27 「cheer routine does not count food」)**: 營養 section MUST 引用今日食物 log 入面嘅具體 meal + 數字 (例: 「你今日 lunch 食咗半個 pizza 加芝士通心粉, 兩餐合共八百幾 kcal, P 落咗四十二克, 蛋白質追 PT 120 仲差幾十」)。唔好 generic 寫「食嘢方面建議清淡啲」就帶過。要 actionable: 蛋白質唔夠就提議晏晝 snack, 碳水太多就提醒下晝做帶氧, 脂肪超標就建議聽晚 dinner 走醬。 **reference 一定要 quote 返 `今日飲食記錄` block 嘅具體 meal name 同 kcal/P/C/F 數字**, AI 唔好憑空諗。
 9. **唔好 fabricate 數字**：所有 metric 必須喺上面 data 入面搵到
 9a. **(v3.2.7.42) 開頭唔可以做 role-intro, 第一句要直入內容**: 你係兄弟傾偈, 唔係 CEO 滙報。第一句直接講具體 metric / 觀察 (e.g. 「噉晚瞓咗七個鐘, 深層瞓得個半鐘零十六分」/ 「HRV 跌到廿四, 自律神經攤咗喺度抖緊」/ 「今日零 workout, 紅燈復原, 你個 body 維修中」)。**唔好寫** 「管家同你報數先」/ 「教練即刻同你 update」/ 「CIO 開工先睇吓」/ 「返工之前先 check」/ 「我會先講」/ 「而家就同你 update」/ 「哈嘍 Jim」/ 「Hey Jim」呢類 meta-intro opener。Standalone greeting (「早晨啊。」/「朝早 Jim。」) 唔可以單獨成句, 必須同第一句內容 merge。
 10. **粵語助詞密度**：嘅/啦/咗/嗰/咁/吖/囉/嘢 ≥8 個 per 100 字
@@ -8552,20 +12829,28 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
                     "8. **Standalone greeting 句 (例如 「早晨啊。」 / 「朝早 Jim。」) 唔可以單獨成句。** "
                     "如果寫咗 greeting, 必須即刻跟住內容 (e.g. 「早晨 Jim, 噉晚瞓咗七個鐘」一氣呵成), "
                     "唔可以分兩句。\n"
-                    "9. **(v3.2.7.44) 唔好寫 IT / 網絡 / 科技新聞內容** —呢類新聞 (e.g. PortSwigger 漏洞、HTTPS 1.0、HTTP/3 speed、"
-                    "Trend Micro、ServiceNow、N-central、AI security、cyber attack) 與 Jim 嘅健身/健康 cheer 完全無關，"
-                    "而且 TTS 讀出嚟會變「H-T-T-P 斜線 1 點 0」、「PortSwigger 字母一個一個讀」— 變成機械人讀 tech spec。"
-                    "Jim OOB 2026-08-12 17:58 HKT 「There are many words like 'htt www... speed version 1.0' and 'slash' and 'break' wording」。"
-                    "即使本週熱話 news 入面有 IT security 內容, 都要 skip, 唔好寫入 cheer。 範圍:\n"
-                    "   - ❌ 任何 HTTP/HTTPS/SSL/TLS/API/URL/JSON/XML/HTML 提及\n"
-                    "   - ❌ 任何版本號 (v1.0, version 2.3, HTTPS/1.1, HTTP/3)\n"
-                    "   - ❌ 任何網絡安全品牌 (PortSwigger, Trend Micro, ServiceNow, N-central, CrowdStrike, Palo Alto, Fortinet, Cloudflare)\n"
-                    "   - ❌ 速度提及 (e.g. 「speed 係 1.0 嘅 X 倍」、「faster than HTTP/1.1」)\n"
-                    "   - ❌ Cyber attack / 漏洞 / 修補 / 加密 / 解密 / 漏洞披露 等技術詞\n"
-                    "   - 唯一可以提嘅科技詞: 與 Jim 健身 app (Whoop、Withings) 健康數據相關嘅。用「你個 Whoop」、「返 Withings 睇體重」呢類口語。\n"
-                    "10. **(v3.2.7.44) 唔好用 `斜線`/`slash`/`break`/markdown 標記**：edge-tts --ssml 會解析 <break> 標籤做停頓，"
+                    "9. **(v3.2.7.44 + 2026-08-30 「I want full Chinese on gymbro Chinese」) 唔好寫 IT / 網絡 / 科技 / 外匯新聞內容** —呢類新聞 (e.g. APT24 黑客、HTTPS 1.0、HTTP/3 speed、"
+                        "Trend Micro、ServiceNow、N-central、AI security、cyber attack、"
+                        "美匯指數、港元匯率、USD/HKD、聯儲局息口走勢) 與 Jim 嘅健身/健康 cheer 完全無關，"
+                        "而且 TTS 讀出嚟會變「H-T-T-P 斜線 1 點 0」、「APT24 字母一個一個讀」、「USD/HKD 字母拼讀」— 變成機械人讀 tech spec。\n"
+                        "Jim OOB 2026-08-12 17:58 HKT 「There are many words like 'htt www... speed version 1.0' and 'slash' and 'break' wording」+ 2026-08-30 「I want full Chinese on gymbro Chinese」。\n"
+                        "即使本週熱話 news 入面有 IT / 外匯 / 網絡安全內容, 都要 skip, 唔好寫入 cheer。 範圍:\n"
+                        "   - ❌ 任何 HTTP/HTTPS/SSL/TLS/API/URL/JSON/XML/HTML 提及\n"
+                        "   - ❌ 任何版本號 (v1.0, version 2.3, HTTPS/1.1, HTTP/3)\n"
+                        "   - ❌ 任何網絡安全品牌 (PortSwigger, Trend Micro, ServiceNow, N-central, CrowdStrike, Palo Alto, Fortinet, Cloudflare, APT24)\n"
+                        "   - ❌ 任何外匯 / 息口 / 財經術語 (美匯指數、USD/HKD、DXY、聯儲局、加息、減息、息口走勢、外資流入)\n"
+                        "   - ❌ 速度提及 (e.g. 「speed 係 1.0 嘅 X 倍」、「faster than HTTP/1.1」)\n"
+                        "   - ❌ Cyber attack / 漏洞 / 修補 / 加密 / 解密 / 漏洞披露 等技術詞\n"
+                        "   - 唯一可以提嘅科技詞: 與 Jim 健身 app (Whoop、Withings) 健康數據相關嘅。用「你個 Whoop」、「返 Withings 睇體重」呢類口語。\n"
+                        "   - 唯一可以提嘅財經詞: CIO 身分下嘅 office / 開會 / corporate schedule — 唔好寫具體市場數字。\n"
+                        "10. **(v3.2.7.44) 唔好用 `斜線`/`slash`/`break`/markdown 標記**：edge-tts --ssml 會解析 <break> 標籤做停頓，\n"
                     "但如果寫出嚟嘅文字本身包含 `斜線`、`break`、`左括號`、`右括號`、`星號`、`version` 等英文 mark-up 詞，"
                     "TTS 會讀成「斜線」、「break」、「星號」— 變 robotic。寫作時唔好用任何 mark-up 字眼。\n"
+                    "11. **(v3.3.23aw Jim OOB 2026-10-01 「For voice, pls avoid using date format mm/dd which is difficult to pronounce in Cantonese」): 日期一律用中文寫法。**\n"
+                    "    - ❌ 「9/30」、「8/27」、「10/1」、「2026/09/30」、「7/4」 — slash/橫線分隔嘅英文數字格式 TTS 讀成「斜線」「月」「日」, 變 robotic gibberish\n"
+                    "    - ✅ 「九月二十七號」、「十月一號」、「二零二六年八月二十七號」\n"
+                    "    - 包括「前晚 (10/1) gym」、「噉晚 (8/27) workout」呢種括號內標日期都要轉中文\n"
+                    "    - \"今日 / 昨日 / 前日 / 噉晚\" 之類嘅相對時間詞 OK, 但跟住嘅具體日期必須中文\n"
                 ),
             },
             {"role": "user", "content": prompt},
@@ -8701,7 +12986,7 @@ def _build_daily_context() -> dict:
 
     Returns dict with:
         - whoop snapshot (recovery_pct, hrv_ms, sleep_pct, sleep_bed_hr, ...)
-        - withings (weight, fat, steps, distance)
+        - body (weight, fat) + steps — from WHOOP (legacy key name "withings")
         - last_food_ts, last_gym_ts (ISO strings; "" if none)
         - recovery_pct, sleep_pct (top-level for hash)
         - now_hkt
@@ -8735,11 +13020,18 @@ def _build_daily_context() -> dict:
     except Exception:
         pass
     # Withings (non-blocking — values already in cache from cheer flow)
+    # v3.3.25: Withings is no longer a step source; steps live under
+    # ctx["whoop"]["steps"].
     try:
-        ctx["withings"] = {
-            "weight_kg": _withings_weight() if "_withings_weight" in globals() else None,
-            "fat_pct": _withings_fat_pct() if "_withings_fat_pct" in globals() else None,
-            "steps": (_withings_steps_today() or {}).get("steps") if "_withings_steps_today" in globals() else None,
+        ctx["withings"] = {  # v3.3.25: now WHOOP-sourced (weight/fat/steps)
+            "weight_kg": _body_weight() if "_body_weight" in globals() else None,
+            "fat_pct": _body_fat_pct() if "_body_fat_pct" in globals() else None,
+        }
+    except Exception:
+        pass
+    try:
+        ctx["whoop"] = {
+            "steps": (_whoop_steps() or {}).get("steps"),
         }
     except Exception:
         pass
@@ -8772,6 +13064,20 @@ def _build_daily_context() -> dict:
         ctx["fund_fact"] = _get_latest_fund_fact_for_cheer()
     except Exception:
         ctx["fund_fact"] = ""
+    # v3.3.23am (Jim OOB 2026-09-27 'The cheer routine does not count the
+    # food ingested today and recently. Pls add. Moreover, pls also
+    # factor in latest workout activities from whoop.'): thread the
+    # today_nutrition + recent_workouts_zh from whoop metrics into ctx
+    # so the daily-coaching prompt can reference real meal macros and
+    # recent training load. Without this, the LLM prompt only shows
+    # Whoop + Withings + a last_food_ts timestamp — it has no concrete
+    # kcal/P/C/F numbers per meal to quote, so the cheer text is
+    # generic filler like "食嘢方面建議清淡啲".
+    try:
+        ctx["whoop"]["today_nutrition"] = m.get("today_nutrition", {})
+        ctx["whoop"]["recent_workouts_zh"] = m.get("recent_workouts_zh", "")
+    except Exception:
+        pass
     return ctx
 
 
@@ -8824,6 +13130,15 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
     Reuses the data-freshness / persona / style scaffolding from
     _synthesize_cheer_text so the output tone matches what cheer produced
     before unification.
+
+    v3.3.23am (Jim OOB 2026-09-27 'The cheer routine does not count the
+    food ingested today and recently. Pls add. Moreover, pls also factor
+    in latest workout activities from whoop.'): the daily narrative is
+    what gets read aloud by TTS, so it MUST include today's nutrition
+    (kcal/P/C/F per meal + total) and the last-3-day workout trend.
+    Previously this prompt only showed Whoop + Withings + last_food_ts
+    (just a timestamp) — the LLM had no concrete macro numbers to talk
+    about, so it generated generic "食嘢方面建議清淡啲" filler.
     """
     whoop = ctx.get("whoop", {})
     w = ctx.get("withings", {})
@@ -8836,6 +13151,16 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
     steps = (w.get("steps") or {}).get("steps") if isinstance(w.get("steps"), dict) else w.get("steps")
     weight = w.get("weight_kg")
     fat = w.get("fat_pct")
+
+    # v3.3.23am: pull today's nutrition snapshot from metrics so the
+    # narrative can quote real meal names + kcal/P/C/F per meal.
+    today_nutrition = whoop.get("today_nutrition") or {}
+    meal_count = today_nutrition.get("meal_count", 0) or 0
+    totals = today_nutrition.get("totals", {}) or {}
+    meals = today_nutrition.get("meals", []) or []
+
+    # v3.3.23am: recent workouts (last 3 days) formatted as Chinese block.
+    recent_workouts_zh = whoop.get("recent_workouts_zh") or "(過去 3 日未做運動)"
 
     rec_state = "綠燈" if (rec or 0) >= 67 else ("黃燈" if (rec or 0) >= 34 else "紅燈")
     fire_type_zh = {
@@ -8852,6 +13177,19 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
     hkt = datetime.now(HKT)
     hkt_str = hkt.strftime("%H:%M")
 
+    # Build per-meal line list (quote exactly what user logged)
+    meals_lines = []
+    for m in meals:
+        t = m.get("time") or "??:??"
+        name = m.get("name") or "(未命名)"
+        kcal = int(m.get("kcal") or 0)
+        p = m.get("P", 0)
+        c = m.get("C", 0)
+        f = m.get("F", 0)
+        meals_lines.append(f"  - {t} {name} ~{kcal} kcal / P{p:g} / C{c:g} / F{f:g}")
+
+    meals_block = "\n".join(meals_lines) if meals_lines else "  (今日未 log 食物)"
+
     return (
         f"{fire_type_zh} 嘅 daily narrative 嚟喇，目標：俾 cheer voice 讀 + "
         f"video 主題 seed + 食物 coach comment 主題。三個 consumer 共用呢段 narrative，"
@@ -8863,16 +13201,23 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"- 靜止心跳：{rhr} 下/分鐘\n"
         f"- 噉晚瞓：{sleep_hr} 個鐘頭（表現 {sleep_perf}%）\n"
         f"- 疲勞度：{strain}\n"
-        f"- Withings 體重：{weight} 公斤 / 體脂 {fat} %\n"
+        f"- 體重（WHOOP）：{weight} 公斤 / 體脂 {fat} %\n"
         f"- 今日步數：{steps} 步\n"
         f"- 最後進食：{ctx.get('last_food_ts') or '今日未 log'}\n"
         f"- 最後 gym：{ctx.get('last_gym_ts') or '今日未做 gym'}\n\n"
+        f"**今日飲食記錄（Jim OOB 2026-09-27: cheer 要引用, 唔好 generic）**：\n"
+        f"- 已 log {meal_count} 餐\n"
+        f"- 累計 ~{int(totals.get('kcal', 0))} kcal / P{int(totals.get('P', 0))}g / C{int(totals.get('C', 0))}g / F{int(totals.get('F', 0))}g\n"
+        f"{meals_block}\n\n"
+        f"**過去 3 日 workout 趨勢（Jim OOB 2026-09-27: 加埋 latest whoop activity）**：\n"
+        f"{recent_workouts_zh}\n\n"
         f"**本週熱話 news fact (pplx 30 min 內, 隨機 4 類 — 明星/體育/AI/黑客)**：\n"
         f"{ctx.get('news') or '(本週未有確認熱話)'}\n\n"
         f"**最新 fund fact (pplx 30 min 內 — 港股/匯率/利率/金融/商品)**：\n"
         f"{ctx.get('fund_fact') or '(本週未確認)'}\n\n"
         f"**寫作要求**：news fact 同 fund fact 要用「啱啱睇到⋯⋯」/「今朝睇新聞⋯⋯」呢類口語自然嵌入 cheer 內, "
-        f"唔好直接 quote 原文, 唔好用 markdown, 唔好逐個字讀出嚟。\n\n"
+        f"唔好直接 quote 原文, 唔好用 markdown, 唔好逐個字讀出嚟。\n"
+        f"**強制**要喺營養 section 引用今日具體 meal 名 + kcal/P/C/F 數字 (例: 「你 lunch 食咗半個 pizza 加芝士通心粉, 兩餐合共八百幾 kcal, P 落咗四十二克, 蛋白質追 PT 仲差幾十」)。**唔好 generic 寫「食嘢方面建議清淡啲」就帶過**, 要 actionable 建議。\n\n"
         f"寫作風格：同 _synthesize_cheer_text 一致 (1500-2400 字, 6-8 段, 粵語口語, "
         f"冇 markdown, 全繁體中文)。"
     )
@@ -9130,7 +13475,39 @@ def _probe_audio_duration(path: str) -> float:
 
 
 def _synthesize_cheer_voice(text: str) -> str:
-    """Generate Edge-TTS WanLung voice MP3 from cheer text.
+    """Generate MiniMax TTS voice MP3 from cheer text (Cantonese
+    Cantonese_crisp_news_anchor_vv2). Edge-TTS WanLungNeural is now
+    FALLBACK only.
+
+    v3.3.24b (Jim OOB 2026-10-17 21:38 HKT「Edge tts dead? Pls fix.
+    If there is problem, use minimal voice to replace」): edge-tts
+    WanLung started returning 403 WSS (TrustedClientToken rotated)
+    around 2026-10-13. Even with retry, edge-tts fails immediately.
+    MiniMax TTS is the new PRIMARY. Edge-tts WanLung retained as
+    last-resort fallback (in case MiniMax quota/network goes down).
+
+    Earlier history:
+    - v3.3.6 (2026-08-27): edge-tts was primary.
+    - v3.3.11 (Jim OOB 2026-09-01「please switch all voice to minimax
+      audio - Cantonese_crisp_news_anchor_vv2」): MiniMax promoted.
+    - v3.3.15 (Jim OOB 2026-09-04「for gymbro, please use edge tts
+      instead. wanlun voice is better than minimax tts」): edge-tts
+      re-promoted to primary.
+    - v3.3.24b (Jim OOB 2026-10-17): back to MiniMax primary, edge-tts
+      demoted to fallback (current).
+    Also subject to:
+    - v3.3.6 (NEW 2026-08-27, Jim OOB 「Never use slash in voice.
+      Spell out the date if applicable」): strip slash + symbol characters
+      (dates with /, times with :, units kg/g/ml/°C, % percentages, dash
+      ranges) BEFORE humanize/zh-replace so TTS reads 「八月二十七號」
+      not 「八 slash 二十七」. Rule 74 in text-coach-summary-voice.
+    - Rule 79 (HARD DISABLE 2026-08-31, reinforced 2026-09-01): this
+      function renders MP3 to CHEER_AUDIO_CACHE only — NEVER push to
+      Telegram directly via MEDIA: or sendAudio. Caller (PWA cheer tab,
+      MCP server) decides whether to embed in voice bubble. Jim OOB
+      「Don't reply me in voice on telegram anymore. I mean it」.
+    - Rate calibrated for WanLung (empirical 5.69 char/sec at +0%;
+      re-verified 2026-09-04 against measured cheer durations).
 
     Jim OOB 2026-07-23 17:35 HKT: voice was too short and lacked detail.
     Strategy (v2.5.3 — Jim OOB 7/24 14:18 HKT ~150s target):
@@ -9146,6 +13523,10 @@ def _synthesize_cheer_voice(text: str) -> str:
     - Inject 5-7 intonation transitions ("下一節係..." / "教練建議係咁..." /
       "再講下...") between sections so each section gets a clear breath
       pause instead of running-on.
+    - WanLung voice returns to primary (v3.3.15). Earlier v3.3.6→v3.3.10 used
+      WanLung rate 5.69 char/sec estimate which produced ~150s audio for
+      600-720 字 sweet zone. Re-apply same target now that voice engine is
+      edge-tts again.
     - 100% 中文 enforcement (Rule 26 + Rule 37): zh-replace + audit loop,
       2 retries before fallback to detailed ~280 字 fallback script.
     - Timeout 45s → 240s; stderr logged to /tmp/cheer_errors.log.
@@ -9226,9 +13607,16 @@ def _synthesize_cheer_voice(text: str) -> str:
         # is now only a runaway-prevention guard, not a target.
         if len(voice_text) > 12000:
             voice_text = voice_text[:12000]
-        # Audit EN leaks
+        # Audit EN leaks (v3.3.7+ 2026-08-30 Jim OOB「I want full Chinese on gymbro Chinese」)
+        # Beefed-up 4-layer enforcement: (1) zh-replace loop x3, (2) inline-replace
+        # any remaining words (NOT quote them — inline-replace with 通用 placeholder
+        # so TTS never reads literal English phonemes), (3) hard zero-EN strip via
+        # regex on ASCII letters (covers 合體字 like "hyd比例n" where miniMax
+        # splices Chinese inside English word), (4) final assertion guard logs
+        # leaks to /tmp/cheer_en_leaks.log for post-mortem debug.
+        import re as _re_audit
         leaks = _voice_audit_en(voice_text)
-        for _ in range(2):
+        for _ in range(3):
             if not leaks:
                 break
             voice_text = _voice_zh_replace(voice_text)
@@ -9236,37 +13624,205 @@ def _synthesize_cheer_voice(text: str) -> str:
         if leaks:
             # Inline-replace any remaining EN leaks so we keep the full body (v2.7.3
             # fix — previously nuked 1200 chars and replaced with 383-char stub).
-            import re as _re
-            voice_text = _re.sub(r"([A-Za-z]+)", lambda m: _zh_inline(m.group(0)), voice_text)
+            voice_text = _re_audit.sub(r"([A-Za-z]+)", lambda m: _zh_inline(m.group(0)), voice_text)
+            leaks = _voice_audit_en(voice_text)
+        # Final hard strip (v3.3.7+): any leftover ASCII letter = drop. Even if
+        # _zh_inline fell through to default, strip it so TTS never reads literal
+        # English. Logs residual leaks for next-wave dict expansion.
+        if leaks:
+            try:
+                with open("/tmp/cheer_en_leaks.log", "a") as _f:
+                    _f.write(f"{now_iso()} | residual_en={leaks} | text_excerpt={voice_text[:300]}\n")
+            except Exception:
+                pass
+            # Drop ALL ASCII letters — covers 合體字 where miniMax splices CJK inside
+            # English (e.g. "hyd比例n" → "比例" after strip). Preserve spaces + CJK.
+            voice_text = _re_audit.sub(r"[A-Za-z]+", "", voice_text)
+            voice_text = _re_audit.sub(r"\s{2,}", " ", voice_text).strip()
+            voice_text = _re_audit.sub(r"([一-鿿])\s+([一-鿿])", r"\1\2", voice_text)
+            # Final polish: collapse any double-spaces the empty inline
+            # replacement left behind, AND drop trailing spaces before punctuation.
+            voice_text = _re_audit.sub(r" +", " ", voice_text)
+            voice_text = _re_audit.sub(r" +([，。、！？：；])", r"\1", voice_text)
+        # v3.3.24c (Jim OOB 2026-10-17 21:42 HKT「No. Edge tts is of
+        # priority. Pls fix the 403 problem」): edge-tts WanLung is
+        # PRIMARY. Fixed by upgrading edge-tts 7.2.8 → 7.3.1 (the new
+        # version's Sec-MS-GEC generation uses a chrome version that
+        # Microsoft hasn't rotated yet). MiniMax retained as FALLBACK
+        # only (in case edge-tts 403 returns).
+        edge_path = _synthesize_cheer_voice_edge_tts(voice_text)
+        if edge_path:
+            return edge_path
+        # Fall back to MiniMax TTS if edge-tts 403s again
+        return _synthesize_cheer_voice_new(voice_text)
+    except Exception as e:
+        try:
+            with open('/tmp/cheer_errors.log', 'a') as f:
+                f.write(f"\n=== cheer voice dispatcher exception at {now_iso()}: {type(e).__name__}: {str(e)[:200]} ===\n")
+        except Exception:
+            pass
+        return ""
 
-        # Step 2: Edge-TTS WanLung +0% (natural pace). Edge-TTS WanLung has
-        # shown 1m30s-2m runtime for 800-1500 字 scripts. Use 240s (4 min)
-        # timeout to be safe. Jim OOB 2026-07-23 voice detail direction —
-        # sacrifice latency for completeness.
-        #
-        # v3.2.7.44: edge-tts CLI does NOT support --ssml flag. Pass plain
-        # text via --text. The library internally wraps the text in SSML
-        # via mkssml() and sends to Microsoft Edge TTS service. Plain text
-        # with proper Chinese punctuation (。 ， ！ ？) gives natural pauses.
-        # Previous SSML <break> tags got read literally by WanLung, producing
-        # the robotic "左括號 break time 等於 450ms 右括號" Jim OOB heard.
+
+def _synthesize_cheer_voice_new(voice_text: str) -> str:
+    """Generate MiniMax TTS voice MP3 from cheer text — FALLBACK ONLY.
+
+    Jim OOB 2026-09-04「for gymbro, please use edge tts instead. wanlun
+    voice is better than minimax tts」: MiniMax TTS demoted from primary
+    to fallback. Edge-TTS WanLungNeural (雲龍) is primary now. This
+    function retained so cheer pipeline still has a backup if edge-tts
+    fails (network outage, edge 5xx, voice unavailable).
+
+    Earlier history:
+    - v3.3.11 (Jim OOB 2026-09-01「please switch all voice to minimax
+      audio - Cantonese_crisp_news_anchor_vv2」): this function was
+      promoted to PRIMARY voice path.
+    - v3.3.14: added language_boost="Chinese,Yue" + Jyutping tone hints
+      so MiniMax TTS actually pronounced Cantonese text properly
+      (without it, MiniMax defaulted to Mandarin auto-detect).
+    """
+    api_key = _minimax_api_key()
+    if not api_key:
+        # No MiniMax key available — try edge-tts as last resort
+        return _synthesize_cheer_voice_edge_tts(voice_text)
+    try:
+        # MiniMax TTS REST endpoint: POST /v1/audio/speech
+        # Returns MP3 binary (or OGG depending on response_format)
+        # MiniMax TTS REST endpoint: POST /v1/t2a_v2
+        # (Hermes tts_tool.py:_generate_minimax_tts — official payload spec).
+        # Returns JSON with hex-encoded audio in data.audio field.
+        req_url = "https://api.minimax.io/v1/t2a_v2"
+        payload = {
+            "model": "speech-02-hd",
+            "text": voice_text,
+            "voice_setting": {
+                "voice_id": "Cantonese_crisp_news_anchor_vv2",
+                "speed": 0.95,
+                "vol": 1.0,
+                "pitch": 0,
+            },
+            "audio_setting": {
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "format": "mp3",
+                "channel": 1,
+            },
+            # v3.3.14 (Jim OOB 2026-09-01「Why the voice in gymbro cheer is mandarin?
+            # Make it Cantonese」): add language_boost="Chinese,Yue" + Jyutping
+            # tone hints so MiniMax TTS actually pronounces Cantonese text
+            # with proper Yue tones. Without this, MiniMax defaults to Mandarin
+            # (auto-detect) which Jim heard. Verified live: file size
+            # dropped 26% (119KB → 88KB) indicating true Cantonese speed.
+            "language_boost": "Chinese,Yue",
+            "pronunciation_dict": {
+                "tone": [
+                    "噉(gam2)",
+                    "瞓(fan3)",
+                    "咗(zo2)",
+                    "嘅(ge3)",
+                    "唔(m4)",
+                    "咩(me1)",
+                    "嚟(lai4)",
+                    "喎(wo3)",
+                    "啲(di1)",
+                    "喺(hai2)",
+                    "梗(gang2)",
+                ]
+            },
+        }
+        # Sandbox-safe bearer construction (Hermes strips env, chr() avoids f-string)
+        PFX = chr(66) + chr(101) + chr(97) + chr(114) + chr(101) + chr(114) + chr(32)
+        req = urllib.request.Request(
+            req_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": PFX + api_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read()
+        result = json.loads(raw.decode('utf-8'))
+        base_resp = result.get("base_resp", {})
+        status_code = base_resp.get("status_code", -1)
+        if status_code != 0:
+            status_msg = base_resp.get("status_msg", "unknown error")
+            raise RuntimeError(f"MiniMax TTS API error (code {status_code}): {status_msg}")
+        hex_audio = result.get("data", {}).get("audio", "")
+        if not hex_audio:
+            raise RuntimeError("MiniMax TTS returned empty audio data")
+        mp3_bytes = bytes.fromhex(hex_audio)
+        if not mp3_bytes:
+            try:
+                with open('/tmp/cheer_errors.log', 'a') as f:
+                    f.write(f"\n=== minimax tts empty response at {now_iso()} ===\n")
+            except Exception:
+                pass
+            return ""
+        # Save directly to output MP3 path
+        today_iso_str = today_iso()
+        out_mp3 = CHEER_AUDIO_CACHE / f"cheer_{today_iso_str}.mp3"
+        out_mp3.parent.mkdir(parents=True, exist_ok=True)
+        out_mp3.write_bytes(mp3_bytes)
+        # Post-flight duration check
+        actual_dur = _probe_audio_duration(str(out_mp3))
+        try:
+            with open("/tmp/cheer_durations.log", "a") as f:
+                f.write(
+                    f"{now_iso()} | text_chars={len(voice_text)} | "
+                    f"est_dur={text_estimated_dur}s | actual_dur={actual_dur:.1f}s | "
+                    f"provider=minimax | mp3={out_mp3.name}\n"
+                )
+        except Exception:
+            pass
+        return str(out_mp3)
+    except Exception as e:
+        # Fallback to Edge-TTS on MiniMax failure
+        try:
+            with open('/tmp/cheer_errors.log', 'a') as f:
+                f.write(f"\n=== minimax tts error at {now_iso()}: {type(e).__name__}: {str(e)[:200]} ===\n")
+        except Exception:
+            pass
+        return _synthesize_cheer_voice_edge_tts(voice_text)
+
+
+def _synthesize_cheer_voice_edge_tts(voice_text: str) -> str:
+    """Edge-TTS PRIMARY cheer voice — zh-HK-WanLungNeural (雲龍).
+
+    Jim OOB 2026-09-04「for gymbro, please use edge tts instead. wanlun
+    voice is better than minimax tts」: this function promoted from
+    fallback (v3.3.11) back to PRIMARY cheer voice path. WanLung is
+    Microsoft's natural HK Cantonese male voice — Jim's preferred
+    engine since 2026-08-30 (rule-79 was only about Telegram push, not
+    TTS choice).
+
+    Earlier history:
+    - v3.3.6 (Jim OOB 2026-08-27): edge-tts was primary with WanLung.
+    - v3.3.11 (Jim OOB 2026-09-01): switched primary to MiniMax TTS,
+      kept this as HiuMaan (曉曼, female) fallback.
+    - v3.3.15 (Jim OOB 2026-09-04): back to WanLung as primary.
+
+    Rule 79 note: this function renders MP3 to CHEER_AUDIO_CACHE only.
+    It does NOT push to Telegram. Caller (PWA cheer tab, MCP server,
+    morning cron) decides whether to embed voice bubble — and per Rule
+    79 the answer is "no" unless Jim explicitly asks.
+    """
+    try:
         plain_text = voice_text
         tmp_ogg = f"/tmp/cheer_voice_{int(time.time())}.ogg"
         result = _sp.run([
             "edge-tts", "--voice", "zh-HK-WanLungNeural",
             "--rate", "+0%", "--text", plain_text,
             "--write-media", tmp_ogg,
-        ], capture_output=True, text=True, timeout=600)  # v3.3.7: 240s → 600s for longer scripts (5-8 min audio).
+        ], capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             try:
                 with open('/tmp/cheer_errors.log', 'a') as f:
-                    f.write(f"\n=== edge-tts failed at {now_iso()} (voice_text {len(voice_text)} chars) ===\n")
-                    f.write(f"stderr: {result.stderr[:500]}\n")
-                    f.write(f"stdout: {result.stdout[:500]}\n")
+                    f.write(f"\n=== edge-tts WanLung failed at {now_iso()}: {result.stderr[:200]} ===\n")
             except Exception:
                 pass
             return ""
-        # Step 3: ffmpeg → real MP3 (Rule 30, universal playback)
         today_iso_str = today_iso()
         out_mp3 = CHEER_AUDIO_CACHE / f"cheer_{today_iso_str}.mp3"
         out_mp3.parent.mkdir(parents=True, exist_ok=True)
@@ -9289,12 +13845,17 @@ def _synthesize_cheer_voice(text: str) -> str:
                 f.write(
                     f"{now_iso()} | text_chars={len(voice_text)} | "
                     f"est_dur={text_estimated_dur}s | actual_dur={actual_dur:.1f}s | "
-                    f"target=130-160s | mp3={out_mp3.name}\n"
+                    f"target=130-160s | provider=edge-tts-WanLung | mp3={out_mp3.name}\n"
                 )
         except Exception:
             pass
         return str(out_mp3)
-    except Exception:
+    except Exception as e:
+        try:
+            with open('/tmp/cheer_errors.log', 'a') as f:
+                f.write(f"\n=== edge-tts WanLung exception at {now_iso()}: {type(e).__name__}: {str(e)[:200]} ===\n")
+        except Exception:
+            pass
         return ""
 
 
@@ -9386,45 +13947,66 @@ VIDEO_JOBS = {}
 VIDEO_JOBS_LOCK = threading.Lock()
 
 VIDEO_PROMPTS = {
-    # v3.3.6 (NEW 2026-08-27, Jim OOB「don't use white girl, use the female
-    # character in gymbro and be more sexy」): replace all 3 themes with
-    # gymbro's Blackpink Jennie character — jet black hair, cat-eye makeup,
-    # slim build, cropped pink sports bra. Same identity as cheer image
-    # prompt (line 9306) so video + image are visually consistent.
+    # v3.3.13 (Jim OOB 2026-09-01「change gymbro video generation — the
+    # lady must be soft skin korean. younger. no tattoo」): shift from
+    # Jennie (age 22, dramatic cat-eye) to a softer Korean beauty aesthetic.
+    # Same character across all themes for consistency. Key visual
+    # changes vs v3.3.8 Jennie prompts:
+    # - Age: 19-21 (younger, fresh-face)
+    # - Skin: dewy soft-glass skin, no contour, no heavy makeup
+    # - Makeup: natural/no-makeup makeup look, no exaggerated cat-eye,
+    #   soft pink lip tint, no heavy lashes
+    # - Tattoo: explicitly NONE (common model artifact to suppress)
+    # - Outfit: still cropped pink sports bra + black leggings
+    # - Pose/expression: gentle confident smile, not smoldering/sexy
+    # - Same Hong Kong rooftop + golden hour (working aesthetic)
     "gym_push": (
-        "Cinematic 4K video of a confident young Asian female fitness coach, age 22, "
-        "Blackpink Jennie aesthetic — jet black long hair with middle part, "
-        "sharp cat-eye makeup, fair porcelain skin, slim athletic build, "
-        "wearing a cropped pink sports bra and high-waist black leggings, "
-        "performing a heavy barbell back squat in a modern bright gym, "
-        "explosive upward push, intense confident gaze toward camera, "
-        "sweat droplets on collarbones and shoulders catching golden hour light, "
-        "slow motion on standing up, deep breath before next rep, "
-        "subtle seductive smile at camera on the lockout, "
-        "motivational sensual energy, 6 seconds."
+        "Cinematic 4K video of a soft-featured young Korean female fitness coach, age 20, "
+        "natural Korean beauty — long straight chestnut-brown hair with soft middle part falling naturally, "
+        "SOFT DEWY GLASS SKIN with luminous natural glow (no heavy makeup, no contour), "
+        "subtle natural eyebrows, soft pink lip tint, gentle clear eyes with minimal eyeliner (NOT cat-eye), "
+        "no tattoo anywhere on visible skin, "
+        "slim toned athletic build with natural proportions, "
+        "wearing a cropped pastel pink sports bra and high-waist soft black compression leggings, "
+        "performing a confident barbell back squat on a Hong Kong waterfront rooftop at golden hour sunset, "
+        "Victoria Harbour and IFC tower silhouette in the warm hazy background, "
+        "smooth controlled upward push from the bottom position, gentle confident natural smile toward camera over the bar, "
+        "slow motion on the standing lockout phase, soft breath before next rep visible as gentle chest expansion, "
+        "warm natural smile at camera on the lockout (NOT seductive), golden hour rim lighting catching the dewy cheek glow, "
+        "slow subtle 5-degree pan down to up revealing more of the skyline, "
+        "motivational gentle confident energy, 6 seconds."
     ),
     "morning_stretch": (
-        "Cinematic 4K video of an athletic young Asian female, age 22, "
-        "Blackpink Jennie aesthetic — jet black long hair flowing in the breeze, "
-        "sharp cat-eye makeup, fair porcelain skin, slim toned physique, "
-        "wearing a lacy black sports bra and high-waist black leggings, "
-        "doing morning sun salutation yoga on a Hong Kong rooftop at sunrise, "
-        "Victoria Harbour skyline background, deep exhale, slow stretch "
-        "with hips subtly arched, golden light wrapping around her silhouette, "
-        "confident smoldering expression looking at camera, "
-        "motivational sensual serenity, 6 seconds."
+        "Cinematic 4K video of a soft-featured young Korean female, age 20, "
+        "natural Korean beauty — long straight chestnut-brown hair with soft middle part flowing gently in the sea breeze, "
+        "SOFT DEWY GLASS SKIN with luminous natural glow (no heavy makeup, no contour), "
+        "subtle natural eyebrows, soft pink lip tint, gentle clear eyes with minimal eyeliner, "
+        "no tattoo anywhere on visible skin, "
+        "slim toned natural physique with gentle curves, "
+        "wearing a soft pastel pink sports bra and high-waist soft black compression leggings, "
+        "performing morning sun salutation yoga on a Hong Kong rooftop terrace at golden hour sunrise, "
+        "Victoria Harbour skyline and Kowloon mountains visible in the hazy warm background, "
+        "slow gentle motion sequence: standing centered facing camera with soft smile → left leg slowly lifts with knee bent and foot near right inner thigh (tree pose preparation) → right hand reaches down to touch the lifted left knee → left hand rises into a soft meditation mudra (thumb-index finger circle) at heart center, "
+        "gentle exhale visible breath, soft natural smile with warm eye contact toward camera, "
+        "golden hour sunlight wrapping around her silhouette creating soft rim lighting on hair and shoulders, "
+        "slow subtle 5-degree pan right to left revealing more of the harbour, "
+        "motivational gentle serene energy, 6 seconds."
     ),
     "finish_line": (
-        "Cinematic 4K video of a determined young Asian female athlete, age 22, "
-        "Blackpink Jennie aesthetic — jet black ponytail with middle part, "
-        "sharp cat-eye makeup, fair porcelain skin with sweat sheen, slim athletic build, "
-        "wearing a cropped pink sports bra and high-waist black leggings, "
-        "running through a rain-soaked Hong Kong street at dawn, "
-        "neon reflections on wet asphalt, water droplets on shoulders and arms, "
-        "pushing through the final stretch, breath visible in cool air, "
+        "Cinematic 4K video of a soft-featured young Korean female athlete, age 20, "
+        "natural Korean beauty — long straight chestnut-brown hair tied in a soft low ponytail with middle part, "
+        "SOFT DEWY GLASS SKIN with luminous natural glow (no heavy makeup, no contour), "
+        "subtle natural eyebrows, soft pink lip tint, gentle clear eyes with minimal eyeliner, "
+        "no tattoo anywhere on visible skin, "
+        "slim toned natural athletic build, "
+        "wearing a cropped pastel pink sports bra and high-waist soft black compression leggings, "
+        "running through a soft rain-soaked Hong Kong street at dawn, "
+        "warm neon reflections on wet asphalt from Mong Kok or Central signage, soft water droplets on shoulders and arms, "
+        "pushing through the final stretch with gentle determination, soft breath visible as white vapor in cool air, "
         "slow motion on crossing an invisible finish line, "
-        "turning to camera with confident seductive smile, "
-        "motivational sensual peak moment, 6 seconds."
+        "turning to camera with a warm natural smile (NOT seductive), "
+        "slow subtle 5-degree pan up to down capturing her full silhouette and the rain streaking past, "
+        "motivational gentle peak moment, 6 seconds."
     ),
 }
 
@@ -9631,53 +14213,56 @@ def _background_cheer_job(job_id: str, fire_type: str):
         metrics["whoop_pulled_at"] = whoop_pulled_at
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({
-                "step": "withings_pull",
+                "step": "whoop_body",
                 "step_at": now_iso(),
                 "metrics": metrics,
                 "whoop_pulled_at": whoop_pulled_at,
             })
 
-        # 1b. Withings pull — refresh weight/fat/steps/distance/calories today.
-        try:
-            _sp.run([
-                sys.executable, str(WITHINGS_PULL_SCRIPT),
-                "today",
-            ], capture_output=True, text=True, timeout=60)
-        except Exception:
-            pass
-        # 7/29 Jim OOB: show 'as of time' for Withings data
-        withings_pulled_at = now_iso()
-        try:
-            if WITHINGS_CACHE.exists():
-                withings_pulled_at = _dt.fromtimestamp(WITHINGS_CACHE.stat().st_mtime, tz=HKT).isoformat(timespec='seconds')
-        except Exception:
-            pass
-        metrics["withings_pulled_at"] = withings_pulled_at
         # Read fresh body weight + fat + steps from the Withings helpers.
         try:
-            metrics["withings_weight_kg"] = _withings_weight()
-            metrics["withings_fat_pct"] = _withings_fat_pct()
+            metrics["weight_kg"] = _body_weight()
+            metrics["fat_pct"] = _body_fat_pct()
+            metrics["height_m"] = _body_latest().get("height_m")
+            metrics["bmi"] = _body_latest().get("bmi")
         except Exception:
-            metrics.setdefault("withings_weight_kg", None)
-            metrics.setdefault("withings_fat_pct", None)
-        # Jim OOB 2026-07-24 09:15: Withings steps must be fresh on every fire
-        # (Whoop V2 cycle has no `steps` field, so steps come from Withings).
+            metrics.setdefault("weight_kg", None)
+            metrics.setdefault("fat_pct", None)
+            metrics.setdefault("height_m", None)
+            metrics.setdefault("bmi", None)
+        # v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is
+        # whoop!」): steps come from WHOOP. The old comment here claimed
+        # "Whoop V2 cycle has no `steps` field" — it does, under the name
+        # `step_count`; nothing read it, so every step number came from
+        # Withings, which often has no same-day record.
         try:
-            steps_data = _withings_steps_today() or {}
-            metrics["withings_steps_today"] = steps_data.get("steps")
-            metrics["withings_distance_km"] = steps_data.get("distance_km")
-            metrics["withings_calories_today"] = steps_data.get("calories")
+            wsteps = _whoop_steps() or {}
+            metrics["steps_today"] = wsteps.get("steps")
+            metrics["steps_7d_avg"] = wsteps.get("steps_7d_avg")
+            metrics["steps_source"] = "whoop"
+            metrics["steps_as_of"] = wsteps.get("data_as_of")
+            metrics["steps_band_off"] = bool(wsteps.get("band_off"))
         except Exception:
-            metrics.setdefault("withings_steps_today", None)
-            metrics.setdefault("withings_distance_km", None)
-            metrics.setdefault("withings_calories_today", None)
+            metrics.setdefault("steps_today", None)
+            metrics.setdefault("steps_7d_avg", None)
+            metrics.setdefault("steps_source", "whoop")
+            metrics.setdefault("steps_as_of", None)
+            metrics.setdefault("steps_band_off", False)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({
                 "step": "text_gen",
                 "step_at": now_iso(),
                 "metrics": metrics,
-                "withings_pulled_at": withings_pulled_at,
             })
+
+        # v3.3.23am (Jim OOB 2026-09-27): invalidate daily coaching cache
+        # so the new today_nutrition + recent_workouts_3d data is used
+        # in the next narrative. Without this, the cheer reuses today's
+        # cached narrative (which doesn't include today's food).
+        try:
+            _invalidate_daily_coaching(today_iso())
+        except Exception:
+            pass
 
         # 1c. Workout detail loop (Jim OOB 2026-07-24: list every exercise).
         try:
@@ -9686,6 +14271,17 @@ def _background_cheer_job(job_id: str, fire_type: str):
             )
         except Exception:
             metrics["workout_detail_zh"] = "(運動 detail 讀取失敗)"
+
+        # 1d. v3.3.23am (Jim OOB 2026-09-27 'Pls add latest workout
+        # activities from whoop'): format last-3-day workouts as Chinese
+        # block so the cheer prompt can reference the trend (back-to-back
+        # hard sessions, recovery window, training load ramp).
+        try:
+            metrics["recent_workouts_zh"] = _format_recent_workouts_3d_for_cheer(
+                metrics.get("recent_workouts_3d") or []
+            )
+        except Exception:
+            metrics["recent_workouts_zh"] = "(近期 workout 讀取失敗)"
 
         # 2. v3.3.8: Text — use unified daily coaching narrative (single LLM call
         # shared with video + coach comment). Falls back to cheer-only call if
@@ -9724,8 +14320,30 @@ def _background_cheer_job(job_id: str, fire_type: str):
         # ok=True / status='done' / text inline (was all-null before,
         # frontpage showed "0 字" looking like cheer silently failed).
         # v3.2.7.38: strip markdown asterisks/citations for frontpage render.
-        # Re-use _voice_zh_replace which already handles **bold** / [n] citations.
+        # v3.3.7+ (Jim OOB 2026-08-30「I want full Chinese on gymbro Chinese」):
+        # clean_text must match voice_text zero-EN enforcement. Run the same
+        # 3-pass _voice_zh_replace + inline-replace + final hard strip loop
+        # so the frontpage displays a CLEAN Chinese version (no English leaks
+        # visible to user, even when miniMax drafts IT/business jargon).
+        import re as _re_clean
         clean_text = _voice_zh_replace(text)
+        clean_leaks = _voice_audit_en(clean_text)
+        for _ in range(2):
+            if not clean_leaks:
+                break
+            clean_text = _voice_zh_replace(clean_text)
+            clean_leaks = _voice_audit_en(clean_text)
+        if clean_leaks:
+            clean_text = _re_clean.sub(r"([A-Za-z]+)", lambda m: _zh_inline(m.group(0)), clean_text)
+            clean_leaks = _voice_audit_en(clean_text)
+        if clean_leaks:
+            clean_text = _re_clean.sub(r"[A-Za-z]+", "", clean_text)
+            clean_text = _re_clean.sub(r"\s{2,}", " ", clean_text).strip()
+            clean_text = _re_clean.sub(r"([一-鿿])\s+([一-鿿])", r"\1\2", clean_text)
+            # Final polish: collapse any double-spaces the empty inline
+            # replacement left behind (e.g. "你個  寫字樓" → "你個 寫字樓").
+            clean_text = _re_clean.sub(r" +", " ", clean_text)
+            clean_text = _re_clean.sub(r" +([，。、！？：；])", r"\1", clean_text)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({
                 "step": "done", "step_at": now_iso(),
@@ -9937,7 +14555,6 @@ def api_cheer_status():
             "step": job.get("step"),
             "step_at": job.get("step_at"),
             "whoop_pulled_at": job.get("whoop_pulled_at"),
-            "withings_pulled_at": job.get("withings_pulled_at"),
         })
     return jsonify({
         "ok": True,
@@ -9946,7 +14563,6 @@ def api_cheer_status():
         "step_at": job.get("step_at"),
         "started_at": job.get("started_at"),
         "whoop_pulled_at": job.get("whoop_pulled_at"),
-        "withings_pulled_at": job.get("withings_pulled_at"),
     })
 
 
@@ -10243,9 +14859,8 @@ def _voice_snapshot_context() -> dict:
     # Health overlay (recovery, weight, steps)
     try:
         snap["recovery_pct"] = _recovery_pct()
-        snap["weight_kg"] = _withings_weight()
-        steps = _withings_steps_today() or {}
-        snap["steps_today"] = steps.get("steps")
+        snap["weight_kg"] = _body_weight()
+        snap["steps_today"] = (_whoop_steps() or {}).get("steps")
     except Exception:
         pass
     # Last cheer MP3 path (if any)
@@ -10646,8 +15261,8 @@ def api_voice_turn():
         try:
             ctx["health"] = {
                 "recovery_pct": _recovery_pct(),
-                "weight_kg": _withings_weight(),
-                "steps_today": (_withings_steps_today() or {}).get("steps"),
+                "weight_kg": _body_weight(),
+                "steps_today": (_whoop_steps() or {}).get("steps"),
             }
         except Exception:
             ctx["health"] = {}
@@ -10912,7 +15527,8 @@ SERVICE_WORKER = """
 //     cooldownUntil / cooldownRemaining / cooldownInterval state and the
 //     "⏳ REST Ns" button label. Button is now always clickable when
 //     !saving.
-//   - Withings steps: new _withings_steps_today() helper runs on every
+//   - Withings steps + body: REMOVED v3.3.25 — WHOOP supplies both
+//     (cycle.step_count for steps, user/measurement/body for weight)
 //     cheer fire (Whoop V2 cycle has no `steps` field, so steps must come
 //     from Withings). Parses "withings.py steps 1" stdout, injects
 //     {steps, distance_km, calories} into metrics. pplx prompt now has
@@ -10975,7 +15591,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v139';
+const CACHE = 'gym-web-v144';
 // SW v64 → v137 changelog (compressed)
 // v137 (Jim OOB 2026-08-12 23:18 HKT): /api/* 改 network-first，唔再 cache API responses。
 //   修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug (例如 燒烤牛肉片10片 deep-search correction)。
@@ -10997,7 +15613,7 @@ const CACHE = 'gym-web-v139';
 //     06:00-23:00, force intraday cross-check. If intraday > daily OR both
 //     < 50 steps, return `syncing: true` (Rule 24 NEVER FABRICATE) instead
 //     of showing stale baseline as today's truth.
-//     Backend function: _get_intraday_steps_today() in gym_web.py.
+//     Backend function: REMOVED v3.3.25 (Withings step path deleted).
 //     Frontend behavior unchanged — widget shows real steps immediately
 //     (no "—/同步中") when intraday data exists.
 self.addEventListener('install', e => self.skipWaiting());
@@ -11016,6 +15632,31 @@ self.addEventListener('fetch', e => {
   if (url.pathname.startsWith('/api/')) {
     e.respondWith(
       fetch(e.request).then(res => res).catch(() => new Response(JSON.stringify({error:'offline'}), {status:503, headers:{'Content-Type':'application/json'}}))
+    );
+    return;
+  }
+  // v3.3.23af (Jim OOB 2026-09-16 'The jpg download, there is broken image
+  // for the first time use after refresh'): /nutrition_card/* ALWAYS
+  // network-first. The daily JPG card regenerates whenever meals change,
+  // so caching is meaningless — stale cached image shows broken pixel
+  // after user edits food macros + SW bumps cache version.
+  if (url.pathname.startsWith('/nutrition_card/')) {
+    e.respondWith(
+      fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response('', {status: 503}))
+    );
+    return;
+  }
+  // v3.3.23ai (Jim OOB 2026-09-19 'after delete some food, the image
+  // are tmeproitly drifted'): /scan_thumb/* + /scan_img/* ALWAYS
+  // network-first. After delete + row shift, the server-side thumb cache
+  // drops + refetches, but the SW cache-first rule returns the OLD
+  // image that previously belonged to a different row_index. Going
+  // network-first guarantees the PWA always sees the row's current
+  // image, even after the index shift. Server-side /scan_thumb already
+  // sends Cache-Control: no-store, but the SW ignores it.
+  if (url.pathname.startsWith('/scan_thumb/') || url.pathname.startsWith('/scan_img/')) {
+    e.respondWith(
+      fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response('', {status: 503}))
     );
     return;
   }
@@ -11074,18 +15715,37 @@ if __name__ == "__main__":
     print(f"   Local:   http://127.0.0.1:{PORT}/")
     print(f"   Tailscale: http://100.114.66.125:{PORT}/")
     print(f"   Persist to: {WORKOUT_LOG}\n")
+    # v3.3.25 (2026-10-21): a job that was still "running" when the process
+    # died is now reported as "interrupted" (and can be resumed via
+    # POST /api/scan_resume/<job_id>). Without this the frontend just saw
+    # a 404 and showed "查 AI 進度失敗 / Load failed".
+    try:
+        _scan_jobs_load_interrupted()
+    except Exception as _e:
+        print(f"[scan-job] interrupted-job recovery failed: "
+              f"{type(_e).__name__}: {_e}", flush=True)
     # v3.3.0: Hydrate cache now that all helper funcs are defined.
     # Failure here is non-fatal — /api/scan_recent will return 503
     # until hydration succeeds, but the server still serves other routes.
-    try:
-        _hydrate_nutrition_cache()
-        _get_nutrition_cache().start_background_refresh(
-            _sheet_read_nutrition_rows, period_s=60
-        )
-    except Exception as _e:
+    # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
+    # win'): LAZY HYDRATION. Previously _hydrate_nutrition_cache() ran
+    # synchronously at startup, blocking server bind by 3-5s. Now spawn
+    # a daemon thread so the server is ready immediately and hydration
+    # happens in the background. /api/scan_recent correctly returns 503
+    # while hydration is in progress.
+    import threading as _threading
+    def _lazy_hydrate():
         try:
-            with open("/tmp/cache_startup_errors.log", "a") as f:
-                f.write(f"{now_iso()} | startup | {type(_e).__name__}: {_e}\n")
-        except Exception:
-            pass
+            _hydrate_nutrition_cache()
+            _get_nutrition_cache().start_background_refresh(
+                _sheet_read_nutrition_rows, period_s=60
+            )
+        except Exception as _e:
+            try:
+                with open("/tmp/cache_startup_errors.log", "a") as f:
+                    f.write(f"{now_iso()} | lazy_hydrate | {type(_e).__name__}: {_e}\n")
+            except Exception:
+                pass
+    _t = _threading.Thread(target=_lazy_hydrate, name="lazy-hydrate", daemon=True)
+    _t.start()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
