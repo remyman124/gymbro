@@ -1,3 +1,69 @@
+## v3.3.34 — 2026-10-21 — 拎走 Perplexity,淨返 MiniMax 一家
+
+Jim OOB 2026-10-21:「Remove perplexity. keep minimax only」
+
+**點解拎走**:Perplexity 條 key 2026-10-21 額度爆咗
+(`{"type":"insufficient_quota","message":"You exceeded your current quota"}`),
+HTTP 401。而且每次 scan 都要多等一個 provider 先交叉核對 —— 救唔到任何嘢。
+
+### 1. 供應商鏈
+```
+之前: MiniMax-text-01 → Perplexity sonar
+而家: MiniMax-text-01            (淨一個)
+```
+`/api/health` 嘅 `vision_pool` 而家係 `["minimax-text-01"]`,
+`api_keys_present` 冇 `pplx` 咗。
+
+### 2. 刪走嘅 function(淨 -281 行)
+| function | 原本做乜 | 而家 |
+|---|---|---|
+| `_perplexity_vision()` | 第 2 個視覺供應商 | 刪走 |
+| `_pplx_enrich()` | 12 個營養 field 嘅第 1 份 estimate | 刪走 → 淨 MiniMax 一份 |
+| `_pplx_check_narration()` | MiniMax 死時嘅 narration 判斷後備 | 刪走 → fail closed |
+| `_pplx_extract_dish_name()` | MiniMax 死時嘅菜名抽取後備 | 刪走 → 空 + 硬攔截 |
+| `_pplx_api_key()` | 讀 `PPLX_API_KEY` | 刪走 → **唔會再有任何 HTTP 請求打去 api.perplexity.ai** |
+
+### 3. cheer 嘅 3 個 web-search context 唔會失效
+原本新聞 / 基金 fact / 利物浦賽程靠 Perplexity sonar-pro 上網。拎走之後
+新增:
+- `_brave_web_search(query, count)` —— Brave 網頁搜尋(key 已經有)
+- `_cheer_web_fact(search_query, ask, ...)` —— Brave 搜尋 + MiniMax 撮一句
+
+仍然守住「**唔准 fabricate**」:搜尋冇結果就回 `""`(cheer 少一塊 context,
+好過亂講);MiniMax 只准用搜尋結果入面出現過嘅事。
+
+### 4. coach tips
+第一遍(form cue + progression)由 Perplexity sonar-pro 改用 MiniMax-M3,
+第二遍(render 做 cheer 教練訊息)不變。
+
+### 5. 2nd opinion:剩返同一個 model 行第二輪
+chain 本身用 **soft preference**(唔係 hard exclusion),所以剩 1 個供應商
+時 2nd opinion 仍然出到 —— 但佢係「同一個 model 問兩次(唔同 prompt)」,
+**唔係兩個獨立意見**。總好過冇第二輪(詳細描述可以帶出第一輪漏咗嘅細節)。
+
+### 6. QA
+- `tests/qa/test_ai_provider_fallback.py` 重寫成 MiniMax-only 版(14 check),
+  新增兩條硬 guard:
+  - `gym_web.py` 唔准再有任何 `api.perplexity.ai` 呼叫
+  - 唔准再讀 `PPLX_API_KEY`
+  - 結構性 guard:prompt 砌好之後嘅每個 `return ""` **必須有 log**
+    (冇後備 = 失敗一定要響,唔可以靜靜哋吞掉)
+- `tests/qa/test_vision_failure_guard.py` 加 `test_perplexity_fully_removed`
+- `tests/qa/test_generic_name_guard.py` 嘅 pool 斷言改成「淨 MiniMax 一家」
+- 新增 `tests/qa/test_repo_hygiene.py`(10 check,pytest 風格):唔准 detached
+  HEAD、唔准孤兒 commit、核心 code 檔要同已提交版本一致、版本號一致、
+  唔准多餘 worktree、寫入閘同平行安全網仍然在、唔准有 Perplexity 依賴
+- 前端 5 處「pplx + MiniMax」字眼改成「AI」
+
+**QA:14/14 組 PASS,meta 35/35。**
+
+### ⚠️ 單一供應商 = 單點故障(要知風險)
+睇 `fitness/jim-image-recognition` Rule 28。現況:
+- MiniMax 死 → 掃描被 rule-2 / rule-25 **硬攔截**(唔會寫「未識別菜式」
+  入表,Jim 見到失敗提示而唔係壞資料)✅
+- 但成個食物 log 會停,第二個意見冇咗,營養 estimate 冇咗 median-merge
+- 想加返第二個 provider → 改 `_VISION_PROVIDER_POOL` 一行就得
+
 ## v3.3.33 — 2026-10-21 — AI 背景識別 + 平行 AI worker(上載完即刻可以繼續用)
 
 Jim OOB 2026-10-21:
