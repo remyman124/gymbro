@@ -45,6 +45,12 @@ from gym_web.core import (
     NUTRITION_TAB_NAME,
     safe_read_json as _safe_read_json,
 )
+# v3.3.25 (Jim OOB 2026-10-20「Steps is whoop!」): WHOOP is the primary step
+# source. gym_web.whoop.whoop_get_steps() reads step_count off the V2 cycle
+# cache (which has always carried it) and applies the same truthfulness rules
+# the web overlay uses.
+from gym_web.whoop import whoop_get_steps as _whoop_get_steps
+from gym_web.whoop import whoop_get_body as _whoop_get_body
 
 load_dotenv("/home/work/.hermes/.env")
 
@@ -332,9 +338,13 @@ def get_today_workout() -> str:
 
 @mcp.tool()
 def get_health_overlay() -> str:
-    """Return current health snapshot: Whoop recovery, Withings weight/fat/steps."""
+    """Return current health snapshot: Whoop recovery, Withings weight/fat/steps.
+
+    v3.3.24d: also surfaces NAP detection + sleep debt. Jim OOB 2026-10-20
+    "why don't you talk about my nap today? you should have detected it from
+    whoop" — the nap record (nap: true) was being skipped by every consumer.
+    """
     whoop = _safe_read_json(WHOOP_CACHE, {})
-    withings = _safe_read_json(WITHINGS_CACHE, {})
 
     recovery = None
     recs = whoop.get("recovery")
@@ -347,17 +357,127 @@ def get_health_overlay() -> str:
                 recovery = int(round(float(score["recovery_score"])))
                 break
 
-    body = withings.get("body") or {}
-    steps_block = withings.get("steps") or {}
+    # --- v3.3.24d: nap + sleep detail ---
+    from datetime import datetime as _dt
+
+    def _parse_iso(v):
+        if not v:
+            return None
+        try:
+            return _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+    def _dur_hrs(s):
+        sd = _parse_iso(s.get("start"))
+        ed = _parse_iso(s.get("end"))
+        if sd and ed:
+            try:
+                return round((ed - sd).total_seconds() / 3600, 2)
+            except (TypeError, ValueError):
+                pass
+        sc = s.get("score") or {}
+        st = sc.get("stage_summary") or {} if isinstance(sc, dict) else {}
+        ms = st.get("total_in_bed_time_milli") if isinstance(st, dict) else None
+        try:
+            if ms is not None:
+                return round(float(ms) / 3600000, 2)
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    sleeps = whoop.get("sleep") or []
+    scored = [s for s in sleeps if isinstance(s, dict) and s.get("score_state") == "SCORED"]
+    scored.sort(key=lambda s: str(s.get("start") or ""), reverse=True)
+    naps = [s for s in scored if s.get("nap") is True]
+    mains = [s for s in scored if s.get("nap") is not True]
+
+    nap_block = {"detected": False, "hrs": None, "pct": None, "start": None, "end": None,
+                 "disturbances": None, "cycles": None}
+    if naps:
+        n = naps[0]
+        nsc = n.get("score") or {}
+        nst = nsc.get("stage_summary") or {} if isinstance(nsc, dict) else {}
+        nap_block = {
+            "detected": True,
+            "hrs": _dur_hrs(n),
+            "pct": nsc.get("sleep_performance_percentage") if isinstance(nsc, dict) else None,
+            "start": n.get("start"),
+            "end": n.get("end"),
+            "disturbances": nst.get("disturbance_count") if isinstance(nst, dict) else None,
+            "cycles": nst.get("sleep_cycle_count") if isinstance(nst, dict) else None,
+        }
+
+    sleep_block = {"hrs": None, "pct": None, "start": None, "end": None,
+                   "debt_hrs": None, "need_hrs": None, "efficiency_pct": None,
+                   "respiratory_rate": None, "total_hrs": None}
+    if mains:
+        m = mains[0]
+        msc = m.get("score") or {}
+        mneed = msc.get("sleep_needed") or {} if isinstance(msc, dict) else {}
+        try:
+            debt = round(float(mneed.get("need_from_sleep_debt_milli") or 0) / 3600000, 2)
+        except (TypeError, ValueError):
+            debt = None
+        try:
+            need = round(float(mneed.get("baseline_milli") or 0) / 3600000, 2)
+        except (TypeError, ValueError):
+            need = None
+        sleep_block = {
+            "hrs": _dur_hrs(m),
+            "pct": msc.get("sleep_performance_percentage") if isinstance(msc, dict) else None,
+            "start": m.get("start"),
+            "end": m.get("end"),
+            "debt_hrs": debt,
+            "need_hrs": need,
+            "efficiency_pct": msc.get("sleep_efficiency_percentage") if isinstance(msc, dict) else None,
+            "respiratory_rate": msc.get("respiratory_rate") if isinstance(msc, dict) else None,
+        }
+        total = (sleep_block["hrs"] or 0)
+        if nap_block["detected"] and nap_block["hrs"] and n.get("cycle_id") == m.get("cycle_id"):
+            total += nap_block["hrs"]
+        sleep_block["total_hrs"] = round(total, 2)
+
+    # v3.3.25 (Jim OOB 2026-10-20「I mean weight. If whoop has weight data.
+    # Remove all withings」): body comes from WHOOP's
+    # /developer/v2/user/measurement/body (weight + height + BMI). WHOOP has no
+    # bioimpedance sensor, so fat% / muscle / bone / hydration are None.
+    try:
+        wbody = _whoop_get_body(cache_path=WHOOP_CACHE) or {}
+    except Exception:
+        wbody = {}
+    try:
+        wsteps = _whoop_get_steps(cache_path=WHOOP_CACHE) or {}
+    except Exception:
+        wsteps = {}
+    w_steps = wsteps.get("steps")
     return json.dumps({
         "fetched_at": _hkt_now_iso(),
         "whoop_recovery_pct": recovery,
-        "withings_weight_kg": body.get("weight_kg"),
-        "withings_fat_pct": body.get("fat_pct"),
-        "withings_weight_date": body.get("date"),
-        "withings_steps_today": steps_block.get("steps"),
-        "withings_distance_km_today": steps_block.get("distance_km"),
-        "withings_steps_date": steps_block.get("date"),
+        "weight_kg": wbody.get("weight_kg"),
+        "weight_source": "whoop",
+        "height_m": wbody.get("height_m"),
+        "bmi": wbody.get("bmi"),
+        "fat_pct": wbody.get("fat_pct"),
+        "muscle_kg": wbody.get("muscle_kg"),
+        "bone_kg": wbody.get("bone_kg"),
+        "hydration_pct": wbody.get("hydration_pct"),
+        # v3.3.25: steps are WHOOP's, exclusively.
+        "steps_today": w_steps,
+        "steps_source": "whoop",
+        "steps_date": wsteps.get("date"),
+        "steps_as_of": wsteps.get("data_as_of"),
+        "steps_stale": bool(wsteps.get("stale")),
+        "steps_band_off": bool(wsteps.get("band_off")),
+        "steps_in_progress": bool(wsteps.get("in_progress")),
+        "steps_yesterday": wsteps.get("steps_yesterday"),
+        "steps_yesterday_date": wsteps.get("steps_yesterday_date"),
+        "steps_7d_avg": wsteps.get("steps_7d_avg"),
+        "steps_7d_samples": wsteps.get("steps_7d_samples", 0),
+        "steps_series": wsteps.get("series", []),
+        # v3.3.24d nap + sleep
+        "whoop_nap": nap_block,
+        "whoop_sleep": sleep_block,
     }, ensure_ascii=False)
 
 
@@ -531,8 +651,11 @@ def log_meal_text(food_desc: str) -> str:
     """Direct text food log — bypasses vision, uses gym_web /api/scan_preview_text.
 
     Phase B: Jim OOB 2026-08-02 'food log should allow direct text input'.
-    Posts to gym_web server which calls APiyi gpt-4o-mini for nutrition
+    Posts to gym_web server which calls the AI provider chain for nutrition
     estimate, then commits to Google Sheet (v3.3.0 source of truth).
+
+    v3.3.30: the chain is now MiniMax-text-01 → Perplexity sonar — the
+    APiyi gpt-4o-mini leg was removed (its key was dead, HTTP 401).
 
     Returns: {ok, meal, totals_after, sheet_row}
     """
@@ -592,12 +715,259 @@ def trigger_cheer_pipeline(fire_type: str = "manual", quick: bool = False) -> st
     }
     out["next_steps"] = [
         "1. Write 8-section cheer text (per cheer-routine SKILL.md) using persona + jim_context",
-        "2. Generate voice via edge-tts zh-HK-WanLungNeural (if !quick)",
+        "2. Generate voice via edge-tts zh-HK-WanLungNeural (雲龍, Jim preferred) (if !quick)",
         "3. Generate image via MiniMax hailuo (if !quick)",
         "4. Send Telegram voice + image + text",
         "5. Log to cheer_artifacts/cheer_<ts>_<fire_type>/",
     ]
     return json.dumps(out, ensure_ascii=False)
+
+
+# ── Phase D 2026-10-16: expose gym_web POST endpoints as MCP tools ──
+# Jim OOB "make sure gymbro have all the mcp for both update and read".
+# 15 new write wrappers — Alonso now has full read+write MCP coverage
+# without curl/HTTP roundtrips. Gym_web binds 0.0.0.0:7000 with no auth
+# (local trust model) so direct POST is safe.
+from typing import Optional
+
+GYM_WEB_BASE = "http://127.0.0.1:7000"
+
+
+def _post_gym_web(path: str, payload: Optional[dict] = None,
+                  timeout: float = 30.0) -> str:
+    """POST to gym_web REST endpoint. Returns raw JSON string for MCP."""
+    url = f"{GYM_WEB_BASE}{path}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        return json.dumps({"ok": False, "http_error": e.code,
+                           "error": body[:500]}, ensure_ascii=False)
+    except Exception as e:
+        print(f"[mcp_post] {path} transport error: {e}",
+              file=sys.stderr, flush=True)
+        return json.dumps({"ok": False, "transport_error": str(e)[:200]},
+                          ensure_ascii=False)
+
+
+def _get_gym_web(path: str, params: Optional[dict] = None,
+                 timeout: float = 10.0) -> str:
+    """GET from gym_web REST endpoint. Returns raw JSON string."""
+    from urllib.parse import urlencode
+    url = f"{GYM_WEB_BASE}{path}"
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        return json.dumps({"ok": False, "http_error": e.code,
+                           "error": body[:500]}, ensure_ascii=False)
+    except Exception as e:
+        print(f"[mcp_get] {path} transport error: {e}",
+              file=sys.stderr, flush=True)
+        return json.dumps({"ok": False, "transport_error": str(e)[:200]},
+                          ensure_ascii=False)
+
+
+# --- Workout session writes ---
+
+@mcp.tool()
+def log_set(exercise: str,
+            weight_kg: Optional[float] = None,
+            reps: Optional[int] = None,
+            set_n: Optional[int] = None,
+            intensity: Optional[str] = None,
+            form_check: str = "ok",
+            weight_note: str = "",
+            source: str = "mcp-gymbro") -> str:
+    """Log one set into today's workout session.
+
+    weight_kg: skip for bodyweight. reps: defaults via stored Jim preference (10).
+    set_n: auto-increment if omitted. intensity: auto-detected if blank.
+    Returns {ok, entry, total_sets}.
+    """
+    payload: dict = {"exercise": exercise, "form_check": form_check,
+                     "weight_note": weight_note, "source": source}
+    if weight_kg is not None:
+        payload["weight_kg"] = weight_kg
+    if reps is not None:
+        payload["reps"] = reps
+    if set_n is not None:
+        payload["set_n"] = set_n
+    if intensity is not None:
+        payload["intensity"] = intensity
+    return _post_gym_web("/api/log_set", payload)
+
+
+@mcp.tool()
+def finish_exercise(exercise: str) -> str:
+    """Mark exercise done — returns pyramid summary (sets / vol / breakdown)."""
+    return _post_gym_web("/api/finish_exercise", {"exercise": exercise})
+
+
+@mcp.tool()
+def end_session() -> str:
+    """Finalize today's workout session, invalidate daily coaching, return pyramid."""
+    return _post_gym_web("/api/end_session", {})
+
+
+@mcp.tool()
+def cancel_last_set() -> str:
+    """Pop the last entry from today's session. Returns removed entry + remaining count."""
+    return _post_gym_web("/api/cancel_last_set", {})
+
+
+# --- Sheet / cache sync ---
+
+@mcp.tool()
+def sync_sheet(date: Optional[str] = None) -> str:
+    """Push local WORKOUT_LOG to Google Sheet (idempotent dedup by date+exercise+set_n+time).
+
+    date: optional YYYY-MM-DD for one day; omit to sync all.
+    Returns {rows_added, skipped, errors, status}.
+    """
+    payload = {"date": date} if date else {}
+    return _post_gym_web("/api/sync_sheet", payload)
+
+
+@mcp.tool()
+def repair_sheet(date: str) -> str:
+    """Surgical rebuild: delete all rows for one date, then re-push from local.
+
+    Use after duplicate rollbacks or known corruption. date: YYYY-MM-DD required.
+    """
+    return _post_gym_web("/api/repair_sheet", {"date": date})
+
+
+@mcp.tool()
+def sync_health() -> str:
+    """Cheer-side health probe — local count vs last poll vs sheet state."""
+    return _get_gym_web("/api/sync_health")
+
+
+# --- External service refresh ---
+
+@mcp.tool()
+def whoop_refresh() -> str:
+    """Force a fresh Whoop pull (cycles + recovery + sleep + workouts)."""
+    return _post_gym_web("/api/whoop_refresh", {})
+
+
+@mcp.tool()
+def whoop_refresh() -> str:
+    """Force a fresh Whoop pull (cycles / recovery / sleep / workouts).
+
+    v3.3.25 (Jim OOB 2026-10-20「Fully remove withings / Steps is whoop!」):
+    WHOOP is the only step source, so the step refresh is a Whoop pull.
+    The old `withings_refresh` MCP tool is removed — it only ever refreshed
+    Withings STEP data, which no longer feeds any surface.
+    """
+    return _post_gym_web("/api/whoop_refresh", {}, timeout=60.0)
+
+
+# --- Food scan writes ---
+
+@mcp.tool()
+def scan_commit(image_path: str, entries_json: str,
+               user_correction: str = "", user_hints: str = "") -> str:
+    """Commit one or more food entries to the Nutrition Sheet.
+
+    image_path: "" for text-only (auto-backfill from Brave search),
+                or absolute path to a scan image (rename + Drive upload).
+    entries_json: JSON-string array of entry dicts with keys
+                  {name, calories, protein, carbs, fat, restaurant_chain?,
+                   meal_type?, note?}.
+    user_hints: comma-separated hint strings.
+    """
+    try:
+        entries = json.loads(entries_json) if entries_json.strip() else None
+    except json.JSONDecodeError as e:
+        return json.dumps({"ok": False,
+                           "error": f"entries_json not valid JSON: {e}"},
+                          ensure_ascii=False)
+    payload: dict = {"image_path": image_path}
+    if entries is not None:
+        payload["entries"] = entries
+    if user_correction:
+        payload["user_correction"] = user_correction
+    if user_hints:
+        payload["user_hints"] = [h.strip() for h in user_hints.split(",")
+                                  if h.strip()]
+    return _post_gym_web("/api/scan_commit", payload, timeout=60.0)
+
+
+@mcp.tool()
+def scan_correct(scan_index: int, name: str = "",
+                 calories: Optional[int] = None,
+                 protein: Optional[float] = None,
+                 carbs: Optional[float] = None,
+                 fat: Optional[float] = None,
+                 restaurant_chain: str = "",
+                 note: str = "") -> str:
+    """Correct a scan row's name + macros + restaurant + note.
+
+    scan_index: 1-based Sheet row (header=1, first data row=2).
+    Empty fields keep existing values. Zero macros + new name triggers
+    4-tier recalc (explicit numbers → brand table → sheet history).
+    """
+    payload: dict = {"scan_index": scan_index, "name": name,
+                     "restaurant_chain": restaurant_chain, "note": note}
+    if calories is not None:
+        payload["calories"] = calories
+    if protein is not None:
+        payload["protein"] = protein
+    if carbs is not None:
+        payload["carbs"] = carbs
+    if fat is not None:
+        payload["fat"] = fat
+    return _post_gym_web("/api/scan_correct", payload)
+
+
+@mcp.tool()
+def scan_delete(scan_index: int) -> str:
+    """Delete a food scan row from Sheet + cascade-clear JPG cache for that date."""
+    return _post_gym_web("/api/scan_delete", {"scan_index": scan_index})
+
+
+@mcp.tool()
+def scan_edit_datetime(scan_index: int, new_date: str, new_time: str) -> str:
+    """Edit date+time of a scan row (Sheet columns A and B).
+
+    new_date: YYYY-MM-DD. new_time: HH:MM (24h).
+    """
+    return _post_gym_web(
+        "/api/scan_edit_datetime",
+        {"scan_index": scan_index,
+         "new_date": new_date, "new_time": new_time},
+    )
+
+
+# --- Cheer pipeline ---
+
+@mcp.tool()
+def fire_cheer(fire_type: str = "auto") -> str:
+    """Trigger a cheer routine. Returns {job_id}; pipeline runs in background.
+
+    fire_type: auto|morning|evening|manual|pre_lunch|afternoon|
+               post_gym|post_meal|late_night.
+    Poll cheer_status(job_id) for progress.
+    """
+    return _post_gym_web("/api/cheer", {"fire_type": fire_type})
+
+
+@mcp.tool()
+def cheer_status(job_id: str) -> str:
+    """Poll a cheer job. Returns full artifact paths when done."""
+    return _get_gym_web("/api/cheer/status", {"job_id": job_id})
 
 
 @mcp.resource("gymbro://today/summary")
