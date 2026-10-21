@@ -90,7 +90,13 @@ def scan_upload():
             return jsonify({"ok": False, "error": "image too large"}), 413
         name = f"upload_{now}_{i}.jpg"
         if BUGS["wrong_path"]:
-            path = Path("/tmp/gymbro_qa_wrong_dir") / name
+            # v3.3.35 (2026-10-21, 機器慢診斷): 原本寫死 `/tmp/gymbro_qa_wrong_dir`。
+            # /tmp 喺呢部機係 **tmpfs(食 RAM)**,每跑一次 QA 就留低一堆 upload
+            # 落去記憶體 —— 2026-10-21 查到 /tmp 用咗 3.4G/3.9G(86%),連帶
+            # swap 用咗 7.2G/8G,成部機慢到唔郁。而家改寫去 TMPDIR
+            # (Hermes 指住 /home/work/.hermes/cache/scratch,係真 disk)。
+            path = Path(os.environ.get("TMPDIR") or "/home/work/.hermes/cache/scratch") \
+                / "gymbro_qa_wrong_dir" / name
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
             path = SCAN_CACHE_DIR / name
