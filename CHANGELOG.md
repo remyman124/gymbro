@@ -57,6 +57,20 @@ chain 本身用 **soft preference**(唔係 hard exclusion),所以剩 1 個供應
 
 **QA:14/14 組 PASS,meta 35/35。**
 
+### 跟進修正(同一個 v3.3.34 發布窗口)
+
+- **`9c18089` / `b8cbecd`(Torres)**:前端「✓ 已寫入 log」badge 之前淨 gate 喺
+  `item.preview`,所以 server 回 `ok=false`(Rule 25 攔截、相片冇入賬)嗰陣,
+  張卡會**同時**見到紅色「失敗」pill + 綠色「✓ 已寫入 log」—— 等於話「扮成成功」。
+  而家每個 `item.status`(`committed` / `failed` / `skipped`)都有自己嘅 badge。
+- **`e0d6356`**:修兩個 QA flaky/過嚴斷言
+  - `test_no_test_pollution.py` 之前淨喺 token 欄**缺失**時先 refresh,可能攞到
+    **已過期**嘅 token → Sheets API 401 → 誤報「有污染」(實際 production 乾淨)。
+    而家會睇 `expires_at`,過期即 refresh,401 都會再 refresh 重試,原子寫回 token 檔。
+  - `test_repo_hygiene.py` 原本要求核心 code 檔唔可以有未提交改動 —— 但 repo 係
+    多個 agent 共用(Torres / Frimpong 會同時改檔),工作區有改動係正常狀態。
+    改成比對「**行緊嘅 server 版本 == 工作區版本**」,真正要保證嘅嘢。
+
 ### ⚠️ 單一供應商 = 單點故障(要知風險)
 睇 `fitness/jim-image-recognition` Rule 28。現況:
 - MiniMax 死 → 掃描被 rule-2 / rule-25 **硬攔截**(唔會寫「未識別菜式」
