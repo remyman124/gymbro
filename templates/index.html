@@ -941,7 +941,13 @@
                 <!-- v3.3.34 (Torres): 呢個 badge 之前淨係 gate 喺 item.preview,
                      所以 server 回 ok=false (Rule 25,相片冇入账)嗰陣,
                      張卡會同時見到紅色「失敗」pill + 綠色「✓ 已寫入 log」——
-                     等於話「扮成成功」。而家兩個 badge 分開 gate 喺 status。 -->
+                     等於話「扮成成功」。而家每個 status 都有自己嘅 badge,
+                     由 status 決定,唔再淨靠 preview。
+                     - committed → 綠色(真係入咗账)
+                     - failed    → 紅色(冇入账)
+                     - skipped   → 灰色(入咗账但 Jim 收埋咗張卡)
+                     - pending / uploading / uploaded / recognising → 冇 preview,
+                       成個 template 唔 render(只見 spinner),所以唔需要 badge。 -->
                 <div x-show="item.status === 'committed'"
                      class="rounded-lg bg-emerald-500/30 border border-emerald-400/40 px-3 py-2 text-[11px] font-bold text-emerald-100 text-center">
                   ✓ 已寫入 log
@@ -949,6 +955,10 @@
                 <div x-show="item.status === 'failed'"
                      class="rounded-lg bg-red-500/30 border border-red-400/40 px-3 py-2 text-[11px] font-bold text-red-100 text-center">
                   ✗ 冇入账
+                </div>
+                <div x-show="item.status === 'skipped'"
+                     class="rounded-lg bg-white/10 border border-white/20 px-3 py-2 text-[11px] font-bold text-white/70 text-center">
+                  ✓ 已入账 · 已收埋
                 </div>
               </div>
               <div class="mt-2 text-[10px] text-yellow-300" x-show="item.preview.suggested_entry.is_shared_meal">
