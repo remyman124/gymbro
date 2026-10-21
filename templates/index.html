@@ -938,8 +938,17 @@
                         class="rounded-lg bg-white/10 px-3 py-2 text-[11px] font-bold text-white/80 active:scale-95 disabled:opacity-30">
                   <span x-text="item.status === 'skipped' ? '已跳過' : '收埋呢張'"></span>
                 </button>
-                <div class="rounded-lg bg-emerald-500/30 border border-emerald-400/40 px-3 py-2 text-[11px] font-bold text-emerald-100 text-center">
+                <!-- v3.3.34 (Torres): 呢個 badge 之前淨係 gate 喺 item.preview,
+                     所以 server 回 ok=false (Rule 25,相片冇入账)嗰陣,
+                     張卡會同時見到紅色「失敗」pill + 綠色「✓ 已寫入 log」——
+                     等於話「扮成成功」。而家兩個 badge 分開 gate 喺 status。 -->
+                <div x-show="item.status === 'committed'"
+                     class="rounded-lg bg-emerald-500/30 border border-emerald-400/40 px-3 py-2 text-[11px] font-bold text-emerald-100 text-center">
                   ✓ 已寫入 log
+                </div>
+                <div x-show="item.status === 'failed'"
+                     class="rounded-lg bg-red-500/30 border border-red-400/40 px-3 py-2 text-[11px] font-bold text-red-100 text-center">
+                  ✗ 冇入账
                 </div>
               </div>
               <div class="mt-2 text-[10px] text-yellow-300" x-show="item.preview.suggested_entry.is_shared_meal">
