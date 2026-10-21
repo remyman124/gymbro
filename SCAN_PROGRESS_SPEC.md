@@ -1,4 +1,9 @@
-# Gymbro 食物相片上傳 + AI 識別進度條 — 實作規格 (v3.3.24e)
+# Gymbro 食物相片上載 + AI 識別進度條 — 實作規格 (v3.3.24e)
+
+> ⚠️ **呢份係 v3.3.24 時代嘅設計文件,部分內容已過時。**
+> 2026-10-21 更新:Perplexity 同 APiyI 供應商已完全移除(v3.3.30 / v3.3.34),
+> 而家淨返 MiniMax 一家;掃描亦已改成**上載完即刻 return、AI 喺背景行**
+> (v3.3.33)。當中講「MiniMax + APiyi + PPLX」嘅 pipeline 描述屬歷史記錄。
 
 **Owner:** Alonso (tech leads: Frimpong / Torres / Isak)
 **日期:** 2026-10-20

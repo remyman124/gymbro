@@ -127,7 +127,7 @@ points plus a package:
 
 ### Added capabilities (v2.1 → v3.2.7)
 
-- 🍽️ **Food scan** — PWA camera upload → MiniMax vision → Pplx/APiyi nutrition enrichment → Google Sheet mirror
+- 🍽️ **Food scan** — PWA camera upload → MiniMax vision → AI nutrition enrichment → Google Sheet mirror(v3.3.34 起:供應商鏈淨返 MiniMax 一家,Perplexity / APiyI 已移除)
 - 🤖 **AI coach comments** — Traditional Chinese, 4-section, A–F grade per scan
 - 📊 **Whoop + Withings overlays** — recovery %, steps, body composition
 - 📅 **Schedule tab** — Whoop activities on a monthly calendar

@@ -191,6 +191,21 @@ def _install_fake_sheet(gw, monkeypatch):
         return {"ok": True, "range": "dryrun"}
 
     # 只換內層,保留 decorator wrapper(lock 仍然生效)
+    #
+    # ⚠️ 試過嘅三個方法(2026-10-21,每個都踩坑,記錄低免得下次再撞):
+    #   (a) monkeypatch 成個 `_append_to_sheet_nutrition`
+    #       → 完全繞過 decorator 嘅 lock,見到 max_inflight=3(假象)
+    #   (b) 攔 `urllib.request.urlopen` 呢個 network boundary
+    #       → 試唔到:production 模式行到 dryrun 分支(第 6388 行)就 return,
+    #         根本唔會走到 network;要行到 network 就得要用 production 模式,
+    #         但咁就真係有寫入 production 嘅風險 —— 唔可以為咗測試而冒險
+    #   (c) `GYMBRO_WRITE_MODE=dryrun`
+    #       → 同 (b),喺 network boundary 之前已經 return
+    #
+    # 正確做法:**patch `__wrapped__`**。因為 decorator 係喺「每次呼叫時」
+    # 做 `inner = getattr(_wrapped, "__wrapped__", fn)`(動態查找,唔係 closure
+    # 捉實),所以換走 `__wrapped__` 就換走真實 Google 寫入,而 lock 仍然生效
+    # —— 測到嘅係**真嘅** serialization 行為,而且零網絡、零 production 風險。
     wrapped = getattr(gw._append_to_sheet_nutrition, "__wrapped__", None)
     assert wrapped is not None, (
         "_append_to_sheet_nutrition 冇 __wrapped__ —— "

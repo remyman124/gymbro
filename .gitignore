@@ -24,3 +24,7 @@ image_cache/
 .idea/
 *.swp
 *.swo
+
+# QA 上載殘留(mock_backend_harness 會產生 upload_<date>_<i>.jpg)
+# —— 唔好 commit 入 repo,每次 QA 完都要清
+scan_cache/*.jpg
