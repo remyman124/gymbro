@@ -801,7 +801,7 @@
                    loading="lazy"
                    @error="$el.src = scanTextPreview.image_path">
               <div class="text-[9px] text-gray-500 mt-1 italic"
-                   x-text="`🖼 來源: ${scanTextPreview.image_search?.source || 'web'} · AI 自動搵嘅代表相`"></div>
+                   x-text="`🖼 ${scanTextPreview.image_search?.kind === 'brand_cover' ? '品牌封面' : (scanTextPreview.image_search?.kind === 'restaurant' ? '餐廳相' : '食物相')} · 來源 ${scanTextPreview.image_search?.source || 'web'} · ${scanTextPreview.image_search?.verified ? '✅ 驗證相符' : '⚠ 未驗證'}${scanTextPreview.image_search?.query ? ' · query: ' + scanTextPreview.image_search.query : ''}`"></div>
             </div>
           </template>
           <div class="text-xs text-white mb-2 line-clamp-3" x-text="scanTextPreview.vision_short || ''"></div>
@@ -822,6 +822,9 @@
             <input type="number" placeholder="C" x-model.number="scanTextEditForm.carbs" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
             <input type="number" placeholder="F" x-model.number="scanTextEditForm.fat" class="rounded-lg bg-black/40 px-2 py-1.5 text-white border border-white/15">
           </div>
+          <div class="text-[9px] text-gray-500 mb-2"
+               x-show="scanTextPreview.restaurant_source && scanTextPreview.restaurant_source !== 'none'"
+               x-text="`🏪 餐廳來源: ${({brand:'品牌', text:'你輸入提到', history:'上次食過同一碟', ai:'AI 猜'})[scanTextPreview.restaurant_source] || scanTextPreview.restaurant_source}`"></div>
           <textarea x-model="scanTextEditForm.note" placeholder="備註（永久保留）" class="w-full rounded-lg bg-black/40 px-2 py-1.5 text-[11px] text-white border border-white/15" rows="2"></textarea>
           <div class="mt-3 grid grid-cols-2 gap-2">
             <button @click="commitScanText()" :disabled="scanTextCommitting || !scanTextPreview" class="rounded-lg py-2 text-sm font-bold transition-all active:scale-95 disabled:opacity-50" style="background: linear-gradient(135deg, rgba(16,185,129,0.4), rgba(16,185,129,0.2)); border: 1.5px solid rgba(16,185,129,0.55);">
@@ -4949,16 +4952,6 @@ function gymApp() {
           return;
         }
         this.scanTextPreview = data.preview;
-        // v3.3.20: surface image-search status in the flash so Jim sees
-        // whether a real food photo was downloaded (or no result found).
-        const imgInfo = data.preview.image_search || {};
-        if (imgInfo.downloaded) {
-          this.flash(`✨ 已估算 + 從 ${imgInfo.source} 搵到食物相 (檢查再 ✓ log)`);
-        } else if (imgInfo.attempted) {
-          this.flash(`✨ 已估算（搵唔到食物相: ${imgInfo.error || 'no_results'}，照樣可以 ✓ log）`);
-        } else {
-          this.flash('✨ 已估算 — 檢查再 ✓ 確認 log');
-        }
         const s = data.preview.suggested_entry;
         this.scanTextEditForm = {
           name: s.name || '',
@@ -4971,7 +4964,22 @@ function gymApp() {
         };
         // Lock the hints in as part of the preview history
         this.scanTextHints = hintsForReq.slice();
-        this.flash(`✨ 已估算 (kcal: ${s.calories ?? '—'}, P: ${s.protein ?? '—'}) — 檢查再 ✓ 確認 log`);
+        // v3.3.32: 單一 toast。舊版連續 flash 三次,最後一句
+        // 「已估算 (kcal: …)」會把「搵到食物相」嘅訊息完全蓋走,
+        // 所以 Jim 從來睇唔到相片到底搵到咗冇。
+        const imgInfo = data.preview.image_search || {};
+        let imgMsg = '';
+        if (imgInfo.downloaded) {
+          const kindLabel = imgInfo.kind === 'brand_cover' ? '品牌封面'
+            : (imgInfo.kind === 'restaurant' ? '餐廳相' : '食物相');
+          imgMsg = ` · ${kindLabel}${imgInfo.verified ? '✅已驗證' : '⚠未驗證'}(${imgInfo.source || 'web'})`;
+        } else if (imgInfo.attempted) {
+          imgMsg = ` · 搵唔到相關嘅相(${imgInfo.error || 'no_results'})`;
+        }
+        const RS_LABEL = { brand: '品牌', text: '你輸入提到', history: '上次食過同一碟', ai: 'AI 猜' };
+        const rs = data.preview.restaurant_source || 'none';
+        const restMsg = RS_LABEL[rs] ? ` · 餐廳: ${RS_LABEL[rs]}` : '';
+        this.flash(`✨ 已估算 (kcal ${s.calories ?? '—'}, P ${s.protein ?? '—'})${imgMsg}${restMsg} — 檢查再 ✓ log`);
       } catch(e) {
         this.flash('Error：' + e.message);
       } finally {

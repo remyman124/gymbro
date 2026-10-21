@@ -1,3 +1,103 @@
+## v3.3.32 — 2026-10-21 — 文字輸入流程大修:餐廳自動填、食物相優先、品牌 cover
+
+Jim OOB 2026-10-21:
+> I want you to fix the manual food input workflow. It has been very buggy.
+> Can you fill in the restaurant (in best effort basis) based on what I inputted.
+> Moreover, the food image capture should be related to the food. Secondary
+> option is the restaurant. Sometimes, I would input Protein drinks and brand.
+> You research it online and put the brand cover as food image
+
+### 起因 — production 餐廳欄 98% 係 AI 嘅半句說話
+實測 `Nutrition` tab(1645 行):餐廳欄只有 21 個真店名,198 個係 AI 廢話
+```
+難以辨認餐廳 ×45   描述可靠識別餐廳 ×13   睇唔到餐廳 ×12   冇見到餐廳 ×12
+一間香港連鎖餐廳 ×10   相片可靠識別餐廳 ×5   所以餐廳 ×2
+「如果你係做餐廳」「碟炸蔬菜係喺餐廳」「楚具體係邊間餐廳」「景係一個露天餐廳」
+```
+原因:舊流程由 AI 直接填 `restaurant_guess`,**冇任何消毒步驟**就寫入
+golden copy。
+
+### 1. 餐廳自動填(優先次序固定,全部有 source)
+新增 `gym_web/food_context.py`(新模組):
+```
+品牌 → 文字提到 → 上次食過同一碟(歷史索引) → AI 猜(經消毒) → 留空
+```
+* **品牌**:自然寫法「Optimum Nutrition Gold Standard」而唔再係淨收
+  「on gold standard」縮寫。alias 層把 `optimum nutrition`→`Optimum Nutrition`、
+  `my protein`→`MyProtein`、`muscle tech`→`MuscleTech`、
+  `quest nutrition`→`Quest Nutrition`、`dymatize iso 100`→`Dymatize`、
+  `iso 100`→`Dymatize` 正規化。
+* **文字提到**:輸入「星巴克拿鐵」→ 餐廳「星巴克」。
+* **歷史索引**:同一碟菜上次食過嘅店。相似度**收緊咗**(見下)。
+* **AI 猜**:經消毒器,AI 廢話 → 留空(唔會發明)。
+
+### 2. 餐廳名消毒器
+`sanitise_restaurant_name()` 攔截:AI 自我描述(難以/可靠/描述/相片/未見到…)、
+不肯定假設(一間/任何/應該/所以/如果/邊間/連鎖/屬於…)、散文式(睇落/好似/以下為/
+採用/判定/足夠/典型…)、泛用場所字尾(餐廳/連鎖/茶餐廳/小店,只限 ≤6 字,
+**避免誤殺「新羅寶韓國餐廳」**)、純場所類型(居酒屋/酒樓 — 完全一樣先算)、
+純菜系(韓式燒肉 / Hainanese chicken rice shop)。
+> 全部規則由 production 實測垃圾值反推,唔係憑空想像。
+
+### 3. 食物相優先 → 餐廳相次選 → 品牌 cover
+新增 `gym_web/food_image.py`(新模組):
+* **食物相優先**:用「最終菜名 + 最終餐廳」砌 query(餐廳名已喺菜名入面就唔重複 prepend)。
+* **餐廳相次選**:排喺最後,只有搵唔到食物先用。
+* **品牌 cover**:蛋白飲品/蛋白棒 → 先查官方網域 og:image,再 fallback 官網直連
+  `https://www.{domain}/`。實測「Optimum Nutrition Gold Standard」攞到官方產品圖
+  `optimumnutrition.com/cdn/shop/files/US_GSW_2LB_EXTMLKCHOC_FOP.png`。
+* **相關性驗證**:每張候選相都要經視覺驗證先至用;舊版淨係攞 Brave 第一個結果
+  (實測舊版「Optimum Nutrition Gold Standard」→ iStock stock 圖)。
+* **stock 網封鎖**:istockphoto / shutterstock / getty 唔會被 download。
+* **query 唔重複**:「星巴克拿鐵」唔會變成「星巴克 星巴克拿鐵」。
+
+### 4. 統寫入閘 `_sheet_write_guard`(唯一 production writer)
+**最關鍵嘅修正**。實測 2026-10-21 13:52(HKT):Jim 自己 13:16 影嘅午餐盒相,
+AI 認唔出,相片路徑嘅 **scan job 自動 commit** 直接寫咗入 golden copy:
+```
+餐名 =「黑金圓形餐盒內食物（無法識別）」  餐廳 =「描述可靠識別餐廳」  營養 = 0/0/0/0
+```
+相片路徑**唔經** `/api/scan_commit`,所以之前放喺 commit endpoint 嘅消毒器
+完全冇覆蓋到。而家防線放喺 `_append_to_sheet_nutrition`:
+* 泛用 / 認唔出嘅名(未識別/無法識別/無法辨認/睇唔到/唔知係咩…)→ **唔寫**
+* AI 廢話餐廳 → **清空**
+* 4 大營養素全 0 → 先試 Sheet 歷史 median 補,補唔到就 **唔寫**
+  (白開水/無糖茶等真係 0 卡嘅嘢除外)
+
+### 5. 文字輸入穩定性
+* **0 kcal 重試**:MiniMax 偶爾回傳空/壞 JSON(實測「星巴克拿鐵」一次 0 kcal),
+  而家重試一次,再失敗就由 Sheet 歷史 median 補,唔會靜靜哋寫 0 入表。
+* **品牌產品名要穩定**:同一個「Optimum Nutrition Gold Standard」AI 一次出
+  「金標乳清蛋白粉」(啱),另一次出「雞胸肉」(完全唔啱)。而家品牌產品用返
+  Jim 自己打嘅字,除非 AI 個名夠具體。
+* **產品但冇品牌 → 餐廳留空**:唔會亂填另一個品牌(實測舊版「whey protein
+  chocolate」被填成「Quest Nutrition」,但 Jim 根本冇講過 Quest)。
+
+### 6. 歷史相似度收緊
+舊 fuzzy 門檻係「重疊 bigram 數 ≥ 2」→ **「乳清蛋白粉」會撞到
+「Dim sum dinner (8 dishes, Jim 60%)」**(實測 score 2.0 剛好過門檻)。
+而家三級:完全一樣 1.00 / 一個係另一個嘅子字串 0.95 / 英文 token 重疊 ≥2 且
+bigram ≥0.5。「chocolate cake」亦唔會再撞「chocolate peanut butter bar」。
+
+### 7. 前端
+* **一句 toast**(舊版連續三句,最後一句會蓋走「搵到食物相」嘅訊息):
+  `✨ 已估算 (kcal 720, P 28) · 食物相✅已驗證(img-global.cpcdn.com) — 檢查再 ✓ log`
+* 餐廳來源標籤:🏪 餐廳來源: 品牌 / 你輸入提到 / 上次食過同一碟 / AI 猜
+* 相片標籤:🖼 品牌封面 / 餐廳相 / 食物相 · 來源 · ✅驗證相符 / ⚠未驗證 · query
+
+### 8. Production 資料清理(已備份,可 100% 還原)
+* 刪走 2026-10-21 13:16 嗰行 AI 廢話(0 kcal + 無法識別 + 餐廳廢話)。
+* 清走 198 行歷史 AI 廢話餐廳值(只動 column E,其他欄一律唔掂)。
+  備份:`scan_cache/restaurant_cleanup_backup.json`
+* 清理後:**餐廳欄垃圾 0 行、『未識別菜式』0 行**,剩低 21 個相異值全部係真店名。
+
+### 9. 測試
+* `tests/qa/test_manual_food_input.py`(新,145 個測試)—— 消毒器 / 品牌 alias /
+  歷史索引 / 圖片策略 / 統一寫入閘 / 前端 toast 數量
+* `tests/qa/check_production_clean.py`(新)—— production 污染檢查
+* `tests/qa/clean_restaurant_column.py`(新)—— 餐廳欄清理(預設 dryrun)
+* QA suite:**241 passed / 4 skipped**
+
 ## v3.3.31 — 2026-10-21 — the "as of" time was lying; header clock used the device timezone
 
 Jim OOB 2026-10-21:「In gymbro, the as of time is incorrect. This is showing

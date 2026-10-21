@@ -40,6 +40,22 @@ from gym_web.cache import NutritionCache, NutritionRow, get_cache, get_cache as 
 from gym_web import image_proxy
 from gym_web.whoop import whoop_get_steps as _whoop_get_steps
 from gym_web.whoop import whoop_get_body as _whoop_get_body
+# v3.3.32 (Jim OOB 2026-10-21「fix the manual food input workflow」):
+# 餐廳名消毒 + 餐廳歷史索引 + 品牌識別,同食物相搜尋策略
+from gym_web.food_context import (
+    sanitise_restaurant_name as _sanitise_restaurant_name,
+    build_restaurant_history as _build_restaurant_history,
+    match_brand as _match_brand,
+    detect_mentioned_chain as _detect_mentioned_chain,
+    looks_like_product as _looks_like_product,
+    product_name_is_specific as _product_name_is_specific,
+    BRAND_BASELINE as _BRAND_BASELINE,
+    BRAND_ALIAS_TO_CANON as _BRAND_ALIAS_TO_CANON,
+)
+from gym_web.food_image import (
+    pick_food_image as _pick_food_image,
+    plan_image_search as _plan_image_search,
+)
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -841,7 +857,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.31"
+__version__ = "3.3.32"
 
 
 def _recovery_pct():
@@ -6440,6 +6456,78 @@ def _safe_num(v, default=0.0, lo=None, hi=None):
     return x
 
 
+_GENERIC_NAME_MARKERS = (
+    "無法識別", "無法辨認", "無法認出", "無法確認", "未能識別", "未能辨認",
+    "未識別", "認唔到", "認唔出", "睇唔到", "睇唔清", "睇唔出",
+    "唔知係咩", "唔清楚係咩", "唔知係邊", "不確定", "not food", "no food",
+)
+
+# 真係零卡路里嘅嘢(白開水、無糖茶…)—— 呢啲 0 kcal 係正常,唔可以當壞行擋
+_ZERO_CAL_NAMES = {
+    "水", "白開水", "清水", "凍水", "熱水", "冰水", "蒸餾水", "礦泉水",
+    "黑咖啡", "無糖咖啡", "美式咖啡", "茶", "無糖茶", "綠茶", "普洱茶",
+    "菊花茶", "紅茶",
+}
+
+
+def _sheet_write_guard(entry: dict) -> dict:
+    """寫入 golden copy 嘅最後一道閘(所有路徑共用)。
+
+    實測 2026-10-21 13:52(HKT):Jim 自己 13:16 影嘅午餐盒相,AI 認唔出,
+    結果寫咗一行落 production Sheet:
+        餐名  =「黑金圓形餐盒內食物（無法識別）」
+        餐廳  =「描述可靠識別餐廳」(AI 廢話)
+        營養  = 0 / 0 / 0 / 0
+    相片路徑係 scan job **自動 commit**(`_scan_preview_core` → 直接叫
+    `_append_to_sheet_nutrition`),唔經 `/api/scan_commit`,所以之前放喺
+    commit endpoint 嘅消毒器完全冇覆蓋到。
+    → 而家防線放喺 `_append_to_sheet_nutrition`(唯一嘅 production writer),
+      一次過覆蓋:相片自動 commit / 文字輸入 commit / MCP tool / 修正。
+
+    回傳 {"ok": True} = 准寫;{"ok": False, "reason": ...} = 擋。
+    """
+    name = str(entry.get("meal_name") or entry.get("name") or "").strip()
+    low = name.lower()
+
+    # 1) 泛用 / 認唔出嘅菜名 —— 一律唔准入表(Rule 25)
+    if (not name
+            or name in _GENERIC_DISH_NAMES_BLOCKLIST
+            or any(m in low for m in _GENERIC_NAME_MARKERS)):
+        print(f"[sheet-guard] BLOCKED unusable name {name!r}", flush=True)
+        return {"ok": False, "reason": "unusable_name"}
+
+    # 2) 餐廳消毒 —— AI 廢話變空字串,唔會污染 golden copy
+    rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
+    clean_rest = _sanitise_restaurant_name(rest, dish_name=name)
+    if rest and not clean_rest:
+        print(f"[sheet-guard] restaurant dropped (AI 廢話): {rest!r}",
+              flush=True)
+    entry["restaurant_chain"] = clean_rest
+
+    # 3) 4 大營養素全 0 → 補唔到就唔准入表
+    kcal = _safe_num(entry.get("calories", entry.get("kcal", 0)),
+                     default=0.0, lo=0, hi=3000)
+    p = _safe_num(entry.get("protein", 0), default=0.0, lo=0, hi=300)
+    c = _safe_num(entry.get("carbs", 0), default=0.0, lo=0, hi=300)
+    f = _safe_num(entry.get("fat", 0), default=0.0, lo=0, hi=300)
+    if kcal <= 0 and p <= 0 and c <= 0 and f <= 0:
+        if name in _ZERO_CAL_NAMES:
+            return {"ok": True}
+        looked = _lookup_known_macros(name) or _lookup_brand_macros(name)
+        if looked and looked.get("kcal"):
+            entry["calories"] = entry["kcal"] = looked["kcal"]
+            entry["protein"] = looked.get("protein", 0)
+            entry["carbs"] = looked.get("carbs", 0)
+            entry["fat"] = looked.get("fat", 0)
+            print(f"[sheet-guard] backfilled {name!r} → {looked['kcal']} kcal "
+                  f"from {looked.get('_source', '?')}", flush=True)
+        else:
+            print(f"[sheet-guard] BLOCKED all-zero nutrition for {name!r}",
+                  flush=True)
+            return {"ok": False, "reason": "zero_nutrition"}
+    return {"ok": True}
+
+
 def _append_to_sheet_nutrition(entry: dict) -> dict:
     """Mirror entry to Google Sheet Nutrition tab (sheetId 474877075).
     Returns {"ok": bool, "range": str} — silent on quota/error.
@@ -6457,8 +6545,15 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
       - throwaway → writes to GYMBRO_SHEET_ID (a COPY of the tab).
       - production → real behaviour (default).
     """
-    # v3.3.25 production-write guard — evaluated BEFORE any network call
+    # v3.3.32 production-write guard — evaluated BEFORE any network call
     # so a dryrun run can never touch Jim's golden copy.
+    # v3.3.32: 統一寫入閘先跑 —— 唔准嘅行(泛用名 / AI 廢話餐廳 / 0 營養)
+    # 一律唔寫,dryrun 模式亦都一樣(方便 QA 睇到同一個決定)。
+    _guard = _sheet_write_guard(entry)
+    if not _guard.get("ok"):
+        return {"ok": False, "range": "", "skipped": True,
+                "error": _guard.get("reason", "blocked"),
+                "blocked_by": "sheet_write_guard"}
     _mode = _write_mode()
     _target_sid = _target_sheet_id()
     if _mode == "dryrun":
@@ -9761,20 +9856,35 @@ def _lookup_brand_macros(dish_name: str) -> dict:
     if not dish_name or len(dish_name.strip()) < 2:
         return {}
     name_l = dish_name.strip().lower()
+    # v3.3.32: 品牌自然寫法正規化 —— 舊 table 淨係收「on gold standard」縮寫,
+    # 「Optimum Nutrition Gold Standard」呢類完全 miss(實測 2026-10-21)。
+    variants = {name_l}
+    for alias, canon in _BRAND_ALIAS_TO_CANON.items():
+        if alias in name_l:
+            variants.add(name_l.replace(alias, canon))
+    matches = []
+    for v in variants:
+        for (kw, brand), macros in _PROTEIN_BRAND_TABLE.items():
+            if kw in v:
+                matches.append((kw, brand, macros))
     # Sort by keyword length DESC so "double rich chocolate" wins over plain "chocolate"
-    matches = sorted(
-        [(kw, brand, macros) for (kw, brand), macros in _PROTEIN_BRAND_TABLE.items()
-         if kw in name_l],
-        key=lambda x: -len(x[0]),
-    )
-    if not matches:
-        return {}
-    keyword, brand, macros = matches[0]
-    # Return a copy with restaurant_chain filled in
-    out = dict(macros)
-    out["restaurant_chain"] = brand
-    out["_source"] = f"brand_table: '{keyword}' → {brand} ({out.get('_source', '')})"
-    return out
+    matches = sorted(set(matches), key=lambda x: -len(x[0]))
+    if matches:
+        keyword, brand, macros = matches[0]
+        # Return a copy with restaurant_chain filled in
+        out = dict(macros)
+        out["restaurant_chain"] = brand
+        out["_source"] = f"brand_table: '{keyword}' → {brand} ({out.get('_source', '')})"
+        return out
+    # v3.3.32: 第二級 —— 識到品牌但冇 flavour 專屬值 → 用品牌 baseline
+    bm = _match_brand(dish_name)
+    if bm and bm.get("baseline"):
+        out = dict(bm["baseline"])
+        out["restaurant_chain"] = bm["brand"]
+        out["_source"] = (f"brand_baseline: {bm['alias']!r} → {bm['brand']} "
+                          f"({out.get('_source', '')})")
+        return out
+    return {}
 
 
 def _lookup_known_macros(dish_name: str) -> dict:
@@ -9997,6 +10107,18 @@ def api_scan_commit():
         entry_c = entry.get("carbs", entry.get("carbs_g", 0)) or 0
         entry_f = entry.get("fat", entry.get("fat_g", 0)) or 0
         entry_rest = entry.get("restaurant_chain", entry.get("restaurant", "")) or ""
+        # v3.3.32 (Jim OOB 2026-10-21「fill in the restaurant (in best effort
+        # basis)」):呢個係寫入 golden copy 嘅最後一道閘 —— 任何路徑(文字
+        # 輸入 / 相片掃描 / 修正 / MCP tool)嘅餐廳都要經過消毒,垃圾一律
+        # 變空字串。實測 production 餐廳欄 90% 係「難以辨認餐廳」呢類 AI
+        # 廢話,係因為舊流程由 AI 直接寫落 Sheet。
+        _rest_clean = _sanitise_restaurant_name(entry_rest,
+                                                dish_name=entry.get("name", ""))
+        if entry_rest and not _rest_clean:
+            print(f"[scan_commit] restaurant dropped (AI 廢話): "
+                  f"{entry_rest!r}", flush=True)
+        entry["restaurant_chain"] = _rest_clean
+        entry_rest = _rest_clean
         # v3.3.7: backfill empty macros from Sheet history (Jim OOB
         # 2026-08-16 'why today egg tarts have nutrient info?' — vision
         # AI returned empty for that photo, all 12 fields defaulted to 0).
@@ -10583,6 +10705,171 @@ def api_transcribe():
             pass
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# v3.3.32 (Jim OOB 2026-10-21「fix the manual food input workflow」)
+#   「Can you fill in the restaurant (in best effort basis) based on what I
+#     inputted. Moreover, the food image capture should be related to the
+#     food. Secondary option is the restaurant. Sometimes, I would input
+#     Protein drinks and brand. You research it online and put the brand
+#     cover as food image」
+#
+# 實測 production Sheet 餐廳欄:90% 係 AI 廢話(「難以辨認餐廳」45 次、
+# 「描述可靠識別餐廳」13 次、「所以餐廳」、「如果你係做餐廳」⋯⋯)。
+# 根因:舊流程把 AI 嘅 restaurant_guess 原封不動寫入 Sheet,冇消毒步驟。
+# ──────────────────────────────────────────────────────────────────────────
+
+# 餐廳歷史索引(Sheet + scan log),TTL 15 分鐘
+_RESTAURANT_HISTORY_TTL = 900
+_RESTAURANT_HISTORY: dict = {"at": 0.0, "hist": None}
+
+
+def _get_restaurant_history():
+    """由 Sheet cache + food_scan_log 建餐廳歷史索引(TTL 快取)。
+
+    只收通過 `_sanitise_restaurant_name` 嘅名 —— 即係真店名先入索引,
+    AI 廢話(「難以辨認餐廳」呢類)直接唔入,唔會污染下一次嘅自動填充。
+    """
+    now = time.time()
+    cached = _RESTAURANT_HISTORY.get("hist")
+    if cached is not None and (now - _RESTAURANT_HISTORY.get("at", 0)) < _RESTAURANT_HISTORY_TTL:
+        return cached
+    rows = []
+    try:
+        rows = list(get_cache().by_row.values())
+    except Exception as e:
+        print(f"[restaurant_history] sheet cache read failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+    scans = []
+    try:
+        p = Path("/home/work/.hermes/food_scan_log.json")
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            scans = raw if isinstance(raw, list) else (raw.get("entries") or [])
+    except Exception as e:
+        print(f"[restaurant_history] scan log read failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+    hist = _build_restaurant_history(rows, scans)
+    _RESTAURANT_HISTORY["hist"] = hist
+    _RESTAURANT_HISTORY["at"] = now
+    print(f"[restaurant_history] rebuilt: {len(hist.restaurants)} restaurants "
+          f"from {len(rows)} sheet rows + {len(scans)} scan entries", flush=True)
+    return hist
+
+
+def _resolve_restaurant(user_text: str, dish_name: str, ai_guess: str,
+                         brand: dict = None) -> tuple:
+    """Best-effort 餐廳。回傳 (餐廳名, 來源)。
+
+    優先次序(可靠 → 不可靠):
+      brand   —— 蛋白飲品品牌(品牌本身就係「餐廳」欄嘅內容)
+      text    —— 用家輸入直接提到一間已知連鎖
+      history —— 同一碟菜 / 近似菜之前喺邊間食過
+      ai      —— AI 猜,但通過咗消毒器
+      none    —— 搵唔到,留空(寧願留空都唔寫垃圾)
+    """
+    if brand and brand.get("brand"):
+        return brand["brand"], "brand"
+    chain = _detect_mentioned_chain(user_text or "")
+    if chain:
+        return chain, "text"
+    # v3.3.32: 蛋白產品但冇講品牌 → 唔好亂填。呢類輸入嘅「餐廳」欄
+    # 本来就係品牌(見上面 brand 分支),估第二個品牌只會填錯
+    # (實測 2026-10-21:「whey protein chocolate」被填成「Quest Nutrition」,
+    #  但 Jim 根本冇講過 Quest)。
+    if _looks_like_product(user_text or "") or _looks_like_product(dish_name or ""):
+        print(f"[resolve_restaurant] product input without brand → "
+              f"leave restaurant empty ({user_text!r})", flush=True)
+        return "", "none"
+    try:
+        hist = _get_restaurant_history()
+    except Exception as e:
+        print(f"[resolve_restaurant] history unavailable: "
+              f"{type(e).__name__}: {e}", flush=True)
+        hist = None
+    if hist is not None:
+        name, src = hist.lookup(user_text or "", dish_name or "", ai_guess or "")
+        if name:
+            return name, src
+    clean = _sanitise_restaurant_name(ai_guess or "", dish_name=dish_name or "")
+    if clean:
+        return clean, "ai"
+    return "", "none"
+
+
+def _fetch_page_html(url: str, timeout: int = 15) -> str:
+    """抓 HTML(搵 og:image 用)。失敗回傳 ""。"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-HK;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(2_000_000).decode("utf-8", "ignore")
+    except Exception as e:
+        print(f"[fetch_page_html] {type(e).__name__}: {e} — {url[:80]}",
+              flush=True)
+        return ""
+
+
+def _verify_food_image(path, expected: str, kind: str) -> bool:
+    """視覺驗證:張相係咪真係同 expected 相關?
+
+    kind = "food"       → 呢張相係咪 <expected>(食物)
+    kind = "brand_cover"→ 呢張相係咪 <expected> 品牌嘅產品/包裝
+    kind = "restaurant" → 呢張相係咪 <expected> 嘅餐廳/店面
+
+    回傳 True = 相關(可以擺上),False = 唔相關(剔走)。
+    ⚠️ 視覺供應商全死 → 回傳 True 但唔算「已驗證」(視覺鏈記錄咗狀態),
+       寧願畀一張未驗證嘅搜尋結果,都好過完全冇相。
+    """
+    if not expected:
+        return True
+    try:
+        raw = Path(path).read_bytes()
+    except Exception as e:
+        print(f"[verify_food_image] read failed: {type(e).__name__}: {e}",
+              flush=True)
+        return False
+    b64 = base64.b64encode(raw).decode()
+    if kind == "brand_cover":
+        prompt = (
+            "你係食物視覺識別助手。請直接回答,唔好道歉、唔好拒絕。\n"
+            f"呢張相係咪 {expected} 品牌嘅產品?(樽身、罐、盒、棒、包裝、或者"
+            f"沖好嘅飲品都得)\n"
+            "如果係,只答「係」。如果唔係、或者相入面完全係另一樣嘢,只答「唔係」。"
+            "一行,唔好解釋。"
+        )
+    elif kind == "restaurant":
+        prompt = (
+            "你係食物視覺識別助手。請直接回答,唔好道歉、唔好拒絕。\n"
+            f"呢張相係咪 {expected}?(餐廳店面、招牌、菜牌、或者同一家店嘅食物相)\n"
+            "如果係,只答「係」。如果唔係,只答「唔係」。一行,唔好解釋。"
+        )
+    else:
+        prompt = (
+            "你係食物視覺識別助手。請直接回答,唔好道歉、唔好拒絕。\n"
+            f"呢張相係咪 {expected}?\n"
+            "如果係,只答「係」。如果唔係(例如係完全唔同嘅食物、或者純色圖、"
+            "或者產品包裝而唔係食物),只答「唔係」。一行,唔好解釋。"
+        )
+    desc = _minimax_vision(b64, prompt)
+    if not desc:
+        print(f"[verify_food_image] vision 供應商全死 → 當作通過但未驗證: "
+              f"{expected!r}", flush=True)
+        return True
+    d = desc.strip()
+    head = d[:24]
+    neg = any(x in head for x in ("唔係", "不是", "唔是", "並非", "唔相符",
+                                  "唔同", "no ", "not "))
+    pos = any(x in head for x in ("係", "是", "yes", "correct", "相符"))
+    verdict = (not neg) and pos
+    print(f"[verify_food_image] {kind} {expected!r} → "
+          f"{'MATCH' if verdict else 'REJECT'} ({d[:60]!r})", flush=True)
+    return verdict
+
+
 @app.route("/api/scan_preview_text", methods=["POST"])
 def api_scan_preview_text():
     """Text-only food entry preview (no image required).
@@ -10649,6 +10936,26 @@ def api_scan_preview_text():
     # and falls back to last-{...}-regex if MiniMax emits prose)
     parsed = _safe_parse_nutrition_json(mm_text_desc)
 
+    # v3.3.32 (Jim OOB 2026-10-21「manual food input ... has been very
+    # buggy」):實測「星巴克拿鐵」有一次 MiniMax 回傳空/壞 JSON,
+    # 結果 12 個欄全部 0 kcal 顯示俾 Jim,更壞係會寫入 golden Sheet。
+    # 而家:0 kcal 就重試一次,再失敗就由 Sheet 歷史 median 補,
+    # 補唔到就明確標記(唔會靜靜哋寫 0 入去)。
+    if not parsed or not parsed.get("calories"):
+        print(f"[scan_preview_text] nutrition parse empty/0 kcal "
+              f"({text_desc!r}) → retry once", flush=True)
+        retry_raw = _minimax_nutrition_enrich(
+            prompt + "\n\n(重試:上一個回覆格式錯,必須回傳完整 JSON object)")
+        retry_parsed = _safe_parse_nutrition_json(retry_raw)
+        if retry_parsed.get("calories"):
+            parsed = retry_parsed
+            mm_text_desc = retry_raw
+            print(f"[scan_preview_text] retry OK → "
+                  f"{retry_parsed.get('calories')} kcal", flush=True)
+        else:
+            print(f"[scan_preview_text] retry still empty → will backfill "
+                  f"from Sheet history", flush=True)
+
     # v3.3.23v (Jim OOB 2026-09-15 'my recent quest energy bar does not
     # record any nutrient info'): AI estimate often misses brand-specific
     # macros (Quest Bar: AI returns 190/21/21/8 but actual is 200/21/22/8).
@@ -10676,50 +10983,35 @@ def api_scan_preview_text():
         if not parsed.get("restaurant_guess") and brand_hit.get("restaurant_chain"):
             parsed["restaurant_guess"] = brand_hit["restaurant_chain"]
 
+    # v3.3.32 (Jim OOB 2026-10-21「Protein drinks and brand … put the brand
+    # cover as food image」):品牌識別 —— 舊 brand table 淨係收縮寫
+    # 「on gold standard」,自然寫法「Optimum Nutrition Gold Standard」完全
+    # miss(實測 2026-10-21:攞到 120 kcal 撞正,但係名同圖片都唔啱)。
+    # 而家另外用 alias 識別,順便攞到官方網域(搵 brand cover 用)。
+    brand_info: dict = _match_brand(text_desc) or {}
+    if brand_info and brand_hit.get("restaurant_chain"):
+        # 統一用 brand table 嘅正式品牌名(兩邊一致)
+        brand_info["brand"] = brand_hit.get("restaurant_chain") or brand_info["brand"]
+    if brand_info:
+        print(f"[scan_preview_text] brand detected: {brand_info['brand']} "
+              f"(alias {brand_info['alias']!r}, product "
+              f"{brand_info.get('product_phrase', '')!r})", flush=True)
+
     # v3.3.20 (Jim OOB 2026-09-10): optionally fetch a representative food image
     # via Brave Image Search. Best-effort — failure here doesn't block the nutrition
     # preview. Query prioritizes the MiniMax-suggested dish name (cleanest), with
     # user input as fallback + restaurant_guess as prefix hint if present.
+    #
+    # ⚠️ v3.3.32 (2026-10-21):呢段舊邏輯搬到下面(建議名 + 餐廳計好之後),
+    #    因為新策略需要用「最終菜名」同「最終餐廳」嚟砌搜尋 query,
+    #    而且每張相要經視覺驗證。舊邏輯嘅問題:
+    #      - 淨係攞 Brave 第一個結果,零相關性驗證
+    #      - 「Optimum Nutrition Gold Standard」→ 攞咗 istockphoto 張 stock 圖
+    #      - 完全搵唔到品牌 cover
     downloaded_image_path = ""
-    image_search_meta = {"attempted": bool(with_image_flag), "downloaded": False, "source": "", "error": ""}
-    if with_image_flag:
-        # Build a good search query. Prefer the MiniMax name (clean dish label) +
-        # restaurant hint. Fallback chain: name → user input.
-        name_hint = (parsed.get("name") if isinstance(parsed, dict) else "") or ""
-        rest_hint = (parsed.get("restaurant_guess") if isinstance(parsed, dict) else "") or ""
-        candidates = []
-        if name_hint and rest_hint:
-            candidates.append(f"{rest_hint} {name_hint}")
-        if name_hint:
-            candidates.append(name_hint)
-        # User input — strip common phrases like "I ate", "午餐", "lunch"
-        cleaned_input = re.sub(
-            r"^(我食咗|i ate|i had|午餐|lunch|晚餐|dinner|早餐|breakfast|食咗|order咗|叫咗)\s*",
-            "", text_desc, flags=re.I
-        ).strip()
-        if cleaned_input:
-            candidates.append(cleaned_input[:80])
-        img_result = None
-        for q in candidates:
-            if not q.strip():
-                continue
-            results = _brave_image_search(q, count=3)
-            if results:
-                # Prefer high-confidence then medium then low
-                results.sort(key=lambda r: {"high": 3, "medium": 2, "low": 1}.get(r.get("confidence", "low"), 1), reverse=True)
-                img_result = results[0]
-                image_search_meta["source"] = img_result.get("source", "")
-                break
-        if img_result and img_result.get("url"):
-            slug = name_hint or cleaned_input or "food"
-            local_path = _download_food_image(img_result["url"], slug)
-            if local_path:
-                downloaded_image_path = str(local_path)
-                image_search_meta["downloaded"] = True
-            else:
-                image_search_meta["error"] = "download_failed"
-        else:
-            image_search_meta["error"] = "no_results"
+    image_search_meta = {"attempted": bool(with_image_flag), "downloaded": False,
+                         "source": "", "error": "", "kind": "", "query": "",
+                         "verified": False, "via": "", "title": ""}
 
     # Detect shared meal via keyword scan (Jim OOB 2026-08-02 02:50 HKT —
     # only scan USER-FACING text, NOT the JSON dump which has
@@ -10754,14 +11046,85 @@ def api_scan_preview_text():
     # If still empty or the generic "食物" fallback, try the user input directly
     if not suggested_name or suggested_name.strip() == "食物":
         suggested_name = _extract_dish_name(text_desc, "", fallback=text_desc[:60])
+    final_name = _sanitise_dish_name(suggested_name, vision_desc=text_desc, pplx_desc=mm_text_desc)
+
+    # ── v3.3.32: 品牌產品嘅名要穩定 ──
+    # 實測 2026-10-21:同一個「Optimum Nutrition Gold Standard」,
+    # MiniMax 一次出「金標乳清蛋白粉」(啱),另一次出「雞胸肉」(完全唔啱)。
+    # 品牌產品就一定用返 Jim 自己打嘅字(最忠實),除非 AI 個名夠具體。
+    if brand_info and not _product_name_is_specific(final_name):
+        fallback_name = (text_desc or "").strip()[:60]
+        if fallback_name:
+            print(f"[scan_preview_text] brand product name "
+                  f"{final_name!r} too generic → use user input "
+                  f"{fallback_name!r}", flush=True)
+            final_name = fallback_name
+
+    # ── v3.3.32: 0 kcal 唔可以靜靜哋入 Sheet ──
+    # MiniMax 偶爾回傳空/壞 JSON(實測「星巴克拿鐵」)。
+    # 呢度用 Sheet 歷史 median 補返;補唔到就照 0 但會有 log。
+    if not field_entries.get("calories"):
+        hist_macros = _lookup_known_macros(final_name)
+        if hist_macros and hist_macros.get("kcal"):
+            field_entries["calories"] = hist_macros.get("kcal", 0)
+            field_entries["protein"] = hist_macros.get("protein", field_entries.get("protein", 0))
+            field_entries["carbs"] = hist_macros.get("carbs", field_entries.get("carbs", 0))
+            field_entries["fat"] = hist_macros.get("fat", field_entries.get("fat", 0))
+            if isinstance(parsed, dict):
+                parsed["calories"] = field_entries["calories"]
+                parsed["protein"] = field_entries["protein"]
+                parsed["carbs"] = field_entries["carbs"]
+                parsed["fat"] = field_entries["fat"]
+            print(f"[scan_preview_text] 0 kcal → backfilled from Sheet history: "
+                  f"{final_name!r} = {field_entries['calories']} kcal", flush=True)
+        else:
+            print(f"[scan_preview_text] ⚠️ 0 kcal and no history match for "
+                  f"{final_name!r} — 建議 Jim 手動檢查", flush=True)
+
+    # ── v3.3.32: best-effort 餐廳(唔好再寫 AI 廢話落 golden copy)──
+    # 舊流程:`restaurant_guess` 由 AI 嚟,原封不動寫入 Sheet →
+    #  production 餐廳欄 90% 係「難以辨認餐廳」呢類垃圾。
+    # 新流程:品牌 → 文字提到 → 歷史索引 → AI(經消毒)→ 留空
+    restaurant_final, restaurant_source = _resolve_restaurant(
+        text_desc, final_name, restaurant_guess, brand_info or None)
+    if restaurant_final != restaurant_guess:
+        print(f"[scan_preview_text] restaurant: AI {restaurant_guess!r} → "
+              f"{restaurant_final!r} (source={restaurant_source})", flush=True)
+
+    # ── v3.3.32: 食物相策略(食物優先 → 餐廳次選 → 品牌 cover)──
+    if with_image_flag:
+        img_res = _pick_food_image(
+            dish_name=final_name,
+            restaurant=restaurant_final,
+            user_text=text_desc,
+            brand=brand_info or None,
+            search_fn=_brave_image_search,
+            download_fn=_download_food_image,
+            verify_fn=_verify_food_image,
+            ddg_fn=_ddg_search,
+            fetch_page_fn=_fetch_page_html,
+            max_candidates=3,
+            log=lambda m: print(m, flush=True),
+        )
+        downloaded_image_path = img_res.get("image_path") or ""
+        image_search_meta["downloaded"] = bool(downloaded_image_path)
+        image_search_meta["source"] = img_res.get("source") or ""
+        image_search_meta["kind"] = img_res.get("kind") or ""
+        image_search_meta["query"] = img_res.get("query") or ""
+        image_search_meta["verified"] = bool(img_res.get("verified"))
+        image_search_meta["via"] = img_res.get("via") or ""
+        image_search_meta["title"] = (img_res.get("title") or "")[:120]
+        if not downloaded_image_path:
+            image_search_meta["error"] = "no_matching_image"
+
     # v3.2.7.3: single A-F grade via _coach_comment (replaces old 1-5 star rating)
     coach_cc = _coach_comment(
-        suggested_name,
+        final_name,
         field_entries.get("calories", 0) or 0,
         field_entries.get("protein", 0) or 0,
         field_entries.get("carbs", 0) or 0,
         field_entries.get("fat", 0) or 0,
-        restaurant_guess,
+        restaurant_final,
         daily_ctx_seed=_daily_ctx_seed(),
     )
 
@@ -10778,14 +11141,18 @@ def api_scan_preview_text():
         # v3.3.20: expose Brave image-search metadata to the frontend so
         # the user can see WHERE the image came from (source domain) and
         # whether the fetch actually succeeded (downloaded=True/False).
+        # v3.3.32: + kind (brand_cover/food/restaurant) + verified (視覺驗證)
+        #           + query (用咗咩 query 搵) + via (og_image / search)
         "image_search": image_search_meta,
+        # v3.3.32: 餐廳係點嚟嘅(brand/text/history/ai/none)—— 前端會顯示俾 Jim 睇
+        "restaurant_source": restaurant_source,
         "suggested_entry": {
             "date": today_iso(),
             "time": now_hkt_dt.strftime("%H:%M"),
             "meal_type": "scan",
-            "name": _sanitise_dish_name(suggested_name, vision_desc=text_desc, pplx_desc=mm_text_desc),
+            "name": final_name,
             "coach_comment": coach_cc,
-            "restaurant_chain": restaurant_guess,
+            "restaurant_chain": restaurant_final,
             "cooking_method": (parsed.get("cooking_method", "") if isinstance(parsed, dict) else ""),
             "calories": field_entries["calories"],
             "protein": field_entries["protein"],

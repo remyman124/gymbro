@@ -72,6 +72,7 @@ declare -a QA_GROUPS=(
   "vision:tests/qa/test_vision_failure_guard.py"
   "aifallback:tests/qa/test_ai_provider_fallback.py"
   "rule25:tests/qa/test_generic_name_guard.py"
+  "manualinput:tests/qa/test_manual_food_input.py"
   "meta:tests/qa/baseline_diff_meta_test.py"
 )
 
