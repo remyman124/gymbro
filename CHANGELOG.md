@@ -88,10 +88,32 @@ Vision pool 會自動由 MiniMax 頂上(實測 `minimax-text-01 served after 1 f
 
 ### 7. QA
 
-新增 `tests/qa/test_background_parallel_scan.py`(17 個 check)——
+新增 `tests/qa/test_background_parallel_scan.py`(17 個**靜態** check)——
 背景唔准 block、平行 worker 存在、Sheet 寫入必須 serialized、
 結果必須用 client_index 對返、`nonlocal` 陷阱、persist lock、
 同卡路里唔可以當重複、統一寫入閘未被搞走。
+
+### 8. Frimpong 動態測試再捉到 3 個問題(全部已修)
+
+Frimpong 收到 A2A 通知後,自己寫咗 `tests/qa/test_v3333_dynamic.py`
+(12 個**真動態**測試:真起 thread、真跑 parallel、真令 AI stage 亂序完成)。
+佢捉到我自己冇捉到嘅 3 個問題:
+
+| # | 問題 | 症狀 | 修法 |
+|---|---|---|---|
+| 1 | **進度百分比公式搞錯 scale** | `((done_count + stage_frac) / total * 100)` —— `stage_frac` 係 0-100 嘅 stage 百分比,唔係張數。`stage_frac=12` 計出 600% → bar 即刻跳到 99% 然後**成個 job 停喺 99%**(實測 0 → 99 喺 2.8 秒,然後 pin 住 110 秒)。呢個正正係 Jim 禁止嘅「假進度」。 | 改用 SPEC §2.3 公式:`raw = (done_count * 100 + stage_frac) / total` —— 完成嘅相每張計 100,進行緊嘅 stage 貢獻**一張**相嘅 0-100 切片 |
+| 2 | **decorator 唔可以被測試換內層** | `@_serialise_sheet_write` 直接叫 closure 嘅 `fn`,QA 換唔走內層實作 → 動態驗證「序列化有效」做唔到 | wrapper 經 `getattr(_wrapped, "__wrapped__", fn)` 間接叫內層(預設行為完全一樣) |
+| 3 | **`completed` 漏計失敗嘅相** | 收尾用 `completed=len(results)`(只計成功)→ 一張相失敗,前端個「(已完成 x/y)」label **永遠到唔到 100%** | 改用 `completed=done_count`(已處理 = 成功 + 失敗) |
+
+> 呢個係「靜態 source 檢查」嘅盲區:我嗰 17 個 check 全部係 `assert "ThreadPoolExecutor" in gw`
+> 呢類字串檢查 —— 證明到「有呢段碼」,證明唔到「行得到」。
+> Fimpong 嘅動態測試先捉到上面 3 個。
+
+新增 `tests/qa/test_v3333_dynamic.py`(12 個**動態** check,Frimpong 寫)——
+真起 thread、真跑 parallel、真令 AI stage 亂序完成:
+平行真係同時行、client_index 對應、pct 單調遞增、completed/inflight 正確、
+**Sheet 寫入真係 serialized**(兩個 thread 同時寫唔會撞爛)、
+一張相爆咗唔會連累其他相、前端上載完即刻交還控制權。
 
 
 ## v3.3.32 — 2026-10-21 — 文字輸入流程大修:餐廳自動填、食物相優先、品牌 cover

@@ -6549,7 +6549,13 @@ def _serialise_sheet_write(fn):
     @functools.wraps(fn)
     def _wrapped(*args, **kwargs):
         with _SHEET_WRITE_LOCK:
-            return fn(*args, **kwargs)
+            # v3.3.33 (Frimpong 2026-10-21 指出):經 `__wrapped__` 間接層
+            # 叫內層實作 —— 咁 QA 可以換走真實 Google 寫入(唔打真 API)
+            # 而 lock 仍然生效,真正動態驗證「序列化有效」。
+            # 預設 `functools.wraps` 已經令 `_wrapped.__wrapped__ is fn`，
+            # 所以行為同直接叫 fn 一模一樣。
+            inner = getattr(_wrapped, "__wrapped__", fn)
+            return inner(*args, **kwargs)
     return _wrapped
 
 
@@ -8829,7 +8835,17 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
         with lock:
             inflight[ci] = SCAN_STAGE_PCT_START.get(stage_key, 0)
             stage_frac = max(inflight.values()) if inflight else 0
-            raw = ((done_count + stage_frac) / total * 100) if total else 100
+            # v3.3.33fix (Frimpong 2026-10-21): stage_frac is on a 0-100
+            # scale (SCAN_STAGE_PCT_START), NOT a count of images. The old
+            # formula ((done_count + stage_frac) / total * 100) mixed the two
+            # scales — at stage_frac=12 it computed 600% and the bar jumped
+            # straight to the 99% clamp, then sat there for the rest of the
+            # job (live: 0 -> 99 at t=2.8s, pinned at 99 for 110s). That is
+            # exactly the "假進度" Jim forbids. Use the SPEC §2.3 formula:
+            #   整體 pct = (current_index * 100 + stage_pct) / total
+            # i.e. completed images contribute 100 each, and the in-flight
+            # stage contributes its 0-100 slice of ONE image.
+            raw = ((done_count * 100) + stage_frac) / total if total else 100
             new_pct = max(0, min(99, int(round(raw))))
             if new_pct > pct_high:
                 pct_high = new_pct
@@ -8938,7 +8954,10 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
         total=total,
         results=list(results),
         errors=list(errors),
-        completed=len(results),
+        # v3.3.33 (Frimpong 2026-10-21 指出):completed = **已處理**(成功 + 失敗),
+        # 唔係只計成功。用 len(results) 嘅話,一張相失敗 → completed 永遠少 1,
+        # 前端個「(已完成 x/y)」label 永遠到唔到 100%。
+        completed=done_count,
         inflight=[],
     )
 
