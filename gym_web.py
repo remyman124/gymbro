@@ -518,7 +518,24 @@ def api_health():
         try:
             data = json.loads(whoop_cache.read_text())
             meta = data.get("_meta", {})
-            checks["whoop_cache_age_minutes"] = meta.get("sync_time_hkt_age_min", None)
+            # v3.3.31: compute the cache age HERE instead of reading
+            # meta["sync_time_hkt_age_min"]. No writer ever produced that key,
+            # so /api/health always reported null and a stale Whoop cache was
+            # indistinguishable from a fresh one. Prefer the epoch the pull
+            # script writes (sync_time_epoch); fall back to the file mtime.
+            age_min = None
+            epoch = meta.get("sync_time_epoch")
+            if epoch is None:
+                try:
+                    epoch = whoop_cache.stat().st_mtime
+                except OSError:
+                    epoch = None
+            if epoch is not None:
+                try:
+                    age_min = round((time.time() - float(epoch)) / 60.0, 2)
+                except (TypeError, ValueError):
+                    age_min = None
+            checks["whoop_cache_age_minutes"] = age_min
         except Exception:
             checks["whoop_cache_age_minutes"] = "corrupt"
     # Withings
@@ -824,7 +841,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.30"
+__version__ = "3.3.31"
 
 
 def _recovery_pct():
@@ -1279,6 +1296,13 @@ def api_whoop_steps():
         "steps": data.get("steps"),
         "date": data.get("date"),
         "data_as_of": data.get("data_as_of"),
+        # v3.3.31 (2026-10-21): WHOOP's cycle `updated_at` is frozen and
+        # does NOT track the live step_count (proved: 1042 -> 1159 -> 1342
+        # while updated_at stayed 08:14:53). `data_as_of` is therefore the
+        # pull time; the source stamp is exposed separately for diagnostics
+        # and for the band-off heuristic.
+        "source_updated_at": data.get("source_updated_at"),
+        "source_age_min": data.get("source_age_min"),
         "age_min": data.get("age_min"),
         "stale": data.get("stale", False),
         "band_off": data.get("band_off", False),
@@ -8643,9 +8667,16 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
 
             entries = core.get("entries") or []
             first = entries[0] if entries else {}
+            # v3.3.30 (2026-10-21): the Phase-2 wrapper used to hardcode
+            # "ok": True, which SWALLOWED the Rule 25 / vision-failure block
+            # signal from _scan_preview_core. The frontend has a branch for
+            # `res.ok === false` ("呢張相搵唔到菜名,冇入账") but it could never
+            # fire on this path — Jim would see the photo marked as 已入账
+            # while nothing was written to his golden copy.
+            # Pass the core's real ok through so the block is honest.
             results.append({
                 "client_index": client_index,
-                "ok": True,
+                "ok": bool(core.get("ok", True)),
                 "name": first.get("name", ""),
                 "calories": first.get("calories", 0),
                 "protein": first.get("protein", 0),

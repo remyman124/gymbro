@@ -1,3 +1,62 @@
+## v3.3.31 — 2026-10-21 — the "as of" time was lying; header clock used the device timezone
+
+Jim OOB 2026-10-21:「In gymbro, the as of time is incorrect. This is showing
+08:14 but should be at 11am」
+
+### Root cause 1 — WHOOP's `updated_at` does not track the step count
+The steps "as of HH:MM" stamp used the Whoop cycle record's `updated_at`.
+Three live pulls on 2026-10-21:
+
+```
+11:22 -> step_count 1042, updated_at 08:14:53
+11:45 -> step_count 1159, updated_at 08:14:53
+11:46 -> step_count 1342, updated_at 08:14:53
+```
+
+The number was advancing in real time while `updated_at` stayed frozen — and
+`recovery` / `activity/sleep` carried the *same* frozen stamp, so it is a
+record-level stamp, not a "band last wrote" stamp. The app therefore claimed
+the count was 3 hours old when it was seconds old.
+
+**Fix**: `data_as_of` is now WHEN WE READ THE NUMBER — the cache file's mtime
+(i.e. gymbro's last successful pull). The source stamp is kept as
+`source_updated_at` (+ `source_age_min`) and still drives the band-off
+heuristic. `/api/whoop_steps` exposes the new fields.
+
+### Root cause 2 — the tap flash contradicted the stamp
+Tapping the shoes widget flashed「✓ WHOOP 已更新 (11:20)」— 11:20 being the
+*PULL* time — while the stamp right below read「as of 08:14」— the *DATA AGE*.
+Two different meanings, side by side, so the time looked broken.
+
+**Fix**: the flash now reports the truth after the pull:
+「WHOOP 已拉,但雲端仲係 3小時30分前(手機未同步)」. When the data is fresh it
+shows the source time, not the pull time.
+
+### Root cause 3 — the header clock used the device timezone
+`tickClock()` used `d.getHours()`, i.e. the *browser's* timezone. On a device
+not set to HKT the header clock showed the wrong time entirely (a UTC browser
+showed 03:22 for 11:22 HKT). The same pattern put the food log's「今日/昨日」
+grouping and the schedule month picker on the device clock.
+
+**Fix**: all of them now derive from `Asia/Hong_Kong` via `Intl.DateTimeFormat`,
+plus a shared `hkTodayAndYesterday()` helper.
+
+### Also
+- The "as of" label now prints the data AGE (`as of 08:14 ⚠ 3小時29分前`) so a
+  bare ⚠ can't be misread as "the app is showing the wrong time".
+- `loadSteps()` silently fires a background WHOOP pull when the cache is older
+  than 5 min, so the stamp tracks "now" instead of the 45-min cron cadence.
+- `whoop_nutrition.py` now writes the cache ATOMICALLY (tmp + `os.replace`).
+  The cache has three concurrent writers (45-min refresh cron, 9am sync cron,
+  app tap-to-refresh); the old `open(path,'w')` truncated first, so a reader
+  could see half-written JSON and the app would briefly show NO steps at all.
+
+### Verified
+- `/api/whoop_steps`: `data_as_of 11:46:09`, `source_updated_at 08:14:53`,
+  `age_min 15`, `stale false`
+- App header: `👟 1,378 as of 12:02 WHOOP 5.5K 12:03 10-21` (no ⚠)
+- QA 10/10 PASS
+
 ## v3.3.30 — 2026-10-21 — APIyI removed + Rule 25 generic-name hard block
 
 Jim OOB 2026-10-21:「Remove apiyi stuff」

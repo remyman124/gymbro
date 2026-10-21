@@ -259,11 +259,16 @@
                   x-text="stepsSyncing ? '—' : stepsToday.toLocaleString()"></span>
             <!-- v3.3.7: 'as of HH:MM' freshness stamp (Jim OOB 2026-08-17).
                  Tiny text under the step number so Jim knows how stale
-                 the count is (iPhone sync lag). Amber when > 30 min. -->
+                 the count is (iPhone sync lag). Amber when > 30 min.
+                 v3.3.31 (2026-10-21, Jim OOB「the as of time is incorrect —
+                 showing 08:14 but should be at 11am」): a bare ⚠ looked like
+                 the APP was showing the wrong time. Now we also print the
+                 data AGE so it is obvious the number itself is old, not
+                 that the clock is broken. -->
             <span class="text-[8px] tabular-nums leading-none mt-0.5"
                   :class="stepsStale ? 'text-amber-400/80' : 'text-gray-500'"
                   x-show="stepsLastSync"
-                  x-text="stepsLastSync ? (stepsStale ? 'as of ' : 'as of ') + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) + (stepsStale ? ' ⚠' : '') : ''"></span>
+                  x-text="stepsLastSync ? 'as of ' + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) + (stepsStale ? ' ⚠ ' + stepsAgeText() : '') : ''"></span>
             <!-- v3.3.25 (Jim OOB 2026-10-20「Steps is whoop!」): the source
                  badge + the band-off warning. When the Whoop band has been
                  off-body for >6h the count is a real LAST-KNOWN total, not a
@@ -489,7 +494,7 @@
                   :class="stepsToday >= 8000 ? 'text-emerald-300' : 'text-amber-300'"
                   x-text="stepsToday.toLocaleString()"></span>
             <span class="mt-0.5 text-[9px] text-gray-500"
-                  x-text="stepsLastSync ? 'as of ' + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) : 'sync…'"></span>
+                  x-text="stepsLastSync ? 'as of ' + new Date(stepsLastSync).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'}) + (stepsStale ? ' ⚠ ' + stepsAgeText() : '') : 'sync…'"></span>
           </div>
           <!-- Yesterday small -->
           <div class="flex items-center pl-2 border-l border-white/15">
@@ -1987,6 +1992,11 @@ function gymApp() {
     stepsToday: 0,
     // v2.7.40: tap-to-refresh withings (Jim OOB 2026-08-06 "tap shoes triggers refresh")
     stepsRefreshing: false,
+    // v3.3.31 (2026-10-21): separate flag for the silent auto-refresh that
+    // loadSteps() fires when the WHOOP cache is older than 5 min. Kept
+    // apart from stepsRefreshing (the tap spinner) so the two cannot
+    // deadlock each other.
+    stepsAutoRefreshing: false,
     stepsYesterday: null,
     stepsKcal: 0,
     steps7dAvg: 0,
@@ -2529,13 +2539,21 @@ function gymApp() {
     },
     tickClock() {
       const d = new Date();
-      const hh24 = d.getHours();
-      const mm = String(d.getMinutes()).padStart(2, '0');
-      const ss = String(d.getSeconds()).padStart(2, '0');
+      // v3.3.31 (2026-10-21): force Asia/Hong_Kong. `d.getHours()` returns
+      // the BROWSER's local timezone — on a device that is not on HKT (or a
+      // PWA opened from a machine in UTC) the header clock showed the
+      // wrong time entirely. Always render HKT, same as the 'as of' stamps.
+      const hkParts = new Intl.DateTimeFormat('en-GB', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false, hourCycle: 'h23', timeZone: 'Asia/Hong_Kong',
+      }).formatToParts(d).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+      const hh24 = hkParts.hour;
+      const mm = hkParts.minute;
+      const ss = hkParts.second;
       // Digital clock 24-hour format (Jim OOB 2026-07-29 — 24h, no AM/PM)
-      this.clockStr = `${String(hh24).padStart(2,'0')}:${mm}:${ss}`;
+      this.clockStr = `${hh24}:${mm}:${ss}`;
       // v3.2.2: header compact version (HH:MM only) for slim top bar
-      this.clockStrShort = `${String(hh24).padStart(2,'0')}:${mm}`;
+      this.clockStrShort = `${hh24}:${mm}`;
     },
 
     // v3.3.16 (Jim OOB 2026-09-05 'pull to refresh, whoop and withings
@@ -2636,11 +2654,11 @@ function gymApp() {
           const dt = new Date(y, m - 1, d);
           const weekday = weekdayNames[dt.getDay()];
           // Label: today = '今日 HH/MM', yesterday = '昨日 HH/MM', else 'MM/DD'
-          const today = new Date();
-          const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
-          const yestMs = today.getTime() - 86400000;
-          const yestDt = new Date(yestMs);
-          const yestStr = `${yestDt.getFullYear()}-${String(yestDt.getMonth() + 1).padStart(2,'0')}-${String(yestDt.getDate()).padStart(2,'0')}`;
+          // v3.3.31 (2026-10-21): today/yesterday derived in HKT, not the
+          // device timezone — otherwise a device not on HKT mislabels days.
+          const hkDays = this.hkTodayAndYesterday();
+          const todayStr = hkDays.today;
+          const yestStr = hkDays.yesterday;
           let label;
           if (date === todayStr) label = '今日';
           else if (date === yestStr) label = '昨日';
@@ -3243,9 +3261,13 @@ function gymApp() {
       try {
         // v3.2.7.19: month view. Compute target YYYY-MM from offset.
         // offset=0 → current month; offset=-1 → previous month; etc.
-        const now = new Date();
-        const target = new Date(now.getFullYear(), now.getMonth() + this.scheduleMonthOffset, 1);
-        const monthStr = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}`;
+        // v3.3.31 (2026-10-21): current month derived in HKT (the device
+        // timezone may not be HKT) + pure calendar arithmetic so month
+        // roll-over never depends on the local clock either.
+        const hkNow = this.hkTodayAndYesterday();
+        const [curY, curM] = hkNow.today.split('-').map(Number);
+        const target = new Date(Date.UTC(curY, curM - 1 + this.scheduleMonthOffset, 1));
+        const monthStr = `${target.getUTCFullYear()}-${String(target.getUTCMonth() + 1).padStart(2, '0')}`;
         const monthRes = await fetch(`/api/whoop_activities_calendar?month=${monthStr}`).then(r => r.json());
         // v3.3.12 (Jim OOB 2026-09-01「the calendar tab on gymbro is
         // disappearing」): on the 1st of each month, the calendar tab was
@@ -3255,8 +3277,8 @@ function gymApp() {
         // tab stays visible on month-boundary days. Calendar grid still
         // renders only `scheduleMonth` (current month view); the prev-month
         // fetch is purely for the `scheduleHasAny` flag.
-        const prevTarget = new Date(target.getFullYear(), target.getMonth() - 1, 1);
-        const prevMonthStr = `${prevTarget.getFullYear()}-${String(prevTarget.getMonth() + 1).padStart(2, '0')}`;
+        const prevTarget = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() - 1, 1));
+        const prevMonthStr = `${prevTarget.getUTCFullYear()}-${String(prevTarget.getUTCMonth() + 1).padStart(2, '0')}`;
         const prevRes = await fetch(`/api/whoop_activities_calendar?month=${prevMonthStr}`).then(r => r.json());
         const prevDays = prevRes.days || [];
         this.scheduleMonth = monthRes.days || [];
@@ -3447,12 +3469,13 @@ function gymApp() {
       // tapping the shoes widget now forces a WHOOP pull — Withings was
       // removed as a step source, so its step-refresh endpoint is gone.
       this.flash('從 WHOOP 拉新步數…');
+      let pullOk = false;
       try {
         // Step 1: trigger backend force refresh (~5-15s)
         const r = await fetch('/api/whoop_refresh', { method: 'POST' });
         const data = await r.json();
         if (data.ok) {
-          this.flash(`✓ WHOOP 已更新 (${data.synced_at?.slice(11, 16) || 'now'})`);
+          pullOk = true;
         } else {
           this.flash('WHOOP refresh 失敗：' + (data.error || '未知'));
         }
@@ -3464,7 +3487,58 @@ function gymApp() {
         await this.loadSteps();
         this.haptic(40);  // success feedback
       } catch(e) { /* silent */ }
+      // v3.3.31 (2026-10-21, Jim OOB「the as of time is incorrect — showing
+      // 08:14 but should be at 11am」):
+      // 之前呢度 flash「✓ WHOOP 已更新 (11:20)」—— 11:20 係「拉取時間」,
+      // 但下面個 as-of 顯示 08:14 —— 係「數據年齡」(WHOOP 雲端 source
+      // updated_at)。兩個唔同意思,Jim 撳完見到「已更新 11:20」下面卻寫
+      // 「as of 08:14」→ 睇落自相矛盾,自然會覺得個時間錯。
+      // 而家講真話:拉咗,但源頭仲係舊 → 係手機未同步上雲,唔係 app 壞咗。
+      if (pullOk) {
+        const ageMin = this.stepsAgeMin;
+        if (ageMin != null && ageMin > 30) {
+          this.flash(`WHOOP 已拉,但雲端仲係 ${this.stepsAgeText()}(手機未同步)`);
+        } else {
+          const t = this.stepsLastSync
+            ? new Date(this.stepsLastSync).toLocaleTimeString('en-GB',
+                {hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Hong_Kong'})
+            : 'now';
+          this.flash(`✓ WHOOP 已更新 (${t})`);
+        }
+      }
       this.stepsRefreshing = false;
+    },
+
+    // v3.3.31 (2026-10-21): HKT calendar-day helpers.
+    // `new Date()` + getFullYear()/getMonth()/getDate()/getDay() all use
+    // the DEVICE's timezone. On a device not set to Asia/Hong_Kong the
+    // header clock, the food-log "今日/昨日" grouping and the schedule
+    // month were all off. Jim's food log is a HK diary — always derive
+    // calendar days in HKT.
+    hkTodayAndYesterday() {
+      const p = new Intl.DateTimeFormat('en-CA', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        timeZone: 'Asia/Hong_Kong',
+      }).formatToParts(new Date()).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+      const y = Number(p.year), m = Number(p.month), d = Number(p.day);
+      const pad = n => String(n).padStart(2, '0');
+      // Pure calendar arithmetic via UTC — no timezone involved.
+      const yst = new Date(Date.UTC(y, m - 1, d - 1));
+      return {
+        today: `${y}-${pad(m)}-${pad(d)}`,
+        yesterday: `${yst.getUTCFullYear()}-${pad(yst.getUTCMonth() + 1)}-${pad(yst.getUTCDate())}`,
+      };
+    },
+
+    // v3.3.31 (2026-10-21): compact age label for the steps 'as of' stamp.
+    // "3小時前" / "45分前". Empty string when the age is unknown.
+    stepsAgeText() {
+      const m = this.stepsAgeMin;
+      if (m == null) return '';
+      if (m < 60) return `${m}分前`;
+      const h = Math.floor(m / 60);
+      const rest = m % 60;
+      return rest ? `${h}小時${rest}分前` : `${h}小時前`;
     },
 
     async loadSteps() {
@@ -3513,6 +3587,25 @@ function gymApp() {
         this.stepsYesterday = (typeof data.steps_yesterday === 'number') ? data.steps_yesterday : null;
         // 7d avg — Whoop's own, over the last 7 complete cycles.
         this.steps7dAvg = (typeof data.steps_7d_avg === 'number') ? data.steps_7d_avg : 0;
+        // v3.3.31 (2026-10-21, Jim OOB「the as of time is incorrect — showing
+        // 08:14 but should be at 11am」): the as-of stamp is now WHEN WE READ
+        // the number (the pull time), so it is only as good as the last pull.
+        // The whoop-auto-refresh cron runs every 45 min — too coarse. If the
+        // cache is older than 5 min, kick a silent background pull and
+        // re-render when it lands. Non-blocking: the current numbers stay on
+        // screen while the refresh runs.
+        if (this.stepsAgeMin != null && this.stepsAgeMin > 5 && !this.stepsAutoRefreshing) {
+          this.stepsAutoRefreshing = true;
+          fetch('/api/whoop_refresh', { method: 'POST' })
+            .then(r => r.ok ? r.json() : null)
+            .then(d => {
+              // Only re-render when the pull actually succeeded — otherwise
+              // a failing pull would re-trigger this branch forever.
+              if (d && d.ok) return this.loadSteps();
+            })
+            .catch(() => {})
+            .finally(() => { this.stepsAutoRefreshing = false; });
+        }
       } catch(e) { /* silent */ }
     },
 
