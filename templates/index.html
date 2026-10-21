@@ -683,9 +683,12 @@
         <!-- iPhone photo stream picker (left) — v3.3.24 (Jim OOB 2026-10-16
              'pls allow me to reupload an image'): only block while queue
              is actively processing; allow re-upload when all items are
-             committed/failed/skipped. -->
+             committed/failed/skipped.
+             v3.3.33 (Jim OOB 2026-10-21「After upload, ai food recognition
+             can be done in background」): 唔再因為 AI 背景識別而鎖住掣 ——
+             淨係真係仲喺度上傳(pending/uploading)先 disable。 -->
         <button @click="$refs.scanPhotosInputEl.click()"
-                :disabled="scanUploading || scanPhotosQueue.some(q => q.status === 'pending' || q.status === 'processing' || q.status === 'uploading' || q.status === 'uploaded' || q.status === 'recognising')"
+                :disabled="scanUploading || scanPhotosQueue.some(q => q.status === 'pending' || q.status === 'uploading')"
                 class="rounded-xl py-2.5 px-2 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                 style="background: rgba(255,255,255,0.05); border: 1px solid rgba(16,185,129,0.3);">
           <div class="flex items-center justify-center gap-1.5">
@@ -2170,6 +2173,15 @@ function gymApp() {
     scanAiIndeterminate: false,   // legacy flow: no real stage pct available
     scanApiMode: 'unknown',       // unknown | two-phase | legacy (Frimpong API 未上線時 fallback)
     _scanLastResults: [],
+
+    // v3.3.33 (Jim OOB 2026-10-21「After upload, ai food recognition can be
+    // done in background」):Phase 2 唔再阻塞前端。舊版 onScanPhotosPicked 用
+    // `await this._scanRecognisePhase(...)` —— 即係上傳 bar 明明 100% 咗,
+    // 但成個 app 仲係「影緊…」狀態、影相掣 disable 住,Jim 要白等 30-60 秒。
+    // 而家:開完 job 即刻返回,AI 喺 server thread + 背景 poll 跑,完成咗先通知。
+    scanQueueToken: 0,            // 每次新 scan +1 → 舊背景 job 唔會寫錯新 queue
+    scanBgJobs: [],               // 進行中嘅背景 job [{jobId, token, total, startedAt}]
+    scanBgDisplayJobId: null,     // 進度條顯示邊個 job(最新嗰個)
 
     // v2.7.45 P3: Voice memo → text (gpt-4o-transcribe)
     voiceInputMode: false,
@@ -4135,14 +4147,129 @@ function gymApp() {
       await this._scanPollJob(jobId, uploads, queueItems);
     },
 
+    // ==========================================================================
+    // v3.3.33 — Phase 2 真·背景執行
+    //
+    // Jim OOB 2026-10-21:「After upload, ai food recognition can be done in
+    // background」。舊流程雖然 server 已經係 daemon thread,但前端
+    // `await this._scanRecognisePhase(...)` 等到全部 AI 做完先返回 ——
+    // 上傳 bar 100% 之後,Jim 仲要等 30-60 秒,影相掣 disable 住,成個 app 卡死。
+    //
+    // 而家:開 job 即刻返回。AI 喺 server thread 行,前端喺背景 poll,
+    // 完成咗先 flash + 刷新 food log。Jim 上載完可以即刻繼續用。
+    // ==========================================================================
+
+    // 開一個背景 AI 識別 job。**刻意唔 await 個 poll** —— 呢個就係「背景」。
+    async _scanStartBgRecognition(uploads, queueItems, token) {
+      const paths = uploads.map(u => u.path);
+      const client_indexes = uploads.map(u => u.client_index);
+      const r = await fetch('/api/scan_recognize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: paths, client_indexes: client_indexes }),
+      });
+      let data = null;
+      try { data = await r.json(); } catch (e) { data = null; }
+      if (!r.ok || !data || !data.ok) {
+        throw new Error((data && (data.error || data.message)) || ('啟動 AI 識別失敗 HTTP ' + r.status));
+      }
+      const jobId = data.job_id;
+      if (!jobId) throw new Error('伺服器冇返 job_id');
+      this.scanAiJobId = jobId;
+      this.scanAiTotal = Number(data.total) || uploads.length;
+      this.scanBgDisplayJobId = jobId;
+      this.scanBgJobs = [...this.scanBgJobs, {
+        jobId: jobId, token: (token === undefined ? null : token),
+        total: this.scanAiTotal, startedAt: Date.now(),
+      }];
+      console.log('[scan] background recognise job', jobId, 'total', this.scanAiTotal);
+      // 唔 await —— 背景跑
+      this._scanPollJob(jobId, uploads, queueItems, { token: token, bg: true })
+        .then(() => this._scanBgFinished(jobId, uploads, queueItems))
+        .catch((e) => this._scanBgFailed(jobId, e, uploads, queueItems));
+      return jobId;
+    },
+
+    // 背景 job 完成 → 通知 Jim + 刷新 food log
+    async _scanBgFinished(jobId, uploads, queueItems) {
+      this.scanBgJobs = this.scanBgJobs.filter(j => j.jobId !== jobId);
+      const q = queueItems || [];
+      const ok = q.filter(x => x.status === 'committed').length;
+      const fail = q.filter(x => x.status === 'failed').length;
+      const names = [];
+      q.forEach(x => (x.committed || []).forEach(c => {
+        if (c && c.name && names.length < 3) names.push(c.name);
+      }));
+      const wasDisplay = (this.scanBgDisplayJobId === jobId);
+      if (wasDisplay) {
+        this.scanAiPct = 100;
+        this.scanAiStageLabel = '完成';
+        this.scanAiTitle = fail ? '⚠️ AI 識別完成(部分失敗)' : '✅ AI 識別完成';
+        this.scanPhase = 'done';
+      }
+      // 仲有其他背景 job 跑緊 → 進度條轉去下一個
+      const next = this.scanBgJobs[this.scanBgJobs.length - 1];
+      if (next) {
+        this.scanBgDisplayJobId = next.jobId;
+        this.scanAiTitle = '🤖 AI 背景識別緊…';
+        this.scanAiStageLabel = '繼續背景識別…';
+        this.scanAiPct = 0;
+        this.scanAiCurrent = 1;
+      } else if (wasDisplay) {
+        this.scanBgDisplayJobId = null;
+      }
+      const nameTxt = names.length ? ' · ' + names.join(' · ') : '';
+      if (fail === 0) {
+        this.flash(`✅ 背景 AI 識別完成 · ${ok} 張已寫入 log + Sheet${nameTxt}`);
+      } else if (ok > 0) {
+        this.flash(`✅ 背景 AI 識別完成 · ${ok} 張寫入 · ⚠️ ${fail} 張失敗,睇下點解`);
+      } else {
+        this.flash(`⚠️ 背景 AI 識別 ${fail} 張全部失敗`);
+      }
+      try { await this.loadRecentScans(); }
+      catch (e) { console.error('[scan] bg refresh failed', e); }
+    },
+
+    // 背景 job 失敗
+    _scanBgFailed(jobId, e, uploads, queueItems) {
+      console.error('[scan] background job failed', jobId, e);
+      this.scanBgJobs = this.scanBgJobs.filter(j => j.jobId !== jobId);
+      const wasDisplay = (this.scanBgDisplayJobId === jobId);
+      (uploads || []).forEach((up) => {
+        const item = (queueItems || []).find(x => x.client_index === up.client_index);
+        if (item && !item.__done) {
+          item.__done = true;
+          item.status = 'failed';
+          item.error = (e && e.message) || 'AI 識別失敗';
+        }
+      });
+      if (wasDisplay) {
+        this.scanAiTitle = '❌ AI 識別失敗';
+        this.scanAiStageLabel = (e && e.message) || '未知錯誤';
+        this.scanPhase = 'done';
+        this.scanBgDisplayJobId = this.scanBgJobs.length
+          ? this.scanBgJobs[this.scanBgJobs.length - 1].jobId : null;
+      }
+      this.flash('❌ 背景 AI 識別失敗:' + ((e && e.message) || '未知錯誤'));
+    },
+
     // Poll GET /api/scan_progress/<job_id> — 每次 700ms (SCAN_PROGRESS_SPEC §3.2)
-    async _scanPollJob(jobId, uploads, queueItems) {
+    async _scanPollJob(jobId, uploads, queueItems, opts = {}) {
       const started = Date.now();
       const MAX_MS = 15 * 60 * 1000;
       let lastPct = 0;
-      // queueItems === this.scanPhotosQueue 呢個 reference 會喺 loop 入面
-      // 被換掉 (this.scanPhotosQueue = [...]),所以要喺入 loop 之前 freeze。
-      const isAppQueue = (queueItems === this.scanPhotosQueue);
+      // v3.3.33: queue 身分檢查改用 token(每次新 scan +1)。
+      // 舊版靠 array reference(`queueItems === this.scanPhotosQueue`),但
+      // `this.scanPhotosQueue = [...]` 每次更新都換新 array,所以要 freeze 喺
+      // loop 之前 —— 咁樣舊 background job 會寫錯新 scan 嘅 queue。
+      const token = (opts.token === undefined) ? null : opts.token;
+      const bg = !!opts.bg;
+      const ownsQueue = () => {
+        if (token === null) return (queueItems === this.scanPhotosQueue);
+        return this.scanQueueToken === token;
+      };
+      // 進度條只畀「顯示中」嘅 job 寫(多個背景 job 同時跑唔會互相覆蓋)
+      const ownsBar = () => !bg || this.scanBgDisplayJobId === jobId;
       for (;;) {
         if (Date.now() - started > MAX_MS) {
           throw new Error('AI 識別等太耐(超過 15 分鐘),試下再 upload 一次');
@@ -4155,24 +4282,40 @@ function gymApp() {
 
         // 真實 server pct (單調遞增,唔會倒退)
         const pct = Math.max(0, Math.min(100, Number(d.pct) || 0));
-        this.scanAiPct = Math.max(lastPct, pct);
-        lastPct = this.scanAiPct;
-        this.scanAiStageLabel = d.stage_label || this._scanStageLabelLocal(d.stage) || 'AI 睇緊…';
+        lastPct = Math.max(lastPct, pct);
         const cur = Number(d.current_index);
-        this.scanAiCurrent = isFinite(cur) && cur >= 0 ? cur + 1 : this.scanAiCurrent;
-        this.scanAiTotal = Number(d.total) || this.scanAiTotal;
-        this.scanAiElapsed = Number(d.elapsed_s) || 0;
-        this.scanAiTitle = '🤖 AI 睇緊第 ' + this.scanAiCurrent + ' 張相…';
+        // v3.3.33: 只有「顯示中」嘅 job 先可以寫進度條(多個背景 job 並行時
+        // 唔會互相覆蓋)。
+        if (ownsBar()) {
+          this.scanAiPct = lastPct;
+          this.scanAiStageLabel = d.stage_label || this._scanStageLabelLocal(d.stage) || 'AI 睇緊…';
+          this.scanAiCurrent = isFinite(cur) && cur >= 0 ? cur + 1 : this.scanAiCurrent;
+          this.scanAiTotal = Number(d.total) || this.scanAiTotal;
+          this.scanAiElapsed = Number(d.elapsed_s) || 0;
+          // v3.3.33: server 會回 `inflight` → 即係平行模式(results 唔保證順序)。
+          const parallelMode = (d.inflight !== undefined);
+          this.scanAiTitle = parallelMode
+            ? '🤖 AI 背景識別緊…'
+            : '🤖 AI 睇緊第 ' + this.scanAiCurrent + ' 張相…';
+        }
+
+        // v3.3.33 (parallel AI): results 唔再保證順序 —— 一律用 client_index
+        // 對返 queue item。舊版用 uploads[ri] 嘅位置對返,sequential 啱,
+        // parallel 就會對錯相(最慘寫錯人嘅記錄)。
+        const _clientOf = (row, ri) => {
+          const ci = Number(row && row.client_index);
+          if (isFinite(ci)) return ci;
+          const up = uploads[ri];
+          return up ? up.client_index : ri;
+        };
 
         // 逐張結果 → queue
         // 重要:server 只會收到成功上傳嗰啲 path,所以佢 echo 返嘅
         // client_index 係「成功上傳名單」入面嘅位置,唔等於原始
         // client_index。所以要靠 uploads[] 嘅順序嚟對返 queue item。
         (Array.isArray(d.results) ? d.results : []).forEach((res, ri) => {
-          // uploads[] 入面第 ri 個 = server 處理緊嗰張 (server 順序處理)
-          const up = uploads[ri];
-          if (!up) return;
-          const item = queueItems.find(q => q.client_index === up.client_index);
+          // v3.3.33: 用 client_index 對返,唔用位置(平行模式 results 亂序)
+          const item = queueItems.find(q => q.client_index === _clientOf(res, ri));
           if (!item) return;
           if (item.__done) return;
           item.__done = true;
@@ -4199,9 +4342,7 @@ function gymApp() {
 
         // 逐張錯誤 → queue
         (Array.isArray(d.errors) ? d.errors : []).forEach((err, ei) => {
-          const up = uploads[ei];
-          if (!up) return;
-          const item = queueItems.find(q => q.client_index === up.client_index);
+          const item = queueItems.find(q => q.client_index === _clientOf(err, ei));
           if (!item) return;
           if (item.__done) return;
           item.__done = true;
@@ -4209,15 +4350,22 @@ function gymApp() {
           item.error = err.error || 'AI 識別失敗';
         });
 
-        // 邊張正處理緊 → queue 顯示「AI 睇緊」
-        if (isFinite(cur) && cur >= 0) {
+        // 邊啲張正處理緊 → queue 顯示「AI 睇緊」
+        // v3.3.33: 平行模式用 server 嘅 inflight 清單(唔止一張喺度做)。
+        const inflightList = Array.isArray(d.inflight) ? d.inflight : null;
+        if (inflightList && inflightList.length) {
+          inflightList.forEach((ci) => {
+            const it = queueItems.find(q => q.client_index === Number(ci));
+            if (it && it.status === 'uploaded') it.status = 'recognising';
+          });
+        } else if (isFinite(cur) && cur >= 0) {
           const upNow = uploads[cur];
           if (upNow) {
             const itemNow = queueItems.find(q => q.client_index === upNow.client_index);
             if (itemNow && itemNow.status === 'uploaded') itemNow.status = 'recognising';
           }
         }
-        if (isAppQueue) {
+        if (ownsQueue()) {
           this.scanPhotosQueue = [...this.scanPhotosQueue];
           this.scanPhotosQueueDone = this.scanPhotosQueue.filter(
             q => q.status === 'committed' || q.status === 'skipped' || q.status === 'failed'
@@ -4309,14 +4457,12 @@ function gymApp() {
           this.scanUploadPct = 100;
           this.scanUploadTitle = '✅ 上傳完成 1/1';
           this.scanPhase = 'recognising';
-          this.scanAiTitle = '🤖 AI 睇緊第 1 張相…';
+          this.scanAiTitle = '🤖 AI 背景識別緊…';
           this.scanAiStageLabel = '準備緊…';
-          await this._scanRecognisePhase([up], queueItems);
-          this.scanAiPct = 100;
-          this.scanAiStageLabel = '完成';
-          const names = (queueItems[0].committed || []).map(c => c.name).filter(Boolean).slice(0, 3).join(' · ');
-          this.flash('✓ 已寫入：' + (names || (queueItems[0].preview && queueItems[0].preview.suggested_entry
-            ? queueItems[0].preview.suggested_entry.name : '') || '食物'));
+          // v3.3.33: 背景行 —— 單張相都唔使等 AI 做完
+          await this._scanStartBgRecognition([up], queueItems, null);
+          this.flash('📤 已上載 · AI 背景識別緊(唔使等,搞掂會通知)');
+          return;
         } else {
           this.scanUploadTitle = '📸 上傳緊 1/1 相';
           await this._scanLegacyRun([file], queueItems);
@@ -4445,6 +4591,10 @@ function gymApp() {
       const files = Array.from(event.target.files || []);
       if (!files.length) return;
       const picker = event.target;
+      // v3.3.33: 新 scan → token +1。之前嘅 background job 唔會再寫入
+      // 呢個新 queue(避免舊 job 覆蓋新結果)。
+      this.scanQueueToken += 1;
+      const myToken = this.scanQueueToken;
       this.scanPhotosQueue = files.map((f, i) => ({
         client_index: i,
         filename: f.name || `image_${i+1}.jpg`,
@@ -4513,19 +4663,22 @@ function gymApp() {
             ).length;
           }
 
-          // ---------- PHASE 2: AI 識別 (全部上傳完先開始) ----------
+          // ---------- PHASE 2: AI 識別 —— 背景行 (v3.3.33) ----------
           if (!uploads.length) {
             throw new Error('全部相片都上傳失敗');
           }
           this.scanUploadPct = 100;
           this.scanUploadTitle = `✅ 上傳完成 ${uploads.length}/${files.length} 相`;
           this.scanPhase = 'recognising';
-          this.scanAiTitle = '🤖 AI 睇緊第 1 張相…';
+          this.scanAiTitle = '🤖 AI 背景識別緊…';
           this.scanAiStageLabel = '準備緊…';
           this.scanAiCurrent = 1;
-          await this._scanRecognisePhase(uploads, this.scanPhotosQueue);
-          this.scanAiPct = 100;
-          this.scanAiStageLabel = '完成';
+          // 開 job 就即刻走 —— 唔等 AI 做完
+          // (Jim OOB 2026-10-21「After upload, ai food recognition can be
+          //  done in background」)
+          await this._scanStartBgRecognition(uploads, this.scanPhotosQueue, myToken);
+          this.flash(`📤 ${uploads.length} 張已上載 · AI 背景識別緊(唔使等,搞掂會通知)`);
+          return;   // 背景跑 —— 唔好喺呢度 block 住 Jim
         } else {
           // ---------- 舊流程 fallback (API 未上線) ----------
           await this._scanLegacyRun(files, this.scanPhotosQueue);

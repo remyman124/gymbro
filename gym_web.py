@@ -9,6 +9,7 @@ Persistence: /home/work/.whoop_workout_log.json[YYYY-MM-DD]
 PWA: installable, wake-lock enabled
 """
 import base64
+import functools
 import json
 import os
 import random
@@ -20,6 +21,7 @@ import time
 import urllib.request
 import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta, date
 from datetime import datetime as _dt
 from pathlib import Path
@@ -857,7 +859,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.32"
+__version__ = "3.3.33"
 
 
 def _recovery_pct():
@@ -6528,6 +6530,30 @@ def _sheet_write_guard(entry: dict) -> dict:
     return {"ok": True}
 
 
+# v3.3.33 (Jim OOB 2026-10-21「ai work can be done in parallel」):
+# 平行 AI worker 會同時叫 `_append_to_sheet_nutrition`。Sheet append 本身安全
+# (Google append API 會接喺最後一行之下),但呢段嘢**唔係 concurrency-safe**:
+#   1. google_token.json 嘅 refresh + write_text(非 atomic,可能寫到爛 JSON)
+#   2. idempotency store 嘅 read-modify-write(可能漏 key)
+#   3. trim pre-flight 嘅 read + batchUpdate
+# 所以用一把 process-wide lock 包住成段寫入。AI 係慢嘅部分(每張 10-20 秒),
+# Sheet 寫入只係 1-2 秒 —— parallel AI + serialised write = 快 N 倍而唔會
+# 撞爛 Jim 嘅 golden copy。
+#
+# 用 RLock(唔係 Lock)——萬一將來有 function 互相叫,RLock 唔會死鎖。
+_SHEET_WRITE_LOCK = threading.RLock()
+
+
+def _serialise_sheet_write(fn):
+    """Decorator: 把 production writer 序列化(平行 AI worker 安全網)。"""
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with _SHEET_WRITE_LOCK:
+            return fn(*args, **kwargs)
+    return _wrapped
+
+
+@_serialise_sheet_write
 def _append_to_sheet_nutrition(entry: dict) -> dict:
     """Mirror entry to Google Sheet Nutrition tab (sheetId 474877075).
     Returns {"ok": bool, "range": str} — silent on quota/error.
@@ -6608,6 +6634,11 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
             # v3.2.7.48: keep dedup's cal signature consistent with the
             # clamped integer that will actually be written to the sheet.
             entry_cal = str(int(round(_safe_num(entry.get("calories", 0), default=0.0, lo=0, hi=3000))))
+            # v3.3.33 (parallel AI): 同一分鐘 + 同一卡路里 **唔等於重複**。
+            # 平行模式之下幾張相會喺同一分鐘完成,如果兩碟嘢啱啱好同一卡路里,
+            # 舊 dedup 會當重複 → **漏寫一行落 Jim 個 golden copy**。
+            # 所以加多一重:兩行都有相片 URL 而且唔同 → 一定唔係重複。
+            entry_img = entry.get("drive_image_url", "") or ""
             for row in existing[1:]:
                 if not row:
                     continue
@@ -6616,6 +6647,10 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
                 row_time = row_time_full[11:16] if 'T' in row_time_full else row_time_full[:5]
                 row_cal = row[5] if len(row) > 5 else ''
                 if row_date == entry_date and row_time == entry_time and row_cal == entry_cal:
+                    row_img = row[10] if len(row) > 10 else ''
+                    if row_img and entry_img and row_img != entry_img:
+                        # 唔同相 → 唔係重複,照寫
+                        continue
                     # Already in sheet — mark synced locally + skip push
                     entry["sheet_synced"] = True
                     return {"ok": True, "range": "deduped", "skipped": True}
@@ -8009,6 +8044,34 @@ SCAN_STAGE_LABELS = {
     "done": "第 {n} 張搞掂咗",
 }
 
+# v3.3.33 (Jim OOB 2026-10-21「And ai work can be done in parallel to save
+# queuing time too」): 平行模式嘅 stage label。
+# 舊 label 係「第 {n} 張」—— 平行跑嘅時候唔止一張喺度做,講「第 n 張」會
+# 誤導。所以改用「已完成 done/total」嘅聚合講法。
+SCAN_STAGE_LABELS_PARALLEL = {
+    "queued": "排緊 AI 隊…(已完成 {done}/{total})",
+    "vision": "AI 睇緊相片…(已完成 {done}/{total})",
+    "second_opinion": "第二個 AI 交叉檢查…(已完成 {done}/{total})",
+    "enrich": "估算營養中…(已完成 {done}/{total})",
+    "enrich2": "交叉核對營養值…(已完成 {done}/{total})",
+    "multi": "分析餸數…(已完成 {done}/{total})",
+    "brand": "對照品牌營養表…(已完成 {done}/{total})",
+    "drive": "上載到雲端…(已完成 {done}/{total})",
+    "commit": "寫入 Google Sheet…(已完成 {done}/{total})",
+    "done": "全部搞掂晒",
+}
+
+
+def _scan_stage_label_parallel(stage_key: str, done: int, total: int) -> str:
+    """繁中 stage label — 平行模式(用已完成數,唔用「第 n 張」)。"""
+    tmpl = SCAN_STAGE_LABELS_PARALLEL.get(stage_key, stage_key)
+    try:
+        return tmpl.format(done=done, total=total)
+    except (KeyError, IndexError) as e:
+        print(f"[scan-job] parallel stage label format failed for {stage_key}: {e}",
+              flush=True)
+        return tmpl
+
 
 def _scan_preview_core(img_bytes: bytes, img_path_hint: str = "",
                        on_stage=None) -> dict:
@@ -8571,6 +8634,12 @@ def api_scan_preview():
 # In-process status dict — keyed by job_id (same pattern as VIDEO_JOBS).
 SCAN_JOBS = {}
 SCAN_JOBS_LOCK = threading.Lock()
+# v3.3.33 (parallel AI): 平行 worker 會同時叫 `_scan_job_set` → 同時寫
+# scan_jobs_state.json。舊版 persist 用固定 tmp 檔名 + 喺 lock 外面讀
+# SCAN_JOBS,兩個 thread 會寫爛同一個 tmp 檔,而且讀 dict 途中被改會拋
+# "dictionary changed size during iteration"。所以:獨立 persist lock +
+# 喺 SCAN_JOBS_LOCK 下面先影一份 snapshot。
+_SCAN_JOBS_PERSIST_LOCK = threading.Lock()
 
 # v3.3.25 (2026-10-21): on-disk mirror of SCAN_JOBS so a job that was
 # running when the process died is reported as "interrupted" instead of
@@ -8607,15 +8676,20 @@ def _scan_jobs_persist():
     "interrupted" instead of vanishing — and the remaining image paths
     survive so the scan can be resumed.
     """
-    try:
-        tmp = str(_SCAN_JOBS_STATE_FILE) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({jid: {k: v for k, v in j.items()
-                             if k not in ("results", "errors")}
-                       for jid, j in SCAN_JOBS.items()}, fh)
-        os.replace(tmp, _SCAN_JOBS_STATE_FILE)
-    except Exception as e:
-        print(f"[scan-job] persist failed: {type(e).__name__}: {e}", flush=True)
+    with _SCAN_JOBS_PERSIST_LOCK:
+        try:
+            # v3.3.33: 喺 SCAN_JOBS_LOCK 下面影 snapshot —— 唔好喺
+            # dict 迭代中途畀人改(會拋 RuntimeError)。
+            with SCAN_JOBS_LOCK:
+                snapshot = {jid: {k: v for k, v in j.items()
+                                  if k not in ("results", "errors")}
+                            for jid, j in list(SCAN_JOBS.items())}
+            tmp = f"{_SCAN_JOBS_STATE_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh)
+            os.replace(tmp, _SCAN_JOBS_STATE_FILE)
+        except Exception as e:
+            print(f"[scan-job] persist failed: {type(e).__name__}: {e}", flush=True)
 
 
 def _scan_jobs_load_interrupted():
@@ -8713,16 +8787,68 @@ def _scan_path_allowed(img_path: Path) -> bool:
     return True
 
 
+def _scan_parallel_workers() -> int:
+    """v3.3.33: 平行 AI worker 數量。預設 3,可用 GYMBRO_SCAN_PARALLEL 調整。"""
+    try:
+        n = int(os.environ.get("GYMBRO_SCAN_PARALLEL", "3") or 3)
+    except (TypeError, ValueError):
+        n = 3
+    return max(1, min(8, n))
+
+
 def _scan_run_job(job_id: str, paths: list, client_indexes: list):
     """Background worker: run the recognition pipeline for each image.
 
-    Sequential on purpose (SPEC §2.2) — MiniMax rate-limit if run
-    in parallel.
+    v3.3.33 (Jim OOB 2026-10-21「And ai work can be done in parallel to save
+    queuing time too」):舊版刻意 sequential(SPEC §2.2)—— 但 AI stage
+    (MiniMax 視覺 → 第二意見 → 營養估算 → Perplexity 交叉核對 → 品牌表 →
+    Drive 上載)全部係 network-bound,一張相要 10-20 秒。3 張相排隊 = 30-60 秒,
+    期間 Jim 個 app 完全卡住。
+
+    而家用 ThreadPoolExecutor 平行跑(預設 3 個 worker)。
+    **Sheet 寫入仍然 serialized** —— `_append_to_sheet_nutrition` 有
+    process-wide lock(見 `_serialise_sheet_write`),因為 token refresh +
+    idempotency store + trim pre-flight 唔係 concurrency-safe。
+    AI 係慢嘅部分,Sheet 寫入只係 1-2 秒 → 整體快 ~3 倍而 golden copy 唔會花。
+
+    **結果順序唔再保證** —— parallel 之下先完成嘅先入 results。server 每個
+    result 都帶 `client_index`,前端一定要用 client_index 對返 queue item,
+    唔可以用 array 位置(舊版 sequential 嘅隱含假設)。
     """
     total = len(paths)
     results = []
     errors = []
-    for idx, p in enumerate(paths):
+    lock = threading.Lock()
+    done_count = 0
+    pct_high = 0
+    inflight = {}          # client_index -> stage_pct_start
+
+    def _publish(stage_key: str, ci: int):
+        """Thread-safe 進度更新。pct 用 high-water mark 保證單調遞增。"""
+        nonlocal pct_high
+        with lock:
+            inflight[ci] = SCAN_STAGE_PCT_START.get(stage_key, 0)
+            stage_frac = max(inflight.values()) if inflight else 0
+            raw = ((done_count + stage_frac) / total * 100) if total else 100
+            new_pct = max(0, min(99, int(round(raw))))
+            if new_pct > pct_high:
+                pct_high = new_pct
+            _scan_job_set(
+                job_id,
+                status="running",
+                stage=stage_key,
+                stage_label=_scan_stage_label_parallel(stage_key, done_count, total),
+                pct=pct_high,
+                current_index=min(done_count, max(total - 1, 0)),
+                total=total,
+                completed=done_count,
+                inflight=sorted(inflight.keys()),
+            )
+
+    def _process(idx: int, p: str):
+        # v3.3.33: `done_count += 1` 係 rebind,唔係 mutate → 一定要 nonlocal,
+        # 否則 Python 當佢係 `_process` 嘅 local variable → UnboundLocalError。
+        nonlocal done_count
         client_index = client_indexes[idx] if idx < len(client_indexes) else idx
         img_path = Path(p)
         try:
@@ -8733,28 +8859,12 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
             if img_path.stat().st_size > 10 * 1024 * 1024:
                 raise ValueError(f"image too large: {img_path}")
 
-            _scan_job_set(
-                job_id,
-                status="running",
-                stage="queued",
-                stage_label=_scan_stage_label("queued", idx, total),
-                pct=_scan_job_pct(idx, "queued", total),
-                current_index=idx,
-                total=total,
-            )
+            _publish("queued", client_index)
 
             img_bytes = img_path.read_bytes()
 
-            def _on_stage(stage_key: str, _idx: int = idx):
-                _scan_job_set(
-                    job_id,
-                    status="running",
-                    stage=stage_key,
-                    stage_label=_scan_stage_label(stage_key, _idx, total),
-                    pct=_scan_job_pct(_idx, stage_key, total),
-                    current_index=_idx,
-                    total=total,
-                )
+            def _on_stage(stage_key: str, _ci: int = client_index):
+                _publish(stage_key, _ci)
 
             core = _scan_preview_core(
                 img_bytes, img_path_hint=str(img_path), on_stage=_on_stage,
@@ -8769,7 +8879,7 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
             # fire on this path — Jim would see the photo marked as 已入账
             # while nothing was written to his golden copy.
             # Pass the core's real ok through so the block is honest.
-            results.append({
+            result = {
                 "client_index": client_index,
                 "ok": bool(core.get("ok", True)),
                 "name": first.get("name", ""),
@@ -8781,14 +8891,40 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
                 "thumbnail_url": core.get("thumbnail_url", ""),
                 "vision_desc": core.get("vision_desc", ""),
                 "entries": entries,
-            })
-            _scan_job_set(job_id, results=list(results), errors=list(errors))
+            }
+            with lock:
+                results.append(result)
+                done_count += 1
+                inflight.pop(client_index, None)
+                _scan_job_set(job_id, results=list(results), errors=list(errors),
+                              completed=done_count, inflight=sorted(inflight.keys()))
         except Exception as e:
             print(f"[scan-job] {job_id} image {idx} "
                   f"(client_index={client_index}) failed: "
                   f"{type(e).__name__}: {e}", flush=True)
-            errors.append({"client_index": client_index, "error": str(e)})
-            _scan_job_set(job_id, results=list(results), errors=list(errors))
+            with lock:
+                errors.append({"client_index": client_index, "error": str(e)})
+                done_count += 1
+                inflight.pop(client_index, None)
+                _scan_job_set(job_id, results=list(results), errors=list(errors),
+                              completed=done_count, inflight=sorted(inflight.keys()))
+
+    workers = min(_scan_parallel_workers(), max(total, 1))
+    if workers > 1 and total > 1:
+        print(f"[scan-job] {job_id} running {total} photos in PARALLEL "
+              f"({workers} workers)", flush=True)
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="scan-par") as pool:
+            futures = [pool.submit(_process, idx, p) for idx, p in enumerate(paths)]
+            for fut in futures:
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"[scan-job] {job_id} worker crashed: "
+                          f"{type(e).__name__}: {e}", flush=True)
+    else:
+        for idx, p in enumerate(paths):
+            _process(idx, p)
 
     final_status = "completed" if results else "failed"
     _scan_job_set(
@@ -8802,6 +8938,8 @@ def _scan_run_job(job_id: str, paths: list, client_indexes: list):
         total=total,
         results=list(results),
         errors=list(errors),
+        completed=len(results),
+        inflight=[],
     )
 
 
@@ -8962,6 +9100,10 @@ def api_scan_progress(job_id: str):
         "pct": job.get("pct", 0),
         "current_index": job.get("current_index", 0),
         "total": job.get("total", 0),
+        # v3.3.33 (parallel AI): 已完成張數 + 處理中嘅 client_index 清單。
+        # 前端靠 client_index 對返 queue item(平行模式下 results 唔保證順序)。
+        "completed": job.get("completed", 0),
+        "inflight": job.get("inflight") or [],
         "results": job.get("results") or [],
         "errors": job.get("errors") or [],
         "elapsed_s": round(time.time() - created, 1) if created else 0.0,

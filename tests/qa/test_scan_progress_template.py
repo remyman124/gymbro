@@ -119,6 +119,10 @@ def test_upload_phase_completes_before_recognise(tpl):
 
     喺 JS 入面搵:所有 _scanUploadOne() call 應該喺
     _scanRecognisePhase() call 之前。
+
+    v3.3.33 (2026-10-21, Jim OOB「After upload, ai food recognition can be
+    done in background」): Phase 2 改成 `_scanStartBgRecognition()` ——
+    開完 job 就返回,唔再 await 個 poll。所以呢個 test 要接受兩個名。
     """
     # 喺 onScanPhotosPicked 函式入面搵
     m = re.search(
@@ -129,7 +133,10 @@ def test_upload_phase_completes_before_recognise(tpl):
     body = m.group(1)
 
     upload_calls = [mm.start() for mm in re.finditer(r"await this\._scanUploadOne\(", body)]
-    recognise_calls = [mm.start() for mm in re.finditer(r"await this\._scanRecognisePhase\(", body)]
+    recognise_calls = [
+        mm.start() for mm in re.finditer(
+            r"await this\._scan(?:RecognisePhase|StartBgRecognition)\(", body)
+    ]
 
     assert upload_calls, "onScanPhotosPicked 入面冇 upload call"
     assert recognise_calls, "onScanPhotosPicked 入面冇 recognise call"

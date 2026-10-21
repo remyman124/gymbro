@@ -1,3 +1,99 @@
+## v3.3.33 — 2026-10-21 — AI 背景識別 + 平行 AI worker(上載完即刻可以繼續用)
+
+Jim OOB 2026-10-21:
+> After upload, ai food recognition can be done in background
+> And ai work can be done in parallel to save queuing time too
+
+### 起因 — 兩層「等」
+
+**第一層(前端)**:舊流程 `await this._scanRecognisePhase(...)` —— 上載 bar 100% 咗,
+但個 app 仲要等**全部 AI 做完**先返回。相機掣 disable 住,Jim 三十秒乜都做唔到。
+
+**第二層(server)**:`_scan_run_job` 刻意 sequential(舊註釋寫住
+「MiniMax rate-limit if run in parallel」)。但 AI stage 全部 network-bound
+(MiniMax 視覺 → 第二意見 → 營養估算 → 交叉核對 → 品牌表 → Drive 上載),
+一張相要 60-120 秒。4 張相 = 排隊 4-8 分鐘。
+
+### 1. 背景識別(前端)
+
+* 新增 `_scanStartBgRecognition()`:開完 job **即刻 return**,唔再 await 個 poll。
+* 舊 background job 用 `scanQueueToken` 判斷仲屬唔屬於當前 scan ——
+  舊 job 唔會覆蓋新 scan 嘅 queue(舊版靠 array reference,但
+  `this.scanPhotosQueue = [...]` 每次都換新 array → 根本唔 work)。
+* 多個背景 job 並行時,只有「顯示中」嗰個 job 寫進度條(`scanBgDisplayJobId`)。
+* 搞掂之後 flash 通知 + 自動 refresh 食物記錄,Jim 唔使手動 reload。
+* 相簿掣唔再因為 `recognising` / `uploaded` 狀態 disable —— 淨係真係仲喺度
+  上傳(`pending` / `uploading`)先 block。
+
+### 2. 平行 AI worker(server)
+
+* `_scan_run_job` 改用 `ThreadPoolExecutor`,預設 3 個 worker
+  (`GYMBRO_SCAN_PARALLEL` 可調,上限 8)。
+* 進度百分比改用 high-water mark —— 單調遞增,唔會倒退。
+* stage label 改用平行版(`排緊 AI 隊…(已完成 1/4)`)——
+  唔會再講「第 n 張」而實際上有三張同時進行緊。
+* `/api/scan_progress` 新增 `completed` + `inflight`(邊啲張仲喺度做)。
+
+### 3. 🔴 兩條安全線(平行唔代表可以亂寫)
+
+* **Sheet 寫入仍然 serialized** —— 新增 process-wide `_SHEET_WRITE_LOCK`
+  (`threading.RLock`)+ `@_serialise_sheet_write` decorator,掛喺
+  `_append_to_sheet_nutrition()`。Token refresh、idempotency store 讀改寫、
+  trim pre-flight 全部唔係 concurrency-safe,平行會撞爛 golden copy。
+  AI 係慢嘅部分,Sheet 寫入只係 1-2 秒 → 整體快 N 倍而資料唔會花。
+* **結果對應用 client_index,唔用 array 位置** —— 平行之下 results 唔保證
+  順序,舊嘅 `uploads[ri]` 位置對應會寫錯人嘅記錄。前端 + server 兩邊都改咗。
+* **同分鐘 + 同卡路里唔等於重複** —— 舊 dedup 會當同一碟 → 漏寫一行落 golden
+  copy。而家加多一重:兩行都有相片 URL 而且唔同 → 一定唔係重複,照寫。
+
+### 4. 實測捉到嘅 3 個 bug(唔跑真實 AI 係捉唔到)
+
+| Bug | 症狀 | 修法 |
+|---|---|---|
+| `done_count += 1` 冇 `nonlocal` | `UnboundLocalError` → **每一張相都變 failed** | 加 `nonlocal done_count` |
+| `_scan_jobs_persist` 固定 tmp 檔名 + 喺 lock 外面讀 dict | 兩個 worker 寫爛同一個 tmp;讀 dict 途中被改 → `dictionary changed size during iteration` | 獨立 `_SCAN_JOBS_PERSIST_LOCK` + 喺 `SCAN_JOBS_LOCK` 下面影 snapshot + 唯一 tmp 名 |
+| 舊 dedup 當「同分鐘同卡路里」= 重複 | 平行模式兩碟嘢啱啱好同卡路里 → **漏寫一行** | dedup 加相片 URL 比對 |
+
+### 5. ⚠️ 順帶發現:Perplexity key 額度用完
+
+實測時 log 見到:
+```
+[vision] Perplexity sonar failed: HTTPError: HTTP Error 401: Unauthorized
+{"error":{"message":"You exceeded your current quota, add credits at
+ https://console.perplexity.ai/project/billing.","type":"insufficient_quota"}}
+```
+`/home/work/.hermes/.env` 嘅 `PPLX_API_KEY` 而家**冇額度**。
+Vision pool 會自動由 MiniMax 頂上(實測 `minimax-text-01 served after 1 failure(s)`),
+即係**唔會壞**,但交叉核對同第二意見冇咗 —— 12 個營養欄而家只靠 MiniMax 單邊。
+需要 Jim 去 console 加 credits 或者換新 key。
+
+### 6. 實測 A/B(dryrun 模式,零 production 影響)
+
+用 Jim 自己 2026-10-21 15:42 嗰批 4 張午餐相(真實食物相)行真實 AI:
+
+```
+                        ┌──────────────┬──────────────┬─────────┐
+                        │ 模式         │ 4 張相行費時  │ 結果    │
+                        ├──────────────┼──────────────┼─────────┤
+                        │ 排隊(舊)     │ 308.9s(5:09) │ 4 張    │
+                        │ 平行(新,3 個) │ 147.4s(2:27) │ 4 張    │
+                        └──────────────┴──────────────┴─────────┘
+→ 快 2.1 倍(慳 161.5 秒),0 errors
+```
+
+**關鍵佐證**:平行模式嘅 results 順序係 `0, 2, 1, 3`(**亂序**!)——
+如果仲用舊嘅 `uploads[ri]` 位置對返,會寫錯人嘅記錄。
+今次改用 `client_index` 對返,4 張全部對啱。
+
+
+### 7. QA
+
+新增 `tests/qa/test_background_parallel_scan.py`(17 個 check)——
+背景唔准 block、平行 worker 存在、Sheet 寫入必須 serialized、
+結果必須用 client_index 對返、`nonlocal` 陷阱、persist lock、
+同卡路里唔可以當重複、統一寫入閘未被搞走。
+
+
 ## v3.3.32 — 2026-10-21 — 文字輸入流程大修:餐廳自動填、食物相優先、品牌 cover
 
 Jim OOB 2026-10-21:
