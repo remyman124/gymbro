@@ -272,11 +272,19 @@
             <!-- v3.3.25 (Jim OOB 2026-10-20「Steps is whoop!」): the source
                  badge + the band-off warning. When the Whoop band has been
                  off-body for >6h the count is a real LAST-KNOWN total, not a
-                 live running total — say so instead of implying "live". -->
+                 live running total — say so instead of implying "live".
+
+                 v3.3.35 (2026-10-21, Jim OOB「Why gymbro is saying my whoop
+                 band off?!!」): 呢句「WHOOP band off」係**假警報** —— 佢由
+                 cycle `updated_at` 推斷,但實證嗰個 stamp 每朝 08:00-08:30
+                 就停(連 31147 步嗰日都一樣),同 band 有冇戴完全無關,所以
+                 每晚 08:30 之後一定會出現。而家改用真嘅訊號:**個步數幾時
+                 最後郁過** —— 停咗就喺上面嗰行顯示「as of HH:MM ⚠ 停留咗
+                 11 個鐘」,唔再亂指住個 band 嘅狀態。 -->
             <span class="text-[7px] leading-none mt-0.5"
                   :class="stepsBandOff ? 'text-amber-400/80' : 'text-gray-500/70'"
                   x-show="stepsBandOff"
-                  x-text="'WHOOP band off'"></span>
+                  x-text="stepsFrozenText()"></span>
             <span class="text-[7px] leading-none mt-0.5 text-gray-500/60"
                   x-show="stepsSource"
                   x-text="stepsSource === 'whoop' ? 'WHOOP' : 'Withings'"></span>
@@ -2037,8 +2045,21 @@ function gymApp() {
     // stepsBandOff: the Whoop band was off-body for >6h, so the count is a
     // real LAST-KNOWN total, not a live running total. Surfaced in the UI so
     // the number is never implied to be live when it isn't.
+    //
+    // v3.3.35 (2026-10-21, Jim OOB「Why gymbro is saying my whoop band
+    // off?!!」): 上面呢段講嘅係舊邏輯 —— 佢用 cycle `updated_at` 推斷
+    // band 有冇戴身。實證嗰個 stamp 每朝 08:00-08:30 就停(連 31147 步
+    // 嗰日都一樣),同 band 無關,所以每晚都報「band off」= 假警報。
+    // 而家 `stepsBandOff` 嘅意思改成「個步數停咗 >3 個鐘」,個 badge
+    // 亦改咗用字(見 stepsFrozenText)。
     stepsSource: 'whoop',
     stepsBandOff: false,
+    // v3.3.35: 個步數停咗幾耐(分鐘)—— 取代「band off」嘅誠實講法
+    stepsFrozenMin: null,
+    // v3.3.35: 我哋最後一次 pull WHOOP 係幾耐之前(用嚟決定要唔要
+    // auto-refresh;唔可以用「個數停咗幾耐」,否則一入夜就每次開 app
+    // 都觸發一次 pull)
+    stepsPullAgeMin: null,
     // v2.7.42: HH:MM only 24h format (Jim OOB 2026-08-06 "HH:mm only")
     // Date is shown in the group header so per-entry display is just the time
     formatScanTime(iso) {
@@ -3566,6 +3587,10 @@ function gymApp() {
 
     // v3.3.31 (2026-10-21): compact age label for the steps 'as of' stamp.
     // "3小時前" / "45分前". Empty string when the age is unknown.
+    //
+    // v3.3.35 (2026-10-21): `stepsAgeMin` 而家 = **個步數停咗幾耐**
+    // (因為 data_as_of 改成「最後一次變化」嘅時間),所以用字改到
+    // 「停留咗 X」—— 講嘅係個數,而唔係話個 app 個鐘壞咗。
     stepsAgeText() {
       const m = this.stepsAgeMin;
       if (m == null) return '';
@@ -3573,6 +3598,17 @@ function gymApp() {
       const h = Math.floor(m / 60);
       const rest = m % 60;
       return rest ? `${h}小時${rest}分前` : `${h}小時前`;
+    },
+
+    // v3.3.35: 取代舊嘅「WHOOP band off」—— 講事實(個數冇郁過)，
+    // 唔再亂推斷 band 有冇戴身。
+    stepsFrozenText() {
+      const m = this.stepsFrozenMin;
+      if (m == null) return '';
+      if (m < 60) return `步數 ${m} 分鐘冇增加`;
+      const h = Math.floor(m / 60);
+      const rest = m % 60;
+      return rest ? `步數 ${h} 個鐘 ${rest} 分冇增加` : `步數 ${h} 個鐘冇增加`;
     },
 
     async loadSteps() {
@@ -3617,6 +3653,11 @@ function gymApp() {
         // LAST-KNOWN total, not a live running total. Say so rather than
         // implying "live".
         this.stepsBandOff = !!data.band_off;
+        // v3.3.35: 凍結分鐘數 + pull 年齡(兩個唔同嘅嘢,唔好撈亂)
+        this.stepsFrozenMin = (typeof data.steps_frozen_min === 'number')
+          ? data.steps_frozen_min : null;
+        this.stepsPullAgeMin = (typeof data.age_min === 'number')
+          ? data.age_min : null;
         // Paired yesterday — Whoop's previous complete cycle.
         this.stepsYesterday = (typeof data.steps_yesterday === 'number') ? data.steps_yesterday : null;
         // 7d avg — Whoop's own, over the last 7 complete cycles.
@@ -3628,7 +3669,11 @@ function gymApp() {
         // cache is older than 5 min, kick a silent background pull and
         // re-render when it lands. Non-blocking: the current numbers stay on
         // screen while the refresh runs.
-        if (this.stepsAgeMin != null && this.stepsAgeMin > 5 && !this.stepsAutoRefreshing) {
+        // v3.3.35: 觸發條件改用「最後一次 pull 幾耐之前」(stepsPullAgeMin)。
+        // 之前用 stepsAgeMin,而家 stepsAgeMin = 個數停咗幾耐 —— 一入夜
+        // 個數唔郁就會 >5,令到每次開 app 都無謂 pull 一次。
+        const pullAge = (this.stepsPullAgeMin != null) ? this.stepsPullAgeMin : this.stepsAgeMin;
+        if (pullAge != null && pullAge > 5 && !this.stepsAutoRefreshing) {
           this.stepsAutoRefreshing = true;
           fetch('/api/whoop_refresh', { method: 'POST' })
             .then(r => r.ok ? r.json() : null)

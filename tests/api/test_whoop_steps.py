@@ -55,8 +55,17 @@ def _cycle(start, end, steps, updated_at):
     return c
 
 
-def _seed_whoop(path, cycles):
-    path.write_text(json.dumps({"cycles": cycles, "recovery": [], "sleep": [], "workouts": []}))
+def _seed_whoop(path, cycles, meta=None):
+    payload = {"cycles": cycles, "recovery": [], "sleep": [], "workouts": []}
+    if meta is not None:
+        payload["_meta"] = meta
+    path.write_text(json.dumps(payload))
+
+
+def _hist(*pairs):
+    """steps_history entries: (seconds_ago, steps)."""
+    now = datetime.now(timezone.utc).timestamp()
+    return [{"ts": now - ago, "steps": steps} for ago, steps in pairs]
 
 
 def _now():
@@ -111,8 +120,19 @@ def test_get_steps_7d_avg_excludes_in_progress_cycle(isolated_files):
     assert r["steps_7d_avg"] == 4000
 
 
-def test_get_steps_flags_band_off_when_stale(isolated_files):
-    """A cycle that hasn't been written for >6h means the band was off-body."""
+def test_get_steps_stale_source_does_not_flag_band_off(isolated_files):
+    """v3.3.35 regression (Jim OOB 2026-10-21「Why gymbro is saying my whoop
+    band off?!!」).
+
+    The OLD heuristic derived `band_off` from the cycle `updated_at` age and
+    claimed "the band was off-body". PROVEN WRONG 2026-10-21:
+      * 8 consecutive cycles all carried `updated_at` between 07:59 and
+        08:34 HKT — including a 31,147-step / strain-18.1 day — so the
+        stamp is a daily record write, NOT "when the band last wrote";
+      * three live pulls at 11:22 / 11:45 / 11:46 showed step_count
+        1042 -> 1159 -> 1342 while `updated_at` stayed 08:14:53.
+    So a stale `updated_at` alone must NOT raise a band-off warning.
+    """
     from gym_web.whoop import whoop_get_steps
 
     now = _now()
@@ -121,9 +141,59 @@ def test_get_steps_flags_band_off_when_stale(isolated_files):
 
     r = whoop_get_steps(now=now, cache_path=isolated_files["WHOOP_CACHE"])
     assert r["steps"] == 2286
-    assert r["stale"] is True
+    # v3.3.31 (2026-10-21): `age_min` = 幾耐之前我哋 pull 過 WHOOP
+    # (檔案 mtime),唔再係 source `updated_at` 嘅年齡。source 年齡另外
+    # 用 `source_age_min` 保留做診斷。
+    assert r["age_min"] == 0                     # 我哋啱啱 pull 過
+    assert r["source_age_min"] == 594            # source 已經 9h54m 冇更新
+    assert r["stale"] is False                   # pull 係新鮮嘅
+    assert r["band_off"] is False                # ...但唔代表 band 除咗身
+    assert r["band_off_basis"] == "steps_frozen"
+
+
+def test_get_steps_flags_band_off_when_count_frozen(isolated_files):
+    """v3.3.35: the honest signal — the running total stopped moving.
+
+    `_meta.steps_history` records what every pull saw. If the count has not
+    changed for >3h, the number is a last-known total, not a live one.
+    """
+    from gym_web.whoop import whoop_get_steps
+
+    now = _now()
+    cycles = [_cycle(now - timedelta(hours=10), None, 3364, now - timedelta(hours=9, minutes=54))]
+    _seed_whoop(isolated_files["WHOOP_CACHE"], cycles,
+                meta={"steps_history": _hist((60, 3364), (7200, 3364), (15000, 3364))})
+
+    r = whoop_get_steps(now=now, cache_path=isolated_files["WHOOP_CACHE"])
+    assert r["steps"] == 3364
     assert r["band_off"] is True
-    assert r["age_min"] == 594
+    assert r["steps_frozen_min"] >= 240        # >3h, our threshold
+    # the 'as of' must point at the last observed CHANGE, not at the pull
+    assert r["last_change_known"] is False       # no change inside the window
+    assert r["data_as_of"] is not None
+
+
+def test_get_steps_data_as_of_is_last_change(isolated_files):
+    """v3.3.35 (Jim OOB「The as of date, make it same as data as of data」).
+
+    The visible 'as of' must be the time the step count last changed, so the
+    app can never claim "as of 19:51" while simultaneously saying the band is
+    off. When the count IS moving, that timestamp tracks the pull (≈ now).
+    """
+    from gym_web.whoop import whoop_get_steps
+
+    now = _now()
+    cycles = [_cycle(now - timedelta(hours=6), None, 2286, now - timedelta(minutes=5))]
+    _seed_whoop(isolated_files["WHOOP_CACHE"], cycles,
+                meta={"steps_history": _hist((600, 1000), (300, 1500), (30, 2286))})
+
+    r = whoop_get_steps(now=now, cache_path=isolated_files["WHOOP_CACHE"])
+    assert r["steps"] == 2286
+    assert r["last_change_known"] is True
+    assert r["steps_frozen_min"] <= 1            # moved 30s ago
+    assert r["band_off"] is False
+    # 'as of' == the last change, NOT the source stamp (08:14-style)
+    assert r["data_as_of"].startswith((now - timedelta(seconds=30)).astimezone(HKT).strftime("%Y-%m-%dT%H:%M"))
 
 
 def test_get_steps_empty_cache_returns_empty(isolated_files):
@@ -243,14 +313,21 @@ def test_health_overlay_yesterday_comes_from_whoop(client, isolated_files):
 
 
 def test_health_overlay_surfaces_band_off_flag(client, isolated_files):
+    """v3.3.35: the overlay flag now means "the count stopped moving", NOT
+    "the band was off-body" (the old `updated_at`-age inference was proven
+    wrong on 2026-10-21 — it fired every evening regardless of reality).
+
+    A stale source stamp alone must NOT set the flag; a frozen count does.
+    """
     now = _now()
     cycles = [_cycle(now - timedelta(hours=10), None, 2286, now - timedelta(hours=9, minutes=54))]
     _seed_whoop(isolated_files["WHOOP_CACHE"], cycles)
 
     d = client.get("/api/health_overlay").get_json()
     assert d["steps_today"] == 2286
-    assert d["steps_band_off"] is True
-    assert d["steps_stale"] is True
+    assert d["steps_stale"] is False         # pull 係新鮮嘅
+    assert d["steps_band_off"] is False      # stale source != band off
+    assert d["steps_band_off_basis"] == "steps_frozen"
     assert d["steps_as_of"] is not None
 
 

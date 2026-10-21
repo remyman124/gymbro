@@ -101,8 +101,13 @@ def whoop_get_refresh_token():
 #     implying a live running total.
 # ---------------------------------------------------------------------------
 
-WHOOP_STALE_MIN = 30       # >30 min since the record was written -> "stale" (UI amber)
-WHOOP_BAND_OFF_HOURS = 6   # >6h -> the band was almost certainly off-body
+WHOOP_STALE_MIN = 30       # >30 min since the last successful pull -> "stale" (UI amber)
+# v3.3.35 (2026-10-21, Jim OOB「Why gymbro is saying my whoop band off?!!」):
+# 舊 `WHOOP_BAND_OFF_HOURS = 6` 係用嚟推斷「band 除咗身」,推論已證偽
+# (updated_at 每朝 08:00-08:30 就停,同 band 有冇戴無關)。而家呢個門檻改成
+# 講真話:「個步數連續幾耐冇郁過」→ 個數係最後已知值,唔係 live。
+WHOOP_BAND_OFF_HOURS = 6   # (legacy name) 個步數 >6h 冇郁過
+WHOOP_STEPS_FROZEN_MIN = 180   # 個步數 >3h 冇郁過 → badge「步數冇增加」
 
 
 def whoop_get_steps(now=None, cache_path=None):
@@ -196,10 +201,62 @@ def whoop_get_steps(now=None, cache_path=None):
     elif cur_updated:
         age_min = source_age_min
     stale = bool(age_min is not None and age_min > WHOOP_STALE_MIN)
-    # band_off still uses the SOURCE stamp: if WHOOP itself has not written
-    # the record for >6h the band was almost certainly off-body.
-    band_off = bool(source_age_min is not None
-                    and source_age_min > WHOOP_BAND_OFF_HOURS * 60)
+
+    # ═══ v3.3.35 (2026-10-21, Jim OOB「Why gymbro is saying my whoop band
+    # off?!!! The as of date, make it same as data as of data」)═══
+    #
+    # 舊 `band_off` 用 `source_age_min`(即 cycle `updated_at` 嘅年齡)去推斷
+    # 「band 除咗身」—— **呢個推論係錯嘅,已實測推翻**:
+    #   • 連續 8 個 cycle,`updated_at` 全部落喺朝早 07:59-08:34 HKT,
+    #     連「31147 步、strain 18.1」嗰日都一樣 → 佢係「每日 08:00 寫一次
+    #     記錄」嘅 record-level stamp,同 band 有冇戴完全無關。
+    #   • 今日 11:22 / 11:45 / 11:46 三次 pull,step_count 1042 → 1159 → 1342
+    #     一路升,而 `updated_at` 一直企喺 08:14:53。
+    # 所以舊邏輯**每晚 08:30 之後一定會報「WHOOP band off」**,無論 band
+    # 有冇戴 —— 係假警報。Jim 2026-10-21 晚上投訴正正就係呢個。
+    #
+    # 而家改用真係有訊號嘅嘢:**個步數幾時最後郁過**。
+    # `whoop_nutrition.py --sync` 每次 pull 都會喺 `_meta.steps_history`
+    # 記低 {ts, steps};由後面掃返落去就知到個數幾時開始變成現時呢個值。
+    _meta = cache.get("_meta") or {}
+    _hist = _meta.get("steps_history") or []
+    last_change_epoch = None
+    last_change_known = False
+    if steps_today is not None and isinstance(_hist, list) and _hist:
+        _pts = []
+        for _h in _hist:
+            try:
+                _ts = float(_h.get("ts"))
+                _sv = int(_h.get("steps"))
+            except (TypeError, ValueError):
+                continue
+            _pts.append((_ts, _sv))
+        _pts.sort()
+        if _pts and _pts[-1][1] == steps_today:
+            # 由最後一個向前搵第一個「唔同值」嘅點 —— 嗰個就係
+            # 個數變成現時呢個值嘅起點。
+            for _i in range(len(_pts) - 1, 0, -1):
+                if _pts[_i][1] != _pts[_i - 1][1]:
+                    last_change_epoch = _pts[_i][0]
+                    last_change_known = True
+                    break
+            else:
+                # 成段 history 都係同一個值 → 變化喺 history 之外
+                last_change_epoch = _pts[0][0]
+                last_change_known = False
+    if last_change_epoch is None and pulled_at is not None:
+        last_change_epoch = pulled_at.timestamp()
+        last_change_known = False
+
+    steps_frozen_min = None
+    if last_change_epoch is not None:
+        steps_frozen_min = max(0, int((now - datetime.fromtimestamp(
+            last_change_epoch, HKT)).total_seconds() // 60))
+
+    # 誠實嘅「個數冇郁」旗標(唔再推斷 band 有冇戴身)。
+    # >3 個鐘冇郁過 → 個數係「最後已知值」而唔係 live running total。
+    band_off = bool(steps_frozen_min is not None
+                    and steps_frozen_min > WHOOP_STEPS_FROZEN_MIN)
 
     # --- 7d average over the last 7 COMPLETE cycles ----------------------
     complete = [c for c in cycles[1:8] if c.get("end") is not None]
@@ -236,13 +293,30 @@ def whoop_get_steps(now=None, cache_path=None):
         "date": date_hkt,
         # v3.3.31: the as-of stamp is when WE read the number (cache mtime),
         # not WHOOP's frozen `updated_at`. See the long comment above.
-        "data_as_of": (pulled_at or cur_updated).astimezone(HKT).isoformat()
-                      if (pulled_at or cur_updated) else None,
+        # v3.3.35: `data_as_of` = 個步數**最後一次變化**嘅時間(如果知),
+        # 否則 = 我哋最後一次 pull 嘅時間。咁樣:
+        #   • band 錄緊嘢 → 個數幾分钟前先郁過 → as-of ≈ 而家(同 v3.3.31
+        #     Jim 想要嘅「顯示 11 點」一致)
+        #   • 個數冇郁 → as-of = 真正停低嗰刻(例如 08:14)→ 同「個數有幾
+        #     舊」一致,唔會出現「as of 19:51 但 band off」自相矛盾
+        "data_as_of": (datetime.fromtimestamp(last_change_epoch, HKT).isoformat()
+                       if last_change_epoch is not None
+                       else ((pulled_at or cur_updated).astimezone(HKT).isoformat()
+                             if (pulled_at or cur_updated) else None)),
+        "pulled_at": pulled_at.isoformat() if pulled_at else None,
+        "last_change_at": (datetime.fromtimestamp(last_change_epoch, HKT).isoformat()
+                           if last_change_epoch is not None else None),
+        "last_change_known": last_change_known,
+        "steps_frozen_min": steps_frozen_min,
+        # v3.3.35: 保留做診斷用,但**唔再當成 band 有冇戴身嘅證據**
+        # (實證每朝 08:00-08:30 就會停,同 band 無關)。
         "source_updated_at": cur_updated.astimezone(HKT).isoformat() if cur_updated else None,
         "source_age_min": source_age_min,
         "age_min": age_min,
         "stale": stale,
+        # v3.3.35: 語意由「band 除咗身」改成「個步數冇郁過 >3 個鐘」。
         "band_off": band_off,
+        "band_off_basis": "steps_frozen",
         "in_progress": in_progress,
         "steps_yesterday": steps_yesterday,
         "steps_yesterday_date": yesterday_date,
@@ -307,7 +381,7 @@ def whoop_get_body(cache_path=None):
 __all__ = [
     "WHOOP_TOKEN_PATH", "WHOOP_CODE_VERIFIER_PATH", "WHOOP_CACHE_PATH",
     "WHOOP_USER_AGENT", "WHOOP_BASE_URL", "WHOOP_V2_BASE",
-    "WHOOP_STALE_MIN", "WHOOP_BAND_OFF_HOURS",
+    "WHOOP_STALE_MIN", "WHOOP_BAND_OFF_HOURS", "WHOOP_STEPS_FROZEN_MIN",
     "whoop_is_authenticated", "whoop_get_cached", "whoop_get_token",
     "whoop_get_refresh_token", "whoop_get_steps", "whoop_get_body",
 ]

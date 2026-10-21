@@ -1,3 +1,56 @@
+## v3.3.35 — 2026-10-21 — 修「WHOOP band off」假警報 + 統一 as-of
+
+Jim OOB 2026-10-21 20:0x:
+「Why gymbro is saying my whoop band off?!!! The as of date, make it same as
+data as of data」
+
+### 1. 「WHOOP band off」係假警報 —— 推論已實測推翻
+舊邏輯:`band_off = source_age_min > 6h`,即係用 cycle `updated_at` 嘅年齡
+去推斷「band 除咗身」。**呢個推論係錯嘅**:
+- 連續 8 個 cycle 嘅 `updated_at` 全部落喺朝早 **07:59-08:34 HKT**,
+  連「31147 步 / strain 18.1 / maxHR 163」嗰日都一樣 → 佢係「每日朝早
+  寫一次記錄」嘅 record-level stamp,**同 band 有冇戴完全無關**;
+- 今日 11:22 / 11:45 / 11:46 三次 live pull,`step_count` 由 **1042 → 1159
+  → 1342** 一路升,而 `updated_at` 一直企喺 **08:14:53**。
+→ 舊邏輯**每晚 08:30 之後一定會報「band off」**,無論 band 有冇戴。
+
+而家改成講真話:**個步數連續 >3h 冇郁過** → badge 寫「步數 X 個鐘冇增加」,
+唔再亂指住個 band 嘅狀態;`band_off` 保留喺 API(兼容),但加咗
+`band_off_basis: "steps_frozen"` 講明新語意。
+
+### 2. 同一份資料兩個「as of」→ 統一
+- `/api/health` 用 `_meta.sync_time_epoch` → 報 **65.74 分鐘**;
+- app 用檔案 mtime → 報「as of 19:51」。
+根因:`_meta` 係一個**已經唔存在嘅 script**(`whoop_pull_inline.py`)留低嘅
+遺物,之後冇人再改過 → 永遠停喺舊時間。
+而家:
+- `whoop_nutrition.py --sync` **每次寫入都重新蓋章**
+  `sync_time_hkt / sync_time_utc / sync_time_epoch / refreshed_at`;
+- `/api/health` 嘅 `whoop_cache_age_minutes` 以**檔案 mtime** 為準;
+- **`data_as_of` = 個步數最後一次變化嘅時間**(data 嘅真正 as-of),
+  所以 app 唔會再出現「as of 19:51」同時又話「band off」咁自相矛盾。
+  個數郁嘅時候 as-of ≈ 而家;個數停咗 as-of 就企喺真實停低嗰刻。
+
+### 3. 新增欄位
+`/api/whoop_steps`:`pulled_at`、`last_change_at`、`last_change_known`、
+`steps_frozen_min`、`band_off_basis`;
+`/api/health_overlay`:`steps_band_off_basis`、`steps_frozen_min`;
+MCP `get_health_overlay`:`steps_band_off_basis`、`steps_frozen_min`、
+`steps_last_change_at`。
+
+### 4. 步數變化史
+`whoop_nutrition.py --sync` 每次 pull 都喺 `_meta.steps_history` 記低
+`{ts, steps, date}`(保留 96 條 ≈ 4 日),下游由佢計「最後一次變化」。
+
+### 5. 測試
+- `tests/qa/test_whoop_freshness.py`(新,6 個 test):舊推論已死、
+  凍結先會 flag、as-of = 最後一次變化、pull age / source age 分開、
+  writer 每次都重新蓋章、health age 用 mtime。
+- `tests/api/test_whoop_steps.py`:2 個**舊有失敗**順手修好
+  (v3.3.31 改咗 `age_min` 語意但測試冇跟),另外加咗 3 個新 test。
+
+---
+
 ## v3.3.34 — 2026-10-21 — 拎走 Perplexity,淨返 MiniMax 一家
 
 Jim OOB 2026-10-21:「Remove perplexity. keep minimax only」

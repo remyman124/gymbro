@@ -469,6 +469,11 @@ def get_health_overlay() -> str:
         "steps_as_of": wsteps.get("data_as_of"),
         "steps_stale": bool(wsteps.get("stale")),
         "steps_band_off": bool(wsteps.get("band_off")),
+        # v3.3.35 (2026-10-21): band_off 嘅語意改成「個步數停咗 >3 個鐘」
+        # (舊版用 cycle `updated_at` 推斷 band 有冇戴身,已實測推翻)。
+        "steps_band_off_basis": wsteps.get("band_off_basis", "steps_frozen"),
+        "steps_frozen_min": wsteps.get("steps_frozen_min"),
+        "steps_last_change_at": wsteps.get("last_change_at"),
         "steps_in_progress": bool(wsteps.get("in_progress")),
         "steps_yesterday": wsteps.get("steps_yesterday"),
         "steps_yesterday_date": wsteps.get("steps_yesterday_date"),

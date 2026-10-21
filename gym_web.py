@@ -542,12 +542,17 @@ def api_health():
             # indistinguishable from a fresh one. Prefer the epoch the pull
             # script writes (sync_time_epoch); fall back to the file mtime.
             age_min = None
-            epoch = meta.get("sync_time_epoch")
-            if epoch is None:
-                try:
-                    epoch = whoop_cache.stat().st_mtime
-                except OSError:
-                    epoch = None
+            # v3.3.35 (2026-10-21, Jim OOB「The as of date, make it same as
+            # data as of data」): 之前呢度用 `_meta.sync_time_epoch`,但嗰個
+            # 係一個已經唔存在嘅 script 留落嘅遺物(永遠停喺舊時間),而 app
+            # 用檔案 mtime —— 同一份資料兩個 as-of,health 報 65 分鐘但 app
+            # 報「as of 19:51」。而家以**檔案 mtime 為準**(就係 app 顯示嘅
+            # 嗰個值),_meta 只做對照,唔再係真相來源。
+            epoch = None
+            try:
+                epoch = whoop_cache.stat().st_mtime
+            except OSError:
+                epoch = meta.get("sync_time_epoch")
             if epoch is not None:
                 try:
                     age_min = round((time.time() - float(epoch)) / 60.0, 2)
@@ -859,7 +864,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.34"
+__version__ = "3.3.35"
 
 
 def _recovery_pct():
@@ -1315,7 +1320,16 @@ def api_whoop_steps():
         "source_age_min": data.get("source_age_min"),
         "age_min": data.get("age_min"),
         "stale": data.get("stale", False),
+        # v3.3.35 (2026-10-21, Jim OOB「Why gymbro is saying my whoop band
+        # off?!!!」): 語意由「band 除咗身」改成「個步數冇郁過」——
+        # 舊推斷用 cycle `updated_at`,實證每朝 08:00-08:30 就停,同 band
+        # 有冇戴完全無關,所以每晚都報「band off」(假警報)。
         "band_off": data.get("band_off", False),
+        "band_off_basis": data.get("band_off_basis", "steps_frozen"),
+        "steps_frozen_min": data.get("steps_frozen_min"),
+        "last_change_at": data.get("last_change_at"),
+        "last_change_known": data.get("last_change_known", False),
+        "pulled_at": data.get("pulled_at"),
         "in_progress": data.get("in_progress", False),
         "steps_yesterday": data.get("steps_yesterday"),
         "steps_yesterday_date": data.get("steps_yesterday_date"),
@@ -1458,6 +1472,11 @@ def api_health_overlay():
     _w_asof = wsteps.get("data_as_of") if isinstance(wsteps, dict) else None
     _w_stale = bool(wsteps.get("stale")) if isinstance(wsteps, dict) else False
     _w_band_off = bool(wsteps.get("band_off")) if isinstance(wsteps, dict) else False
+    # v3.3.35 (2026-10-21): band_off 嘅語意 =「個步數停咗 >3 個鐘」
+    # (舊版用 cycle `updated_at` 推斷 band 有冇戴身,已實測推翻)。
+    _w_band_off_basis = (wsteps.get("band_off_basis") if isinstance(wsteps, dict)
+                          else None) or "steps_frozen"
+    _w_frozen_min = wsteps.get("steps_frozen_min") if isinstance(wsteps, dict) else None
     _w_in_progress = bool(wsteps.get("in_progress")) if isinstance(wsteps, dict) else False
     _w_avg7 = wsteps.get("steps_7d_avg") if isinstance(wsteps, dict) else None
     _w_series = wsteps.get("series", []) if isinstance(wsteps, dict) else []
@@ -1504,6 +1523,11 @@ def api_health_overlay():
         "steps_as_of": _w_asof,
         "steps_stale": _w_stale,
         "steps_band_off": _w_band_off,
+        # v3.3.35 (2026-10-21): band_off 嘅語意 =「個步數停咗 >3 個鐘」;
+        # 舊版用 cycle `updated_at` 推斷 band 有冇戴身,已實測推翻
+        # (每朝 08:00-08:30 就停,同 band 無關)。
+        "steps_band_off_basis": _w_band_off_basis,
+        "steps_frozen_min": _w_frozen_min,
         "steps_in_progress": _w_in_progress,
         "steps_yesterday": _w_yesterday,
         "steps_yesterday_date": _w_yesterday_date,
@@ -14599,6 +14623,8 @@ def _background_cheer_job(job_id: str, fire_type: str):
             metrics["steps_source"] = "whoop"
             metrics["steps_as_of"] = wsteps.get("data_as_of")
             metrics["steps_band_off"] = bool(wsteps.get("band_off"))
+            metrics["steps_frozen_min"] = wsteps.get("steps_frozen_min")
+            metrics["steps_last_change_at"] = wsteps.get("last_change_at")
         except Exception:
             metrics.setdefault("steps_today", None)
             metrics.setdefault("steps_7d_avg", None)
