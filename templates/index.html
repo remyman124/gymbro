@@ -656,7 +656,7 @@
          gym sessions now live on the calendar grid itself with
          volume + sets + exercises per day. -->
 
-    <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
+    <!-- SCAN TAB (v2.1 — MiniMax vision + MiniMax enrichment) -->
     <section x-show="isTabVisible('scan')" x-cloak class="px-4 pb-32 pt-3">
       <div class="text-[10px] uppercase tracking-[0.2em] text-emerald-400 mb-2 text-center font-bold">掃描食物 / 餐單</div>
 
@@ -1545,7 +1545,7 @@
 
         <!-- Loading state -->
         <div x-show="coachTipsLoading" class="text-sm text-gray-400">
-          <div class="animate-pulse">pplx + MiniMax 分析緊你嘅 session…</div>
+          <div class="animate-pulse">AI 分析緊你嘅 session…</div>
         </div>
 
         <!-- Loaded tips -->
@@ -1553,7 +1553,7 @@
           <div class="text-sm text-white whitespace-pre-wrap leading-relaxed mb-3" x-text="coachTips?.tips?.mm_summary || ''"></div>
 
           <details x-show="coachTips?.tips?.pplx_raw">
-            <summary class="text-[10px] text-emerald-300 cursor-pointer">原始 pplx 內容（參考）</summary>
+            <summary class="text-[10px] text-emerald-300 cursor-pointer">原始 AI 內容（參考）</summary>
             <div class="text-xs text-gray-300 whitespace-pre-wrap mt-2 leading-relaxed" x-text="coachTips?.tips?.pplx_raw || ''"></div>
           </details>
 
@@ -2264,7 +2264,7 @@ function gymApp() {
     previewEditing: false,     // toggle edit-mode for preview fields
     previewCorrectForm: { name: '', restaurant_chain: '', calories: null, protein: null, carbs: null, fat: null, note: '' },
     // v2.7.19: supplementary hint (Jim OOB 2026-07-31 13:25 HKT)
-    // After preview shown, Jim types hint → re-runs pplx + MiniMax enrichment → swaps in new preview
+    // After preview shown, Jim types hint → re-runs MiniMax enrichment → swaps in new preview
     previewHint: '',           // current hint textarea content (cleared after each re-enrich)
     previewUserHints: [],      // history of hints Jim already used in this preview session
     reEnrichInFlight: false,   // prevent double-tap on "🔄 用補充資料再 estimate"
@@ -2305,7 +2305,7 @@ function gymApp() {
     scanTextReEnriching: false,// prevent double-tap on "🔄 再估算"
     scanTextHints: [],         // supplementary hints for re-estimate
     scanTextHintInput: '',     // current hint input
-    coachTips: null,           // pplx + MiniMax result for just-ended session
+    coachTips: null,           // AI result for just-ended session
     coachTipsLoading: false,
     quote: '努力唔會辜負你',
     quoteBank: ['努力唔會辜負你', '今日破 PR!', '肌肉記得晒', '每次一公斤', '收檔先贏', '慢慢嚟', '穩住', '加油'],
@@ -3880,7 +3880,7 @@ function gymApp() {
           const stepMap = {
             whoop_pull: '🟢 WHOOP 拉緊數據…',
             whoop_body: '🟢 WHOOP 拉緊身體數據…',
-            text_gen: '✍️ pplx 寫緊 cheer 文字…',
+            text_gen: '✍️ AI 寫緊 cheer 文字…',
             voice_gen: '🎙 Edge-TTS 整緊雲龍語音…',
             image_gen: '🖼 MiniMax 整緊勵志圖…',
           };

@@ -75,6 +75,7 @@ declare -a QA_GROUPS=(
   "manualinput:tests/qa/test_manual_food_input.py"
   "bgparallel:tests/qa/test_background_parallel_scan.py"
   "bgdynamic:tests/qa/test_v3333_dynamic.py"
+  "hygiene:tests/qa/test_repo_hygiene.py"
   "meta:tests/qa/baseline_diff_meta_test.py"
 )
 

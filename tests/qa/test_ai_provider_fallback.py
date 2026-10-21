@@ -1,34 +1,21 @@
 """
-v3.3.29 — AI 依賴單點故障嘅 regression 測試 (Isak 2026-10-21)
+v3.3.34 — 供應商鏈 regression 測試(MiniMax-only 版)
 
-背景: Alonso 提交 v3.3.29 RULE 28 報告,話三個 AI 依賴(視覺 / 抽菜名 /
-narration 分類)都加咗 Perplexity 後備,QA 8/8 全綠。我獨立驗證之後發現
-**三個真 bug**,全部係「fallback 存在但行唔到」或者「狀態被蓋寫」:
+2026-10-21 Jim OOB:「Remove perplexity. keep minimax only」
 
-  BUG 1 (line 5070) — `_extract_dish_name_ai` 嘅「進思考」早退冇 fallback。
-    MiniMax 生存但半死(think block 被 max_tokens 截斷)→ 直接 `return ""`
-    → Perplexity 抽取器永遠行唔到 → 完美描述變「未識別菜式」。
-    Alonso 報告第 4 點話「fallback 要喺每個 return "" 之前行」,但呢個
-    return 漏咗。PROVEN:Perplexity call count = 0。
+原本呢個檔係 v3.3.29 Isak 嘅「AI 依賴單點故障」測試,建基於
+MiniMax + Perplexity 兩家供應商。而家 Perplexity 拎走,呢啲測試要改成
+**單一供應商**嘅現實:
 
-  BUG 2 — `_VISION_STATUS` 被 2nd opinion 覆蓋。
-    2nd opinion 用同一條 provider chain,chain 結束時寫死 `_VISION_STATUS`
-    → /api/health 報嘅係第 2 個供應商,唔係主力嗰個。
-    PROVEN: opinion#1=minimax-text-01, opinion#2=perplexity-sonar,
-    最終 status=perplexity-sonar。
+  • 供應商池 = [minimax-text-01] 淨一個
+  • 冇後備 = 失敗一定要「響」,唔可以靜靜哋寫壞資料
+    (Rule 28:AI 依賴單點故障清零)
+  • MiniMax 死 → 菜名攞唔到 → 掃描被 Rule 25 硬攔截(唔會寫「未識別菜式」)
+  • 2nd opinion 會行返同一個 model(唔同 prompt)—— 唔係「兩個獨立意見」,
+    但總好過冇第二輪
 
-  BUG 3 (BUG 2 嘅更嚴重後果) — rule-2 寫入保護會被繞過。
-    2nd opinion 期間 provider 失敗 → provider 層呼叫
-    `_record_vision_status(failed)` → 寫入主 dict → 之後第 2 個供應商
-    成功再寫 `ok` → 主 dict 變 "ok" → rule-2 guard
-    (`state == "failed" and not vision_desc`) 唔會觸發 →
-    「未識別菜式」寫得入 golden copy。呢個正正就係 v3.3.25 存在嘅原因。
-
-呢組測試係 **unit level** — 唔打 network、唔打 Google API、唔掂
-Jim 個 Sheet。用 fake provider 模擬各種死法。
-
-Regression target: 2026-10-20 嘅「未識別菜式」事故 + v3.3.29 報告嘅
-三個漏網。
+另外加咗一個新 guard:**gym_web.py 內唔准再有任何 Perplexity 呼叫**。
+呢個正正就係 Jim 今次要求嘅可執行版本。
 """
 
 import importlib.util
@@ -44,7 +31,7 @@ REPO = Path(__file__).resolve().parent.parent.parent
 def gw():
     """Load gym_web.py by path (the gym_web/ package shadows the module)."""
     spec = importlib.util.spec_from_file_location(
-        "gym_web_v3329_test", REPO / "gym_web.py")
+        "gym_web_v3334_test", REPO / "gym_web.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
@@ -67,39 +54,35 @@ class FakeResp:
 
 
 def _install_fake_http(gw, monkeypatch, *, minimax_reply=None,
-                       minimax_raises=None, pplx_reply=None,
-                       pplx_raises=None):
-    """Fake the two remaining providers. Returns a call-counter dict.
+                       minimax_raises=None, fail_after=None):
+    """Fake MiniMax (唯一供應商). Returns a call-counter dict.
 
     `minimax_reply`  → the content MiniMax returns (dict body)
     `minimax_raises` → exception MiniMax raises (simulates a dead key)
-    `pplx_reply`     → the content Perplexity returns
-    `pplx_raises`    → exception Perplexity raises
+    `fail_after`     → 第 N 次呼叫之後開始失敗(用嚟模擬「第一個意見成功、
+                        第二個意見失敗」)
 
-    v3.3.30: APIyI was removed from the chain (dead key), so there is no
-    third provider to fake any more.
+    ⚠️ v3.3.34:Perplexity 已經拎走,所以 fake 遇到任何非 MiniMax 嘅 URL
+    會直接 AssertionError —— 呢個就係「殘留 Perplexity 呼叫」嘅即時警報。
     """
-    calls = {"minimax": 0, "pplx": 0}
+    calls = {"minimax": 0}
 
     def fake_urlopen(req, timeout=None):
         url = getattr(req, "full_url", "") or ""
         body = (req.data.decode() if getattr(req, "data", None) else "")
+        if "perplexity" in url:
+            raise AssertionError(
+                f"v3.3.34:唔准再打 Perplexity!但有程式叫咗:{url}")
         if "minimax" in url:
             calls["minimax"] += 1
+            if fail_after is not None and calls["minimax"] > fail_after:
+                raise OSError("HTTP Error 429: Too Many Requests")
             if minimax_raises:
                 raise OSError(minimax_raises)
             if minimax_reply is not None:
                 return FakeResp({"choices": [
                     {"message": {"content": minimax_reply}}]})
             raise OSError("no minimax reply configured")
-        if "perplexity" in url:
-            calls["pplx"] += 1
-            if pplx_raises:
-                raise OSError(pplx_raises)
-            if pplx_reply is not None:
-                return FakeResp({"choices": [
-                    {"message": {"content": pplx_reply}}]})
-            raise OSError("no pplx reply configured")
         raise AssertionError(f"unexpected URL in fake: {url}")
 
     monkeypatch.setattr(gw.urllib.request, "urlopen", fake_urlopen)
@@ -110,53 +93,104 @@ VISION_DESC = "牛扒配焗薯、芝士煙肉,配西蘭花同車厘茄。"
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BUG 1 — 「進思考」早退冇 fallback
+# v3.3.34 新 guard — 唔准再有 Perplexity 呼叫
 # ──────────────────────────────────────────────────────────────────────
 
-def test_dish_name_think_truncation_still_uses_perplexity(gw, monkeypatch):
-    """MiniMax 半死(think block 截斷)→ Perplexity 必須接手。
+def test_no_perplexity_http_call_left_in_source():
+    """gym_web.py 唔准再有任何 Perplexity HTTP endpoint。
 
-    Alonso 報告第 4 點:「fallback 要喺每個 return "" 之前行」。
-    呢個測試就係守住嗰個 return —— 之前佢直接 return ""。
+    Jim 2026-10-21:「Remove perplexity. keep minimax only」。
+    淨係註解可以提,任何 `api.perplexity.ai` 都要冇。
+    """
+    src = (REPO / "gym_web.py").read_text(encoding="utf-8")
+    bad = []
+    for i, line in enumerate(src.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if "api.perplexity.ai" in line or "perplexity.ai" in line:
+            bad.append((i, stripped[:90]))
+    assert not bad, (
+        "v3.3.34:仲有 Perplexity 呼叫留喺 code 度(Jim 要求拎走):\n"
+        + "\n".join(f"  line {i}: {l}" for i, l in bad))
+
+
+def test_no_perplexity_key_read_left_in_source():
+    """唔准再讀 PPLX_API_KEY(連 health 都唔應該報呢個 key)。"""
+    src = (REPO / "gym_web.py").read_text(encoding="utf-8")
+    code = [l for l in src.splitlines()
+            if "PPLX_API_KEY" in l and not l.strip().startswith("#")]
+    assert not code, (
+        "v3.3.34:仲有 code 讀 PPLX_API_KEY:\n"
+        + "\n".join("  " + l.strip()[:90] for l in code))
+
+
+def test_provider_pool_is_minimax_only(gw):
+    """供應商池淨返 MiniMax 一家。"""
+    pool = gw._VISION_PROVIDER_POOL
+    names = [p[0] for p in pool]
+    assert names == ["minimax-text-01"], (
+        f"供應商池應該淨返 MiniMax 一家,實際 {names}")
+    assert not any("perplexity" in n.lower() for n in names)
+    assert not any("pplx" in str(p[1]).lower() for p in pool), (
+        f"供應商池唔應該再指向 Perplexity function:{pool}")
+
+
+def test_perplexity_vision_function_is_gone(gw):
+    """`_perplexity_vision` 應該完全唔存在(唔係「disable」,係「拎走」)。"""
+    assert not hasattr(gw, "_perplexity_vision"), (
+        "_perplexity_vision 仲喺度 —— 應該刪走")
+    for gone in ("_pplx_enrich", "_pplx_check_narration",
+                 "_pplx_extract_dish_name", "_pplx_api_key"):
+        assert not hasattr(gw, gone), f"{gone} 仲喺度 —— 應該刪走"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 單一供應商:失敗一定要響,唔可以靜靜哋寫壞資料
+# ──────────────────────────────────────────────────────────────────────
+
+def test_dish_name_think_truncation_returns_empty(gw, monkeypatch):
+    """MiniMax 半死(think block 截斷)→ 返回空。
+
+    v3.3.34:冇後備供應商,所以呢度唔會再「另一家接手」——
+    但**唔可以靜靜哋返回空**:抽取器必須有 log,而且上游會被
+    Rule 25 硬攔截(唔會寫「未識別菜式」入表)。
     """
     calls = _install_fake_http(
         gw, monkeypatch,
         # 未閉合嘅 think block:有「進思考」但冇 closed tag
         minimax_reply="進思考...呢張相顯示一碟食物",
-        pplx_reply="牛扒、芝士焗薯",
     )
     gw._NARRATION_CACHE.clear()
 
     result = gw._extract_dish_name_ai(VISION_DESC)
 
-    assert calls["pplx"] >= 1, (
-        "BUG 1 未修:MiniMax 回咗未閉合 think block,Perplexity 抽取器"
-        "完全冇被叫過 → 上游會寫「未識別菜式」")
-    assert result == "牛扒、芝士焗薯", (
-        f"BUG 1 未修:fallback 應該保住菜名,實際返回 {result!r}")
+    assert result == "", (
+        f"MiniMax 半死應該返回空(等上游硬攔截),實際 {result!r}")
+    assert calls["minimax"] >= 1, "根本冇叫過 MiniMax"
 
 
 def test_dish_name_all_providers_dead_returns_empty(gw, monkeypatch):
-    """全部供應商死 → 返回空(唔可以亂估一個菜名)。
+    """唯一供應商死 → 返回空(唔可以亂估一個菜名)。
 
-    反向 guard:fallback 唔係「乜都試」,係「試唔到就認」。
+    反向 guard:唔係「乜都試」,係「試唔到就認」。
     """
     _install_fake_http(
         gw, monkeypatch,
         minimax_raises="HTTP Error 401: Unauthorized",
-        pplx_raises="HTTP Error 401: Unauthorized",
     )
     gw._NARRATION_CACHE.clear()
 
     result = gw._extract_dish_name_ai(VISION_DESC)
-    assert result == "", f"全部供應商死應該返回空,實際 {result!r}"
+    assert result == "", f"供應商死應該返回空,實際 {result!r}"
 
 
-def test_every_empty_return_in_extractor_has_a_fallback(gw):
-    """結構性 guard:每個 `return ""` 前面都要有 fallback。
+def test_every_early_return_in_extractor_is_logged(gw):
+    """結構性 guard:prompt 砌好之後嘅每個 `return ""` 都必須有 log。
 
-    呢個係「用 source code 結構」代替「逐個情境手動測」——
-    任何未來新加嘅早退都會被呢個測試捉到,唔使靠人記得。
+    v3.3.34 嘅新常規:**冇後備供應商 = 失敗一定要響**。
+    呢個測試用 source code 結構代替逐個情境手動測 ——
+    任何未來新加嘅早退都會被捉到,唔使靠人記得。
     """
     src = (REPO / "gym_web.py").read_text(encoding="utf-8")
     lines = src.splitlines()
@@ -167,50 +201,42 @@ def test_every_empty_return_in_extractor_has_a_fallback(gw):
                and not lines[i].startswith("def _extract_dish_name_ai("))
     body = lines[start:end]
 
-    # 呢啲 early return 係「prompt 都未砌好就冇嘢可抽」——
-    # 唔需要 fallback(冇 prompt 就冇嘢可以叫供應商)。
-    # 註釋掉嘅 docstring 行唔算。
-    pre_prompt_exempt = []
-    guarded = []
+    unguarded = []
     for i, line in enumerate(body):
         if line.strip() != 'return ""':
             continue
-        # 行號 <= prompt 砌好之前 → exempt
+        # 行號 <= prompt 砌好之前 → exempt(冇 prompt 就冇嘢可以叫供應商)
         ctx = "\n".join(body[max(0, i - 30):i + 1])
         if "prompt = (" not in ctx:
-            pre_prompt_exempt.append(i)
             continue
-        window = "\n".join(body[max(0, i - 15):i + 1])
-        if "_pplx_extract_dish_name" not in window:
-            guarded.append((start + i + 1, body[max(0, i - 2)].strip()))
+        window = "\n".join(body[max(0, i - 12):i + 1])
+        if "print(" not in window:
+            unguarded.append((start + i + 1, body[max(0, i - 2)].strip()))
 
-    assert not guarded, (
-        "BUG 1 未修 / 復發:_extract_dish_name_ai 有早退冇 fallback:\n"
-        + "\n".join(f"  line {ln}: {ctx}" for ln, ctx in guarded)
-        + "\n  → 供應商半死時,呢個 return 會令後備永遠行唔到。")
+    assert not unguarded, (
+        "v3.3.34:冇後備供應商,early return 一定要有 print(唔可以靜靜哋"
+        "吞掉失敗):\n"
+        + "\n".join(f"  line {ln}: {ctx}" for ln, ctx in unguarded))
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BUG 2 — 2nd opinion 覆蓋 _VISION_STATUS
+# 2nd opinion 唔可以覆蓋主力意見嘅供應商記錄
 # ──────────────────────────────────────────────────────────────────────
 
 def test_second_opinion_does_not_overwrite_primary_status(gw, monkeypatch):
     """2nd opinion 唔可以覆蓋主力意見嘅供應商記錄。
 
-    PROVEN 2026-10-21:before the fix, opinion#1=minimax-text-01,
+    v3.3.29 嘅 bug:before the fix, opinion#1=minimax-text-01,
     opinion#2=perplexity-sonar, 最終 _VISION_STATUS=perplexity-sonar
     → /api/health 報錯供應商。
+    v3.3.34:兩個意見都係 MiniMax,但「唔可以覆蓋」嘅規則一樣要守。
     """
-    # v3.3.30: APiyI 已移除 → chain 輪到 MiniMax 服務 opinion#1。
-    # 擋住真實 network,確保測試唔會打出去。
     def _no_network(req, timeout=None):
         raise AssertionError(f"唔准打真實 network:{getattr(req, 'full_url', '')}")
 
     monkeypatch.setattr(gw.urllib.request, "urlopen", _no_network)
     monkeypatch.setattr(gw, "_minimax_vision_text01",
                         lambda b64, prompt: "MINIMAX 描述")
-    monkeypatch.setattr(gw, "_perplexity_vision",
-                        lambda b64, prompt: "PERPLEXITY 描述")
 
     gw._record_vision_status("none", "unknown")
     gw._VISION_2ND_OPINION = False
@@ -224,13 +250,13 @@ def test_second_opinion_does_not_overwrite_primary_status(gw, monkeypatch):
 
     # opinion #2 — 落到 chain,排除 opinion#1 嘅供應商
     d2 = gw._vision_second_opinion("B64", "prompt")
-    assert d2
+    assert d2, "2nd opinion 應該仍然出到(剩返同一供應商)"
 
     assert gw._VISION_STATUS.get("provider_key") == "minimax-text-01", (
-        "BUG 2 未修:2nd opinion 覆蓋咗主 dict,"
+        "2nd opinion 覆蓋咗主 dict,"
         f"最終 provider_key={gw._VISION_STATUS.get('provider_key')!r}"
         " → /api/health 會報錯供應商")
-    assert gw._VISION_STATUS_2ND.get("provider_key") == "perplexity-sonar", (
+    assert gw._VISION_STATUS_2ND.get("provider_key") == "minimax-text-01", (
         "2nd opinion 應該記錄喺 _VISION_STATUS_2ND,"
         f"實際 {gw._VISION_STATUS_2ND.get('provider_key')!r}")
 
@@ -245,40 +271,40 @@ def test_health_exposes_both_opinions(gw):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BUG 3 — rule-2 寫入保護被 2nd opinion 繞過
+# 主力失敗唔可以被第 2 個意見掩蓋(rule-2 寫入保護)
 # ──────────────────────────────────────────────────────────────────────
 
 def test_primary_failure_not_masked_by_second_opinion(gw, monkeypatch):
     """主力意見死 + 第 2 個意見成功 → 主狀態必須仍然係 failed。
 
-    呢個係 BUG 3:before the fix, 第 2 個意見成功會把主 dict 由
-    "failed" 改成 "ok" → rule-2 guard (`state == "failed" and not
-    vision_desc`) 唔觸發 → 「未識別菜式」寫得入 golden copy。
+    v3.3.29 BUG 3:第 2 個意見成功會把主 dict 由 "failed" 改成 "ok"
+    → rule-2 guard 唔觸發 → 「未識別菜式」寫得入 golden copy。
+    v3.3.34:兩個意見都係 MiniMax,所以要用「第一次失敗、第二次成功」
+    嘅呼叫序列去模擬。
     """
-    # 主力鏈:全部供應商死
-    monkeypatch.setattr(gw, "_minimax_vision_text01",
-                        lambda b64, prompt: "")
-    monkeypatch.setattr(gw, "_perplexity_vision",
-                        lambda b64, prompt: "")
-    # 但第 2 個意見:chain 有一個成功
+    state = {"n": 0}
+
+    def fake_provider(b64, prompt):
+        state["n"] += 1
+        return "" if state["n"] == 1 else "MINIMAX 描述"
+
+    monkeypatch.setattr(gw, "_minimax_vision_text01", fake_provider)
     gw._record_vision_status("none", "unknown")
     gw._VISION_2ND_OPINION = False
 
-    # opinion #1 → 全部死
+    # opinion #1 → 失敗
     d1 = gw._minimax_vision("B64", "prompt")
     assert d1 == "", "opinion#1 應該失敗"
     assert gw._VISION_STATUS.get("state") == "failed", (
-        "opinion#1 全死 → 主狀態必須係 failed,"
+        "opinion#1 死 → 主狀態必須係 failed,"
         f"實際 {gw._VISION_STATUS.get('state')!r}")
 
-    # opinion #2 → 有一個供應商成功
-    monkeypatch.setattr(gw, "_perplexity_vision",
-                        lambda b64, prompt: "PERPLEXITY 描述")
+    # opinion #2 → 成功
     d2 = gw._vision_second_opinion("B64", "prompt")
     assert d2, "opinion#2 應該成功"
 
     assert gw._VISION_STATUS.get("state") == "failed", (
-        "BUG 3 未修:2nd opinion 成功把主狀態改成 ok,"
+        "2nd opinion 成功把主狀態改成 ok,"
         f"實際 {gw._VISION_STATUS.get('state')!r} → rule-2 guard 會被繞過,"
         "「未識別菜式」會寫入生產表")
     assert gw._VISION_STATUS_2ND.get("state") == "ok"
@@ -288,22 +314,23 @@ def test_provider_failure_during_second_opinion_does_not_poison_primary(
         gw, monkeypatch):
     """2nd opinion 期間嘅 provider 失敗唔可以污染主 dict。
 
-    provider 層 (_minimax_vision_text01 / _perplexity_vision) 失敗時
-    會直接呼叫 `_record_vision_status(failed)`。修正前呢個寫入主 dict
-    → 主力意見明明成功,狀態卻變 "failed" → health 報假警,
-    rule-2 guard 又可能誤擋正常 scan。
+    provider 層 (_minimax_vision_text01) 失敗時會直接呼叫
+    `_record_vision_status(failed)`。修正前呢個寫入主 dict → 主力意見
+    明明成功,狀態卻變 "failed"。
 
     ⚠️ 呢個測試刻意**唔** monkeypatch provider 函數本身 —— 咁樣就會
     繞過 provider 函數內部嘅 except 分支,即係測唔到要測嘅嘢。
     要 patch 嘅係底層 urlopen,令真實 provider 函數行到佢嘅 except。
     """
-    # 真實 provider 函數行,只擋住 network。
-    # perplexity → 429;minimax-text-01 → 成功。
+    # 第一次呼叫(意見#1)成功,之後全部 429。
     def fake_urlopen(req, timeout=None):
         url = getattr(req, "full_url", "") or ""
         if "perplexity" in url:
-            raise OSError("HTTP Error 429: Too Many Requests")
+            raise AssertionError(f"唔准打 Perplexity:{url}")
         if "minimax" in url:
+            FakeResp.__call_count = getattr(FakeResp, "__call_count", 0) + 1
+            if FakeResp.__call_count > 1:
+                raise OSError("HTTP Error 429: Too Many Requests")
             return FakeResp({"choices": [{"message": {
                 "content": "MINIMAX 描述"}}]})
         raise AssertionError(f"unexpected URL: {url}")
@@ -313,50 +340,48 @@ def test_provider_failure_during_second_opinion_does_not_poison_primary(
     gw._record_vision_status("none", "unknown")
     gw._VISION_2ND_OPINION = False
 
-    # opinion #1:perplexity 真實失敗(429)→ provider 層 except 觸發 →
-    # MiniMax 服務 → opinion#1 = minimax-text-01
+    # opinion #1:MiniMax 成功
     d1 = gw._minimax_vision("B64", "prompt")
     assert d1, "opinion#1 應該由 MiniMax 服務"
     assert gw._VISION_STATUS.get("provider_key") == "minimax-text-01"
 
-    # opinion #2:chain;perplexity 429 → provider 層 except 觸發
+    # opinion#2:MiniMax 429 → provider 層 except 觸發 → chain 冇得救
     d2 = gw._vision_second_opinion("B64", "prompt")
-    assert d2
+    assert not d2, "opinion#2 應該失敗(供應商 429)"
 
     assert gw._VISION_STATUS.get("provider_key") == "minimax-text-01", (
-        "BUG 3 未修:2nd opinion 期間嘅 provider 失敗污染咗主 dict,"
-        f"provider_key={gw._VISION_STATUS.get('provider_key')!r} "
-        "(應該仍然係 opinion#1 嘅 minimax-text-01)")
+        "2nd opinion 期間嘅 provider 失敗污染咗主 dict,"
+        f"provider_key={gw._VISION_STATUS.get('provider_key')!r}")
     assert gw._VISION_STATUS.get("state") == "ok", (
-        "BUG 3 未修:2nd opinion 期間 provider 失敗把主狀態改成 failed,"
+        "2nd opinion 期間 provider 失敗把主狀態改成 failed,"
         f"實際 {gw._VISION_STATUS.get('state')!r}")
-    assert gw._VISION_STATUS_2ND.get("state") == "ok", (
+    assert gw._VISION_STATUS_2ND.get("state") == "failed", (
         "2nd opinion 自己嘅狀態應該記錄喺 _VISION_STATUS_2ND,"
         f"實際 {gw._VISION_STATUS_2ND.get('state')!r}")
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 佐證 — Alonso 報告嗰啲真係 work 嘅部分
+# narration 分類 —— 冇後備,必須 fail closed
 # ──────────────────────────────────────────────────────────────────────
 
-def test_narration_classifier_falls_back_to_perplexity(gw, monkeypatch):
-    """MiniMax 死 → narration 分類交畀 Perplexity。
+def test_narration_classifier_fails_closed_when_minimax_dead(gw, monkeypatch):
+    """MiniMax 死 → narration 分類 fail closed(當 narration,拒絕自動 commit)。
 
-    Alonso 報告第 2 點:「完美菜名『芝士牛扒焗薯』被判 narration 而被拒」。
-    呢個測試確認修好咗。
+    v3.3.29 呢度原本係「MiniMax 死 → Perplexity 接手」。Perplexity 拎走
+    之後,唯一選擇係 fail closed —— 寧願唔好自動 commit,都唔好存垃圾。
     """
     calls = _install_fake_http(
         gw, monkeypatch,
         minimax_raises="HTTP Error 401: Unauthorized",
-        pplx_reply="DISH",
     )
     gw._NARRATION_CACHE.clear()
 
     is_narration = gw._ai_check_narration("芝士牛扒焗薯")
 
-    assert calls["pplx"] >= 1, "Perplexity 後備冇被叫"
-    assert is_narration is False, (
-        f"好菜名應該判定為 dish,實際 is_narration={is_narration}")
+    assert calls["minimax"] >= 1, "根本冇叫過 MiniMax"
+    assert is_narration is True, (
+        "MiniMax 死 → 必須 fail closed(當 narration),"
+        f"實際 is_narration={is_narration}")
 
 
 def test_narration_classifier_fails_closed_when_everything_dead(gw, monkeypatch):
@@ -364,7 +389,6 @@ def test_narration_classifier_fails_closed_when_everything_dead(gw, monkeypatch)
     _install_fake_http(
         gw, monkeypatch,
         minimax_raises="HTTP Error 401: Unauthorized",
-        pplx_raises="HTTP Error 401: Unauthorized",
     )
     gw._NARRATION_CACHE.clear()
 
@@ -377,13 +401,11 @@ def test_second_opinion_soft_preference_still_yields_second_opinion(
         gw, monkeypatch):
     """只剩 1 個供應商時,第 2 個意見仍然要出到。
 
-    Alonso 報告第 3 點:hard exclusion → 剩 1 個供應商時 2nd opinion
-    冇嘢用。soft preference 修好咗,呢個測試守住佢。
+    v3.3.29 原本用 hard exclusion → 剩 1 個供應商時 2nd opinion 冇嘢用。
+    soft preference 修好咗,而家淨返 1 個供應商 —— 呢個測試更加重要。
     """
     monkeypatch.setattr(gw, "_minimax_vision_text01",
                         lambda b64, prompt: "MINIMAX 描述")
-    monkeypatch.setattr(gw, "_perplexity_vision",
-                        lambda b64, prompt: "")
 
     gw._record_vision_status("none", "unknown")
     gw._VISION_2ND_OPINION = False

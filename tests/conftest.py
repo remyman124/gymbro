@@ -100,7 +100,7 @@ def isolated_files(tmp_path, monkeypatch, gym_web_module):
 @pytest.fixture(autouse=True)
 def mock_api_keys(monkeypatch):
     """Provide deterministic API keys for any LLM call."""
-    monkeypatch.setenv("PPLX_API_KEY", "test-pplx-key")
+    # v3.3.34 (2026-10-21): Perplexity 已拎走,唔使再 mock PPLX_API_KEY
     monkeypatch.setenv("MINIMAX_API_KEY", "test-MiniMax-key")
     monkeypatch.setenv("APIYI_API_KEY", "test-apiyi-key")
 

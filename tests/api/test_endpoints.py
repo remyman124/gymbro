@@ -241,8 +241,9 @@ def test_scan_preview_surfaces_extracted_entry_when_narration(monkeypatch, clien
     # Force the dish-name extractor to return a narration-ish name
     monkeypatch.setattr(gym_web_module, "_extract_dish_name",
                         lambda v, p, fallback="": "這張相顯示一支蘇打水樽")
-    # Force pplx + apiyi to return consistent data
-    monkeypatch.setattr(gym_web_module, "_pplx_enrich",
+    # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity"): Perplexity 拎走,
+    # 營養 estimate 淨返 MiniMax 一家 → patch 返 _minimax_nutrition_enrich。
+    monkeypatch.setattr(gym_web_module, "_minimax_nutrition_enrich",
                         lambda v: "蘇打水 0 kcal, 0g protein, 0g carbs, 0g fat")
     # v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff"): the APIyI
     # enrichment functions were RENAMED — the APIyI key died (HTTP 401) and
@@ -320,8 +321,8 @@ def test_scan_preview_never_writes_to_production_sheet(
     import io
     monkeypatch.setattr(gym_web_module, "_ai_check_narration", lambda name: False)
     monkeypatch.setattr(gym_web_module, "_extract_dish_name", lambda v, p, fallback="": "測試菜式")
-    monkeypatch.setattr(gym_web_module, "_pplx_enrich", lambda v: "測試菜式 500 kcal, 30g protein")
-    monkeypatch.setattr(gym_web_module, "_minimax_nutrition_enrich", lambda v: "")
+    monkeypatch.setattr(gym_web_module, "_minimax_nutrition_enrich",
+                        lambda v: "測試菜式 500 kcal, 30g protein")
     monkeypatch.setattr(gym_web_module, "_minimax_nutrition_enrich_multi", lambda v: "")
     monkeypatch.setattr(gym_web_module, "_minimax_vision", lambda b64, prompt: "測試菜式")
     monkeypatch.setattr(gym_web_module, "_vision_second_opinion", lambda b64, prompt: "")
@@ -353,7 +354,7 @@ def test_scan_preview_extracts_empty_when_vision_fully_fails(monkeypatch, client
     import io
     monkeypatch.setattr(gym_web_module, "_ai_check_narration", lambda name: False)
     monkeypatch.setattr(gym_web_module, "_extract_dish_name", lambda v, p, fallback="": "")
-    monkeypatch.setattr(gym_web_module, "_pplx_enrich", lambda v: "")
+    # v3.3.34: Perplexity 拎走 → 淨返 MiniMax 一家
     monkeypatch.setattr(gym_web_module, "_minimax_nutrition_enrich", lambda v: "")
     monkeypatch.setattr(gym_web_module, "_minimax_nutrition_enrich_multi", lambda v: "")
     monkeypatch.setattr(gym_web_module, "_minimax_vision", lambda b64, prompt: "（MiniMax vision 失敗）")

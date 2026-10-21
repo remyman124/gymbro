@@ -81,7 +81,7 @@ def _stub_vision(gw, monkeypatch, *, desc=""):
     monkeypatch.setattr(gw, "_minimax_vision", lambda b64, prompt: desc)
     monkeypatch.setattr(gw, "_vision_second_opinion", lambda b64, prompt: "")
     monkeypatch.setattr(gw, "_minimax_vision_text01", lambda b64, prompt: "")
-    monkeypatch.setattr(gw, "_perplexity_vision", lambda b64, prompt: "")
+    # v3.3.34: Perplexity 已拎走,冇第二個供應商要 stub
     monkeypatch.setattr(gw, "_VISION_STATUS", {
         "provider": "none",
         "state": "failed",
@@ -275,7 +275,13 @@ def test_apiyi_fully_removed(gw):
     pool = gw._VISION_PROVIDER_POOL
     assert not any("apiyi" in str(p[0]).lower() for p in pool), (
         f"供應商池仲有 APIyI:{pool}")
-    assert len(pool) >= 2, f"供應商池至少要 2 個(唔可以又變單點故障):{pool}"
+    # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only"):
+    # 供應商池而家**淨一個** —— 呢個係 Jim 明確要求,唔係疏漏。
+    # 單點故障嘅風險由 rule-2 / rule-25 硬攔截補住:
+    # 供應商全死 → 掃描被擋,唔會寫「未識別菜式」入表。
+    assert [p[0] for p in pool] == ["minimax-text-01"], (
+        f"供應商池應該淨返 MiniMax 一家,實際 {pool}")
+    assert len(pool) >= 1, "供應商池唔可以係空(否則完全冇視覺能力)"
 
     # 3) 冇 APIyI 嘅 HTTP endpoint call
     assert "api.apiyi.com" not in src, "仲有 APIyI endpoint call"
@@ -287,6 +293,40 @@ def test_apiyi_fully_removed(gw):
     # 5) 2nd opinion 改名後仍然存在(唔係刪走功能)
     assert hasattr(gw, "_vision_second_opinion"), (
         "2nd opinion 應該改名做 _vision_second_opinion,而唔係冇咗")
+
+
+def test_perplexity_fully_removed(gw):
+    """Jim OOB 2026-10-21 "Remove perplexity. keep minimax only"。
+
+    Perplexity 條 key 2026-10-21 額度爆咗(HTTP 401 insufficient_quota),
+    所以成條供應商依賴要清乾淨:冇 function、冇 pool 成員、冇 key 檢查、
+    冇 endpoint call。
+    """
+    src = (REPO / "gym_web.py").read_text(encoding="utf-8")
+
+    # 1) 冇任何 perplexity 嘅 function 定義或者呼叫
+    #    (只查 code 行 —— 註解可以提及歷史,唔算依賴)
+    code_lines = [l for l in src.splitlines()
+                  if not l.strip().startswith("#")]
+    code_only = "\n".join(code_lines)
+    for dead in ("_perplexity_vision", "_pplx_enrich", "_pplx_check_narration",
+                 "_pplx_extract_dish_name", "_pplx_api_key"):
+        assert dead not in code_only, f"仲有 Perplexity 依賴:{dead}"
+
+    # 2) 供應商池淨返 MiniMax
+    pool = gw._VISION_PROVIDER_POOL
+    assert not any("perplexity" in str(p[0]).lower() for p in pool), (
+        f"供應商池仲有 Perplexity:{pool}")
+
+    # 3) 冇 Perplexity 嘅 HTTP endpoint call(只查 code 行)
+    assert "api.perplexity.ai" not in code_only, "仲有 Perplexity endpoint call"
+
+    # 4) health 唔再報 pplx key
+    assert '"pplx": bool(' not in src, "/api/health 仲報 pplx key"
+
+    # 5) 2nd opinion 仍然存在(唔係刪走功能)
+    assert hasattr(gw, "_vision_second_opinion"), (
+        "2nd opinion 應該仍然存在,而唔係冇咗")
 
 
 def test_voice_transcribe_no_longer_uses_apiyi(gw):

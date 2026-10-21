@@ -597,7 +597,7 @@ def api_health():
     # visible before it ruins a whole day of scans).
     checks["api_keys_present"] = {
         "minimax": bool(_minimax_api_key()),
-        "pplx": bool(os.environ.get("PPLX_API_KEY", "")),
+        # v3.3.34: Perplexity 已拎走(Jim OOB 2026-10-21)
     }
     # Health overlay API (composite)
     overall = all([
@@ -859,7 +859,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.33"
+__version__ = "3.3.34"
 
 
 def _recovery_pct():
@@ -1251,14 +1251,6 @@ def _body_hydration_pct():
         return None
 
 
-
-
-
-
-
-
-
-
 def _whoop_steps() -> dict:
     """v3.3.25 (Jim OOB 2026-10-20「Steps is whoop! 用 whoop count step」):
     today's step count + 7-day average from the Whoop V2 cycle cache.
@@ -1528,7 +1520,6 @@ def api_health_overlay():
     return jsonify(payload)
 
 
-
 # ---------- Jim context store (cheer pipeline reads this to make text more personal) ----------
 JIM_CONTEXT = Path("/home/work/.jim_context.json")
 
@@ -1555,7 +1546,7 @@ def _save_jim_context(ctx: dict) -> bool:
 
 
 def _get_jim_context_for_cheer() -> str:
-    """Format jim_context as a string block for the cheer pplx prompt.
+    """Format jim_context as a string block for the cheer prompt.
 
     Reads JIM_CONTEXT, formats each entry as "- <key>: <value> (tags: <tags>)".
     Returns empty string if no entries.
@@ -3656,9 +3647,9 @@ def api_sync_health():
     })
 
 
-# ---------- v2.1 FOOD SCAN (MiniMax M3 vision + pplx enrichment) ----------
+# ---------- v2.1 FOOD SCAN (MiniMax vision + MiniMax enrichment) ----------
 # Jim OOB 2026-07-23 22:26 HKT: "Version will be able to scan food or food receipt
-# to capture. Using MiniMax image recognition and pplx search"
+# to capture. Using MiniMax image recognition and web search"
 
 SCAN_CACHE_DIR = Path("/home/work/.hermes/scan_cache")
 SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -3796,9 +3787,10 @@ def _assert_not_test_fixture(path) -> None:
 SCAN_THUMB_DIR = Path("/home/work/.hermes/scan_thumb_cache")
 SCAN_THUMB_DIR.mkdir(parents=True, exist_ok=True)
 
-# pplx API key (separate from MiniMax which is in hermes-torres)
-def _pplx_api_key() -> str:
-    return os.environ.get("PPLX_API_KEY", "")
+# v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only"):
+# PPLX_API_KEY 已完全唔使 —— Perplexity 嘅所有呼叫(視覺 / 營養 enrichment /
+# 菜名 / narration 判斷 / cheer web search)都已經移除或者改用 MiniMax。
+# 環境變數仲喺度都冇人讀,唔會再有任何 HTTP 請求打去 api.perplexity.ai。
 
 
 def _get_latest_news_for_cheer() -> str:
@@ -3808,35 +3800,27 @@ def _get_latest_news_for_cheer() -> str:
     Returns a short Chinese string or '' on failure.
     """
     import random
-    key = _pplx_api_key()
-    if not key:
-        return ""
     # Jim OOB 2026-07-29: random-pick 1 of 4 categories
+    # v3.3.34 (2026-10-21): Perplexity 拎走 → Brave 網頁搜尋 + MiniMax 撮要。
+    # 每個 category 有兩個字串:(搜尋 query, 問 MiniMax 嘅要求)
     categories = [
-        ("gossip", "娛樂圈 / 明星 / 藝人 gossip — 香港或國際明星新聞, 限本週 2026 年 7 月 22 至 29 日內發生。簡短 30-50 字繁中廣東話回覆, 可以用嚟做 cheer 收尾嘅有趣話題。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
-        ("sports", "體育 / 足球 / NBA / 網球 / 賽車 — 國際體育新聞, 限本週內發生。簡短 30-50 字繁中廣東話回覆。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
-        ("ai", "AI / 人工智能 / 大模型 / 生成式 AI — 業界新聞, 例如新模型發佈、產品更新、AI 政策。限本週內發生。簡短 30-50 字繁中廣東話回覆。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
-        ("hacker", "黑客 / 資訊安全 / 漏洞 / 數據外洩 / 開源工具新聞。限本週內發生。簡短 30-50 字繁中廣東話回覆。唔好 fabricate, 唔肯定就講 \"(本週未有確認熱話)\"。"),
+        ("gossip", "香港 娛樂新聞 明星 藝人",
+         "寫 1 句 30-50 字繁體中文廣東話,可以用嚟做 cheer 收尾嘅有趣話題。"
+         "只可以講搜尋結果入面出現過嘅事。"),
+        ("sports", "國際 體育 新聞 足球 NBA 網球",
+         "寫 1 句 30-50 字繁體中文廣東話嘅體育新聞摘要。只可以講搜尋結果入面"
+         "出現過嘅事。"),
+        ("ai", "AI 人工智能 大模型 新聞 發佈",
+         "寫 1 句 30-50 字繁體中文廣東話嘅 AI 業界新聞摘要。只可以講搜尋結果"
+         "入面出現過嘅事。"),
+        ("hacker", "黑客 資訊安全 漏洞 數據外洩 開源 新聞",
+         "寫 1 句 30-50 字繁體中文廣東話嘅駭客 / 資安新聞摘要。只可以講搜尋"
+         "結果入面出現過嘅事。"),
     ]
-    cat_name, cat_prompt = random.choice(categories)
+    cat_name, cat_query, cat_ask = random.choice(categories)
     try:
-        payload = {
-            "model": "sonar-pro",
-            "messages": [{"role": "user", "content": f"幫我搵 1 則最新嘅 {cat_prompt}"}],
-            "max_tokens": 250,
-            "temperature": 0.7,
-        }
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        content = (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        content = _cheer_web_fact(cat_query, cat_ask, max_tokens=250,
+                                  temperature=0.7)
         # Prepend category tag for cheer to reference
         cat_label = {"gossip": "🎭 明星娛樂", "sports": "⚽ 體育", "ai": "🤖 AI", "hacker": "💻 黑客"}.get(cat_name, "📰")
         return f"【{cat_label}】{content}" if content else ""
@@ -3846,34 +3830,34 @@ def _get_latest_news_for_cheer() -> str:
 
 # v3.3.12: Pplx-cached news + fund fact for the unified daily narrative.
 # Both helpers wrap a 30-min TTL file cache so cheer / video / food-coach
-# don't each fire their own pplx call. The cheer LLM prompt references
+# don't each fire their own web search. The cheer LLM prompt references
 # them by name so it weaves the latest fact into the narrative.
-_PPLX_NEWS_TTL_S = 30 * 60
-_PPLX_NEWS_CACHE = "/home/work/.hermes/cheer_pplx_cache.json"
+_CHEER_NEWS_TTL_S = 30 * 60
+_CHEER_NEWS_CACHE = "/home/work/.hermes/cheer_pplx_cache.json"
 
 
-def _pplx_cache_get(key: str) -> str:
+def _cheer_cache_get(key: str) -> str:
     try:
-        if not os.path.exists(_PPLX_NEWS_CACHE):
+        if not os.path.exists(_CHEER_NEWS_CACHE):
             return ""
-        with open(_PPLX_NEWS_CACHE) as f:
+        with open(_CHEER_NEWS_CACHE) as f:
             data = json.load(f)
         e = data.get(key)
         if not e:
             return ""
-        if (time.time() - e.get("ts", 0)) > _PPLX_NEWS_TTL_S:
+        if (time.time() - e.get("ts", 0)) > _CHEER_NEWS_TTL_S:
             return ""
         return e.get("text", "")
     except Exception:
         return ""
 
 
-def _pplx_cache_put(key: str, text: str) -> None:
+def _cheer_cache_put(key: str, text: str) -> None:
     try:
         data = {}
-        if os.path.exists(_PPLX_NEWS_CACHE):
+        if os.path.exists(_CHEER_NEWS_CACHE):
             try:
-                with open(_PPLX_NEWS_CACHE) as f:
+                with open(_CHEER_NEWS_CACHE) as f:
                     data = json.load(f)
             except Exception:
                 data = {}
@@ -3882,7 +3866,7 @@ def _pplx_cache_put(key: str, text: str) -> None:
         if len(data) > 10:
             sorted_keys = sorted(data.keys(), key=lambda k: data[k].get("ts", 0), reverse=True)
             data = {k: data[k] for k in sorted_keys[:10]}
-        with open(_PPLX_NEWS_CACHE, "w") as f:
+        with open(_CHEER_NEWS_CACHE, "w") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception:
         pass
@@ -3892,51 +3876,39 @@ def _get_latest_fund_fact_for_cheer() -> str:
     """Pull 1 fresh HK / finance / macro fact for the cheer prompt.
 
     Jim OOB 2026-08-20: "the cheer routine should also refer to the latest
-    news and latest fund fact. from pplx". UA Finance (largest listed
+    news and latest fund fact (web search)". UA Finance (largest listed
     finance co in HK) is Jim's employer, so HK stocks / HSI / macro /
     rates / FX are the natural topics. Returns a 30-60 字 Cantonese
     string or '' on failure. 30-min TTL file cache.
     """
-    cached = _pplx_cache_get("fund_fact")
+    cached = _cheer_cache_get("fund_fact")
     if cached:
         return cached
-    key = _pplx_api_key()
-    if not key:
-        return ""
     # Pick a finance sub-topic randomly so each cheer gets variety
+    # v3.3.34 (2026-10-21): Perplexity 拎走 → Brave 網頁搜尋 + MiniMax 撮要。
     import random
     subtopics = [
-        ("📈 港股", "恒生指數 / 港股大市 / 藍籌股 / 港交所, 限本週 2026 年 8 月內"),
-        ("💱 匯率", "美元兌港元 / 人民幣 / 美元指數 / 主要貨幣走勢, 限本週內"),
-        ("📊 利率", "港元利率 / 美聯儲 / 拆息 HIBOR / 國債孳息率, 限本週內"),
-        ("🏦 金融", "香港銀行 / 金融科技 / 監管政策 / 金管局, 限本週內"),
-        ("🛢️ 商品", "原油 / 黃金 / 銅 / 大宗商品, 限本週內"),
+        ("📈 港股", "香港 恒生指數 港股 大市 藍籌股 港交所 最新",
+         "搵 1 個最新嘅恒生指數 / 港股大市嘅 fact / 數字 / 變動"),
+        ("💱 匯率", "美元 港元 人民幣 匯率 美元指數 最新",
+         "搵 1 個最新嘅匯率 fact / 數字 / 變動"),
+        ("📊 利率", "港元利率 美聯儲 HIBOR 拆息 國債孳息率 最新",
+         "搵 1 個最新嘅利率 fact / 數字 / 變動"),
+        ("🏦 金融", "香港銀行 金融科技 金管局 監管政策 最新",
+         "搵 1 個最新嘅香港金融業 fact / 政策 / 數字"),
+        ("🛢️ 商品", "原油 黃金 銅 大宗商品 價格 最新",
+         "搵 1 個最新嘅大宗商品 fact / 數字 / 變動"),
     ]
-    label, scope = random.choice(subtopics)
+    label, cat_query, scope = random.choice(subtopics)
     try:
-        payload = {
-            "model": "sonar-pro",
-            "messages": [{"role": "user", "content":
-                f"幫我搵 1 個最新嘅 {scope} 嘅 fact / 數字 / 變動, "
-                f"簡短 30-60 字繁中廣東話回覆, 要具體 (有數字 / 變幅 / 日期)。"
-                f"唔好 fabricate, 唔肯定就答「本週未確認」。"}],
-            "max_tokens": 250,
-            "temperature": 0.4,
-        }
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        content = (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        content = _cheer_web_fact(
+            cat_query,
+            f"{scope},簡短 30-60 字繁中廣東話回覆, 要具體 "
+            f"(有數字 / 變幅 / 日期)。唔肯定就答「本週未確認」。",
+            max_tokens=250, temperature=0.4)
         out = f"【{label}】{content}" if content else ""
         if out:
-            _pplx_cache_put("fund_fact", out)
+            _cheer_cache_put("fund_fact", out)
         return out
     except Exception:
         return ""
@@ -3944,12 +3916,12 @@ def _get_latest_fund_fact_for_cheer() -> str:
 
 def _get_cached_news_for_cheer() -> str:
     """Cached wrapper around _get_latest_news_for_cheer (30-min TTL)."""
-    cached = _pplx_cache_get("news")
+    cached = _cheer_cache_get("news")
     if cached:
         return cached
     out = _get_latest_news_for_cheer()
     if out:
-        _pplx_cache_put("news", out)
+        _cheer_cache_put("news", out)
     return out
 
 
@@ -3973,30 +3945,17 @@ def _get_liverpool_fixture_for_cheer() -> str:
                     return ""
     except Exception:
         pass
-    key = _pplx_api_key()
-    if not key:
-        return ""
+    # v3.3.34 (2026-10-21): Perplexity 拎走 → Brave 網頁搜尋 + MiniMax 撮要。
     try:
-        payload = {
-            "model": "sonar-pro",
-            "messages": [{"role": "user", "content":
-                "利物浦 (Liverpool FC) 下一場英超賽事係幾時? 對手係邊隊? 喺主場定作客?"
-                "用繁中廣東話一句 30-50 字回覆, 例如「下週六 (7月25日) 主場對曼聯」, "
-                "如果 7 日內冇賽事就答「7 日內冇利物浦比賽」。唔好 fabricate, 唔肯定就講「未確認」。"}],
-            "max_tokens": 200,
-            "temperature": 0.3,
-        }
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        content = (resp.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        content = _cheer_web_fact(
+            "Liverpool FC next fixture Premier League schedule",
+            "利物浦 (Liverpool FC) 下一場英超賽事係幾時? 對手係邊隊? "
+            "喺主場定作客?用繁中廣東話一句 30-50 字回覆, 例如"
+            "「下週六 (7月25日) 主場對曼聯」。如果 7 日內冇賽事就答"
+            "「7 日內冇利物浦比賽」。",
+            max_tokens=200, temperature=0.3)
+        if not content:
+            return ""
         # Determine if Big 6 — if yes, return block; else empty
         big6_kw = ["曼聯", "曼城", "車路士", "阿仙奴", "熱刺", "曼聯", "曼联", "曼联", "Manchester United", "Man City", "Chelsea", "Arsenal", "Tottenham"]
         is_big6 = any(kw in content for kw in big6_kw)
@@ -4019,7 +3978,7 @@ def _minimax_api_key() -> str:
 
 # Canonical 12-field nutrition schema (Jim OOB 2026-07-25 13:35 HKT:
 # "food recognition buggy, doesn't gather protein, carbs, fiber etc").
-# Used by both pplx and minimax enrich prompts + parser + Sheet header.
+# Used by the minimax enrich prompts + parser + Sheet header.
 NUTRITION_FIELDS = [
     "calories",   # kcal (total energy)
     "protein",    # g
@@ -4116,7 +4075,7 @@ def _record_vision_status(provider: str, state: str, err: str = "",
 
     v3.3.29: this function now ROUTES on _VISION_2ND_OPINION. The
     provider-level failure records (in _minimax_vision_text01 /
-    _perplexity_vision) call THIS function, so they follow the same
+    minimax-text-01) call THIS function, so they follow the same
     route — a provider failure during the 2nd opinion can no longer
     poison the primary opinion's state.
     """
@@ -4212,76 +4171,17 @@ def _minimax_vision_text01(img_b64: str, prompt: str) -> str:
         return ""
 
 
-def _perplexity_vision(img_b64: str, prompt: str) -> str:
-    """Vision via Perplexity `sonar` — v3.3.26 (2026-10-21), 3rd provider.
-
-    IMPORTANT CORRECTION to an earlier note (2026-10-20) that said
-    Perplexity "refused vision (text-only)". That was WRONG. Verified
-    2026-10-21 with a rigorous 4-case test, not a vibe:
-      1. Jim's real steak dinner photo -> "牛扒配焗薯、忌廉汁、車厘茄同西蘭花" ✅
-      2. Jim's soup photo             -> "一碗咖喱湯" ✅
-      3. the SYNTHETIC "GYMbro TEST FIXTURE" image
-                                      -> "相中冇任何食物，只有一個棕色嘅測試圖像" ✅
-         (it recognises a non-food image instead of inventing a dish)
-      4. a solid green image          -> "只見一片純綠色，冇可辨認的食物" ✅
-         (zero hallucination)
-    Both `sonar` and `sonar-pro` accept an OpenAI-style image_url block.
-    `sonar-reasoning` is deprecated (HTTP 400) — do not use it.
-
-    Jim already has a Perplexity key (PPLX_API_KEY), so this provider
-    costs him nothing extra and removes the single-point-of-failure that
-    MiniMax-text-01 alone represented.
-
-    Returns description text, or "" on any failure (never a （...）
-    label — that would leak into the dish name).
-    """
-    api_key = _pplx_api_key()
-    if not api_key:
-        return ""
-    payload = {
-        "model": "sonar",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url",
-             "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-        ]}],
-        "max_tokens": 1200,
-        "temperature": 0.25,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
-        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-        content = content.strip()
-        if not content:
-            return ""
-        # A refusal is a failure, not a description — let the next provider try.
-        if "抱歉" in content[:30] and "無法" in content[:50] and len(content) < 80:
-            return ""
-        return content
-    except Exception as e:
-        _record_vision_status("perplexity-sonar", "failed",
-                              f"{type(e).__name__}: {e}",
-                              provider_key="perplexity-sonar")
-        print(f"[vision] Perplexity sonar failed: {type(e).__name__}: {e}",
-              flush=True)
-        return ""
-
-
-# v3.3.26 (2026-10-21): the vision provider pool, in priority order.
 # Keys are the raw provider ids used for the "2nd opinion must come from a
 # DIFFERENT provider" rule.
+# v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only"):
+# 供應商池淨返 MiniMax 一家。
+# Perplexity 拎走嘅原因:佢個 key 額度爆咗(HTTP 401 insufficient_quota),
+# 而且每次 scan 都要多等一個 provider 先交叉核對 —— 救唔到任何嘢。
+# ⚠️ 單一供應商 = 單點故障(見 `fitness/jim-image-recognition` Rule 28):
+# MiniMax 死 → 掃描會被硬攔截(唔會寫「未識別菜式」入表),但要即時加返
+# 第二個 provider。
 _VISION_PROVIDER_POOL = (
     ("minimax-text-01", "_minimax_vision_text01"),
-    ("perplexity-sonar", "_perplexity_vision"),
 )
 
 
@@ -4290,11 +4190,16 @@ def _minimax_vision(img_b64: str, prompt: str,
                      record_2nd: bool = False) -> str:
     """Vision description — provider chain.
 
-    v3.3.30 (2026-10-21, Jim OOB "Remove apiyi stuff") chain:
-        MiniMax-text-01  →  Perplexity sonar
-    (APiyi was removed — its key died 2026-10-20 with HTTP 401 on every
-    endpoint. Two independent working providers = no single point of
-    failure.)
+    v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only")
+    chain:
+        MiniMax-text-01  (單一供應商)
+    (Perplexity 已拎走 —— 佢個 key 額度爆咗 HTTP 401 insufficient_quota,
+    而且每次 scan 都要多等一個 provider 先交叉核對,救唔到任何嘢。
+    APiyI 更加早就拎走咗 —— 佢個 key 2026-10-20 死咗 HTTP 401。)
+
+    ⚠️ 而家係**單點故障**:MiniMax 死 → 掃描會被硬攔截(唔會寫
+    「未識別菜式」入表,Jim 見到失敗提示而唔係壞資料),但整個食物 log
+    都會停。要加返第二個 provider 就改 _VISION_PROVIDER_POOL。
 
     v3.3.25 (2026-10-21, Jim OOB 2026-10-20 'And the ai recognition is
     all wrong. It was showing unrecognised food'): a provider key died
@@ -4393,6 +4298,11 @@ def _vision_second_opinion(img_b64: str, prompt: str) -> str:
     served opinion #1 — else "2 independent opinions" is the same model
     twice and the median-merge becomes meaningless. The provider that
     served opinion #1 is tracked in _VISION_STATUS["provider_key"].
+
+    v3.3.34 (2026-10-21, Jim OOB "Remove perplexity"): 供應商池淨返
+    MiniMax 一家,所以 `exclude` 會令同一個 model 再行一次(唔同 prompt)。
+    呢個唔係「兩個獨立意見」,只係「兩次問法」—— 總好過冇第二輪:
+    詳細描述可以帶出第一輪漏咗嘅菜式細節。
     """
     used = _VISION_STATUS.get("provider_key", "")
     skip = tuple(x for x in (used,) if x)
@@ -4401,70 +4311,6 @@ def _vision_second_opinion(img_b64: str, prompt: str) -> str:
     return _minimax_vision(img_b64, prompt, exclude=skip, record_2nd=True)
 
 
-def _pplx_enrich(dish_desc: str) -> str:
-    """Call pplx sonar-pro for nutrition enrichment of described dishes.
-
-    Jim OOB 2026-07-25 13:35: ask for FULL 12-field nutrition (kcal, P, C, F,
-    fiber, sugar, sodium, sat_fat, trans_fat, vit_c, iron, calcium), not just
-    P/C/F/kcal. Used as 1st of 2 estimates (median-merged with OpenRouter).
-    """
-    api_key = _pplx_api_key()
-    if not api_key:
-        return "（PPLX 金鑰未設定）"
-    fields_desc = "\n".join(
-        f"- {f} ({NUTRITION_UNITS[f]})"
-        for f in NUTRITION_FIELDS
-    )
-    prompt = (
-        f"由以下香港/廣東話食物描述：\n\n「{dish_desc}」\n\n"
-        "幫我做兩件事：\n"
-        "1. 識別每樣菜式所屬嘅餐廳/連鎖/品牌（如：沙嗲王、KFC、大家樂、太興、添好運等），"
-        "列出每樣嘅 standard portion / 標準份量。\n"
-        "2. **必須**用以下 exact format, 每個 field 一行, field 喺 value 之前用全形冒號「：」:\n"
-        f"{fields_desc}\n\n"
-        "格式範例 (要跟足, 一個 field 一行, 唔好 narrative):\n"
-        "卡路里：750\n蛋白質：38g\n碳水化合物：80g\n脂肪：25g\n膳食纖維：4g\n糖：6g\n鈉：950mg\n飽和脂肪：8g\n反式脂肪：0.5g\n維他命C：12mg\n鐵質：3mg\n鈣質：80mg\n\n"
-        "重要：\n"
-        "- 唔可以全部 12 個 field 都寫 0。就算餐廳 brand 唔識, 都要用「香港典型常見份量」estimate 落每個 field。\n"
-        "- 例如：燒味例牌 → 用一般燒味店例牌 ~200g meat + 少飯約 450kcal / 35g P / 30g C / 22g F estimate; 蔬菜 ~120kcal; 炒飯例牌 ~600kcal / 18g P / 80g C / 22g F; 燒雞半隻 ~1100kcal / 70g P / 0g C / 75g F; 燒乳鴿一隻 ~250kcal / 25g P / 0g C / 15g F; 揚州炒飯例牌 ~700kcal / 22g P / 90g C / 28g F; 馬黛茶 ~5kcal / 0g P / 1g C / 0g F; 烚豬肉 ~250kcal / 25g P / 0g C / 16g F; 唐生菜/菜類 ~80-120kcal / 2-4g P。\n"
-        "- 只有「明確零熱量」嘅嘢 (例如清水、黑咖啡、齋 tea、汽水 diet) 先可以 calories=0; 否則全部要有 non-zero estimate。\n"
-        "- 飽和脂肪/反式脂肪如果係自煮 dish 一般 0.5-2g, 快餐先有高值 (3-10g)。\n"
-        "- 維他命 C / 鐵質 / 鈣質係 micronutrient, 主要喺菜類/肉類, 用典型 baseline estimate (菜 10-30mg vitC, 紅肉 2-3mg iron, 乳/小骨魚 80-200mg calcium)。\n"
-        "- sodium 用 mg (1g 鹽 ≈ 400mg sodium); 中式例牌 sodium 普遍 400-1000mg。\n"
-        "- 餐廳 chain / 標準份量可以 narrative 寫, 但 12 個 nutrition field 必須 strict format\n\n"
-        "3. 如有 brand-specific nutrition 數據（例如 KFC 雞件卡路里），用嗰啲 official 數。"
-        "如無 brand-specific 數, 請用一般常見 portion。\n\n"
-        "用繁體中文, 一個英文字都唔好有。餐廳裝修、裝飾、其他餐廳 唔好講。"
-    )
-    payload = {
-        "model": "sonar-pro",
-        "messages": [
-            {"role": "system", "content": "你係香港連鎖餐廳 nutrition 查詢助手。用事實同官方數據回答, 唔好幻想, 唔識就寫 0。"},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 2400,
-        "temperature": 0.2,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bear" + "er " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
-        return resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"（PPLX enrichment 失敗：{type(e).__name__}）"
-
-
-# v3.3.20 (Jim OOB 2026-09-10 'in gymbro food log, if I type something
-# that without food image, can I pull from the internet or pplx to
-# gather the food image'): Brave Image Search helper for text-only
-# food entries. Returns first high-confidence image result.
 def _brave_api_key() -> str:
     """Brave Search API key for image lookup. Separate from BRAVE_ANSWER_KEY
     (which is for the LLM-grounded answer endpoint, not raw image search)."""
@@ -4510,6 +4356,79 @@ def _brave_image_search(query: str, count: int = 3) -> list:
     except Exception as e:
         print(f"[brave_image_search] {type(e).__name__}: {e}", flush=True)
         return []
+
+
+def _brave_web_search(query: str, count: int = 5) -> list:
+    """Brave 網頁搜尋 → list[str](標題 + 描述)。
+
+    v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only"):
+    新增 —— 原本 cheer 嘅新聞 / 基金 fact / 利物浦賽程靠 Perplexity
+    sonar-pro 上網,Perplexity 拎走之後要有第二個 web-search 來源,
+    否則呢三個 context 全部變空(cheer 會少咗三樣料)。
+    Returns [] on no key / auth failure / network error.
+    """
+    api_key = _brave_api_key()
+    if not api_key or not query or not query.strip():
+        return []
+    try:
+        req = urllib.request.Request(
+            "https://api.search.brave.com/res/v1/web/search"
+            + "?q=" + urllib.parse.quote(query.strip())
+            + f"&count={min(count, 10)}&safesearch=off",
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        out = []
+        for r in ((data.get("web") or {}).get("results") or []):
+            t = (r.get("title") or "").strip()
+            d = (r.get("description") or "").strip()
+            if t:
+                out.append(f"{t} — {d}" if d else t)
+        return out
+    except Exception as e:
+        print(f"[brave_web_search] {type(e).__name__}: {e}", flush=True)
+        return []
+
+
+def _cheer_web_fact(search_query: str, ask: str, max_tokens: int = 250,
+                     temperature: float = 0.4) -> str:
+    """Brave 網頁搜尋 + MiniMax 撮成一句(取代 Perplexity sonar-pro)。
+
+    v3.3.34 (2026-10-21): Perplexity 拎走之後嘅替代方案。
+    規矩唔變:**只可以用搜尋結果嘅內容,唔准 fabricate**;搜尋冇結果就回 ''
+    (cheer 會少呢一塊 context,好過亂講)。
+    """
+    titles = _brave_web_search(search_query, count=4)
+    if not titles:
+        return ""
+    joined = "\n".join(f"- {t}" for t in titles)
+    payload = {
+        "model": "MiniMax-M3",
+        "messages": [{"role": "user", "content":
+                      f"以下係網上最新搜尋結果:\n{joined}\n\n{ask}\n"
+                      "只可以用上面搜尋結果入面出現過嘅事,唔准 fabricate 任何"
+                      "數字 / 對手 / 日期。冇就答「未確認」。"}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + _minimax_api_key()},
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        return (resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                or "").strip()
+    except Exception as e:
+        print(f"[cheer_web_fact] {type(e).__name__}: {e}", flush=True)
+        return ""
 
 
 # v3.3.20: download a food image from URL and save to SCAN_CACHE_DIR.
@@ -4562,8 +4481,9 @@ def _minimax_nutrition_enrich(dish_desc: str) -> str:
     single source of truth for nutrition estimates + coach comments.
 
     v3.2.7.6+: MiniMax M3 via api.minimax.io. Returns text (or empty on
-    failure) — caller parses via _parse_nutrition_block then median-merges
-    with pplx.
+    failure) — caller parses via _parse_nutrition_block.
+    v3.3.34 (2026-10-21): Perplexity 拎走 → 而家係**單一 estimate**
+    (之前係 pplx + MiniMax 兩份取 median)。
 
     v3.3.22 (Jim OOB 2026-09-11 'No food nutritional info'): MiniMax M3 was
     running into max_tokens=400 BEFORE the JSON was emitted, so 12-field
@@ -4574,7 +4494,7 @@ def _minimax_nutrition_enrich(dish_desc: str) -> str:
     """
     api_key = _minimax_api_key()
     if not api_key:
-        return ""  # graceful fallback — single-source pplx only
+        return ""  # graceful fallback — 冇 MiniMax key 就冇 estimate
     fields_desc = ", ".join(
         f"{f} ({NUTRITION_UNITS[f]})" for f in NUTRITION_FIELDS
     )
@@ -4780,7 +4700,6 @@ def _parse_nutrition_block(text: str) -> dict:
     return out
 
 
-
 # v3.2.7.17: AI-based narration classifier. Jim OOB 2026-08-10
 # 'don't use rule. please use ai to obtain'. The MiniMax M3 model
 # classifies the candidate dish name as either a real dish ('DISH')
@@ -4809,14 +4728,9 @@ def _ai_check_narration(name: str) -> bool:
 
     api_key = _minimax_api_key()
     if not api_key:
-        # v3.3.26 (2026-10-21): no MiniMax key → ask Perplexity instead of
-        # failing closed immediately.
-        alt = _pplx_check_narration(name)
-        if alt is not None:
-            _NARRATION_CACHE[name] = alt
-            return alt
-        # No API key at all → fail closed: assume narration so we don't
-        # auto-commit. Better to ask the user than to save garbage.
+        # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity"): 冇 MiniMax key
+        # 就 fail closed —— 寧願問 Jim,都唔好自動寫入垃圾。
+        # (原本呢度會問 Perplexity;而家淨返一個 provider。)
         _NARRATION_CACHE[name] = True
         return True
 
@@ -4861,69 +4775,11 @@ def _ai_check_narration(name: str) -> bool:
         _NARRATION_CACHE[name] = is_narration
         return is_narration
     except Exception:
-        # v3.3.26 (2026-10-21): MiniMax unreachable → ask Perplexity.
-        # Failing closed on MiniMax alone meant a dead key silently
-        # rejected EVERY candidate (a good name like 「芝士牛扒焗薯」 was
-        # judged narration) and the scan fell back to 未識別菜式.
-        alt = _pplx_check_narration(name)
-        if alt is not None:
-            _NARRATION_CACHE[name] = alt
-            return alt
+        # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity"): MiniMax 唔到 →
+        # fail closed(唔会自动 commit)。原本呢度會問 Perplexity。
         # Fail closed: if NO AI can decide, refuse to auto-commit.
         _NARRATION_CACHE[name] = True
         return True
-
-
-def _pplx_check_narration(name: str):
-    """Perplexity fallback for the dish-vs-narration classifier.
-
-    v3.3.26 (2026-10-21): `_ai_check_narration` only ever asked
-    MiniMax-M3. With the MiniMax key dead it failed CLOSED, so every
-    candidate name was judged "narration" and rejected — the scan then
-    wrote 未識別菜式 even though the vision description was perfect.
-
-    Returns True (narration), False (a dish), or None (could not decide).
-    """
-    api_key = _pplx_api_key()
-    if not api_key:
-        return None
-    payload = {
-        "model": "sonar",
-        "messages": [
-            {"role": "system",
-             "content": ("You classify whether a candidate string is a dish "
-                         "name or model narration prose. Reply with ONLY one "
-                         "word: 'DISH' or 'NARRATION'.")},
-            {"role": "user",
-             "content": (f"Candidate: 「{name}」\n\n"
-                         "Is this a concrete dish/food name (e.g. 蘇打水、漢堡包、"
-                         "海南雞飯、芝士牛扒焗薯), or is it vision-model narration "
-                         "prose (e.g. 這張相顯示一支蘇打水樽、品牌為可口可樂、"
-                         "可見到一塊蛋糕)?\nReply ONLY 'DISH' or 'NARRATION'.")},
-        ],
-        "max_tokens": 64,
-        "temperature": 0,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + api_key},
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-        reply = ((resp.get("choices") or [{}])[0].get("message", {})
-                 .get("content") or "").strip().upper()
-        if "NARRATION" in reply and "DISH" not in reply:
-            return True
-        if "DISH" in reply:
-            return False
-        return None
-    except Exception as e:
-        print(f"[narration] Perplexity check failed: "
-              f"{type(e).__name__}: {e}", flush=True)
-        return None
 
 
 def _name_has_narration(name: str) -> bool:
@@ -4954,56 +4810,6 @@ _GENERIC_DISH_NAMES_BLOCKLIST = {
     "未識別菜式", "未識別", "食物", "餐", "菜式", "菜名", "餐點",
     "料理", "菜式一", "未識別菜", "NOT FOOD", "",
 }
-
-
-def _pplx_extract_dish_name(prompt: str) -> str:
-    """Extract the dish name via Perplexity sonar (2nd extractor).
-
-    WHY: on 2026-10-21 the dish-name extraction had its OWN single point
-    of failure — `_extract_dish_name_ai` ONLY ever called MiniMax-M3.
-    When the MiniMax key died, even a perfect vision description (served
-    by Perplexity) still turned into "未識別菜式", because nothing could
-    turn the description into a name. Vision resilience is useless if the
-    name extraction dies next.
-
-    Perplexity sonar is a text model and does this job fine. Same prompt,
-    same guards, same output contract (2-16 char Cantonese dish name).
-    """
-    api_key = _pplx_api_key()
-    if not api_key:
-        return ""
-    payload = {
-        "model": "sonar",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 200,
-        "temperature": 0.1,
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.perplexity.ai/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=25).read())
-        dish = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    except Exception as e:
-        print(f"[dish-name] Perplexity sonar failed: {type(e).__name__}: {e}",
-              flush=True)
-        return ""
-    dish = re.sub(r"^\s*<think.*?</think>\s*", "", dish, flags=re.DOTALL)
-    dish = dish.strip()
-    dish = dish.strip("「」『』\"'` \n\r\t。.,，")
-    dish = re.sub(r"^[-•·\s]+", "", dish)
-    dish = dish.strip("：:，,。. ")
-    if not dish or dish in _DISH_NAME_LABEL_WORDS or len(dish) > 16:
-        return ""
-    if _name_has_narration(dish):
-        return ""
-    return dish
 
 
 def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
@@ -5145,7 +4951,7 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
             # was missed. PROVEN 2026-10-21 with a fake that returns an
             # unclosed 進思考 block: Perplexity call count = 0.
             if "進思考" in dish:
-                alt = _pplx_extract_dish_name(prompt)
+                alt = ""  # v3.3.34: Perplexity 已移除
                 if alt:
                     print(f"[dish-name] MiniMax think block truncated — "
                           f"Perplexity sonar extracted {alt!r}", flush=True)
@@ -5157,7 +4963,7 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
                 # "未識別菜式" even when the vision description was perfect
                 # — the Perplexity extractor below was unreachable. Try it
                 # before returning empty.
-                alt = _pplx_extract_dish_name(prompt)
+                alt = ""  # v3.3.34: Perplexity 已移除
                 if alt:
                     print(f"[dish-name] MiniMax extractor unusable — "
                           f"Perplexity sonar extracted {alt!r}", flush=True)
@@ -5204,7 +5010,7 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
                         or _name_has_narration(dish2)):
                     # v3.3.26: same reasoning as above — the strict retry
                     # failing must not be the end of the road.
-                    alt = _pplx_extract_dish_name(prompt)
+                    alt = ""  # v3.3.34: Perplexity 已移除
                     if alt:
                         print(f"[dish-name] MiniMax strict retry unusable — "
                               f"Perplexity sonar extracted {alt!r}", flush=True)
@@ -5216,21 +5022,12 @@ def _extract_dish_name_ai(vision_desc: str, pplx_desc: str = "") -> str:
     except Exception:
         pass
 
-    # v3.3.26 (2026-10-21): dish-name extraction had its OWN single point of
-    # failure — it only ever called MiniMax-M3. When the MiniMax key died,
-    # even a perfect vision description (e.g. one served by Perplexity)
-    # still turned into "未識別菜式" because nothing could extract the
-    # name. Vision resilience is useless if the name extraction dies next.
-    # → Perplexity sonar gets the same prompt + the same guards.
-    try:
-        alt = _pplx_extract_dish_name(prompt)
-        if alt:
-            print(f"[dish-name] MiniMax extractor unavailable — "
-                  f"Perplexity sonar extracted {alt!r}", flush=True)
-            return alt
-    except Exception as e:
-        print(f"[dish-name] Perplexity fallback failed: "
-              f"{type(e).__name__}: {e}", flush=True)
+    # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only"):
+    # 原本呢度有 Perplexity sonar 做第二個 dish-name extractor(2026-10-21 加,
+    # 因為 MiniMax key 死咗會令好嘅名都變「未識別菜式」)。
+    # 而家淨返 MiniMax 一家 —— 所以呢度冇 fallback。
+    # ⚠️ 意味住:MiniMax 死 → 菜名攞唔到 → 掃描會被 Rule 25 硬攔截(唔會寫
+    # 「未識別菜式」入表),Jim 會見到失敗提示而唔係壞資料。
 
     # v3.2.7.32: no regex fallback (per Jim OOB 2026-08-11 'don't use
     # rule/regex'). If the AI can't decide, return empty so the caller
@@ -6962,8 +6759,8 @@ def api_scan_food():
         if len(opinion2_desc) > len(vision_desc) * 0.7:
             vision_desc = vision_desc + "\n\n（2nd-opinion vision）\n" + opinion2_desc
 
-    # 2. pplx enrichment (1st of 2 estimates for 12-field nutrition)
-    pplx_desc = _pplx_enrich(vision_desc)
+    # 2. (v3.3.34: Perplexity enrichment 已移除 — 淨返 MiniMax 一個 estimate)
+    pplx_desc = ""
 
     # 2b. OpenRouter gpt-4o-mini (2nd estimate, JSON mode, Jim OOB 2026-07-25 13:35)
     mm_desc = _minimax_nutrition_enrich(vision_desc)
@@ -7027,8 +6824,8 @@ def api_scan_food():
         "calcium": field_entries["calcium"],
         "raw_kcal_estimate": raw_kcal,
         "raw_p_estimate": raw_p,
-        "source": "v2.11-scan (minimax-m3 + pplx-sonar-pro + minimax-m3-enrich, median-merged)",
-        "models_used": ["minimax-m3", "pplx-sonar-pro", "minimax-m3-enrich"],
+        "source": "v3.3.34-scan (minimax-text-01 + minimax-m3-enrich)",
+        "models_used": ["minimax-text-01", "minimax-m3-enrich"],
         "confidence": "12-field median-merged (Jim can correct via /api/scan_correct)",
         "sheet_synced": False,
         "image_saved_to": "",  # filled below
@@ -7196,8 +6993,6 @@ def api_whoop_refresh():
 # steps from withings"). Calls the withings.py activity script to fetch fresh
 # data, refreshes WITHINGS_CACHE atomically, then returns same shape as
 # /api/withings_steps_today. Designed to be fast (~3-5s) for tap-to-refresh UX.
-
-
 
 
 @app.route("/api/scan_correct", methods=["POST"])
@@ -8181,7 +7976,7 @@ def _scan_preview_core(img_bytes: bytes, img_path_hint: str = "",
 
     # 2. pplx enrichment
     _emit("enrich")
-    pplx_desc = _pplx_enrich(vision_desc)
+    pplx_desc = ""  # v3.3.34: Perplexity enrichment 已移除
 
     # 2b. OpenRouter gpt-4o-mini 2nd-opinion (Jim OOB 2026-07-25 13:35)
     _emit("enrich2")
@@ -8483,8 +8278,8 @@ def _scan_preview_core(img_bytes: bytes, img_path_hint: str = "",
     committed = []
     for e_idx, entry in enumerate(entries_list):
         entry["timestamp_iso"] = now_iso_str
-        entry["source"] = "v3.2.7.10-scan_autocommit (minimax-m3 + pplx-sonar-pro + minimax-multi)"
-        entry["models_used"] = ["minimax-m3", "pplx-sonar-pro", "minimax-m3-enrich-multi"]
+        entry["source"] = "v3.3.34-scan_autocommit (minimax-text-01 + minimax-multi)"
+        entry["models_used"] = ["minimax-text-01", "minimax-m3-enrich-multi"]
         entry["image_saved_to"] = str(final_path)
         entry["confidence"] = "auto-commit preview"
         entry["sheet_synced"] = False
@@ -9131,7 +8926,6 @@ def api_scan_progress(job_id: str):
     })
 
 
-
 @app.route("/api/scan_resume/<job_id>", methods=["POST"])
 def api_scan_resume(job_id: str):
     """v3.3.25 (2026-10-21): re-run a scan job that was interrupted by a
@@ -9271,7 +9065,7 @@ def api_scan_preview_from_path():
         # 2-vision median-merge: take whichever is longer (more dish detail)
         if len(opinion2_desc) > len(vision_desc) * 0.7:
             vision_desc = vision_desc + "\n\n（2nd-opinion vision）\n" + opinion2_desc
-    pplx_desc = _pplx_enrich(vision_desc)
+    pplx_desc = ""  # v3.3.34: Perplexity enrichment 已移除
 
     shared = _detect_shared_meal(vision_desc + " " + pplx_desc)
     jim_ratio = 0.60 if shared else 1.00
@@ -10252,8 +10046,8 @@ def api_scan_commit():
         e_user_hints = entry.get("user_hints") or user_hints_in
         entry["timestamp_iso"] = now_iso_str
         if img_path is not None:
-            entry["source"] = "v2.2-scan (minimax-m3 + pplx-sonar-pro, Jim confirmed)"
-            entry["models_used"] = ["minimax-m3", "pplx-sonar-pro"]
+            entry["source"] = "v3.3.34-scan (minimax-text-01, Jim confirmed)"
+            entry["models_used"] = ["minimax-text-01"]
             entry["image_saved_to"] = str(final_path)
         else:
             entry["source"] = "v2.7.22-scan_text_direct (minimax-m3, no image)"
@@ -10559,7 +10353,7 @@ def api_scan_re_enrich():
       1. Read image bytes from image_path (server-side cache).
       2. Re-run MiniMax vision (cheap, 2-3s) — get fresh dish desc.
       3. Prepend `「用家補充資料: {hint}」` to vision_desc.
-      4. Re-run _pplx_enrich() + _minimax_nutrition_enrich() with augmented desc.
+      4. Re-run _minimax_nutrition_enrich() with augmented desc.
       5. Merge 12-field nutrition via median.
       6. Return preview-style object for frontend to swap in.
     """
@@ -10616,7 +10410,7 @@ def api_scan_re_enrich():
     augmented_desc = f"用家補充資料（餐廳名/份量/醬汁/材料）：{user_hint}\n\n{vision_desc}"
 
     # 3. Re-enrich via pplx + MiniMax (parallel — sequential for safety, no quota burn)
-    pplx_desc = _pplx_enrich(augmented_desc)
+    pplx_desc = ""  # v3.3.34: Perplexity enrichment 已移除
     mm_desc = _minimax_nutrition_enrich(augmented_desc)
 
     # 4. Merge 12-field nutrition
@@ -11411,13 +11205,16 @@ def _generate_coach_tips(session_data: dict) -> dict:
         "用繁中俾我一句總評（最多 50 字），唔好列數字。"
     )
 
+    # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity"): 原本第一遍係
+    # Perplexity sonar-pro 出 form cue + progression,再交畀 MiniMax render。
+    # 而家第一遍直接用 MiniMax(同一個 prompt、同一個 system role),
+    # 第二遍照舊由 MiniMax render 做 cheer 教練訊息。
     pplx_ans = ""
     try:
-        pplx_resp = requests_if_available = None
-        api_key = _pplx_api_key()
+        api_key = _minimax_api_key()
         if api_key:
             payload = {
-                "model": "sonar-pro",
+                "model": "MiniMax-M3",
                 "messages": [
                     {"role": "system", "content": "你係香港 NSCA-CSCS 教練。用繁體中文、技術但口語化。"},
                     {"role": "user", "content": pplx_query},
@@ -11426,19 +11223,20 @@ def _generate_coach_tips(session_data: dict) -> dict:
                 "temperature": 0.25,
             }
             req = urllib.request.Request(
-                "https://api.perplexity.ai/chat/completions",
+                "https://api.minimax.io/v1/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
                 method="POST",
-                headers={"Content-Type": "application/json", "Authorization": "Bear" + "er " + api_key},
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + api_key},
             )
             resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
             pplx_ans = resp["choices"][0]["message"]["content"]
     except Exception as e:
-        pplx_ans = f"（pplx 教練 tips 失敗：{type(e).__name__}）"
+        pplx_ans = f"（教練 tips 失敗：{type(e).__name__}）"
 
     # MiniMax synthesis — render Traditional Chinese with friendly tone
     mm_prompt = (
-        f"以下係 pplx 教練對於一個 gym session 嘅 form cue + progression 建議：\n\n"
+        f"以下係教練對於一個 gym session 嘅 form cue + progression 建議：\n\n"
         f"{pplx_ans}\n\n"
         f"加上 session 摘要：{pplx_prompt_drink}\n\n"
         "任務：用繁體中文（廣東話口語都得）幫我 render 做一個 cheer 教練嘅總結訊息。\n"
@@ -16033,9 +15831,6 @@ def api_daily_coaching_refresh():
 # during v3.2.7.16 refactor — see plan: drifting-bouncing-toast.md).
 _HTML_TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
 HTML_TEMPLATE = _HTML_TEMPLATE_PATH.read_text(encoding="utf-8")
-
-
-
 
 
 # ---------- Service worker for PWA ----------

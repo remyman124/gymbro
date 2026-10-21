@@ -130,7 +130,12 @@ def test_apiyi_fully_removed(gw):
     pool = gw._VISION_PROVIDER_POOL
     assert not any("apiyi" in str(p[0]).lower() for p in pool), (
         f"供應商池仲有 APIyI:{pool}")
-    assert len(pool) >= 2, f"供應商池至少要 2 個(唔可以又變單點故障):{pool}"
+    # v3.3.34 (2026-10-21, Jim OOB "Remove perplexity. keep minimax only"):
+    # 供應商池而家淨一個 —— 呢個係 Jim 明確要求。單點故障嘅風險由
+    # rule-2 / rule-25 硬攔截補住(供應商死 → 唔會寫「未識別菜式」入表)。
+    assert [p[0] for p in pool] == ["minimax-text-01"], (
+        f"供應商池應該淨返 MiniMax 一家,實際 {pool}")
+    assert len(pool) >= 1, "供應商池唔可以係空"
 
     assert "api.apiyi.com" not in src, "仲有 APIyI endpoint call"
     assert "vip.apiyi.com" not in src, "仲有 APIyI vip endpoint call"
