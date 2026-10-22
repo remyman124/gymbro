@@ -24,10 +24,13 @@ NO file persistence — restart = empty cache until hydration finishes.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Optional
+
+log = logging.getLogger(__name__)
 
 from .core import NUTRITION_SHEET_ID, NUTRITION_TAB_NAME, now_hkt
 
@@ -334,7 +337,17 @@ class NutritionCache:
                 self._hydrated = True
                 self._last_hydrated_at = now_hkt()
                 loaded = len(self.by_row)
-                return loaded
+            # v3.3.36 (2026-10-22): a fresh Sheet snapshot may have different
+            # row indices or a different column K than the last one, so the
+            # image proxy's row → Drive URL LRU must not survive it.
+            # (Root cause of「昨日啲餐縮圖全部一樣」: the LRU kept pointing at
+            #  Drive files that had since been trashed.)
+            try:
+                from gym_web.image_proxy import clear_url_cache   # local import avoids cycles
+                clear_url_cache()
+            except Exception as e:   # never break hydration on a proxy hiccup
+                log.warning("clear_url_cache after hydrate failed: %s", e)
+            return loaded
         finally:
             with self._lock:
                 self._hydrating = False

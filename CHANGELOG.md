@@ -1,3 +1,53 @@
+## v3.3.36 — 2026-10-22 — 修「昨日啲餐嘅縮圖全部一樣」
+
+Jim OOB 2026-10-22 01:1x:
+「i just logged on gymbro, the thumbnail for ytd meal are all the same
+(incorrect). please fix it」
+
+### 1. 實測證據(唔係猜)
+`/scan_thumb/659..665` 逐張抓落嚟比對 byte:
+- 659/660/661/662 → 4 張唔同 ✅
+- **663 / 664 / 665 → md5 一模一樣(`f0c72585af72`,39911 bytes)** ❌
+
+再查落去:
+- Sheet `column K`(真相):row 663/664/665 → `scan_20261021_210255.jpg`
+  (21:02 上載)、`scan_20261021_214520.jpg`(21:46 上載),**trashed=False** ✅
+- `/scan_img/663..665` 派嘅 id → `scan_20261021_170451.jpg`、
+  `scan_20261021_170759.jpg`(17:04-17:09 上載),**trashed=True** ❌
+- Drive 對住 **trashed** 檔會回同一張「已掉進垃圾桶」placeholder
+  → 3 張縮圖 byte 级一樣。
+
+### 2. 根因: image proxy 個 URL LRU 唔識跟住 column K 變
+`gym_web/image_proxy.py` 有一個 row → Drive URL 嘅記憶體 LRU
+(`_url_cache`)。**但佢只喺 miss 時讀一次 Sheet,之後就唔再核對。**
+今日 17:04-17:09 Jim 上載咗一批相(之後被 trash 換走),URL LRU 記低咗
+舊 id;21:02-21:46 新相入咗 Sheet,但 LRU 冇更新 →
+`/scan_thumb` 繼續去 Drive 攞已被 trash 嘅檔 → placeholder → 全部一樣。
+另外 `NutritionCache` 有 background refresher 定期 re-hydrate
+(所以 app 自己嘅 JSON 一直顯示啱嘅 id),**但 image proxy 唔知呢件事**。
+
+### 3. 修法(3 層)
+1. **`_resolve_drive_url()` 先問 `NutritionCache`**(定期 re-hydrate,先新鮮),
+   再問 URL LRU,最後先直讀 Sheet。cache 壞咗唔會炸 image serving
+   (fallback + `log.warning`)。
+2. **thumb bytes 快取記住「由邊個 URL 生成」**(`_thumb_src`):URL 一變就
+   重新生成,唔再照派舊 bytes。`_thumb_src` 會跟住 `shift_thumb_cache()`
+   一齊 shift(而且獨立於 bytes LRU,唔會被 early-return 吞掉)。
+3. **`NutritionCache.hydrate()` 之後清走 URL LRU**(`clear_url_cache()`):
+   一次新快照唔應該有舊快照嘅 row → id 對應。
+
+### 4. 驗證
+- `/scan_thumb/659..665` → **7 張全部唔同**(修正前 5 張,3 張重複)✅
+- `/scan_img/663..665` → id 同 Sheet `column K` **逐個一致** ✅
+- 每日 JPG 卡(`/api/nutrition/card?date=2026-10-21`)重生後 7 餐 2 頁 ✅
+- 新增 `tests/qa/test_thumb_url_freshness.py`(12 個測試,全綠),
+  已加入 `run_qa.sh` 嘅 `thumbfresh` 組。
+
+### 5. 冇碰生產資料
+全部係讀取 + 記憶體快取修正;冇改 Sheet、冇改 Drive、冇刪任何檔案。
+
+---
+
 ## v3.3.35 — 2026-10-21 — 修「WHOOP band off」假警報 + 統一 as-of
 
 Jim OOB 2026-10-21 20:0x:

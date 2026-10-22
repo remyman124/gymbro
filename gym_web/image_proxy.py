@@ -58,6 +58,40 @@ URL_CACHE_MAX = 600
 _url_cache: "OrderedDict[int, Optional[str]]" = OrderedDict()
 _url_cache_lock = threading.Lock()
 
+# v3.3.36 (2026-10-22, Jim OOB「昨日啲餐嘅縮圖全部一樣(錯)」):
+# row → Drive URL **會變** —— 重新上載 / 換圖 / 清理會令舊 Drive 檔被
+# trash,而 Sheet column K 已經指向新檔。thumb bytes 快取淨係記 row_index,
+# 唔記「呢啲 bytes 係由邊個 URL 生成」→ 舊 bytes 會喺新 URL 下繼續派出去。
+# 而 Drive 對住 trashed 檔會回同一張「已掉進垃圾桶」placeholder
+# → 幾張縮圖一模一樣(2026-10-21 實測:row 663/664/665 三張 byte 级一樣)。
+_thumb_src: "OrderedDict[int, str]" = OrderedDict()
+_thumb_src_lock = threading.Lock()
+
+
+def _thumb_src_get(row_index: int) -> Optional[str]:
+    with _thumb_src_lock:
+        return _thumb_src.get(row_index)
+
+
+def _thumb_src_put(row_index: int, url: str) -> None:
+    with _thumb_src_lock:
+        if row_index in _thumb_src:
+            _thumb_src.move_to_end(row_index)
+        _thumb_src[row_index] = url
+        while len(_thumb_src) > THUMB_CACHE_MAX:
+            _thumb_src.popitem(last=False)
+
+
+def clear_url_cache() -> None:
+    """v3.3.36: drop every cached row → Drive URL mapping.
+
+    Called when the Nutrition cache re-hydrates from the Sheet: a fresh
+    snapshot may have different row indices or a different column K, so
+    the old mapping must not survive it.
+    """
+    with _url_cache_lock:
+        _url_cache.clear()
+
 
 def remember_drive_url(row_index: int, drive_url: Optional[str]) -> None:
     """Called by /api/scan_recent (or any writer) to seed the URL cache."""
@@ -87,6 +121,8 @@ def invalidate_thumb(row_index: int) -> None:
     """Drop the cached thumbnail bytes for one row."""
     with _thumb_cache._lock:
         _thumb_cache._data.pop(row_index, None)
+    with _thumb_src_lock:
+        _thumb_src.pop(row_index, None)
 
 
 def shift_thumb_cache(row_index: int) -> None:
@@ -95,6 +131,21 @@ def shift_thumb_cache(row_index: int) -> None:
     entries must move down by 1 as well — otherwise /scan_thumb/<new_idx>
     would return a JPEG that originally belonged to a different row.
     """
+    # v3.3.36: the src-URL map is keyed by row_index too → must shift with
+    # the bytes cache, but INDEPENDENTLY of it (the bytes LRU may have been
+    # evicted while the src map still holds entries).
+    with _thumb_src_lock:
+        new_src = OrderedDict()
+        for k, v in _thumb_src.items():
+            if k > row_index:
+                new_src[k - 1] = v
+            elif k != row_index:           # k < row_index stays; row_index itself is dropped
+                new_src[k] = v
+        while len(new_src) > THUMB_CACHE_MAX:
+            new_src.popitem(last=False)
+        _thumb_src.clear()
+        _thumb_src.update(new_src)
+
     with _thumb_cache._lock:
         if not _thumb_cache._data:
             return
@@ -248,8 +299,42 @@ def _make_thumbnail(raw: bytes) -> bytes:
         return buf.getvalue()
 
 
+def _nutrition_drive_url(row_index: int) -> Optional[str]:
+    """Row → Drive URL from the in-memory NutritionCache.
+
+    v3.3.36: 之前 `_resolve_drive_url` 只信自己個 URL 快取,而嗰個快取**唔會**
+    跟住 Sheet column K 嘅變化(重新上載 / 換圖 → 舊 Drive 檔被 trash)。
+    NutritionCache 係由 background refresher 定期 re-hydrate 嘅,先佢新鮮。
+
+    2026-10-21 實測故障:row 663/664/665 嘅 Sheet column K 已經指向
+    21:02-21:46 上載嘅新相(未 trashed),但 URL 快取仲係 17:04-17:09 嗰批
+    已被 trash 嘅舊 id → /scan_thumb 派 Drive 嘅「已掉進垃圾桶」placeholder
+    → 三張縮圖 byte 级一模一樣。
+    """
+    try:
+        from gym_web.cache import get_cache      # local import avoids cycles
+        row = get_cache().get_by_row(row_index)
+        if row is None:
+            return None
+        u = (row.drive_image_url or "").strip()
+        return u or None
+    except Exception as e:   # never break image serving on a cache hiccup
+        log.warning("nutrition drive-url lookup failed row=%s: %s", row_index, e)
+        return None
+
+
 def _resolve_drive_url(row_index: int) -> Optional[str]:
-    """Cache-first lookup of the Drive URL for a row."""
+    """v3.3.36: freshest source first.
+
+    1. NutritionCache (in-memory, re-hydrated from the Sheet on a timer) —
+       this is the truth the app's own JSON is showing.
+    2. The per-row URL LRU (fast path, kept in sync with #1).
+    3. A direct single-row Sheet read (last resort).
+    """
+    url = _nutrition_drive_url(row_index)
+    if url:
+        remember_drive_url(row_index, url)   # keep the LRU in sync
+        return url
     url = get_drive_url(row_index)
     if url is not None:
         return url or None
@@ -293,17 +378,21 @@ def scan_img(row_index: int) -> Response:
 
 @bp.route("/scan_thumb/<int:row_index>")
 def scan_thumb(row_index: int) -> Response:
+    # v3.3.36: 先解 Drive URL,再決定用唔用 cache —— 同一個 row_index 嘅
+    # URL 會變(重新上載/換圖),舊 bytes 唔可以照派。
+    drive_url = _resolve_drive_url(row_index)
+    if not drive_url:
+        return Response(b"", status=404)
+
     cached = _thumb_cache.get(row_index)
-    if cached is not None:
+    if cached is not None and _thumb_src_get(row_index) == drive_url:
         return Response(
             cached,
             mimetype="image/jpeg",
             headers={"Cache-Control": "public, max-age=86400"},
         )
-
-    drive_url = _resolve_drive_url(row_index)
-    if not drive_url:
-        return Response(b"", status=404)
+    if cached is not None:
+        log.info("thumb cache stale for row=%s (url changed) — regenerating", row_index)
 
     # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
     # win'): parallel Drive fetch with timeout. Multiple scan_thumb
@@ -332,6 +421,7 @@ def scan_thumb(row_index: int) -> Response:
         return Response(b"thumb generation failed", status=502)
 
     _thumb_cache.put(row_index, thumb)
+    _thumb_src_put(row_index, drive_url)
     return Response(
         thumb,
         mimetype="image/jpeg",

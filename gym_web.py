@@ -864,7 +864,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.35"
+__version__ = "3.3.36"
 
 
 def _recovery_pct():

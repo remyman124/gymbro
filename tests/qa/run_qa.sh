@@ -77,6 +77,7 @@ declare -a QA_GROUPS=(
   "bgdynamic:tests/qa/test_v3333_dynamic.py"
   "hygiene:tests/qa/test_repo_hygiene.py"
   "whoopfresh:tests/qa/test_whoop_freshness.py"
+  "thumbfresh:tests/qa/test_thumb_url_freshness.py"
   "meta:tests/qa/baseline_diff_meta_test.py"
 )
 
