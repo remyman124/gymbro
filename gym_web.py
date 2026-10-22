@@ -32,7 +32,7 @@ try:
 except ImportError:
     _HAS_PIL = False
 
-from flask import Flask, jsonify, request, render_template_string, send_from_directory
+from flask import Flask, Response, jsonify, request, render_template_string, send_from_directory
 from workout_formatter import render as _render_text
 from dotenv import load_dotenv
 from gym_web.core import safe_read_json as _safe_read_json
@@ -88,9 +88,42 @@ app.register_blueprint(image_proxy.bp)
 SESSION_COOKIE = "gym_web_session"
 
 
+# v3.3.38 (2026-10-22, Jim OOB「The thumbnail are the same again. Pls fix the
+# thumbnail and the systemic problem」):Alpine 由 unpkg CDN 改為**本地託管**。
+#   之前 <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js">
+#   → CDN 慢/被擋/手機網絡差 → Alpine 永遠唔起 → 個 app 淨係得個空殼,
+#     所有食物歷史縮圖都係同一個空框 → Jim 見到「啲縮圖一樣」。
+#   順帶消除 QA 嘅 networkidle / wait_for_function 隨機 timeout(實測:
+#   2026-10-22 frontend group 因 unpkg 慢而 ERROR,重跑就綠)。
+#   版本號入檔名(alpine-3.17.5.min.js)→ 可以永久快取 + 換版本即失效。
+_ALPINE_LOCAL = Path(__file__).resolve().parent / "static" / "js" / "alpine-3.17.5.min.js"
+
+
+@app.route("/js/alpine-3.17.5.min.js")
+def serve_alpine_local():
+    """Serve the vendored Alpine build (see comment above)."""
+    try:
+        data = _ALPINE_LOCAL.read_bytes()
+    except OSError as e:
+        print(f"[serve_alpine_local] read failed: {e}", flush=True)
+        return Response(b"", status=404, mimetype="application/javascript")
+    resp = Response(data, mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    resp.headers["X-Gymbro-Immutable"] = "1"
+    return resp
+
+
 @app.after_request
 def add_no_cache_headers(response):
-    """Jim OOB 2026-07-19: force no-cache so iPhone PWA picks up every code change immediately."""
+    """Jim OOB 2026-07-19: force no-cache so iPhone PWA picks up every code change immediately.
+
+    v3.3.38: 內容定址圖片(URL 帶 ?v=<hash>)係 immutable —— 呢類資源可以
+    永久快取,唔應該被呢度嘅 no-store 蓋走。image_proxy 會打上
+    X-Gymbro-Immutable: 1 marker,呢度就放行。
+    """
+    if response.headers.get("X-Gymbro-Immutable") == "1":
+        # 內容定址資源:保留 immutable cache header(客戶端唔會再顯示舊圖)
+        return response
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -864,7 +897,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.37"
+__version__ = "3.3.38"
 
 
 def _recovery_pct():
@@ -1774,15 +1807,16 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
         if not thumb_path.startswith("/scan_thumb/"):
             return (id(meal), None)
         try:
-            rest = thumb_path[len("/scan_thumb/"):]
+            # v3.3.38: URL 帶 ?v=<hash>(內容定址)→ 剝走 query 先 parse row index
+            rest = thumb_path[len("/scan_thumb/"):].split("?", 1)[0]
             if not rest.isdigit():
                 return (id(meal), None)
             row_idx = int(rest)
             resp = _scan_thumb_func(row_idx)
             if resp.status_code == 200:
                 return (id(meal), resp.get_data())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[card._fetch_one_thumb] row fetch failed for {thumb_path}: {e}", flush=True)
         return (id(meal), None)
 
     # Build a thumb_bytes dict keyed by id(meal) for the render loop below
@@ -2075,7 +2109,8 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
                 # v3.3.23al: use pre-fetched bytes from parallel batch
                 thumb_bytes = thumb_bytes_for_meal.get(id(m))
                 if thumb_path_str.startswith("/scan_thumb/"):
-                    rest = thumb_path_str[len("/scan_thumb/"):]
+                    # v3.3.38: URL 帶 ?v=<hash> → 剝走 query 先 parse row index
+                    rest = thumb_path_str[len("/scan_thumb/"):].split("?", 1)[0]
                     if rest.isdigit():
                         # Only fetch inline if not pre-fetched (shouldn't happen)
                         if thumb_bytes is None:
@@ -15976,7 +16011,13 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v144';
+const CACHE = 'gym-web-v145';
+// v3.3.38 (2026-10-22, Jim OOB「The thumbnail are the same again. Pls fix the
+// thumbnail and the systemic problem」):cache 版本 144 → 145。
+//   activate 會刪晒所有舊 cache → Jim 手機上面舊嗰批「一模一樣」嘅縮圖
+//   (2026-10-21 嘅 Drive placeholder bug 留下嚟嘅)一次過清走。
+//   新規則:URL 帶 ?v=<hash>(內容定址)→ cache-first(immutable,安全又快);
+//   冇 ?v= 嘅舊 URL → 照舊 network-first no-store。
 // SW v64 → v137 changelog (compressed)
 // v137 (Jim OOB 2026-08-12 23:18 HKT): /api/* 改 network-first，唔再 cache API responses。
 //   修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug (例如 燒烤牛肉片10片 deep-search correction)。
@@ -16040,6 +16081,18 @@ self.addEventListener('fetch', e => {
   // image, even after the index shift. Server-side /scan_thumb already
   // sends Cache-Control: no-store, but the SW ignores it.
   if (url.pathname.startsWith('/scan_thumb/') || url.pathname.startsWith('/scan_img/')) {
+    // v3.3.38: 內容定址 URL(?v=<hash of drive file id>)→ 同一個 URL 永遠係
+    // 同一張相 → 可以 cache-first(快,而且唔會顯示舊圖)。
+    // 冇 ?v= 嘅舊 URL(row_index 對應嘅相會變)→ 照舊 network-first。
+    if (url.searchParams.get('v')) {
+      e.respondWith(
+        caches.open(CACHE).then(cache => cache.match(e.request).then(hit => hit || fetch(e.request).then(res => {
+          if (res && res.status === 200 && res.type === 'basic') cache.put(e.request, res.clone());
+          return res;
+        }).catch(() => new Response('', {status: 503}))))
+      );
+      return;
+    }
     e.respondWith(
       fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response('', {status: 503}))
     );

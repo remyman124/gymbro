@@ -16,7 +16,10 @@
 <link rel="apple-touch-icon-precomposed" sizes="180x180" href="/static/gymbro_apple-touch-icon.png">
 <link rel="manifest" href="/manifest.json">
 <script src="https://cdn.tailwindcss.com"></script>
-<script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<!-- v3.3.38: Alpine 本地託管(原本靠 unpkg CDN → CDN 慢就成個 app 空,
+     食物歷史縮圖全部變成同一個空框)。CDN 留做後備,本地檔唔見就自動 fallback。 -->
+<script defer src="/js/alpine-3.17.5.min.js"
+        onerror="this.onerror=null;var s=document.createElement('script');s.defer=true;s.src='https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js';document.head.appendChild(s);"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
 <style>
@@ -805,6 +808,7 @@
                so Jim can visually confirm the dish before commit. -->
           <template x-if="scanTextPreview.image_path">
             <div class="mb-3">
+              <!-- v3.3.38: 同樣唔用 loading="lazy"(lazy 圖實際上冇 load 過) -->
               <img :src="'/scan_thumb/' + (scanTextPreview.image_path.split('/').pop().replace('.jpg', '.thumb.jpg'))"
                    :alt="scanTextPreview.suggested_entry.name || 'food'"
                    class="w-full rounded-xl object-cover"
@@ -1159,10 +1163,16 @@
                   <!-- v3.2.7.46: use 480px thumbnail for fast food history
                        (was full-res ~1.9MB JPEGs). Tap-to-open still loads
                        the full image for the detail view. -->
+                  <!-- v3.3.38: 移除 loading="lazy" —— 實測(Chrome/Playwright,
+                       2026-10-22):lazy 嘅食物歷史縮圖**從來冇發出過 request**
+                       (naturalWidth=0, complete=false),結果每一行都係同一個
+                       空白框 → Jim 見到「啲縮圖一樣」。server 有 100 行 LRU
+                       快取,回應快到唔需要 lazy;URL 本身已經內容定址
+                       (?v=<hash>),所以唔會有 stale 問題。 -->
                   <img :src="scan.thumbnail_url || scan.image_url"
                        class="w-full aspect-[16/9] rounded-xl object-cover bg-black/40 cursor-pointer active:scale-95"
                        style="max-height: 200px;"
-                       loading="lazy"
+                       decoding="async"
                        @click="window.open(scan.image_url, '_blank')">
                   <!-- v3.2.0 + v3.2.7.3: coach grade as image overlay (Jim OOB 2026-08-07
                        17:00 HKT 'under food log, move the rating on the picture

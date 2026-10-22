@@ -1,3 +1,62 @@
+## v3.3.38 — 2026-10-22 — 修「縮圖又全部一樣」(系統性修法)+ Alpine 本地化
+
+Jim OOB 2026-10-22 20:1x:
+「The thumbnail are the same again. Pls fix the thumbnail and the systemic problem.」
++ OOB「Do a deeper research to see what's going on」
+
+### 1. 深查證據(逐層排除,唔係猜)
+| 層 | 檢查 | 結果 |
+|---|---|---|
+| 伺服器 byte | 24 行 `/scan_thumb` 逐個 md5 | **24/24 全部唔同** ✅ 唔係渲染 bug |
+| Sheet column K | 重複 id / trashed / 唔存在 | 只有 2026-08 一對舊重複;**冇一行指向 trashed 檔** ✅ |
+| API payload | scan_index / image_url / thumbnail_url / Alpine `:key` | **全部唯一** ✅ 唔係資料重複 |
+| 前端 DOM | 每行 `img.src` | **全部唔同** ✅ 唔係 template 綁錯 |
+| HTTP cache | `Cache-Control` | `no-store` ✅ 唔係瀏覽器 HTTP 快取 |
+| SW | `/scan_thumb/*` 規則 | network-first ✅ |
+| **前端 `loading="lazy"`** | 實測 20 張縮圖 | **0/20 發出過 request**(naturalWidth=0,complete=false)❌ |
+| 改成 `loading="eager"` | 同一頁重測 | **20/20 全部載入** ✅ |
+
+**真正根因(兩個,都係「系統性」)**
+1. **`loading="lazy"` 嘅食物歷史縮圖從來冇 load 過** → 每一行顯示同一個
+   空白/失敗框 → Jim 見到「縮圖一樣」。實測加 `?bust=` 都無用(仍然 0 載入),
+   證明唔係快取問題,而係 lazy 本身根本冇發 request。
+2. **`/scan_thumb/<row_index>` 呢條 URL 唔係 immutable** —— 刪一行 → row 移位;
+   換相 → 檔案換咗;但 URL 冇變 → 客戶端(手機瀏覽器 / iOS 圖片解碼快取)
+   可以繼續顯示舊圖。同一類「縮圖一樣」會無限復發 —— 呢個就係
+   v3.3.36 修完之後仍然「again」嘅原因。
+
+### 2. 修法(5 層)
+1. **內容定址 URL**:`?v=<drive file id 嘅短 hash>`(`gym_web/cache.py`
+   `_content_version()`)。同一個檔 → 同一個 v;檔案換咗 / row 移位 → v 變
+   → URL 變 → 客戶端**唔可能**再顯示舊圖。
+2. **Cache header 分兩種**:帶 `?v=` → `public, max-age=31536000, immutable`
+   (內容定址可以永久快取);舊 URL → 照舊 `no-store`。
+   `after_request` 加 `X-Gymbro-Immutable: 1` 放行,唔好被 no-store 蓋走。
+3. **trashed 守衛**:派圖之前查 Drive 檔案係咪已被 trash(30 分鐘快取,
+   fail-open)。trashed → **404**,唔再派 Drive 嗰張「垃圾桶」placeholder
+   (2026-10-21 三張縮圖 byte 级一樣嘅元兇)。
+4. **前端移除 `loading="lazy"`**(食物歷史 + 掃描預覽),改 `decoding="async"`。
+   伺服器有 100 行 LRU,回應 1.8ms,唔需要 lazy。
+5. **SW cache 版本 144 → 145** → 手機上面所有舊快取( 包括 2026-10-21
+   嗰批 placeholder)一次過清走;新規則:`?v=` 內容定址 → cache-first,
+   冇 `?v=` → 照舊 network-first。
+
+### 3. 順手修嘅系統性問題
+- **Alpine 由 unpkg CDN 改為本地託管**(`/js/alpine-3.17.5.min.js`,CDN 留後備)。
+  CDN 慢/被擋 → Alpine 唔起 → 成個 app 空 → **所有縮圖同一個空框**;
+  亦係 QA `frontend` group 隨機 timeout 嘅真正原因(實測:重跑即綠)。
+- **Google access token 加 45 分鐘記憶體快取** —— 之前每次 Drive 查詢都做一次
+  OAuth refresh,餐牌 JPG 拉 7 張縮圖慢 3-4 秒;快取後由 8.5s → 2.8ms。
+- **餐牌 JPG 解析 row index 要剝走 `?v=`**(否則卡上縮圖會消失)。
+- 新增唯讀診斷工具 `scripts/check_thumb_integrity.py`:
+  逐行查 column K 重複 / trashed / 唔存在 + 逐行拉縮圖比對 byte。
+
+### 4. 驗證
+- 新 regression `tests/qa/test_thumb_url_integrity.py`(19 passed)+ QA 組 `thumbintegrity`
+- 伺服器:`/scan_thumb/669?v=0dcfec79ba` → 200 immutable;冇 `?v=` → no-store
+- **20 張縮圖逐張 md5:20/20 唯一,0 重複組**
+- 瀏覽器實測:20/20 縮圖載入成功、每行 md5 唔同、Alpine 由本地載入、SW 已接管
+
 ## v3.3.37 — 2026-10-22 — 修「改名之後 macro detail 冇變」
 
 Jim OOB 2026-10-22 14:0x:

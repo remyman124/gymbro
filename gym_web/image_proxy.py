@@ -26,7 +26,7 @@ import urllib.request
 from collections import OrderedDict
 from typing import Optional
 
-from flask import Blueprint, Response, redirect
+from flask import Blueprint, Response, redirect, request
 from PIL import Image, ImageOps
 
 log = logging.getLogger(__name__)
@@ -270,6 +270,82 @@ class _DriveFetchError(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# v3.3.38 (2026-10-22, Jim OOB「The thumbnail are the same again. Pls fix the
+# thumbnail and the systemic problem」)—— 系統性修法兩件套:
+#
+# (A) 內容定址 cache header
+#     /scan_thumb/<row>?v=<hash> 係「內容定址」URL:同一個 v = 同一張相。
+#     → 可以永久快取(public, max-age=31536000, immutable),客戶端唔會再
+#       因為本地快取而顯示舊圖。
+#     冇 ?v= 嘅舊 URL → 唔可以快取(no-store),因為 row_index 對應嘅相會變。
+#
+# (B) trashed 守衛
+#     Drive 對住已被 trash 嘅檔會回**同一張**「已掉進垃圾桶」placeholder JPEG。
+#     只要多行指向已被 trash 嘅檔 → 啲縮圖 byte 级一模一樣(2026-10-21 實測)。
+#     → 派圖之前先查 trashed 狀態,trashed 就回 404(唔派錯圖)。
+# ---------------------------------------------------------------------------
+
+IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+NO_STORE_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
+
+# trashed 狀態快取:file_id → (is_trashed, fetched_at_epoch)
+_TRASHED_TTL_S = 1800
+_trashed_cache: "OrderedDict[str, tuple]" = OrderedDict()
+_trashed_lock = threading.Lock()
+
+
+def _file_id_from_drive_url(drive_url: str) -> str:
+    """Extract the bare Drive file id from any of the URL shapes we store."""
+    if not drive_url:
+        return ""
+    if "id=" in drive_url:
+        return drive_url.split("id=", 1)[1].split("&", 1)[0].strip()
+    if "/d/" in drive_url:
+        return drive_url.split("/d/", 1)[1].split("/", 1)[0].strip()
+    return ""
+
+
+def _drive_file_trashed(drive_url: str) -> Optional[bool]:
+    """Is the Drive file behind this URL already in the trash?
+
+    Cached (30 min TTL) so a thumbnail render costs one metadata call, not
+    one per request. Returns None when we can't tell (API/token error) —
+    callers must fail OPEN (serve the image) in that case.
+    """
+    import time as _time
+    fid = _file_id_from_drive_url(drive_url)
+    if not fid:
+        return None
+    now = _time.time()
+    with _trashed_lock:
+        hit = _trashed_cache.get(fid)
+        if hit and (now - hit[1]) < _TRASHED_TTL_S:
+            _trashed_cache.move_to_end(fid)
+            return hit[0]
+    try:
+        from gym_web.core import drive_file_is_trashed   # local import avoids cycles
+        state = drive_file_is_trashed(fid)
+    except Exception as e:
+        log.warning("trashed check failed id=%s: %s", fid, e)
+        return None
+    if state is None:
+        return None            # unknown → fail open, don't cache
+    with _trashed_lock:
+        _trashed_cache[fid] = (state, now)
+        _trashed_cache.move_to_end(fid)
+        while len(_trashed_cache) > 500:
+            _trashed_cache.popitem(last=False)
+    return state
+
+
+def _img_headers(content_addressed: bool) -> dict:
+    """Cache headers for image responses (v3.3.38)."""
+    if content_addressed:
+        return {"Cache-Control": IMMUTABLE_CACHE_CONTROL, "X-Gymbro-Immutable": "1"}
+    return {"Cache-Control": NO_STORE_CACHE_CONTROL}
+
+
 def _fetch_drive_bytes(drive_url: str) -> bytes:
     """GET the Drive image. Raises _DriveFetchError on failure."""
     req = urllib.request.Request(drive_url, headers={"User-Agent": USER_AGENT})
@@ -358,6 +434,14 @@ def scan_img(row_index: int) -> Response:
     if not drive_url:
         return Response(b"", status=404)
 
+    # v3.3.38: trashed 檔唔可以派(會派 Drive 嘅「垃圾桶」placeholder)。
+    if _drive_file_trashed(drive_url) is True:
+        log.info("scan_img row=%s: drive file trashed — 404 (唔派 placeholder)", row_index)
+        return Response(b"", status=404, headers=_img_headers(False))
+
+    # v3.3.38: 內容定址 URL → immutable;舊 URL → no-store
+    headers = _img_headers(bool(request.args.get("v")))
+
     # Default: 302 redirect. Cheap, masks Drive URL only via Referer.
     # Switch to proxy by setting GYMBRO_PROXY_IMAGES=1 in env.
     import os
@@ -370,10 +454,13 @@ def scan_img(row_index: int) -> Response:
         return Response(
             data,
             mimetype="image/jpeg",
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers=headers,
         )
 
-    return redirect(drive_url, code=302)
+    resp = redirect(drive_url, code=302)
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
 
 
 @bp.route("/scan_thumb/<int:row_index>")
@@ -384,15 +471,24 @@ def scan_thumb(row_index: int) -> Response:
     if not drive_url:
         return Response(b"", status=404)
 
+    # v3.3.38: 內容定址 URL → immutable;舊 URL → no-store
+    headers = _img_headers(bool(request.args.get("v")))
+
     cached = _thumb_cache.get(row_index)
     if cached is not None and _thumb_src_get(row_index) == drive_url:
         return Response(
             cached,
             mimetype="image/jpeg",
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers=headers,
         )
     if cached is not None:
         log.info("thumb cache stale for row=%s (url changed) — regenerating", row_index)
+
+    # v3.3.38: trashed 檔唔可以派(Drive 會回「垃圾桶」placeholder → 啲縮圖
+    # 全部一模一樣)。fail open:查唔到就照派。
+    if _drive_file_trashed(drive_url) is True:
+        log.info("scan_thumb row=%s: drive file trashed — 404 (唔派 placeholder)", row_index)
+        return Response(b"", status=404, headers=headers)
 
     # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
     # win'): parallel Drive fetch with timeout. Multiple scan_thumb
@@ -425,5 +521,5 @@ def scan_thumb(row_index: int) -> Response:
     return Response(
         thumb,
         mimetype="image/jpeg",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers=headers,
     )

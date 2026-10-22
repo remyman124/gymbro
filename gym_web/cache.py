@@ -24,6 +24,7 @@ NO file persistence — restart = empty cache until hydration finishes.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -33,6 +34,41 @@ from typing import Callable, Optional
 log = logging.getLogger(__name__)
 
 from .core import NUTRITION_SHEET_ID, NUTRITION_TAB_NAME, now_hkt
+
+# ---------------------------------------------------------------------------
+# v3.3.38 (2026-10-22, Jim OOB「The thumbnail are the same again. Pls fix the
+# thumbnail and the systemic problem」):內容定址 URL。
+#
+# 問題類別:`/scan_thumb/<row_index>` 呢條 URL **唔係 immutable** ——
+#   · 刪一行 → 下面所有 row_index 移位 → 同一條 URL 指向另一碟嘢
+#   · 換相(replace-image)/重新上載 → 同一條 URL 指向另一個檔
+#   · 舊嘅 Drive 檔被 trash → Drive 回同一張「垃圾桶」placeholder
+# 只要客戶端(手機瀏覽器 / iOS 圖片解碼快取 / SW)快取咗呢條 URL,
+# 佢就會繼續顯示**舊圖 / 同一張 placeholder** → Jim 見到「啲縮圖一樣」。
+#
+# 修法:URL 加 `?v=<Drive 檔案 id 嘅短 hash>` ——
+#   · 同一個檔 → 同一個 v → URL 穩定(可以安全咁永久快取)
+#   · 檔案換咗 / row 移位 → v 變 → URL 變 → 客戶端唔可能再顯示舊圖
+# ---------------------------------------------------------------------------
+
+
+def _content_version(drive_url: str) -> str:
+    """內容定址版本號 = Drive 檔案 id 嘅短 hash(無 id → 空字串)。
+
+    同一個檔案 → 同一個 v;檔案換咗 → v 變。
+    """
+    if not drive_url:
+        return ""
+    fid = drive_url
+    if "id=" in drive_url:
+        fid = drive_url.split("id=", 1)[1].split("&", 1)[0]
+    elif "/d/" in drive_url:
+        fid = drive_url.split("/d/", 1)[1].split("/", 1)[0]
+    fid = fid.strip()
+    if not fid:
+        return ""
+    return hashlib.sha1(fid.encode("utf-8")).hexdigest()[:10]
+
 
 # ---------- Constants ----------
 SHEET_ID = NUTRITION_SHEET_ID
@@ -205,6 +241,8 @@ class NutritionRow:
         if self.dt:
             # Sheet rows are HKT — append +08:00 for ISO compatibility
             ts_iso = f"{ts_iso}+08:00" if "+" not in ts_iso else ts_iso
+        # v3.3.38: 內容定址版本號(見 _content_version 註解)
+        _cv = f"?v={_content_version(self.drive_image_url)}" if self.drive_image_url else ""
         return {
             # Identity
             "entry_id": self.entry_id,
@@ -246,10 +284,12 @@ class NutritionRow:
             # proxies bytes via image_proxy.bp, never redirects, browser
             # sees only localhost. The /scan_img/ URL is preserved for
             # the full-resolution tap-to-open modal (still via 302).
+            # v3.3.38: 內容定址 URL — Drive 檔案換咗 / row 移位 → v 變 →
+            # 客戶端唔可能再顯示舊圖(或同一張 placeholder)。
             "image_url": self.image_url_for_pwa if not self.drive_image_url
-                        else f"/scan_thumb/{self.row_index}",
+                        else f"/scan_thumb/{self.row_index}{_cv}",
             "thumbnail_url": self.thumbnail_url if not self.drive_image_url
-                             else f"/scan_thumb/{self.row_index}",
+                             else f"/scan_thumb/{self.row_index}{_cv}",
             "drive_image_url": self.drive_image_url,
             "image_path": "",                    # local path no longer used
             "is_text_only": not bool(self.drive_image_url),

@@ -8,7 +8,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 import json
+import threading
 import urllib.parse
+import urllib.request
 
 # ---------- Constants ----------
 HKT = timezone(timedelta(hours=8))
@@ -120,6 +122,90 @@ FOOD_HISTORY_LAYOUT = {
 # for a single Sheet row. Returns the URL string or None if the row is
 # empty / not found. Imported lazily by gym_web.image_proxy to avoid
 # pulling the Sheet reader at module-load time.
+# v3.3.38: access token 記憶體快取(避免每次 Drive 查詢都做一次 OAuth refresh)
+#   之前 get_google_access_token() 每次都 refresh → 餐牌 JPG 拉 7 張縮圖
+#   = 7 次 token refresh(每次 ~300ms)+ 7 次 Drive metadata call → 慢 3-4 秒。
+#   Google access token 有效期 1 鐘頭,快取 45 分鐘好安全。
+_ACCESS_TOKEN_CACHE: dict = {"token": None, "expires_at": 0.0}
+_ACCESS_TOKEN_TTL_S = 45 * 60
+_ACCESS_TOKEN_LOCK = threading.Lock()
+
+
+def get_google_access_token(force_refresh: bool = False) -> Optional[str]:
+    """Return a Google access token via the refresh-token flow (cached 45 min).
+
+    v3.3.38: extracted out of get_row_drive_url so gym_web.image_proxy can
+    reuse it without a circular import (core never imports image_proxy).
+    Token 快取避免每次 Drive metadata 查詢都做 OAuth refresh。
+
+    Returns the access_token string, or None when the token file is
+    missing/incomplete or the refresh call fails.
+    """
+    if not force_refresh:
+        import time as _time
+        with _ACCESS_TOKEN_LOCK:
+            cached = _ACCESS_TOKEN_CACHE.get("token")
+            if cached and _time.time() < _ACCESS_TOKEN_CACHE.get("expires_at", 0):
+                return cached
+    token_path = Path("/home/work/.hermes/google_token.json")
+    try:
+        tok = json.loads(token_path.read_text())
+        refresh = tok.get("refresh_token")
+        client_id = tok.get("client_id")
+        client_secret = tok.get("client_secret")
+        if not (refresh and client_id and client_secret):
+            print(f"[core.get_google_access_token] token file incomplete: {token_path}", flush=True)
+            return None
+        data = urllib.parse.urlencode({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh,
+            "grant_type": "refresh_token",
+        }).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        access = json.loads(urllib.request.urlopen(req, timeout=10).read())["access_token"]
+        import time as _time
+        with _ACCESS_TOKEN_LOCK:
+            _ACCESS_TOKEN_CACHE["token"] = access
+            _ACCESS_TOKEN_CACHE["expires_at"] = _time.time() + _ACCESS_TOKEN_TTL_S
+        return access
+    except Exception as e:
+        print(f"[core.get_google_access_token] failed: {e}", flush=True)
+        return None
+
+
+def drive_file_is_trashed(file_id: str) -> Optional[bool]:
+    """Is this Drive file in the trash? None = unknown (API error).
+
+    v3.3.38: Drive 對住 trashed 檔會回**同一張**「已掉進垃圾桶」placeholder
+    JPEG。2026-10-21 Jim 見到「昨日餐牌縮圖全部一樣」,根因正係多行同時
+    指向已被 trash 嘅檔 → 縮圖 byte 级一模一樣。呢個 helper 俾
+    image_proxy 喺派圖之前先查清楚,避免派錯圖。
+
+    Args:
+        file_id: bare Drive file id (no URL).
+
+    Returns True (trashed), False (live), None (couldn't tell).
+    """
+    if not file_id:
+        return None
+    access = get_google_access_token()
+    if not access:
+        return None
+    try:
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=id,trashed"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access}"})
+        body = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        return bool(body.get("trashed"))
+    except Exception as e:
+        print(f"[core.drive_file_is_trashed] failed for {file_id}: {e}", flush=True)
+        return None
+
+
 def get_row_drive_url(row_index: int) -> Optional[str]:
     """Fetch Drive Image URL (column K) for a single Sheet row.
 
@@ -135,26 +221,10 @@ def get_row_drive_url(row_index: int) -> Optional[str]:
     """
     if row_index < 2:  # row 1 is the header — no Drive URL there
         return None
-    token_path = Path("/home/work/.hermes/google_token.json")
     try:
-        tok = json.loads(token_path.read_text())
-        refresh = tok.get("refresh_token")
-        client_id = tok.get("client_id")
-        client_secret = tok.get("client_secret")
-        if not (refresh and client_id and client_secret):
+        access = get_google_access_token()
+        if not access:
             return None
-        data = urllib.parse.urlencode({
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh,
-            "grant_type": "refresh_token",
-        }).encode()
-        req = urllib.request.Request(
-            "https://oauth2.googleapis.com/token",
-            data=data, method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        access = json.loads(urllib.request.urlopen(req, timeout=10).read())["access_token"]
         url = (
             f"https://sheets.googleapis.com/v4/spreadsheets/{NUTRITION_SHEET_ID}/values/"
             f"{NUTRITION_TAB_NAME}!A{row_index}:K{row_index}"
