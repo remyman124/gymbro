@@ -5611,7 +5611,11 @@ function gymApp() {
         });
         const data = await r.json();
         if (data.ok) {
-          this.renameSubmitMsg = '✓ 改名 + 重新估算成功';
+          // v3.3.37:講真話 —— 重新估算成功定係失敗(保留原本營養)
+          const _src = (data.correction && data.correction.macros_source) || '';
+          this.renameSubmitMsg = (_src === 'kept_previous' || _src === 'none')
+            ? '✓ 改名成功（AI 重新估算失敗，保留原本營養）'
+            : '✓ 改名 + 重新估算成功';
           this.haptic(40);
           // Reload scans to reflect new name + macros
           await this.loadRecentScans();

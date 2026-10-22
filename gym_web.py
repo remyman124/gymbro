@@ -864,7 +864,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.36"
+__version__ = "3.3.37"
 
 
 def _recovery_pct():
@@ -7066,41 +7066,26 @@ def api_scan_correct():
     )
     print(f"[scan_correct] row={scan_index} sup_name={sup_name!r} user_supplied_macros={user_supplied_macros} row.kcal={row.kcal}", flush=True)
 
-    # v3.3.7 / v3.3.23ad: recalc path — only when user did NOT supply macros AND
-    # the current row's macros are all 0. Otherwise trust the user.
-    if sup_name and not user_supplied_macros and row.kcal <= 0:
-        # Layer 1: explicit numbers in name
-        explicit = _extract_explicit_macros(sup_name)
-        if explicit:
-            print(f"[scan_correct] explicit macros: {explicit}", flush=True)
-            correction["calories"] = int(explicit.get("calories", 0))
-            correction["protein"] = explicit.get("protein", 0)
-            correction["carbs"] = explicit.get("carbs", 0)
-            correction["fat"] = explicit.get("fat", 0)
-            correction["_backfill_source"] = f"explicit_numbers: '{sup_name}'"
-
-        # Layer 2: brand table
-        if not correction.get("_backfill_source"):
-            looked_brand = _lookup_brand_macros(sup_name)
-            if looked_brand:
-                print(f"[scan_correct] brand_table hit: {looked_brand.get('_source')}", flush=True)
-                correction["calories"] = looked_brand["kcal"]
-                correction["protein"] = looked_brand["protein"]
-                correction["carbs"] = looked_brand["carbs"]
-                correction["fat"] = looked_brand["fat"]
-                correction["_backfill_source"] = looked_brand["_source"]
-
-        # Layer 3: sheet history (last fallback)
-        if not correction.get("_backfill_source"):
-            looked = _lookup_known_macros(sup_name)
-            if looked:
-                correction["calories"] = looked["kcal"]
-                correction["protein"] = looked["protein"]
-                correction["carbs"] = looked["carbs"]
-                correction["fat"] = looked["fat"]
-                correction["_backfill_source"] = looked["_source"]
-                print(f"scan_correct: backfilled row {scan_index} {sup_name!r} → "
-                      f"{looked['kcal']} kcal from {looked['_source']}", flush=True)
+    # v3.3.7 / v3.3.23ad / v3.3.37: recalc path。
+    #   用戶冇填營養 → 跟住改名重新估算(4 層鏈:explicit → brand → AI → history)
+    #   名冇變(例如淨係加咗餐廳)→ 唔重估,信任原本嘅數字
+    # v3.3.37 修:舊版要求 row.kcal <= 0 先重估 → 改名後數字唔會變
+    #              (Jim OOB 2026-10-22「白飯 → 海南雞白飯,macro detail 冇變」)。
+    name_changed = bool(sup_name) and sup_name != (row.name or "")
+    if sup_name and not user_supplied_macros and (row.kcal <= 0 or name_changed):
+        re_est = _reestimate_macros_for_name(sup_name, sup_rest or (row.restaurant or ""))
+        if re_est.get("kcal", 0) > 0:
+            correction["calories"] = int(re_est["kcal"])
+            correction["protein"] = re_est.get("protein", 0)
+            correction["carbs"] = re_est.get("carbs", 0)
+            correction["fat"] = re_est.get("fat", 0)
+            correction["_backfill_source"] = f"reestimate:{re_est.get('source')}"
+            print(f"[scan_correct] row {scan_index} re-estimated {sup_name!r} → "
+                  f"{re_est['kcal']} kcal via {re_est.get('source')}", flush=True)
+        else:
+            # 全部層都失敗 → 保留原本嘅 macros(唔好把一行變 0)
+            print(f"[scan_correct] re-estimate failed for {sup_name!r}; "
+                  f"keeping row macros", flush=True)
 
     # v3.3.2: push the correction to the Sheet row. Apply corrections field-
     # by-field (only overwrite if the correction supplies a non-empty value).
@@ -7287,6 +7272,90 @@ def api_scan_replace_image():
     })
 
 
+# ---------------------------------------------------------------------------
+# v3.3.37 (2026-10-22, Jim OOB): 改名 / 改名稱後一定要重新估算營養
+#
+# Bug:兩個 endpoint 都用咗同一個錯位嘅判斷 —— 新 macros 先預設填「舊值」,
+#      然後 AI 層用 `if new_kcal <= 0` 先會套用 → 舊值 > 0 → **AI 永遠唔生效**。
+#      症狀:白飯 → 海南雞白飯,名改咗但 kcal/P/C/F 一模一樣(2026-10-22 實測)。
+#
+# 修法:由 0 開始行 4 層鏈(explicit → brand → AI → history),
+#      全部失敗先回落舊值(唔會把一行變 0)。
+# ---------------------------------------------------------------------------
+def _reestimate_macros_for_name(dish_name: str, restaurant: str = "") -> dict:
+    """4 層營養重估鏈(純文字,唔使相):explicit → brand → AI → history。
+
+    Returns {"kcal","protein","carbs","fat","source"}。source 係邊一層贏:
+    explicit / brand / ai / history / none(全部失敗)。
+    """
+    name = (dish_name or "").strip()
+    re_text = f"{name} (餐廳: {restaurant})" if restaurant else name
+    out = {"kcal": 0, "protein": 0, "carbs": 0, "fat": 0, "source": "none"}
+
+    # Layer 1: 名裡面嘅明確數字(e.g. "30g protein shake")
+    explicit = _extract_explicit_macros(name)
+    if explicit:
+        out["kcal"] = int(explicit.get("calories", 0) or 0)
+        out["protein"] = explicit.get("protein", 0) or 0
+        out["carbs"] = explicit.get("carbs", 0) or 0
+        out["fat"] = explicit.get("fat", 0) or 0
+        out["source"] = "explicit"
+        print(f"[macro-reestimate] explicit from {name!r}: {explicit}", flush=True)
+
+    # Layer 2: 品牌表(優先過 AI —— 牌子嘅數字最準)
+    if out["kcal"] <= 0:
+        brand_hit = _lookup_brand_macros(name)
+        if brand_hit:
+            out["kcal"] = int(brand_hit.get("kcal", 0) or 0)
+            out["protein"] = brand_hit.get("protein", 0) or 0
+            out["carbs"] = brand_hit.get("carbs", 0) or 0
+            out["fat"] = brand_hit.get("fat", 0) or 0
+            out["source"] = "brand"
+            print(f"[macro-reestimate] brand hit {brand_hit.get('_source')}", flush=True)
+
+    # Layer 3: AI 估算(MiniMax)。v3.3.23af:用 _safe_parse_nutrition_json
+    # 應對 <think> 前綴。
+    if out["kcal"] <= 0:
+        try:
+            enrich = _minimax_nutrition_enrich(re_text)
+            parsed = _safe_parse_nutrition_json(enrich) if enrich else None
+            if isinstance(parsed, dict) and parsed:
+                a_kcal = int(parsed.get("calories", 0) or 0)
+                a_p = float(parsed.get("protein", 0) or 0)
+                a_c = float(parsed.get("carbs", 0) or 0)
+                a_f = float(parsed.get("fat", 0) or 0)
+                if a_kcal > 0:
+                    out["kcal"] = a_kcal
+                    out["source"] = "ai"
+                if a_p > 0: out["protein"] = a_p
+                if a_c > 0: out["carbs"] = a_c
+                if a_f > 0: out["fat"] = a_f
+                print(f"[macro-reestimate] AI → {a_kcal} kcal / P{a_p} C{a_c} F{a_f} for {name!r}",
+                      flush=True)
+            else:
+                print(f"[macro-reestimate] AI failed (empty/unparsable) for {name!r}", flush=True)
+        except Exception as e:
+            print(f"[macro-reestimate] AI exception for {name!r}: {e}", flush=True)
+
+    # Layer 4: Sheet 歷史(最後 fallback,只喺仍然 0 嘅時候用)
+    if out["kcal"] <= 0:
+        looked = _lookup_known_macros(name)
+        if looked:
+            out["kcal"] = int(looked.get("kcal", 0) or 0)
+            out["protein"] = looked.get("protein", 0) or 0
+            out["carbs"] = looked.get("carbs", 0) or 0
+            out["fat"] = looked.get("fat", 0) or 0
+            out["source"] = "history"
+            print(f"[macro-reestimate] history → {out['kcal']} kcal for {name!r}", flush=True)
+    # Layer 4b: 有部分 macro(brand/explicit)但 kcal 仲係 0 → 只補 kcal
+    if out["kcal"] <= 0 and (out["protein"] > 0 or out["carbs"] > 0 or out["fat"] > 0):
+        looked = _lookup_known_macros(name)
+        if looked and int(looked.get("kcal", 0) or 0) > 0:
+            out["kcal"] = int(looked["kcal"])
+            print(f"[macro-reestimate] partial backfill kcal={out['kcal']} for {name!r}", flush=True)
+    return out
+
+
 # v2.7.39: Rename existing scan + auto re-recognize macros (Jim OOB 2026-08-06
 # 14:50 HKT: "is there a way to adjust the existing record by text and recognize
 # it again. e.g. the current recognized one is called 白切雞, but actually it is
@@ -7324,91 +7393,24 @@ def api_scan_rename():
     restaurant = row.restaurant or ""
     re_text = f"{new_name} (餐廳: {restaurant})" if restaurant else new_name
 
-    # v3.3.23ad (Jim OOB 2026-09-16 'i just recently updated the protein
-    # shake info, it is still showing 21g protein instead of 30g protein'):
-    # 4-tier macro recalc chain:
-    #   1. EXPLICIT NUMBERS in name (e.g. "30g protein") → high priority
-    #   2. Brand table (e.g. "Quest Bar", "ON Gold Standard")
-    #   3. AI estimate via _minimax_nutrition_enrich
-    #   4. Sheet history via _lookup_known_macros (existing fallback)
-    # All layers are merged; explicit numbers always win.
-    new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
-    enrich_failed = False
-
-    # Layer 1: explicit numbers in name (e.g. "30g protein shake")
-    explicit = _extract_explicit_macros(new_name)
-    if explicit:
-        print(f"[scan_rename] explicit macros from name '{new_name}': {explicit}", flush=True)
-        if "calories" in explicit: new_kcal = int(explicit["calories"])
-        if "protein" in explicit: new_p = explicit["protein"]
-        if "carbs" in explicit:   new_c = explicit["carbs"]
-        if "fat" in explicit:     new_f = explicit["fat"]
-
-    # Layer 2: brand table (overrides AI when brand name matches)
-    brand_hit = _lookup_brand_macros(new_name)
-    if brand_hit:
-        print(f"[scan_rename] brand_table hit: {brand_hit.get('_source')}", flush=True)
-        if "calories" in brand_hit: new_kcal = int(brand_hit["kcal"])
-        if "protein" in brand_hit:  new_p = brand_hit["protein"]
-        if "carbs" in brand_hit:    new_c = brand_hit["carbs"]
-        if "fat" in brand_hit:      new_f = brand_hit["fat"]
-
-    # Layer 3: AI estimate (fills gaps left by explicit + brand)
-    try:
-        enrich = _minimax_nutrition_enrich(re_text)
-        if enrich:
-            # v3.3.23af (Jim OOB 2026-09-16 'breakfast estimated as 200kcal
-            # when pplx says 700-800'): MiniMax M3 reasoning emits a <think>
-            # block BEFORE the JSON. The bare `startswith("{")` check
-            # skipped parsing. Use _safe_parse_nutrition_json which
-            # strips <think> + extracts the last {...} block.
-            parsed = _safe_parse_nutrition_json(enrich)
-            if not parsed or not isinstance(parsed, dict):
-                enrich_failed = True
-            else:
-                # Only apply AI values if explicit/brand didn't set them
-                if new_kcal <= 0:
-                    ai_kcal = int(parsed.get("calories", 0) or 0)
-                    if ai_kcal > 0: new_kcal = ai_kcal
-                if new_p <= 0:
-                    ai_p = float(parsed.get("protein", 0) or 0)
-                    if ai_p > 0: new_p = ai_p
-                if new_c <= 0:
-                    ai_c = float(parsed.get("carbs", 0) or 0)
-                    if ai_c > 0: new_c = ai_c
-                if new_f <= 0:
-                    ai_f = float(parsed.get("fat", 0) or 0)
-                    if ai_f > 0: new_f = ai_f
-        else:
-            enrich_failed = True
-    except Exception as e:
-        enrich_failed = True
-        print(f"[scan_rename] re-estimate failed: {e}")
-
-    # Layer 4: sheet history (final fallback if everything else is 0)
-    # v3.3.23ad: ONLY use this fallback if new_kcal is still 0 — don't
-    # override explicit/brand values with historical median which may be
-    # outdated or from a different portion size.
-    if new_kcal <= 0 and new_name:
-        looked = _lookup_known_macros(new_name)
-        if looked:
-            print(f"[scan_rename] backfill: AI gave {new_kcal} kcal, "
-                  f"falling back to {looked['kcal']} kcal from {looked['_source']}",
-                  flush=True)
-            new_kcal = looked["kcal"]
-            new_p = looked["protein"]
-            new_c = looked["carbs"]
-            new_f = looked["fat"]
-    # Layer 4b (NEW v3.3.23ad): if any macro was set by explicit/brand but
-    # AI failed and new_kcal still 0, fill ONLY the missing macros from
-    # history. Don't overwrite the explicit/brand values.
-    if new_kcal <= 0 and new_name and (new_p > 0 or new_c > 0 or new_f > 0):
-        # We have partial macros from explicit/brand but no kcal. Fill kcal only.
-        looked = _lookup_known_macros(new_name)
-        if looked and looked.get("kcal", 0) > 0:
-            new_kcal = looked["kcal"]
-            print(f"[scan_rename] partial backfill: kept explicit macros, "
-                  f"added kcal={new_kcal} from history", flush=True)
+    # v3.3.37 (2026-10-22, Jim OOB '白飯 → 海南雞白飯,但 macro detail 冇變'):
+    # 舊 bug:呢度由「舊 macros」起步,而 AI 層用 `if new_kcal <= 0` 先套用
+    #         → 舊值 > 0 → AI 重新估算**永遠唔生效**(名改咗,數字一樣)。
+    # 而家:由 0 起步行 4 層鏈(explicit → brand → AI → history),
+    #       全部層都失敗先回落舊值(唔會把一行變 0)。
+    re_est = _reestimate_macros_for_name(new_name, restaurant)
+    new_kcal = int(re_est.get("kcal", 0) or 0)
+    new_p = re_est.get("protein", 0) or 0
+    new_c = re_est.get("carbs", 0) or 0
+    new_f = re_est.get("fat", 0) or 0
+    macros_source = re_est.get("source", "none")
+    enrich_failed = (macros_source == "none")
+    if new_kcal <= 0:
+        # 所有層都失敗 → 保留原本嘅 macros(唔好把一行變 0)
+        new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
+        macros_source = "kept_previous"
+        print(f"[scan_rename] re-estimate failed for {new_name!r}; kept previous macros",
+              flush=True)
     # Apply share ratio (Jim 60% / 小寶 40% if shared)
     shared = _detect_shared_meal(re_text)
     jim_ratio = 0.60 if shared else 1.00
@@ -7424,6 +7426,7 @@ def api_scan_rename():
         "to_name": new_name,
         "from_macros": {"calories": old_kcal, "protein": old_p, "carbs": old_c, "fat": old_f},
         "to_macros": {"calories": jim_kcal, "protein": jim_p, "carbs": jim_c, "fat": jim_f},
+        "macros_source": macros_source,
     }
     # Overwrite name + macros fields on the Sheet row
     sheet_entry = {
@@ -7436,7 +7439,9 @@ def api_scan_rename():
         "protein": jim_p,
         "carbs": jim_c,
         "fat": jim_f,
-        "note": (row.notes + (" " + correction["type"] if row.notes else "")).strip()[:200],
+        # v3.3.37: 避免重複 rename 令備註愈堆愈長("scan_food rename rename")
+        "note": (row.notes if ("rename" in (row.notes or "")) or not row.notes
+                 else (row.notes + " " + correction["type"])).strip()[:200],
         "drive_image_url": row.drive_image_url,
     }
     sheet_result = _sheet_update_nutrition_row(scan_index, sheet_entry)

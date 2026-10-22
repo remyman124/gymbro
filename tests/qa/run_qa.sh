@@ -78,6 +78,7 @@ declare -a QA_GROUPS=(
   "hygiene:tests/qa/test_repo_hygiene.py"
   "whoopfresh:tests/qa/test_whoop_freshness.py"
   "thumbfresh:tests/qa/test_thumb_url_freshness.py"
+  "renamemacro:tests/qa/test_rename_macro_reestimate.py"
   "meta:tests/qa/baseline_diff_meta_test.py"
 )
 

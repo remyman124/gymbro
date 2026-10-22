@@ -1,3 +1,51 @@
+## v3.3.37 — 2026-10-22 — 修「改名之後 macro detail 冇變」
+
+Jim OOB 2026-10-22 14:0x:
+「The food recognition is not wrong. It recognized as 白飯 only.
+ When i change the name to 海南雞白飯 the macro detail is unchanged」
+
+### 1. 實測證據(唔係猜)
+- Sheet row 668(2026-10-22 13:35)已經改名做「海南雞白飯」,
+  備註 = `scan_food rename` → **改名功能確實行過**
+- 但 `kcal/P/C/F = 260 / 6 / 56 / 17` —— 同 AI 原本認到嘅「白飯」**一模一樣**
+  (260 kcal、得 6g 蛋白 = 一碟淨白飯,冇雞)
+- 真相:海南雞白飯應該 ~500 kcal / 33g 蛋白
+- 即係:**名改咗,營養冇重估**
+
+### 2. 根因:兩個 endpoint 都用錯咗「未設定」嘅判斷
+`/api/scan_rename` 同 `/api/scan_correct` 都有同一個 pattern:
+
+```python
+new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f   # ← 舊值做預設
+...
+if new_kcal <= 0:      # ← AI 層先會套用
+    new_kcal = ai_kcal
+```
+
+因為預設已經填咗**舊值**(`> 0`),`new_kcal <= 0` 永遠唔成立 →
+**AI 重新估算層根本冇行過**。功能(v2.7.39 為 Jim 2026-08-06
+「白切雞 → Hai nan chicken rice」而寫)一直係壞嘅,只要舊行有營養值。
+
+`/api/scan_correct` 更加絕:`row.kcal <= 0` 先重估 → 有數就唔郁。
+
+### 3. 修法
+1. 抽 `_reestimate_macros_for_name(name, restaurant)`(新 helper):
+   **由 0 起步**行 4 層鏈 —— explicit(名內數字)→ brand(品牌表)→
+   **AI(MiniMax)**→ history(Sheet 歷史)。回傳 `source` 講明邊層贏。
+2. `/api/scan_rename` 同 `/api/scan_correct` 都用呢條鏈;
+   `scan_correct` 額外加咗「名真係改咗先重估」(`name_changed`),
+   淨係加餐廳/備註唔會無謂行 AI。
+3. **全部層都失敗 → 保留原本 macros**(`macros_source = "kept_previous"`),
+   唔會把一行變 0;前端亦都會講「AI 重新估算失敗,保留原本營養」。
+4. 順手修:重複 rename 令備註愈堆愈長(`scan_food rename rename`)。
+
+### 4. 驗證
+- 新增 `tests/qa/test_rename_macro_reestimate.py`(11 項,AST 抽 helper + mock 4 層)
+- 實測 row 668 重新估算:
+  `260 kcal / P6` → **`500 kcal / P33 / C55 / F15`**(`source = ai`)✅
+- Sheet 讀返核實:`海南雞白飯 | 500 | 33 | 55 | 15`✅
+- 2026-10-22 營養卡重新生成(152KB)✅
+
 ## v3.3.36 — 2026-10-22 — 修「昨日啲餐嘅縮圖全部一樣」
 
 Jim OOB 2026-10-22 01:1x:
