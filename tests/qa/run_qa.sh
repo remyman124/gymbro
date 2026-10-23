@@ -80,6 +80,7 @@ declare -a QA_GROUPS=(
   "thumbfresh:tests/qa/test_thumb_url_freshness.py"
   "renamemacro:tests/qa/test_rename_macro_reestimate.py"
   "thumbintegrity:tests/qa/test_thumb_url_integrity.py"
+  "setlogging:tests/qa/test_set_logging.py"
   "meta:tests/qa/baseline_diff_meta_test.py"
 )
 
