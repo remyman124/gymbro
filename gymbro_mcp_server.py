@@ -584,7 +584,8 @@ def search_history(days: int = 7) -> str:
 
 # ── Phase B/C: New tools for full cheer + scheduling orchestration ────────────
 
-GYM_WEB_URL = "http://127.0.0.1:4280"
+# v3.3.39: 舊 GYM_WEB_URL = "http://127.0.0.1:4280" 係死 port(冇 process 監聽),
+# 曾令 log_meal_text 每次都 connection-refused。已移除,一律用 GYM_WEB_BASE(:7000)。
 
 
 @mcp.tool()
@@ -659,13 +660,14 @@ def log_meal_text(food_desc: str) -> str:
     Posts to gym_web server which calls the AI provider chain for nutrition
     estimate, then commits to Google Sheet (v3.3.0 source of truth).
 
-    v3.3.30: the chain is now MiniMax-text-01 → Perplexity sonar — the
-    APiyi gpt-4o-mini leg was removed (its key was dead, HTTP 401).
+    v3.3.30: the chain is now MiniMax-text-01 only (Perplexity + APiyi removed).
+    v3.3.39: was posting to a dead port 4280 (stale GYM_WEB_URL) → always
+    connection-refused. Now uses GYM_WEB_BASE (:7000, the live server).
 
     Returns: {ok, meal, totals_after, sheet_row}
     """
     import urllib.error
-    api_url = "".join([GYM_WEB_URL, "/api/scan_preview_text"])
+    api_url = "".join([GYM_WEB_BASE, "/api/scan_preview_text"])
     payload = json.dumps({"text": food_desc, "commit": True}).encode()
     req = urllib.request.Request(api_url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -793,11 +795,13 @@ def log_set(exercise: str,
             intensity: Optional[str] = None,
             form_check: str = "ok",
             weight_note: str = "",
+            date: Optional[str] = None,
             source: str = "mcp-gymbro") -> str:
-    """Log one set into today's workout session.
+    """Log one set into a workout session (default: today).
 
     weight_kg: skip for bodyweight. reps: defaults via stored Jim preference (10).
     set_n: auto-increment if omitted. intensity: auto-detected if blank.
+    date: optional YYYY-MM-DD → back-fill a past session (e.g. 2026-10-22 class).
     Returns {ok, entry, total_sets}.
     """
     payload: dict = {"exercise": exercise, "form_check": form_check,
@@ -810,6 +814,8 @@ def log_set(exercise: str,
         payload["set_n"] = set_n
     if intensity is not None:
         payload["intensity"] = intensity
+    if date:
+        payload["date"] = date
     return _post_gym_web("/api/log_set", payload)
 
 

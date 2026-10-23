@@ -153,9 +153,14 @@ def save_log(log):
     WORKOUT_LOG.write_text(json.dumps(log, indent=2, ensure_ascii=False))
 
 
-def get_or_create_session():
+def get_or_create_session(session_date=None):
+    """Return the session dict for a date (default: today).
+
+    v3.3.39: optional `session_date` (YYYY-MM-DD) so a past class can be
+    back-filled (Jim 補記 10/22 午市健身課嘅 set)。只寫本機 log,唔掂 Sheet。
+    """
     log = load_log()
-    today = today_iso()
+    today = session_date or today_iso()
     if today not in log:
         log[today] = {
             "date": today,
@@ -669,15 +674,28 @@ def api_log_set():
     exercise = data.get("exercise", "").strip()
     weight = data.get("weight_kg")
     reps = data.get("reps", default_reps())
-    set_n = data.get("set_n", 1)
-    intensity = data.get("intensity") or detect_intensity(set_n)
     form_check = data.get("form_check", "ok")
     source = data.get("source", "gym-web-tap")
 
     if not exercise:
         return jsonify({"error": "exercise name required"}), 400
 
-    session = get_or_create_session()
+    # v3.3.39: 可選 `date`(YYYY-MM-DD)→ 補記過去一節(只寫本機 log)
+    session_date = (data.get("date") or "").strip() or None
+    if session_date:
+        try:
+            datetime.strptime(session_date, "%Y-%m-%d")
+        except Exception:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+
+    session = get_or_create_session(session_date)
+    # set_n 唔俾就自動遞增(同一動作喺該節已做幾多組 + 1)
+    if data.get("set_n") is None:
+        set_n = sum(1 for e in session["exercises"] if e.get("exercise") == exercise) + 1
+    else:
+        set_n = data.get("set_n")
+    if not data.get("intensity"):
+        intensity = detect_intensity(set_n)
     entry = {
         "exercise": exercise,
         "weight_kg": weight,
@@ -691,7 +709,9 @@ def api_log_set():
     }
     session["exercises"].append(entry)
     log = load_log()
-    log[today_iso()] = session
+    # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
+    # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
+    log[session.get("date") or today_iso()] = session
     save_log(log)
     return jsonify({"ok": True, "entry": entry, "total_sets": len(session["exercises"])})
 
@@ -723,7 +743,9 @@ def api_end_session():
     session["end_time"] = now_iso()
     session["completed"] = True
     log = load_log()
-    log[today_iso()] = session
+    # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
+    # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
+    log[session.get("date") or today_iso()] = session
     save_log(log)
     # v3.3.8: invalidate daily coaching so the next cheer/video reflects
     # the freshly completed gym session.
@@ -885,7 +907,9 @@ def api_cancel_last_set():
         return jsonify({"error": "no sets to cancel"}), 400
     removed = session["exercises"].pop()
     log = load_log()
-    log[today_iso()] = session
+    # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
+    # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
+    log[session.get("date") or today_iso()] = session
     save_log(log)
     return jsonify({"ok": True, "removed": removed, "remaining": len(session["exercises"])})
 
@@ -897,7 +921,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.38"
+__version__ = "3.3.39"
 
 
 def _recovery_pct():

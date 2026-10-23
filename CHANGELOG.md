@@ -1,3 +1,38 @@
+## v3.3.39 — 2026-10-23 — 落 set 快路 + 補記過去一節 + 修死 port
+
+Jim 2026-10-23 20:0x「落 set」→ 由「3 個 session 全部 0 組」查起,
+發現 **app-tap log 自 2026-08-28 起就冇新 set**(本機 log 只有 7/19-8/28 嗰 10 日有),
+但後端一直冇壞 → 問題係「冇快路」而唔係「寫入壞」。
+
+### 1. 新增:落 set 快路
+- `scripts/log_sets_from_text.py` — 一句廣東話/中英夾雜 → 多組 set:
+  `臥推 60x8 60x8, 深蹲 80x10` → BB Bench Press 60kg×8 ×2 + Squat 80kg×10
+- 支援 `WxR` / `W x R` / `W R` / `x8` / `WxRxN` / 淨數字(重量+多組次數)/自重動作
+- 中文動作名自動對應 app 目錄 30 個預設動作;對唔到 → 原樣保留中文名
+- `--dry-run` 只解析唔寫入;`--date YYYY-MM-DD` 補記過去一節
+- 只寫本機 `/home/work/.whoop_workout_log.json`,**唔掂生產 Sheet**
+
+### 2. `/api/log_set` 升級
+- 新增選填 `date`(YYYY-MM-DD)→ 補記過去一節(格式錯 → 400)
+- `set_n` 唔俾 → **自動遞增**(同一動作喺嗰一節已做幾多組 + 1)
+- **修 bug**:原本 `log[today_iso()] = session` 會令補記嘅 session 寫錯 key
+  → 覆蓋今日 session。改用 `log[session.get("date") or today_iso()]`(3 處)
+
+### 3. 修 MCP 死 port
+- `gymbro_mcp_server.py` 嘅 `log_meal_text` 一直 POST 去 `GYM_WEB_URL=:4280`
+  (冇 process 監聽)→ 每次都 connection-refused。改用 `GYM_WEB_BASE=:7000`
+- 移除已死嘅 `GYM_WEB_URL` 常量;docstring 同步改返 MiniMax-only
+
+### 4. 版本
+- `__version__` 3.3.38 → 3.3.39;skil `fitness/gymbro-set-logging` 新增
+
+### 驗證
+- 補記測試:2026-10-05 set 1 → set 2 自動遞增 ✅;今日 session 0 組(冇被污染)✅
+- script 端到端:3/3 組寫入 2026-10-06 ✅;測試日全部清走 ✅
+- 錯誤 `date` → 400 ✅
+
+---
+
 ## v3.3.38 — 2026-10-22 — 修「縮圖又全部一樣」(系統性修法)+ Alpine 本地化
 
 Jim OOB 2026-10-22 20:1x:
