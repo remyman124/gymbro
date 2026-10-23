@@ -150,7 +150,15 @@ def load_log():
 
 
 def save_log(log):
-    WORKOUT_LOG.write_text(json.dumps(log, indent=2, ensure_ascii=False))
+    """v3.3.40: atomic write.
+
+    之前用 `write_text()` 直寫 —— 寫到一半撞去(重啟/OOM)會截斷成半個
+    JSON,成個 log 就冇晒。呢個檔係 Jim 唯一嘅本機訓練鏡像,唔可以
+    因為一次 crash 就全失。所以:寫去 .tmp 再 `os.replace()` 原子換入。
+    """
+    tmp = WORKOUT_LOG.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(log, indent=2, ensure_ascii=False))
+    os.replace(tmp, WORKOUT_LOG)
 
 
 def get_or_create_session(session_date=None):
@@ -171,8 +179,16 @@ def get_or_create_session(session_date=None):
             "exercises": [],
         }
         save_log(log)
-    elif "exercises" not in log[today]:
-        log[today]["exercises"] = []
+    else:
+        if "exercises" not in log[today]:
+            log[today]["exercises"] = []
+        # v3.3.40: key 同 inner `date` 一定要一致。
+        # 寫入端用 `log[session.get("date")]` 做 key,所以 inner date 一旦
+        # 唔等於佢自己嘅 key,下次寫入就會寫去錯嘅 key —— 2026-10-23 就係
+        # 咁樣被一節 10/05 嘅 session 頂咗(見 tests/qa/test_workout_log_integrity.py)。
+        # 呢度強制 normalize,令 key ↔ inner date 永遠對齊。
+        if log[today].get("date") != today:
+            log[today]["date"] = today
         save_log(log)
     return log[today]
 
@@ -921,7 +937,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.39"
+__version__ = "3.3.40"
 
 
 def _recovery_pct():

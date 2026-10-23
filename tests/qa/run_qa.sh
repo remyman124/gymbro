@@ -81,6 +81,7 @@ declare -a QA_GROUPS=(
   "renamemacro:tests/qa/test_rename_macro_reestimate.py"
   "thumbintegrity:tests/qa/test_thumb_url_integrity.py"
   "setlogging:tests/qa/test_set_logging.py"
+  "logintegrity:tests/qa/test_workout_log_integrity.py"
   "meta:tests/qa/baseline_diff_meta_test.py"
 )
 
