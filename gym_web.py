@@ -1785,6 +1785,9 @@ def api_nutrition_today():
     """
     data = _load_today_nutrition()
     return jsonify({
+        # v3.3.41: data["date"] is the EFFECTIVE date of the rows returned
+        # (may be yesterday's when the late-night fallback kicks in).
+        # Never label fallback rows with today_iso().
         "date": data.get("date") or today_iso(),
         "fetched_at": now_iso(),
         "meal_count": data.get("meal_count", 0),
@@ -5813,7 +5816,7 @@ def _load_today_nutrition() -> dict:
     meals. Prevents cheer from reporting "今日零 workout / 未 log 食嘢"
     when in reality Jim just stayed up late and it's still his yesterday-day.
     """
-    out = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0}, "meal_count": 0, "last_meal_ts": None}
+    out = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0}, "meal_count": 0, "last_meal_ts": None, "date": today_iso()}
     cache = get_cache()
     if not cache.is_ready():
         return out
@@ -5897,6 +5900,13 @@ def _load_today_nutrition() -> dict:
         except (TypeError, ValueError):
             pass
     out["totals"] = {k: round(v, 1) for k, v in out["totals"].items()}
+    # v3.3.41 (2026-10-24): report the EFFECTIVE date of the returned rows.
+    # `today` may have been re-pointed at yesterday's (or the latest) date
+    # by the v3.3.10 late-night fallback above. Before this fix the
+    # endpoint always replied with the real current date, so a fallback
+    # to 2026-10-23 rows was labelled "2026-10-24" — which silently
+    # mis-dated Jim's food log. out["date"] now follows `today`.
+    out["date"] = today
     if meals:
         last = meals[-1]
         out["last_meal_ts"] = f"{last.get('date', today)}T{last.get('time', '00:00')}:00+08:00"

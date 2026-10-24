@@ -180,6 +180,29 @@ def test_nutrition_today_totals(client, gym_web_module):
     assert d["totals"]["kcal"] == pytest.approx(297, abs=1)
 
 
+def test_nutrition_today_date_matches_the_rows_returned(client, gym_web_module):
+    """v3.3.41: the endpoint's `date` must be the EFFECTIVE date of the rows.
+
+    The v3.3.10 late-night fallback serves yesterday's rows when today has
+    none. Before the fix the reply always carried today_iso(), so 2026-10-23
+    meals were labelled "2026-10-24" — silently mis-dating the food log.
+    """
+    from datetime import datetime, timedelta, timezone
+    from gym_web.cache import NutritionRow
+    cache = gym_web_module._get_nutrition_cache()
+    cache.hydrate(lambda: [])  # no rows for today
+    yest = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).strftime("%Y-%m-%d")
+    cache.insert_row(NutritionRow.from_sheet_row(
+        1, [yest, "13:47", "lunch", "牛肉腸粉（甜醬）", "", "290",
+            "16", "43", "7", "", ""]))
+    d = client.get("/api/nutrition/today").get_json()
+    assert d["meal_count"] == 1
+    assert d["meals"][0]["date"] == yest
+    # the label must match the row, NOT today
+    assert d["date"] == yest
+    assert d["date"] != gym_web_module.today_iso()
+
+
 def test_scan_recent_empty(client, gym_web_module):
     """v3.3.2: empty cache hydrates with no rows → 200 with empty scans."""
     cache = gym_web_module._get_nutrition_cache()
