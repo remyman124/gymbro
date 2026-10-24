@@ -138,23 +138,39 @@ class NutritionRow:
     _coach_comment: Optional[dict] = field(default=None, repr=False)
 
     @classmethod
-    def from_sheet_row(cls, row_index: int, cells: list[str]) -> "NutritionRow":
-        """cells = list of 11 strings (A..K). Defensive: missing/short → ""."""
+    def from_sheet_row(cls, row_index: int, cells: list) -> "NutritionRow":
+        """cells = list of up to 11 raw Sheet cells (A..K).
+
+        Values may be str, int or float: UNFORMATTED_VALUE returns dates and
+        times as serial numbers (float), nutrition columns as numbers.
+        Only column A/B may be interpreted as serials (v3.3.41).
+        """
         # v3.3.23al (Jim OOB 2026-09-27 'food log empty now'): handle
         # UNFORMATTED_VALUE which returns dates/times as serial numbers
         # (floats) instead of strings. Coerce all cells to strings first,
         # then format date/time from serial numbers.
-        def _coerce_str(c):
+        def _coerce_str(c, col):
             if isinstance(c, (int, float)):
-                # Check if it's a date serial (after 1900-01-01)
-                if c > 1000:
+                # v3.3.41 (2026-10-24): the serial→date/time conversion is
+                # COLUMN-AWARE. Applying it to every column silently
+                # destroyed numeric data: a kcal of 2590 (>1000) was rendered
+                # as a date string "2026-04-24" → float() raised → kcal 0.0
+                # (45 Sheet rows affected); a macro of exactly 1 (0 <= c <= 1)
+                # was rendered as a time "24:00" → float() raised → 0.0
+                # (26 carb + 28 protein rows affected).
+                # ONLY the date/time columns may be interpreted as serials.
+                if col == COL_DATE:
                     return _format_serial_date(c)
-                # Check if it's a time fraction (0.0 - 1.0)
-                if 0 <= c <= 1:
-                    return _format_serial_time(c)
+                if col == COL_TIME:
+                    if 0 <= c <= 1:
+                        return _format_serial_time(c)
+                    return str(c)
                 return str(c)
             return str(c) if c is not None else ""
-        cells = [_coerce_str(c) for c in (cells + [""] * EXPECTED_COLS)[:EXPECTED_COLS]]
+        cells = [
+            _coerce_str(c, i)
+            for i, c in enumerate((cells + [""] * EXPECTED_COLS)[:EXPECTED_COLS])
+        ]
         date = cells[COL_DATE].strip()
         time = cells[COL_TIME].strip()
         try:

@@ -40,6 +40,44 @@ def test_nutrition_row_from_sheet_row_short_cells_pads():
     assert row.drive_image_url == ""
 
 
+# --- v3.3.41 (2026-10-24): column-aware serial coercion -------------------
+# Regression: the serial→date/time conversion was applied to EVERY column.
+# A kcal of 2590 (>1000) became the date string "2026-04-24" → float()
+# raised ValueError → kcal silently 0.0 (45 real Sheet rows). A macro of
+# exactly 1 fell into the 0<=c<=1 time branch → "24:00" → 0.0 (26 carb +
+# 28 protein rows). Only column A (date) and B (time) may be serials.
+
+
+def test_kcal_above_1000_is_not_treated_as_a_date_serial():
+    row = NutritionRow.from_sheet_row(
+        210, ["2026-04-24", "12:00", "lunch", "Big meal", "", 2590, 120, 200, 90, "", "", ""]
+    )
+    assert row.kcal == 2590.0
+    assert (row.p, row.c, row.f) == (120.0, 200.0, 90.0)
+    assert row.date == "2026-04-24"
+
+
+def test_macro_value_of_exactly_one_is_not_treated_as_a_time_fraction():
+    row = NutritionRow.from_sheet_row(
+        652, ["2026-10-18", "18:31", "snack", "Tiny", "", 8, 0, 1, 1, "", "", ""]
+    )
+    assert row.kcal == 8.0
+    assert row.p == 0.0
+    assert row.c == 1.0
+    assert row.f == 1.0
+
+
+def test_date_and_time_columns_still_parse_serials():
+    # 46088 = 2026-03-07 (1899-12-30 epoch); 0.5 = 12:00
+    row = NutritionRow.from_sheet_row(
+        2, [46088, 0.5, "lunch", "Serial", "", 800, 30, 40, 20, "", "", ""]
+    )
+    assert row.date == "2026-03-07"
+    assert row.time == "12:00"
+    assert row.kcal == 800.0
+    assert (row.p, row.c, row.f) == (30.0, 40.0, 20.0)
+
+
 def test_nutrition_row_to_pwa_dict_aliases():
     row = NutritionRow.from_sheet_row(4, entry(4, name="Rice"))
     result = row.to_pwa_dict()
