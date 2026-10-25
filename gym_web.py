@@ -937,7 +937,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.40"
+__version__ = "3.3.42"
 
 
 def _recovery_pct():
@@ -13950,6 +13950,11 @@ def _synthesize_cheer_voice(text: str) -> str:
     Cantonese_crisp_news_anchor_vv2). Edge-TTS WanLungNeural is now
     FALLBACK only.
 
+    v3.3.42 (Jim OOB 2026-10-25「Yes. Change to minimax for voice」):
+    MiniMax TTS is PRIMARY again; edge-tts WanLungNeural is FALLBACK.
+    (v3.3.24c had flipped it back to edge-primary on 2026-10-17 after
+    edge-tts 7.3.1 fixed the 403; Jim reversed that on 2026-10-25.)
+
     v3.3.24b (Jim OOB 2026-10-17 21:38 HKT「Edge tts dead? Pls fix.
     If there is problem, use minimal voice to replace」): edge-tts
     WanLung started returning 403 WSS (TrustedClientToken rotated)
@@ -14015,12 +14020,27 @@ def _synthesize_cheer_voice(text: str) -> str:
         # ranges) BEFORE humanize/zh-replace so TTS WanLung reads 「八月二十七號」
         # not 「八 slash 二十七」. Rule 74 in text-coach-summary-voice.
         voice_text = _strip_voice_slash_symbols(text)
+        # v3.3.42 safety copy — _humanize_for_voice() Layer 3 (opener audit)
+        # drops the FIRST sentence when it contains an English word. On a
+        # short single-sentence text that wipes the whole body to "" and
+        # MiniMax then answers "code 2013 invalid params, empty field" →
+        # silent fallback to edge-tts. Keep the pre-humanize copy so the
+        # dispatcher can restore it instead of shipping silence.
+        voice_text_pre_humanize = voice_text
 
         # Step 0b: humanize guardrail (v3.2.7.41 — Jim OOB 2026-08-12 01:15 HKT
         # 「voice is so mechanical, so many non-narrative words at the
         # beginning」). Strip URL + metadata + bad openers BEFORE zh-replace
         # so the TTS never sees gibberish like 「H-T-T-P-S 冒號 斜線」.
         voice_text = _humanize_for_voice(voice_text)
+        if len(voice_text.strip()) < 8 and len(voice_text_pre_humanize.strip()) >= 8:
+            voice_text = voice_text_pre_humanize
+            try:
+                with open("/tmp/cheer_voice_debug.log", "a") as _f:
+                    _f.write(f"{now_iso()} | VOICE_TEXT_WIPED_BY_HUMANIZE "
+                             f"→ restored len={len(voice_text)}\n")
+            except Exception:
+                pass
         try:
             with open("/tmp/cheer_voice_debug.log", "a") as _f:
                 _f.write(f"{now_iso()} | text_in={len(text)} chars | after_humanize={len(voice_text)}\n")
@@ -14086,6 +14106,14 @@ def _synthesize_cheer_voice(text: str) -> str:
         # splices Chinese inside English word), (4) final assertion guard logs
         # leaks to /tmp/cheer_en_leaks.log for post-mortem debug.
         import re as _re_audit
+        # v3.3.42: keep a pre-audit copy. The EN-audit chain can strip a
+        # short text down to NOTHING (e.g. "早晨 Jim,語音已經改咗用 MiniMax。"
+        # → _zh_inline() deletes unmapped words → leftover CJK vanishes →
+        # MiniMax gets an empty string → API error 2013 "invalid params,
+        # empty field" → silent fallback to edge-tts). Rule: TTS must never
+        # receive an empty/too-short string; restore the pre-audit text
+        # instead of shipping silence.
+        voice_text_pre_audit = voice_text
         leaks = _voice_audit_en(voice_text)
         for _ in range(3):
             if not leaks:
@@ -14115,17 +14143,37 @@ def _synthesize_cheer_voice(text: str) -> str:
             # replacement left behind, AND drop trailing spaces before punctuation.
             voice_text = _re_audit.sub(r" +", " ", voice_text)
             voice_text = _re_audit.sub(r" +([，。、！？：；])", r"\1", voice_text)
-        # v3.3.24c (Jim OOB 2026-10-17 21:42 HKT「No. Edge tts is of
-        # priority. Pls fix the 403 problem」): edge-tts WanLung is
-        # PRIMARY. Fixed by upgrading edge-tts 7.2.8 → 7.3.1 (the new
-        # version's Sec-MS-GEC generation uses a chrome version that
-        # Microsoft hasn't rotated yet). MiniMax retained as FALLBACK
-        # only (in case edge-tts 403 returns).
-        edge_path = _synthesize_cheer_voice_edge_tts(voice_text)
-        if edge_path:
-            return edge_path
-        # Fall back to MiniMax TTS if edge-tts 403s again
-        return _synthesize_cheer_voice_new(voice_text)
+        # v3.3.42: last-resort guard — TTS must NEVER get an empty/too-short
+        # string. The EN-audit chain can delete unmapped English words and,
+        # on short texts, wipe the whole body (MiniMax then answers
+        # "code 2013 invalid params, empty field" and we silently fall back
+        # to edge-tts). Restore the pre-audit text instead of shipping
+        # silence, and log it for the next dictionary wave.
+        if len(voice_text.strip()) < 8 and len(voice_text_pre_audit.strip()) >= 8:
+            try:
+                with open("/tmp/cheer_en_leaks.log", "a") as _f:
+                    _f.write(f"{now_iso()} | VOICE_TEXT_WIPED(len={len(voice_text)}) "
+                             f"→ restored pre-audit text len={len(voice_text_pre_audit)}\n")
+            except Exception:
+                pass
+            voice_text = voice_text_pre_audit
+        # v3.3.42 (Jim OOB 2026-10-25 10:2x HKT「Yes. Change to minimax
+        # for voice」): MiniMax TTS (speech-02-hd + Cantonese_crisp_news_anchor_vv2)
+        # is PRIMARY again. edge-tts WanLungNeural demoted to FALLBACK
+        # (kept because Microsoft's TRUSTED_CLIENT_TOKEN rotates every 4-8
+        # weeks → 403 comes back; the fallback covers that day).
+        #
+        # History:
+        # - v3.3.15 (2026-09-04): edge-tts primary
+        # - v3.3.24b (2026-10-17): MiniMax primary (edge 403)
+        # - v3.3.24c (2026-10-17 21:42): edge-tts primary again (edge-tts
+        #   upgraded 7.2.8 → 7.3.1 to fix the 403)
+        # - v3.3.42 (2026-10-25): MiniMax primary (Jim directive) ← current
+        min_path = _synthesize_cheer_voice_new(voice_text)
+        if min_path:
+            return min_path
+        # Fall back to edge-tts WanLung if MiniMax quota/network fails
+        return _synthesize_cheer_voice_edge_tts(voice_text)
     except Exception as e:
         try:
             with open('/tmp/cheer_errors.log', 'a') as f:

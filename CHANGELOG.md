@@ -1,3 +1,51 @@
+## v3.3.42 — 2026-10-25 — 語音改用 MiniMax(全局 + gymbro + 9am cheer)
+
+Jim 2026-10-25「Yes. Change to minimax for voice」。
+
+### 1. 全域 Hermes TTS
+- `hermes config set tts.provider minimax`
+  (`tts.minimax.model = speech-02-hd`,`voice_id = Cantonese_crisp_news_anchor_vv2`,
+  `language = Chinese,Yue`)
+- edge-tts WanLungNeural 保留做**後備**(Microsoft 每 4–8 週輪換 token → 403 會再嚟)
+
+### 2. gymbro cheer dispatcher 翻轉
+- `_synthesize_cheer_voice()`:由 edge-first 改成 **MiniMax-first、edge-tts 後備**
+- ⚠️ 舊碼喺 v3.3.24c(2026-10-17)已經漂移成 edge-first,但 docstring 仍然寫
+  「MiniMax primary」→ **docstring 同 code 會唔一致,永遠睇實際 call order**
+- docstring / 註釋同步更新,寫低三個 OOB 嘅歷史(09-04 edge → 10-17 MiniMax → 10-17 edge → 10-25 MiniMax)
+
+### 3. 9am cheer cron job(`5731dd241e82`)
+- STEP 3:由 edge-tts CLI 改成直接打 `POST /v1/t2a_v2`(speech-02-hd +
+  `Cantonese_crisp_news_anchor_vv2`),輸出 `/home/work/.hermes/audio_cache/cheer_voice_today.mp3`;
+  MiniMax 報錯先做 edge-tts 後備
+- STEP 5:**唔再 sendVoice、唔再 upload 去 uguu.se**(Rule 79:Telegram 一律唔送音訊),
+  改為喺文字報告寫低語音檔案路徑同時長
+
+### 4. 順手修咗「語音文字被清空」嘅老 bug
+- `_humanize_for_voice()` Layer 3(開頭審計)見到第一句有英文就整句丟咗 → **單句短文會被清成空字串**
+  → MiniMax 收空字串 → `code 2013 invalid params, empty field` → 靜靜哋跌返去 edge-tts
+- 修法:dispatcher 保留 humanize 前嘅原文,一旦被清空就還原(兩道防護:humanize 前 + EN 審計後)
+- 實測:純中文 / 有 ASCII / 真實 cheer 全文 三種都真係行 MiniMax,2013 錯誤零新增 ✅
+
+### 5. 驗證
+- `text_to_speech`(無 provider 參數 → 跟 config)→ MiniMax 出貨:486 字 → 107KB OGG、18.1 秒 ✅
+- QA:hygiene 組頭先報 fail 係因為「server 仲跑緊 3.3.40 / 未 commit」→ commit + 部署後重跑
+
+### 5. 同步更新
+- skill `hermes-tts-edge-wanlung-2026-08-30`(改為 MiniMax primary)、`media/minimax-tts`
+- 記憶:全域 `tts.provider=minimax`
+
+## v3.3.41 — 2026-10-25 — 修 /api/nutrition/today 回退日期 + 快取序列號轉換
+
+(每日健康巡檢 job 自己搵到嘅兩個真 bug,已 commit `c4a08f8` / `1a5d019`)
+- `/api/nutrition/today`:回退日期會被標成今日 → 修正
+- `gym_web/cache.py`:欄位感知序列號轉換(kcal ≥ 1000 被當日期 → 0 卡)
+- 注意:呢兩次 commit **冇** bump `__version__`(仍然 3.3.40),所以 v3.3.42 一并補返
+
+## v3.3.40 — 2026-10-23/24 — 修 workout log key/date 錯位 + 原子寫 + 永久 QA 守衛
+
+(commit `9eee9f0`)
+
 ## v3.3.39 — 2026-10-23 — 落 set 快路 + 補記過去一節 + 修死 port
 
 Jim 2026-10-23 20:0x「落 set」→ 由「3 個 session 全部 0 組」查起,
