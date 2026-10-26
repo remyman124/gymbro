@@ -222,7 +222,7 @@ def test_service_worker_fetch_logic_untouched():
     """The v137 network-first /api/* rule must not have been rewritten."""
     src = GYM_WEB.read_text()
     assert "if (url.pathname.startsWith('/api/')) {" in src
-    assert "const CACHE = 'gym-web-v147';" in src
+    assert "const CACHE = 'gym-web-v148';" in src
 
 
 def test_manifest_has_shortcuts_and_scope(client):

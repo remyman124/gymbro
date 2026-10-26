@@ -4239,13 +4239,34 @@ function gymApp() {
         if (e.status === 404 || e.status === 405) { e.endpointMissing = true; throw e; }
         // server 可能淨係收 image 欄位 → 試一次
         if (e.status === 400 && /image|file|field|照片|相/i.test(String(e.message || ''))) {
-          res = await this._scanUploadXhr('/api/scan_upload', build('image'), onProg);
+          try {
+            res = await this._scanUploadXhr('/api/scan_upload', build('image'), onProg);
+          } catch (e2) {
+            // v3.3.44b (2026-10-26, Jim OOB「Failed in upload. It's showing 失敗
+            // no image」):multipart body 可能喺途中消失(iOS Safari Service
+            // Worker 嘅已知 bug:fetch handler 內 intercept multipart POST →
+            // Content-Length 變 0)→ 改用 base64 JSON 路徑再試。
+            res = await this._scanUploadB64(file, clientIndex, onProg);
+          }
+        } else if (e.status === 0) {
+          // 網絡層面斷(唔係 400)→ 一樣用 base64 路徑試多次
+          res = await this._scanUploadB64(file, clientIndex, onProg);
         } else {
           throw e;
         }
       }
       const data = res.data;
-      if (!data || !data.ok) throw new Error((data && data.error) || '上傳失敗');
+      // v3.3.44b (2026-10-26): 舊 Service Worker(iOS WebKit bug)會令
+      // multipart body 消失 → 伺服器收到空 body → 400 "no image"。
+      // 呢個唔係 Jim 嘅錯,要俾佢知道要完全重開個 App(更新 SW)再影相。
+      if (!data || !data.ok) {
+        const _err = (data && data.error) || '上傳失敗';
+        const _detail = (data && data.detail) ? (' — ' + data.detail) : '';
+        if (_err === 'no image') {
+          throw new Error('相片冇傳到(舊版快取搞到)' + _detail);
+        }
+        throw new Error(_err + _detail);
+      }
       const uploads = Array.isArray(data.uploads) ? data.uploads : [];
       const up = uploads[0];
       if (!up || !up.path) throw new Error('伺服器冇返上傳後嘅路徑');
@@ -4255,6 +4276,46 @@ function gymApp() {
         client_index: clientIndex,
         path: up.path,
         filename: up.filename || fname,
+        image_url: up.image_url || '',
+        thumbnail_url: up.thumbnail_url || '',
+        size_kb: up.size_kb || Math.round(file.size / 1024),
+        capture_iso: up.capture_iso || '',
+        capture_hhmm: up.capture_hhmm || '',
+      };
+    },
+
+    // v3.3.44b: base64 fallback 上載路徑(唔用 multipart)。
+    // 用途:multipart body 喺 iOS Safari Service Worker 之下會消失
+    // (2026-10-26 實測:ct 正常但 Content-Length=0 → 400 "no image")。
+    // 呢條路用 JSON body,係第二道防線。
+    async _scanUploadB64(file, clientIndex, onProg) {
+      const b64 = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result || '').split(',')[1] || '');
+        fr.onerror = () => reject(new Error('讀唔到相片'));
+        fr.readAsDataURL(file);
+      });
+      if (!b64) throw new Error('讀唔到相片(空檔案)');
+      onProg(60, file.size, file.size);
+      const r = await fetch('/api/scan_upload_b64', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          images: [{ name: file.name || ('photo_' + (clientIndex + 1) + '.jpg'), b64: b64 }],
+        }),
+      });
+      let data = null;
+      try { data = await r.json(); } catch (err) { data = null; }
+      if (!r.ok || !data || !data.ok) {
+        throw new Error((data && (data.detail || data.error)) || ('HTTP ' + r.status));
+      }
+      const up = (data.uploads || [])[0];
+      if (!up || !up.path) throw new Error('伺服器冇返上傳後嘅路徑');
+      onProg(100, file.size, file.size);
+      return {
+        client_index: clientIndex,
+        path: up.path,
+        filename: up.filename || (file.name || 'photo.jpg'),
         image_url: up.image_url || '',
         thumbnail_url: up.thumbnail_url || '',
         size_kb: up.size_kb || Math.round(file.size / 1024),

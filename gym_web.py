@@ -9184,7 +9184,12 @@ def api_scan_upload():
         print(f"[scan-upload] 400 no image | fields={sorted(request.files.keys())} "
               f"| form={sorted(request.form.keys())} | ct={request.content_type} "
               f"| ip={request.remote_addr} | len={request.content_length}", flush=True)
-        return jsonify({"ok": False, "error": "no image"}), 400
+        # v3.3.44b: 舊 SW(iOS WebKit bug)會令 multipart body 消失 → len=0。
+        # 俾前端一句人話,同埋提示要更新 App。
+        return jsonify({"ok": False, "error": "no image",
+                        "detail": "相片冇傳到(成個 request body 係空)。請撳一下重新影相;"
+                                  "如果連續出現,請完全關閉個 App 再開(更新 Service Worker)。",
+                        "empty_body": request.content_length in (0, None)}), 400
 
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
     ts_str = now_hkt_dt.strftime("%Y%m%d_%H%M%S")
@@ -9192,69 +9197,141 @@ def api_scan_upload():
     uploads = []
     for i, f in enumerate(files):
         img_bytes = f.read()
-        if len(img_bytes) > 10 * 1024 * 1024:
+        try:
+            uploads.append(_store_scan_image(img_bytes, f.filename, i, now_hkt_dt, ts_str))
+        except _ScanImageTooLarge:
             return jsonify({"ok": False, "error": "image too large"}), 413
 
-        orig_name = (f.filename or "").strip() or f"upload_{i}.jpg"
+    return jsonify({"ok": True, "uploads": uploads})
+
+
+class _ScanImageTooLarge(Exception):
+    """相片大過 10MB(同舊版行為一致:413)。"""
+
+
+def _store_scan_image(img_bytes: bytes, filename, client_index: int,
+                      now_hkt_dt, ts_str: str) -> dict:
+    """落盤一張食相 + 抽 EXIF 拍攝時間 + 做縮圖,回傳 upload 記錄。
+
+    v3.3.44b: 由 /api/scan_upload 同 /api/scan_upload_b64 共用,確保兩條
+    路徑嘅行為一模一樣(唔會其中一條漏咗 EXIF / 縮圖)。
+    """
+    if len(img_bytes) > 10 * 1024 * 1024:
+        raise _ScanImageTooLarge()
+
+    i = client_index
+    orig_name = (filename or "").strip() or f"upload_{i}.jpg"
+    ext = ".jpg"
+    lower = orig_name.lower()
+    if lower.endswith(".png"):
+        ext = ".png"
+    elif lower.endswith(".jpeg") or lower.endswith(".jpg"):
         ext = ".jpg"
-        lower = orig_name.lower()
-        if lower.endswith(".png"):
-            ext = ".png"
-        elif lower.endswith(".jpeg") or lower.endswith(".jpg"):
-            ext = ".jpg"
 
-        # v3.3.25 (2026-10-21): the stored name used to be
-        # f"upload_{ts_str}_{i}{ext}" where ts_str has SECOND resolution and
-        # i restarts at 0 for every request. Two uploads in the same second
-        # (Jim's phone uploading 3 photos at once, or a retry) therefore
-        # produced the SAME filename and the second file silently
-        # OVERWROTE the first — a photo lost with no error anywhere.
-        # Verified 2026-10-21: upload_20261021_001848_0 / _001851_0 /
-        # _001853_0 — three separate requests, each index 0.
-        # Fix: add a uuid segment so the name is unique per request AND
-        # per file within the request.
-        stored_name = f"upload_{ts_str}_{uuid.uuid4().hex[:8]}_{i}{ext}"
-        stored_path = SCAN_CACHE_DIR / stored_name
-        stored_path.write_bytes(img_bytes)
+    # v3.3.25 (2026-10-21): the stored name used to be
+    # f"upload_{ts_str}_{i}{ext}" where ts_str has SECOND resolution and
+    # i restarts at 0 for every request. Two uploads in the same second
+    # (Jim's phone uploading 3 photos at once, or a retry) therefore
+    # produced the SAME filename and the second file silently
+    # OVERWROTE the first — a photo lost with no error anywhere.
+    # Verified 2026-10-21: upload_20261021_001848_0 / _001851_0 /
+    # _001853_0 — three separate requests, each index 0.
+    # Fix: add a uuid segment so the name is unique per request AND
+    # per file within the request.
+    stored_name = f"upload_{ts_str}_{uuid.uuid4().hex[:8]}_{i}{ext}"
+    stored_path = SCAN_CACHE_DIR / stored_name
+    stored_path.write_bytes(img_bytes)
 
-        # v3.3.8: pull the real photo shot time out of EXIF (iPhone photo
-        # stream uploads often happen hours after the shot).
-        exif_info = _extract_exif_capture_time(stored_path)
-        capture_iso = now_hkt_dt.strftime("%Y-%m-%d")
-        capture_hhmm = now_hkt_dt.strftime("%H:%M")
-        if exif_info.get("capture_time"):
-            try:
-                capture_dt = datetime.fromisoformat(exif_info["capture_time"])
-                capture_iso = capture_dt.strftime("%Y-%m-%d")
-                capture_hhmm = capture_dt.strftime("%H:%M")
-            except (ValueError, TypeError) as e:
-                print(f"[scan-upload] EXIF capture_time parse failed for "
-                      f"{stored_name}: {e}", flush=True)
-
-        # v3.2.7.46: 480px thumbnail for the food history view.
-        # v3.3.44a: 縮圖失敗(例如 HEIC/壞檔)PIL 解唔到 → 唔好成個上載
-        # 500 掉(前端就顯示「上傳失敗」)。相片照樣存低,縮圖靜靜哋冇咗,
-        # 並且印出原因(唔准靜靜哋 swallow)。
+    # v3.3.8: pull the real photo shot time out of EXIF (iPhone photo
+    # stream uploads often happen hours after the shot).
+    exif_info = _extract_exif_capture_time(stored_path)
+    capture_iso = now_hkt_dt.strftime("%Y-%m-%d")
+    capture_hhmm = now_hkt_dt.strftime("%H:%M")
+    if exif_info.get("capture_time"):
         try:
-            _make_thumb(stored_path, _thumb_path_for(stored_name))
-        except Exception as e:
-            print(f"[scan-upload] thumb failed for {stored_name}: {e}", flush=True)
+            capture_dt = datetime.fromisoformat(exif_info["capture_time"])
+            capture_iso = capture_dt.strftime("%Y-%m-%d")
+            capture_hhmm = capture_dt.strftime("%H:%M")
+        except (ValueError, TypeError) as e:
+            print(f"[scan-upload] EXIF capture_time parse failed for "
+                  f"{stored_name}: {e}", flush=True)
 
-        image_url = f"/scan_img/{stored_name}"
-        uploads.append({
-            "client_index": i,
-            "filename": orig_name,
-            "path": str(stored_path),
-            "image_url": image_url,
-            "thumbnail_url": _thumb_url_for(image_url),
-            "size_kb": int(round(len(img_bytes) / 1024)),
-            "capture_iso": capture_iso,
-            "capture_hhmm": capture_hhmm,
-        })
-        print(f"[scan-upload] stored {stored_name} "
-              f"({uploads[-1]['size_kb']} KB, exif={exif_info.get('source') or 'none'})",
+    # v3.2.7.46: 480px thumbnail for the food history view.
+    # v3.3.44a: 縮圖失敗(例如 HEIC/壞檔)PIL 解唔到 → 唔好成個上載
+    # 500 掉(前端就顯示「上傳失敗」)。相片照樣存低,縮圖靜靜哋冇咗,
+    # 並且印出原因(唔准靜靜哋 swallow)。
+    try:
+        _make_thumb(stored_path, _thumb_path_for(stored_name))
+    except Exception as e:
+        print(f"[scan-upload] thumb failed for {stored_name}: {e}", flush=True)
+
+    image_url = f"/scan_img/{stored_name}"
+    rec = {
+        "client_index": i,
+        "filename": orig_name,
+        "path": str(stored_path),
+        "image_url": image_url,
+        "thumbnail_url": _thumb_url_for(image_url),
+        "size_kb": int(round(len(img_bytes) / 1024)),
+        "capture_iso": capture_iso,
+        "capture_hhmm": capture_hhmm,
+    }
+    print(f"[scan-upload] stored {stored_name} "
+          f"({rec['size_kb']} KB, exif={exif_info.get('source') or 'none'})",
+          flush=True)
+    return rec
+
+
+@app.route("/api/scan_upload_b64", methods=["POST"])
+def api_scan_upload_b64():
+    """v3.3.44b — base64 fallback 上載路徑(唔用 multipart)。
+
+    背景:2026-10-26 21:40 Jim 報「Failed in upload. It's showing 失敗 no image」。
+    伺服器 log 證實:Content-Type 係 multipart/form-data 正常,但
+    Content-Length = 0 —— 個 request body 喺途中消失(而且前端重試 8 次
+    都一樣)。iOS Safari / WebKit 嘅 Service Worker 有一個已知 bug:
+    fetch handler 內 intercept POST + multipart body → body 會被丟。
+    SW 已加 bypass(v3.3.44b),但呢條 JSON 路徑係第二道防線:
+    body 係 JSON(唔係 multipart stream),就算有 interception 都較難被吞,
+    而且前端會喺 multipart 收到 400 "no image" 時自動改行呢條路。
+
+    Body: {"images": [{"name": "IMG_1234.HEIC", "b64": "<base64>"}]}
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception as e:
+        print(f"[scan-upload-b64] bad json: {e}", flush=True)
+        payload = {}
+    items = payload.get("images") or []
+    if not items:
+        print(f"[scan-upload-b64] 400 no image | ip={request.remote_addr} "
+              f"| len={request.content_length} | keys={sorted(payload.keys())}",
               flush=True)
+        return jsonify({"ok": False, "error": "no image",
+                        "detail": "base64 fallback 都收唔到相片,請完全關閉 App 再開。"}), 400
 
+    now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
+    ts_str = now_hkt_dt.strftime("%Y%m%d_%H%M%S")
+    uploads = []
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        b64 = it.get("b64") or ""
+        try:
+            img_bytes = base64.b64decode(b64, validate=False)
+        except Exception as e:
+            print(f"[scan-upload-b64] b64 decode failed at {i}: {e}", flush=True)
+            continue
+        if not img_bytes:
+            continue
+        try:
+            uploads.append(_store_scan_image(img_bytes, it.get("name"), i, now_hkt_dt, ts_str))
+        except _ScanImageTooLarge:
+            return jsonify({"ok": False, "error": "image too large"}), 413
+
+    if not uploads:
+        return jsonify({"ok": False, "error": "no image",
+                        "detail": "base64 fallback 收到嘅相片係空嘅。"}), 400
     return jsonify({"ok": True, "uploads": uploads})
 
 
@@ -16419,7 +16496,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v147';
+const CACHE = 'gym-web-v148';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch
@@ -16477,6 +16554,19 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   // v137: /api/* ALWAYS network-first, NEVER cache (Jim OOB 2026-08-12 23:18 HKT).
   // 修正 nutrition_log 改咗之後 PWA 仍然顯示舊 macros 嘅 bug。
+  // v3.3.44b (2026-10-26, Jim OOB「Failed in upload. It's showing 失敗 no image」):
+  // iOS Safari / WebKit 嘅 Service Worker 有一個已知 bug:fetch handler 內
+  // intercept 一個 POST + multipart body → 個 body 會被丟(Content-Length: 0,
+  // 但 Content-Type / headers 完整)→ 伺服器收到空 body → 400 "no image"。
+  // 2026-10-26 21:40 實測(Jim 經 Tailscale HTTPS 開):ct=multipart/form-data
+  // 正常但 len=0,前端重試 8 次都一樣;同一段 code喺 Chromium 正常。
+  // 修法:multipart POST(相片上載)完全唔好由 SW 攔截 —— 唔好叫
+  // respondWith,俾瀏覽器用預設路徑行,body 就完整。
+  if (e.request.method === 'POST' &&
+      (url.pathname.startsWith('/api/scan_upload') ||
+       (e.request.headers.get('content-type') || '').toLowerCase().includes('multipart/form-data'))) {
+    return;   // 刻意唔 respondWith → 預設 fetch,request body 完整
+  }
   if (url.pathname.startsWith('/api/')) {
     e.respondWith(
       fetch(e.request).then(res => res).catch(() => new Response(JSON.stringify({error:'offline'}), {status:503, headers:{'Content-Type':'application/json'}}))
