@@ -218,6 +218,19 @@
 </style>
 </head>
 <body x-data="gymApp()" x-init="init()">
+  <!-- v3.3.44a (2026-10-26): 非 secure context(HTTP)提示 bar。
+       iOS 會將已加入主畫面嘅 HTTP 網站升級做 HTTPS;如果該 port 冇 TLS
+       (Gymbro 原本就係 http://…:7000 純 HTTP)→ handshake 400 → 獨立
+       PWA 只見白屏。所以畀 Jim 一粒掣直接跳去真 HTTPS 版本。
+       127.0.0.1 / localhost 本身係 secure context → 本機測試唔會見到。 -->
+  <div x-show="!secureCtx" x-cloak
+       class="fixed inset-x-0 bottom-0 z-[100] flex items-center justify-between gap-3 bg-amber-400 px-3 py-2 text-[11px] font-black text-black shadow-[0_-4px_16px_rgba(0,0,0,0.5)]"
+       style="padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));">
+    <span class="leading-tight">⚠️ HTTP 版本:通知同定位用唔到,獨立 App 有機會白屏</span>
+    <button @click="location.href = httpsUrl"
+            data-testid="https-upgrade-btn"
+            class="shrink-0 rounded-full bg-black px-3 py-1.5 text-white active:scale-95">用 HTTPS 版本</button>
+  </div>
 
   <!-- Top Bar -->
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
@@ -1895,6 +1908,14 @@ function gymApp() {
     // v3.1.0: 4-tab reorganization. 'food' is the new default + most frequent.
     // (Jim OOB 2026-08-07 14:50 HKT 'organize the tab. food logging is more frequent')
     tab: 'food',
+    // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」):
+    // secureCtx = 真正嘅 HTTPS/secure context。HTTP 開嘅 PWA 冇 Service
+    // Worker、冇通知、冇定位,而且 iOS 會將「加入主畫面」嘅 HTTP origin 自動
+    // 升級做 HTTPS → TLS handshake 400 → standalone PWA 白屏(2026-10-26
+    // 伺服器日誌實測見 'Bad request version')。httpsUrl = 有正式憑證嘅
+    // Tailscale HTTPS 版本(證書對 alonso.tail9e2b74.ts.net 有效)。
+    secureCtx: (typeof window !== 'undefined') ? (window.isSecureContext !== false) : true,
+    httpsUrl: 'https://alonso.tail9e2b74.ts.net/',
     // v3.1.0: frontpage cheer button state
     cheerInFlight: false,
     // v3.1.0: gym focus mode state
@@ -4361,13 +4382,22 @@ function gymApp() {
         }
       });
       if (wasDisplay) {
-        this.scanAiTitle = '❌ AI 識別失敗';
-        this.scanAiStageLabel = (e && e.message) || '未知錯誤';
+        // v3.3.44a (2026-10-26, Jim OOB「Image upload is error pls check and fix」):
+        // AI 撞速率限制(429)好常見,俾 Jim 一句人話,唔好淨係「未知錯誤」。
+        const _m = String((e && e.message) || '');
+        const _rateLimited = /429|too many|rate|限|繁忙|busy/i.test(_m);
+        this.scanAiTitle = _rateLimited ? '⏳ AI 暫時太 busy' : '❌ AI 識別失敗';
+        this.scanAiStageLabel = _rateLimited
+          ? 'AI 服務撞咗速率限制(相片已經上載咗,冇漏)。等 1 分鐘再撳「重新識別」就得。'
+          : (_m || '未知錯誤');
         this.scanPhase = 'done';
         this.scanBgDisplayJobId = this.scanBgJobs.length
           ? this.scanBgJobs[this.scanBgJobs.length - 1].jobId : null;
       }
-      this.flash('❌ 背景 AI 識別失敗:' + ((e && e.message) || '未知錯誤'));
+      const _m2 = String((e && e.message) || '');
+      this.flash(/429|too many|rate|限|繁忙|busy/i.test(_m2)
+        ? '⏳ AI 暫時太 busy(相已上載,冇漏):等 1 分鐘再試'
+        : ('❌ 背景 AI 識別失敗:' + (_m2 || '未知錯誤')));
     },
 
     // Poll GET /api/scan_progress/<job_id> — 每次 700ms (SCAN_PROGRESS_SPEC §3.2)
@@ -4822,7 +4852,10 @@ function gymApp() {
         console.error('[scan] onScanPhotosPicked failed', e);
         this.flash('Scan 失敗：' + (e.message || '未知錯誤'));
         this.scanPhase = 'done';
-        this.scanUploadTitle = '❌ 上傳/識別失敗';
+        // v3.3.44a: 分開講「上傳失敗」同「AI 識別失敗」—— 之前淨係講
+        // 「上傳/識別失敗」,Jim 見到以為係相片上唔到去,實際上係 AI 撞
+        // 速率限制(相片其實已經上載咗)。
+        this.scanUploadTitle = '❌ 上傳/識別失敗(AI 可能太 busy,等陣再試)';
         this.scanAiStageLabel = (e.message || '未知錯誤');
         if (e.endpointMissing) {
           // API 未上線 → 改用舊流程重試一次,唔好就係死咗

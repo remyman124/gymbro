@@ -4439,6 +4439,31 @@ def _record_vision_status_2nd(provider: str, state: str, err: str = "",
     }
 
 
+# v3.3.44a (2026-10-26, Jim OOB「Image upload is error pls check and fix」):
+# 全域 MiniMax vision 節流 + 429 退避。
+# 問題:一次 page load 嘅 /api/photostream/today?classify=true 會一次過發
+# 30 個 vision 請求(每張新相一個)→ 撞 MiniMax 每分鐘限制 → HTTP 429 →
+# 同一個 app 入面跟住做嘅食相掃描再撞 429 → Jim 見到「上傳/識別失敗」
+# (2026-10-26 21:28 實測:光係我一次測試就觸發 71 個 429)。
+# 修正:(1) 所有 vision call 經同一把鎖 + 最少間隔(預設 1.1s);
+#      (2) 撞 429 會退避 6s 重試一次(唔係即刻死);
+#      (3) photostream 每次 request 最多新分類 4 張(其餘留返下次)。
+_VISION_LOCK = threading.Lock()
+_VISION_LAST_CALL_TS = 0.0
+_VISION_MIN_INTERVAL = float(os.environ.get("GYMBRO_VISION_MIN_INTERVAL", "1.1"))
+_VISION_429_SLEEP = float(os.environ.get("GYMBRO_VISION_429_SLEEP", "6"))
+
+
+def _vision_throttle() -> None:
+    """保證兩次 vision 請求之間最少隔 _VISION_MIN_INTERVAL 秒。"""
+    global _VISION_LAST_CALL_TS
+    with _VISION_LOCK:
+        wait = _VISION_MIN_INTERVAL - (time.time() - _VISION_LAST_CALL_TS)
+        if wait > 0:
+            time.sleep(wait)
+        _VISION_LAST_CALL_TS = time.time()
+
+
 def _minimax_vision_text01(img_b64: str, prompt: str) -> str:
     """Vision via MiniMax-text-01 — the FALLBACK that actually works.
 
@@ -4466,34 +4491,57 @@ def _minimax_vision_text01(img_b64: str, prompt: str) -> str:
         "max_tokens": 1200,
         "temperature": 0.25,
     }
-    try:
-        req = urllib.request.Request(
-            "https://api.minimax.io/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + api_key,
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
-        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-        # Strip a reasoning block if the model emitted one.
-        if "</think>" in content:
-            content = content.split("</think>")[-1].strip()
-        if content.startswith("<think>"):
-            content = ""
-        # Safety-filter refusal → treat as failure so the next provider runs.
-        if content and ("抱歉" in content[:30] and "無法" in content[:50]
-                        and len(content) < 80):
-            return ""
-        return content.strip()
-    except Exception as e:
+    last_err = None
+    resp = None
+    # v3.3.44a (2026-10-26): 撞 429 → 退避 6s 重試一次(之前即刻死 →
+    # Jim 見到「上傳/識別失敗」,而真實原因只係 MiniMax 每分鐘速率限制)。
+    # 每個 vision call 之前都會經 _vision_throttle() 保持最少間隔。
+    for attempt in range(2):
+        try:
+            _vision_throttle()
+            req = urllib.request.Request(
+                "https://api.minimax.io/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + api_key,
+                },
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=90).read())
+            last_err = None
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429 and attempt == 0:
+                print(f"[vision] MiniMax-text-01 got 429, backing off "
+                      f"{_VISION_429_SLEEP:.0f}s and retrying once", flush=True)
+                time.sleep(_VISION_429_SLEEP)
+                continue
+            break
+        except Exception as e:
+            last_err = e
+            break
+
+    if resp is None:
+        e = last_err
         _record_vision_status("minimax-text-01", "failed",
                               f"{type(e).__name__}: {e}")
         print(f"[vision] MiniMax-text-01 failed: {type(e).__name__}: {e}",
               flush=True)
         return ""
+
+    content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    # Strip a reasoning block if the model emitted one.
+    if "</think>" in content:
+        content = content.split("</think>")[-1].strip()
+    if content.startswith("<think>"):
+        content = ""
+    # Safety-filter refusal → treat as failure so the next provider runs.
+    if content and ("抱歉" in content[:30] and "無法" in content[:50]
+                    and len(content) < 80):
+        return ""
+    return content.strip()
 
 
 # Keys are the raw provider ids used for the "2nd opinion must come from a
@@ -7950,6 +7998,20 @@ def _save_photostream_cache(cache: dict) -> None:
     PHOTOSTREAM_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
 
 
+# v3.3.44a (2026-10-26, Jim OOB「Image upload is error pls check and fix」):
+# 每次 /api/photostream/today?classify=true 最多新分類幾多張相。
+# 之前係「全部新相一次過 classify」→ 一次 page load 發 30 個 MiniMax
+# vision 請求 → 撞每分鐘速率限制(HTTP 429)→ 同一個 app 入面跟住做嘅
+# 食相掃描再撞 429 → Jim 見到「上傳/識別失敗」。剩低嘅留返下次 request。
+_PHOTOSTREAM_CLASSIFY_MAX = int(os.environ.get("GYMBRO_PHOTOSTREAM_CLASSIFY_MAX", "4"))
+
+
+def _photostream_cache_has(path: str, mtime_iso: str) -> bool:
+    """呢張相之前有冇分類過(有就唔使再燒 vision 額度)。"""
+    cache = _load_photostream_cache()
+    return f"{path}::{mtime_iso}" in cache
+
+
 def _classify_image_cached(path: str, mtime_iso: str) -> dict:
     """Run MiniMax vision to classify one image. Cache by (path + mtime) to avoid re-work.
 
@@ -8054,6 +8116,7 @@ def api_photostream_today():
         return False
 
     items = []
+    new_classified = 0          # v3.3.44a: 本次 request 已做嘅新 vision call 數
     today = today_iso()
     scan_caches = [
         ("scan", SCAN_CACHE_DIR),
@@ -8114,8 +8177,20 @@ def api_photostream_today():
                 entry["capture_time_source"] = exif_cache_entry.get("source", "")
                 entry["upload_time_iso"] = mtime_iso
             if classify_flag:
-                cls = _classify_image_cached(str(fp), mtime_iso)
-                entry["classification"] = cls
+                # v3.3.44a: 本次 request 嘅 vision 預算用完 → 呢張 defer,
+                # 唔好再打 MiniMax(避免 429 連累食相掃描)。
+                cached_hit = _photostream_cache_has(str(fp), mtime_iso)
+                if (not cached_hit) and new_classified >= _PHOTOSTREAM_CLASSIFY_MAX:
+                    entry["classification"] = {
+                        "is_food": False, "suggested_name": "非食物",
+                        "calories_est": 0, "protein_est": 0,
+                        "dish_desc": "", "deferred": True,
+                    }
+                else:
+                    cls = _classify_image_cached(str(fp), mtime_iso)
+                    if not cached_hit:
+                        new_classified += 1
+                    entry["classification"] = cls
                 # v3.3.2: scan_log.json is gone — already_logged is best-effort
                 # based on whether any cache row has this local image filename
                 # in its drive_image_url path. Skip the heuristic; treat every
@@ -9103,6 +9178,12 @@ def api_scan_upload():
     """
     files = request.files.getlist("images") or request.files.getlist("image")
     if not files:
+        # v3.3.44a: 之前淨係返 400 "no image" 而冇任何 log,
+        # 2026-10-26 Jim 報「Image upload is error」時完全查唔到係邊層出事。
+        # 而家印出實際收到嘅 field 名 + content-type + 來源 IP。
+        print(f"[scan-upload] 400 no image | fields={sorted(request.files.keys())} "
+              f"| form={sorted(request.form.keys())} | ct={request.content_type} "
+              f"| ip={request.remote_addr} | len={request.content_length}", flush=True)
         return jsonify({"ok": False, "error": "no image"}), 400
 
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
@@ -9151,7 +9232,13 @@ def api_scan_upload():
                       f"{stored_name}: {e}", flush=True)
 
         # v3.2.7.46: 480px thumbnail for the food history view.
-        _make_thumb(stored_path, _thumb_path_for(stored_name))
+        # v3.3.44a: 縮圖失敗(例如 HEIC/壞檔)PIL 解唔到 → 唔好成個上載
+        # 500 掉(前端就顯示「上傳失敗」)。相片照樣存低,縮圖靜靜哋冇咗,
+        # 並且印出原因(唔准靜靜哋 swallow)。
+        try:
+            _make_thumb(stored_path, _thumb_path_for(stored_name))
+        except Exception as e:
+            print(f"[scan-upload] thumb failed for {stored_name}: {e}", flush=True)
 
         image_url = f"/scan_img/{stored_name}"
         uploads.append({
@@ -16332,7 +16419,16 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v146';
+const CACHE = 'gym-web-v147';
+// v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
+// 「Image upload is error」):cache 版本 146 → 147。
+//   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch
+//   handler 嘅註釋):舊 SW 對「冇 ?v= 嘅 static asset」用 cache-first,
+//   一份壞掉/半截嘅 JS 或 CSS 會永久釘死喺 Cache Storage → Alpine 起唔到
+//   → x-for/x-show 全部唔 render → 成頁白屏,而且清 cache 之前好唔返。
+//   v147 改成 network-first + cache fallback(自癒),並且令 SW 對非 GET
+//   request 唔會再調 cache.match()(Cache API 對非 GET 會 reject →
+//   非 /api/ 路徑嘅 POST 會直接死掉)。
 // v3.3.44 (2026-10-26, Alonso「enhance gymbro web app to be more mobile
 // friendly」):cache 版本 145 → 146。
 //   SW 新增 push / notificationclick / message / sync handler + IndexedDB
@@ -16438,14 +16534,33 @@ self.addEventListener('fetch', e => {
     );
     return;
   }
-  // Cache-first for other static assets.
+  // v3.3.44a (2026-10-26): static asset 唔再一律 cache-first。
+  //   帶 ?v=<hash>(內容定址)→ 照舊 cache-first(immutable,安全又快)。
+  //   冇 ?v= 嘅(例如 /js/alpine-3.17.5.min.js)→ network-first + cache
+  //   fallback:壞咗嘅快取下次就冇咗(app 會自己好返,唔使人手清 cache)。
+  //   同時唔再對非 GET request 調 cache.match():Cache API 對非 GET 會
+  //   reject → 之前非 /api/ 路徑嘅 POST 會成個 request 死掉。
+  if (url.searchParams.get('v')) {
+    e.respondWith(
+      caches.open(CACHE).then(cache =>
+        cache.match(e.request).then(cached => cached || fetch(e.request).then(res => {
+          if (e.request.method === 'GET' && res.ok) cache.put(e.request, res.clone());
+          return res;
+        }).catch(() => cached))
+      )
+    );
+    return;
+  }
   e.respondWith(
-    caches.open(CACHE).then(cache =>
-      cache.match(e.request).then(cached => cached || fetch(e.request).then(res => {
-        if (e.request.method === 'GET' && res.ok) cache.put(e.request, res.clone());
-        return res;
-      }).catch(() => cached))
-    )
+    fetch(e.request, {cache: 'no-store'}).then(res => {
+      if (e.request.method === 'GET' && res.ok) {
+        const clone = res.clone();
+        caches.open(CACHE).then(c => c.put(e.request, clone));
+      }
+      return res;
+    }).catch(() => (e.request.method === 'GET'
+      ? caches.match(e.request)
+      : new Response(JSON.stringify({error: 'offline'}), {status: 503, headers: {'Content-Type': 'application/json'}})))
   );
 });
 // Force reload when a new SW takes over (controllerchange = new SW activated).
