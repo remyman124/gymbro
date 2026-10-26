@@ -58,6 +58,9 @@ from gym_web.food_image import (
     pick_food_image as _pick_food_image,
     plan_image_search as _plan_image_search,
 )
+# v3.3.44: Mobile PWA — Web Push (VAPID + subscription store) + Geolocation.
+from gym_web import push as _push
+from gym_web import geo as _geo
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -937,7 +940,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.43"
+__version__ = "3.3.44"
 
 
 def _recovery_pct():
@@ -2712,6 +2715,13 @@ def pwa_manifest():
         "short_name": "Gymbro",
         "description": "Quick gym workout logger with Whoop overlay",
         "start_url": "/",
+        # v3.3.44: explicit id/scope so the installed PWA keeps the same
+        # identity across releases, plus the metadata iOS/Android want.
+        "id": "/",
+        "scope": "/",
+        "lang": "zh-HK",
+        "dir": "ltr",
+        "categories": ["health", "fitness", "lifestyle", "sports"],
         "display": "standalone",
         "background_color": "#000000",
         "theme_color": "#000000",
@@ -2721,7 +2731,210 @@ def pwa_manifest():
             {"src": "/static/gymbro_icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
             {"src": "/static/gymbro_apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
         ],
+        # v3.3.44: long-press shortcuts on the installed icon.
+        "shortcuts": [
+            {
+                "name": "影相記錄",
+                "short_name": "影相",
+                "description": "影一相即刻記一餐",
+                "url": "/?action=scan",
+                "icons": [{"src": "/static/gymbro_icon-192.png", "sizes": "192x192", "type": "image/png"}],
+            },
+            {
+                "name": "落 set",
+                "short_name": "落 set",
+                "description": "記低一組",
+                "url": "/?action=logset",
+                "icons": [{"src": "/static/gymbro_icon-192.png", "sizes": "192x192", "type": "image/png"}],
+            },
+        ],
     })
+
+
+# ---------------------------------------------------------------------------
+# v3.3.44 — Mobile PWA: Web Push + Geolocation + offline queue (backend half)
+#
+# All of these fail soft: any exception prints a traceback and returns
+# {"ok": false, "error": "..."} instead of a 500. The PWA is on a flaky
+# phone network — a crash here would take the whole app down.
+# ---------------------------------------------------------------------------
+
+def _json_body() -> dict:
+    """Parse the JSON body defensively (never raises)."""
+    try:
+        data = request.get_json(silent=True)
+    except Exception as e:
+        print(f"[api] get_json failed: {type(e).__name__}: {e}", flush=True)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+@app.route("/api/push/vapid_public_key", methods=["GET"])
+def api_push_vapid_public_key():
+    """Public VAPID key for the browser's pushManager.subscribe()."""
+    try:
+        public_key = _push.vapid_public_key()
+        return jsonify({"ok": True, "public_key": public_key})
+    except Exception as e:
+        print(f"[push] vapid_public_key failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/push/subscribe", methods=["POST"])
+def api_push_subscribe():
+    """Store a Web Push subscription (keyed by endpoint)."""
+    try:
+        data = _json_body()
+        endpoint = str(data.get("endpoint") or "")
+        keys = data.get("keys") or {}
+        if not endpoint or len(endpoint) > _push.MAX_ENDPOINT_LEN:
+            return jsonify({"ok": False, "error": "bad endpoint"})
+        p256dh = str(keys.get("p256dh") or "")
+        auth = str(keys.get("auth") or "")
+        if not p256dh or not auth:
+            return jsonify({"ok": False, "error": "bad keys"})
+        _push.save_subscription({
+            "endpoint": endpoint,
+            "keys": {"p256dh": p256dh, "auth": auth},
+        })
+        return jsonify({"ok": True, "count": len(_push.list_subscriptions())})
+    except Exception as e:
+        print(f"[push] subscribe failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/push/unsubscribe", methods=["POST"])
+def api_push_unsubscribe():
+    """Drop one subscription."""
+    try:
+        data = _json_body()
+        endpoint = str(data.get("endpoint") or "")
+        if not endpoint or len(endpoint) > _push.MAX_ENDPOINT_LEN:
+            return jsonify({"ok": False, "error": "bad endpoint"})
+        removed = _push.remove_subscription(endpoint)
+        return jsonify({"ok": True, "removed": removed})
+    except Exception as e:
+        print(f"[push] unsubscribe failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/push/status", methods=["GET"])
+def api_push_status():
+    """How many subscriptions we hold + whether VAPID keys are usable."""
+    try:
+        return jsonify({
+            "ok": True,
+            "count": len(_push.list_subscriptions()),
+            "vapid_ready": bool(_push.vapid_public_key()),
+        })
+    except Exception as e:
+        print(f"[push] status failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/push/send", methods=["POST"])
+def api_push_send():
+    """Fan a notification out to every stored subscription.
+
+    Subscriptions the push service reports as gone (404/410) are dropped —
+    they are dead and would otherwise fail on every future send.
+    """
+    try:
+        data = _json_body()
+        title = str(data.get("title") or "")[:200]
+        body = str(data.get("body") or "")[:200]
+        url = str(data.get("url") or "/")[:2048]
+        tag = str(data.get("tag") or "gymbro")[:64]
+        try:
+            payload = _push.build_payload(title, body, url, tag)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)})
+
+        subs = _push.list_subscriptions()
+        sent = 0
+        failed = 0
+        errors: list[str] = []
+        for sub in subs:
+            ok, message, status = _push.send_push_detailed(sub, payload)
+            if ok:
+                sent += 1
+                _push.mark_result(sub.get("endpoint"), True)
+                continue
+            failed += 1
+            errors.append(str(message)[:300])
+            _push.mark_result(sub.get("endpoint"), False, message)
+            if status in (404, 410):
+                removed = _push.remove_subscription(sub.get("endpoint"))
+                print(f"[push] dropped dead subscription "
+                      f"(status={status}, removed={removed})", flush=True)
+        return jsonify({
+            "ok": True,
+            "sent": sent,
+            "failed": failed,
+            "errors": errors[:10],
+        })
+    except Exception as e:
+        print(f"[push] send failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/geo/log", methods=["POST"])
+def api_geo_log():
+    """Record one position and reverse-geocode it (best effort)."""
+    try:
+        data = _json_body()
+        try:
+            lat = float(data.get("lat"))
+            lng = float(data.get("lng"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "bad coords"})
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+            return jsonify({"ok": False, "error": "bad coords"})
+        accuracy = data.get("accuracy")
+        context = str(data.get("context") or "manual")[:32]
+
+        # nearest_saved must run BEFORE the new point is stored, otherwise
+        # the freshly-logged point (distance 0) would always win.
+        previous = _geo.nearest_saved(lat, lng)
+        label = _geo.reverse_geocode(lat, lng)
+        _geo.log_location(lat, lng, accuracy=accuracy, context=context, label=label)
+        return jsonify({
+            "ok": True,
+            "label": label,
+            "distance_km": (previous or {}).get("distance_km"),
+        })
+    except Exception as e:
+        print(f"[geo] log failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/geo/recent", methods=["GET"])
+def api_geo_recent():
+    """Most recent positions (newest first)."""
+    try:
+        raw_n = request.args.get("n", "20")
+        try:
+            n = int(raw_n)
+        except (TypeError, ValueError):
+            n = 20
+        return jsonify({"ok": True, "locations": _geo.recent_locations(n)})
+    except Exception as e:
+        print(f"[geo] recent failed: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/audio/<path:filename>")
@@ -16248,6 +16461,163 @@ self.addEventListener('controllerchange', () => {
     window.location.reload();
   }
 });
+
+// ---------------------------------------------------------------------------
+// v3.3.44 — Web Push + Background Sync (offline POST queue).
+// Strictly additive: the fetch/caching logic above is untouched.
+// ---------------------------------------------------------------------------
+const NOTIF_ICON = '/static/gymbro_icon-192.png';
+const QUEUE_DB = 'gymbro-offline';
+const QUEUE_STORE = 'queue';
+const QUEUE_MAX_ATTEMPTS = 5;
+
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (_) { d = { title: 'Gymbro', body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'Gymbro', {
+    body: d.body || '', icon: d.icon || NOTIF_ICON,
+    badge: NOTIF_ICON, tag: d.tag || 'gymbro',
+    data: { url: d.url || '/' }, renotify: false
+  }));
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || '/';
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (list) {
+      for (let i = 0; i < list.length; i++) {
+        const c = list[i];
+        if (c.url === url && 'focus' in c) { return c.focus(); }
+      }
+      if (self.clients.openWindow) { return self.clients.openWindow(url); }
+      return null;
+    })
+  );
+});
+
+self.addEventListener('message', (e) => {
+  const data = e.data || {};
+  if (data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  } else if (data.type === 'FLUSH_QUEUE') {
+    const p = flushQueue();
+    if (e.waitUntil) { e.waitUntil(p); }
+  }
+});
+
+self.addEventListener('sync', (e) => {
+  if (e.tag === 'gymbro-queue') {
+    e.waitUntil(flushQueue());
+  }
+});
+
+// ---------- IndexedDB offline queue ----------
+
+function openQueueDb() {
+  return new Promise(function (resolve, reject) {
+    const req = indexedDB.open(QUEUE_DB, 1);
+    req.onupgradeneeded = function () {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(QUEUE_STORE)) {
+        db.createObjectStore(QUEUE_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error || new Error('idb open failed')); };
+  });
+}
+
+function queueRequest(record) {
+  return openQueueDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(QUEUE_STORE, 'readwrite');
+      tx.objectStore(QUEUE_STORE).put(record);
+      tx.oncomplete = function () { db.close(); resolve(record); };
+      tx.onerror = function () { db.close(); reject(tx.error || new Error('idb put failed')); };
+      tx.onabort = function () { db.close(); reject(tx.error || new Error('idb put aborted')); };
+    });
+  });
+}
+
+function readQueue() {
+  return openQueueDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(QUEUE_STORE, 'readonly');
+      const req = tx.objectStore(QUEUE_STORE).getAll();
+      req.onsuccess = function () { resolve(req.result || []); };
+      req.onerror = function () { reject(req.error || new Error('idb read failed')); };
+      tx.oncomplete = function () { db.close(); };
+    });
+  });
+}
+
+function deleteQueueItem(id) {
+  return openQueueDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(QUEUE_STORE, 'readwrite');
+      tx.objectStore(QUEUE_STORE).delete(id);
+      tx.oncomplete = function () { db.close(); resolve(true); };
+      tx.onerror = function () { db.close(); reject(tx.error || new Error('idb delete failed')); };
+      tx.onabort = function () { db.close(); reject(tx.error || new Error('idb delete aborted')); };
+    });
+  });
+}
+
+function updateQueueBadge(count) {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.setAppBadge) {
+      if (count > 0) { navigator.setAppBadge(count); }
+      else if (navigator.clearAppBadge) { navigator.clearAppBadge(); }
+    }
+  } catch (err) { /* badge API is optional */ }
+  try {
+    self.clients.matchAll({ type: 'window' }).then(function (list) {
+      list.forEach(function (c) { c.postMessage({ type: 'QUEUE_COUNT', count: count }); });
+    }).catch(function () {});
+  } catch (err) { /* no clients yet */ }
+}
+
+function flushQueue() {
+  return readQueue().then(function (items) {
+    if (!items || !items.length) { updateQueueBadge(0); return 0; }
+    let sent = 0;
+    // Sequential so the original order of Jim's taps is preserved.
+    return items.reduce(function (chain, item) {
+      return chain.then(function () {
+        return fetch(item.url, {
+          method: item.method || 'POST',
+          headers: item.headers || { 'Content-Type': 'application/json' },
+          body: item.body
+        }).then(function (res) {
+          if (res && res.ok) {
+            return deleteQueueItem(item.id).then(function () { sent += 1; });
+          }
+          throw new Error('http ' + (res ? res.status : 'unknown'));
+        }).catch(function (err) {
+          const attempts = (item.attempts || 0) + 1;
+          if (attempts > QUEUE_MAX_ATTEMPTS) {
+            return deleteQueueItem(item.id).then(function () {
+              console.warn('[gymbro-sw] dropped queued request after ' + attempts + ' attempts', item.url);
+            });
+          }
+          return queueRequest(Object.assign({}, item, {
+            attempts: attempts,
+            last_error: String((err && err.message) || err)
+          }));
+        });
+      });
+    }, Promise.resolve()).then(function () {
+      return readQueue().then(function (left) {
+        updateQueueBadge(left.length);
+        return sent;
+      });
+    });
+  }).catch(function (err) {
+    console.warn('[gymbro-sw] flushQueue failed', err);
+    return 0;
+  });
+}
 """.strip()
 
 

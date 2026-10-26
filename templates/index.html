@@ -221,7 +221,9 @@
 
   <!-- Top Bar -->
   <header class="sticky top-0 z-50 border-b border-white/10 bg-black/[0.85] px-4 py-2 backdrop-blur-xl">
-    <div class="flex items-center justify-between gap-2">
+    <!-- v3.3.44: flex-wrap so the two new 44px action buttons wrap to a
+         second line on narrow phones instead of squashing the step widget. -->
+    <div class="flex flex-wrap items-center justify-between gap-2">
       <!-- v3.2.0: Global cheer button (Jim OOB 2026-08-07 16:45 HKT
            'there should be global way to trigger cheer and not necessary
            to go into cheer tab. perhaps put the cheer button at the top
@@ -237,6 +239,29 @@
       </button>
       <h1 @click="onBrandTap()" class="text-2xl font-black tracking-tighter cursor-pointer select-none active:opacity-60 transition-opacity" style="-webkit-user-select: none; -webkit-tap-highlight-color: transparent;">Gymbro</h1>
       <div class="flex items-center gap-2">
+        <!-- v3.3.44: Mobile PWA quick actions — Web Push toggle + geolocation.
+             44x44 tap targets (iOS HIG minimum). The 🔕 glyph + the green dot
+             carry the state; the tooltip carries the full wording. -->
+        <div class="flex items-center gap-1 shrink-0">
+          <button @click="togglePush()"
+                  :disabled="pushBusy"
+                  :title="pushLabel"
+                  :aria-label="pushLabel"
+                  data-testid="push-toggle-btn"
+                  class="relative flex h-11 w-11 items-center justify-center rounded-full border border-white/15 bg-white/[0.06] text-lg active:scale-95 disabled:opacity-40 transition-transform">
+            <span x-text="pushState === 'granted' ? '🔔' : '🔕'"></span>
+            <span x-show="pushState === 'granted'"
+                  class="absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+          </button>
+          <button @click="logMyLocation()"
+                  :disabled="geoBusy"
+                  :title="geoBusy ? '定位緊…' : '記低我而家喺邊度'"
+                  aria-label="記低位置"
+                  data-testid="geo-log-btn"
+                  class="flex h-11 w-11 items-center justify-center rounded-full border border-white/15 bg-white/[0.06] text-lg active:scale-95 disabled:opacity-40 transition-transform">
+            <span x-text="geoBusy ? '⏳' : '📍'"></span>
+          </button>
+        </div>
         <!-- v2.7.52: Header mic button removed (Jim OOB 2026-08-07 13:45 HKT
              'REmove the mic frontend on gymbro. keep backend'). iOS Safari
              PWA mic on plain HTTP is blocked by Apple; user is going via
@@ -310,7 +335,10 @@
   <div class="toast" x-show="toast" x-text="toast" x-transition.opacity></div>
 
   <!-- Tab Content -->
+  <!-- v3.3.44: pb-20 (5rem) + safe-area inset so the last row of content
+       clears the fixed bottom tab bar on iPhone (home indicator). -->
   <main class="px-4 pb-20 pt-2"
+        style="padding-bottom: calc(env(safe-area-inset-bottom) + 5rem);"
         @touchstart.passive="onPullStart($event)"
         @touchmove.passive="onPullMove($event)"
         @touchend.passive="onPullEnd($event)">
@@ -2140,6 +2168,11 @@ function gymApp() {
     // v3.2.7.20: gate for the delete-session button (prevents double-tap)
     deletingSession: false,
     toast: '',
+    // v3.3.44: Mobile PWA — Web Push + Geolocation + offline queue state.
+    //   pushState: unknown | granted | denied | unsupported
+    pushState: 'unknown',
+    pushBusy: false,
+    geoBusy: false,
     // v3.2.8: pull-to-refresh state. pullDistance tracks how far the user
     // has dragged down from the top of <main>; pullRefreshing shows the
     // spinner; pullThreshold is the drag distance (px) that triggers a
@@ -2473,6 +2506,10 @@ function gymApp() {
         const next = this.quoteBank[Math.floor(Math.random() * this.quoteBank.length)];
         if (next !== this.quote) this.quote = next;
       }, 4000);
+      // v3.3.44: Web Push state + offline queue plumbing. Non-blocking.
+      this.initPushState();
+      this.applyLaunchAction();
+      window.addEventListener('online', () => { this.flushOfflineQueue(); });
       this.haptic();
     },
 
@@ -2542,14 +2579,12 @@ function gymApp() {
         // endpoint is gone. WHOOP is the only backend the pull has to wake.
         const refreshOk = { whoop: false, whoopError: null };
         const [whoopRes] = await Promise.allSettled([
-          fetch('/api/whoop_refresh', { method: 'POST' }),
+          this.apiPost('/api/whoop_refresh', {}, { queueable: true }),
         ]);
         if (whoopRes.status === 'fulfilled') {
-          try {
-            const d = await whoopRes.value.json();
-            refreshOk.whoop = !!d.ok;
-            if (!d.ok) refreshOk.whoopError = d.error || 'unknown';
-          } catch (e) { refreshOk.whoopError = e.message; }
+          const d = whoopRes.value || {};
+          refreshOk.whoop = !!d.ok;
+          if (!d.ok) refreshOk.whoopError = d.error || 'unknown';
         } else {
           refreshOk.whoopError = whoopRes.reason && whoopRes.reason.message || 'fetch failed';
         }
@@ -2845,19 +2880,18 @@ function gymApp() {
       this.saving = true;
       this.haptic([60, 30, 60]);
       try {
-        const res = await fetch('/api/log_set', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            exercise: this.currentExercise,
-            weight_kg: this.weight,
-            reps: this.reps,
-            set_n: this.session.exercises.filter(e => e.exercise === this.currentExercise).length + 1,
-            intensity: this.intensity,
-          })
-        });
-        const data = await res.json();
-        if (data.ok) {
+        // v3.3.44: queueable POST — offline it parks in IndexedDB and the
+        // Service Worker replays it once the network is back.
+        const data = await this.apiPost('/api/log_set', {
+          exercise: this.currentExercise,
+          weight_kg: this.weight,
+          reps: this.reps,
+          set_n: this.session.exercises.filter(e => e.exercise === this.currentExercise).length + 1,
+          intensity: this.intensity,
+        }, { queueable: true });
+        if (data.queued) {
+          this.flash('已離線，已排隊，恢復網絡後自動同步', 3000);
+        } else if (data.ok) {
           // Add seconds to elapsed counter (click = work done)
           this.workoutSeconds += (data.entry.reps || 10);
           this.tickElapsed();
@@ -2895,9 +2929,10 @@ function gymApp() {
       this.saving = true;
       this.haptic([30, 20, 30]);
       try {
-        const res = await fetch('/api/cancel_last_set', { method: 'POST' });
-        const data = await res.json();
-        if (data.ok) {
+        const data = await this.apiPost('/api/cancel_last_set', {}, { queueable: true });
+        if (data.queued) {
+          this.flash('已離線，已排隊，恢復網絡後自動同步', 3000);
+        } else if (data.ok) {
           // Reload state
           const state = await (await fetch('/api/state')).json();
           this.session = state.session;
@@ -3127,8 +3162,13 @@ function gymApp() {
       this.saving = true;
       this.haptic([80, 50, 80, 50, 80]);
       try {
-        const res = await fetch('/api/end_session', { method: 'POST' });
-        this.endSummary = await res.json();
+        const data = await this.apiPost('/api/end_session', {}, { queueable: true });
+        if (data.queued) {
+          this.flash('已離線，已排隊，恢復網絡後自動同步', 3000);
+          this.saving = false;
+          return;
+        }
+        this.endSummary = data;
         // Auto-push to Google Sheet so cheer session can read it immediately.
         try {
           await fetch('/api/sync_sheet', { method: 'POST' });
@@ -3463,8 +3503,11 @@ function gymApp() {
       this.schedulePullDistance = 70;
       const startedAt = Date.now();
       try {
-        const r = await fetch('/api/whoop_refresh', { method: 'POST' });
-        const data = await r.json();
+        const data = await this.apiPost('/api/whoop_refresh', {}, { queueable: true });
+        if (data.queued) {
+          this.flash('已離線，恢復網絡後會自動同步', 3000);
+          return;
+        }
         if (!data.ok) throw new Error(data.error || 'refresh failed');
         this.schedulePullLastRefreshAt = data.synced_at;
         // Reload the schedule so the freshly-pulled data shows up.
@@ -3537,9 +3580,10 @@ function gymApp() {
       let pullOk = false;
       try {
         // Step 1: trigger backend force refresh (~5-15s)
-        const r = await fetch('/api/whoop_refresh', { method: 'POST' });
-        const data = await r.json();
-        if (data.ok) {
+        const data = await this.apiPost('/api/whoop_refresh', {}, { queueable: true });
+        if (data.queued) {
+          this.flash('已離線，恢復網絡後會自動同步', 3000);
+        } else if (data.ok) {
           pullOk = true;
         } else {
           this.flash('WHOOP refresh 失敗：' + (data.error || '未知'));
@@ -3685,8 +3729,7 @@ function gymApp() {
         const pullAge = (this.stepsPullAgeMin != null) ? this.stepsPullAgeMin : this.stepsAgeMin;
         if (pullAge != null && pullAge > 5 && !this.stepsAutoRefreshing) {
           this.stepsAutoRefreshing = true;
-          fetch('/api/whoop_refresh', { method: 'POST' })
-            .then(r => r.ok ? r.json() : null)
+          this.apiPost('/api/whoop_refresh', {}, { queueable: true })
             .then(d => {
               // Only re-render when the pull actually succeeded — otherwise
               // a failing pull would re-trigger this branch forever.
@@ -5161,19 +5204,21 @@ function gymApp() {
           hintsForReq.push(this.scanTextHintInput.trim());
           this.scanTextHintInput = '';
         }
-        const r = await fetch('/api/scan_preview_text', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: text,
-            user_hints: hintsForReq,
-            // v3.3.20 (Jim OOB 2026-09-10): explicit image-search flag. Default
-            // server-side is True; pass True here for clarity. Set to false
-            // to skip the Brave image fetch (faster, no network call).
-            with_image: true,
-          }),
-        });
-        const data = await r.json();
+        // v3.3.44: queueable — offline the typed text is parked and the
+        // estimate re-runs server-side once the network is back. The commit
+        // step stays manual (scan_commit is never queued).
+        const data = await this.apiPost('/api/scan_preview_text', {
+          text: text,
+          user_hints: hintsForReq,
+          // v3.3.20 (Jim OOB 2026-09-10): explicit image-search flag. Default
+          // server-side is True; pass True here for clarity. Set to false
+          // to skip the Brave image fetch (faster, no network call).
+          with_image: true,
+        }, { queueable: true });
+        if (data.queued) {
+          this.flash('已離線，食物文字已暫存，恢復網絡後會自動重新估算', 3500);
+          return;
+        }
         if (!data.ok) {
           this.flash('估算失敗：' + (data.error || '未知'));
           return;
@@ -5760,9 +5805,248 @@ function gymApp() {
       try { if (navigator.vibrate) navigator.vibrate(pattern); } catch(e) {}
     },
 
-    flash(msg) {
+    flash(msg, ms = 1500) {
       this.toast = msg;
-      setTimeout(() => this.toast = '', 1500);
+      setTimeout(() => this.toast = '', ms);
+    },
+
+    // ─────────────────────────────────────────────────────────────
+    // v3.3.44 — Mobile PWA: Web Push, Geolocation, offline queue
+    // ─────────────────────────────────────────────────────────────
+
+    get pushLabel() {
+      if (this.pushState === 'granted') return '通知已開啟';
+      if (this.pushState === 'denied') return '通知已被封鎖';
+      if (this.pushState === 'unsupported') return '此瀏覽器唔支援通知';
+      return '通知未開啟';
+    },
+
+    // base64url → Uint8Array (the shape pushManager.subscribe wants).
+    b64ToUint8Array(base64String) {
+      const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+      const raw = atob((base64String + padding).replace(/-/g, '+').replace(/_/g, '/'));
+      const out = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+      return out;
+    },
+
+    async initPushState() {
+      try {
+        if (!('Notification' in window) || !('PushManager' in window)
+            || !('serviceWorker' in navigator)) {
+          this.pushState = 'unsupported';
+          return;
+        }
+        this.pushState = Notification.permission;
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.getSubscription();
+        if (sub) this.pushState = 'granted';
+      } catch (e) {
+        this.pushState = 'unknown';
+      }
+    },
+
+    async togglePush() {
+      if (this.pushBusy) return;
+      if (!window.isSecureContext) {
+        this.flash('通知需要 HTTPS 先開到，請用 https://alonso.tail9e2b74.ts.net/', 3500);
+        return;
+      }
+      if (!('Notification' in window) || !('PushManager' in window)) {
+        this.pushState = 'unsupported';
+        this.flash('呢部機嘅瀏覽器唔支援 Web Push', 3000);
+        return;
+      }
+      // iOS 16.4+ only fires Web Push for a PWA that was added to the Home
+      // Screen — in a plain Safari tab the subscribe call silently fails.
+      const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+      const standalone = window.matchMedia('(display-mode: standalone)').matches
+        || window.navigator.standalone;
+      if (isIos && !standalone) {
+        this.flash('請先用 Safari 分享 → 加入主畫面，再開通知', 4000);
+        return;
+      }
+      this.pushBusy = true;
+      try {
+        const perm = await Notification.requestPermission();
+        this.pushState = perm;
+        if (perm !== 'granted') {
+          this.flash(perm === 'denied' ? '通知權限被封鎖' : '未開啟通知', 2500);
+          return;
+        }
+        const reg = await navigator.serviceWorker.ready;
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {
+          const keyRes = await fetch('/api/push/vapid_public_key');
+          const keyData = await keyRes.json();
+          const pub = (keyData && keyData.public_key) || '';
+          if (!pub) {
+            this.flash('通知未準備好（VAPID key 拎唔到）', 3000);
+            return;
+          }
+          sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: this.b64ToUint8Array(pub),
+          });
+        }
+        const res = await fetch('/api/push/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sub.toJSON ? sub.toJSON() : sub),
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          this.pushState = 'granted';
+          this.flash('🔔 通知已開啟', 2500);
+        } else {
+          this.flash('通知開啟失敗：' + ((data && data.error) || '未知'), 3000);
+        }
+      } catch (e) {
+        this.flash('通知開啟失敗：' + (e && e.message ? e.message : e), 3000);
+      } finally {
+        this.pushBusy = false;
+      }
+    },
+
+    async logMyLocation() {
+      if (this.geoBusy) return;
+      if (!navigator.geolocation) {
+        this.flash('定位失敗：呢部機唔支援定位', 3000);
+        return;
+      }
+      if (!window.isSecureContext) {
+        this.flash('定位需要 HTTPS 先開到', 3000);
+        return;
+      }
+      this.geoBusy = true;
+      navigator.geolocation.getCurrentPosition(
+        async (pos) => {
+          try {
+            const body = {
+              lat: pos.coords.latitude,
+              lng: pos.coords.longitude,
+              accuracy: pos.coords.accuracy,
+              context: 'manual',
+            };
+            const res = await fetch('/api/geo/log', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            if (data && data.ok) {
+              const label = data.label || '位置未知';
+              const dist = (data.distance_km != null)
+                ? ' · 距離上次 ' + Number(data.distance_km).toFixed(1) + ' 公里'
+                : '';
+              this.flash('📍 ' + label + dist, 4000);
+            } else {
+              this.flash('定位失敗：' + ((data && data.error) || '未知'), 3000);
+            }
+          } catch (e) {
+            this.flash('定位失敗：' + (e && e.message ? e.message : e), 3000);
+          } finally {
+            this.geoBusy = false;
+          }
+        },
+        (err) => {
+          const code = err && err.code;
+          const why = code === 1 ? '權限被拒'
+            : (code === 2 ? '定位唔到'
+            : (code === 3 ? '逾時'
+            : ((err && err.message) || '未知')));
+          this.flash('定位失敗：' + why, 3000);
+          this.geoBusy = false;
+        },
+        { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 }
+      );
+    },
+
+    // ── offline queue ─────────────────────────────────────────────
+
+    isNetworkError(e) {
+      if (!e) return false;
+      const msg = String(e.message || e).toLowerCase();
+      return /failed to fetch|networkerror|network request failed|load failed|offline/.test(msg);
+    },
+
+    // POST wrapper: on a network failure the payload is parked in IndexedDB
+    // and replayed by the Service Worker once the network is back.
+    async apiPost(url, body, opts = {}) {
+      const queueable = !!(opts && opts.queueable);
+      const payload = (body === undefined || body === null) ? {} : body;
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        let data;
+        try { data = await res.json(); }
+        catch (e) { data = { ok: false, error: 'bad json' }; }
+        this.flushOfflineQueue();
+        return data;
+      } catch (e) {
+        if (queueable && this.isNetworkError(e)) {
+          await this.enqueueOffline(url, payload);
+          return { ok: false, queued: true, error: 'offline' };
+        }
+        throw e;
+      }
+    },
+
+    async enqueueOffline(url, body) {
+      const record = {
+        id: 'q_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+        url: url,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify((body === undefined || body === null) ? {} : body),
+        attempts: 0,
+        created: new Date().toISOString(),
+      };
+      try {
+        await gymbroQueuePut(record);
+      } catch (e) {
+        this.flash('離線排隊失敗：' + (e && e.message ? e.message : e), 3000);
+        return false;
+      }
+      // Background Sync exists on Chrome/Android. iOS Safari has no Sync
+      // API — the 'online' listener + the SW FLUSH_QUEUE message cover it.
+      try {
+        if ('serviceWorker' in navigator) {
+          const reg = await navigator.serviceWorker.ready;
+          if (reg && reg.sync && typeof reg.sync.register === 'function') {
+            await reg.sync.register('gymbro-queue');
+          }
+        }
+      } catch (e) { /* no Sync API — the online event will flush instead */ }
+      this.flash('已離線，已排隊，恢復網絡後自動同步', 3000);
+      return true;
+    },
+
+    async flushOfflineQueue() {
+      try {
+        if (!('serviceWorker' in navigator)) return;
+        const reg = await navigator.serviceWorker.ready;
+        if (reg && reg.active) reg.active.postMessage({ type: 'FLUSH_QUEUE' });
+      } catch (e) { /* SW not ready yet — retried on the next online event */ }
+    },
+
+    // Manifest shortcut (?action=scan / ?action=logset) — jump to the tab
+    // the shortcut points at. The camera itself still needs a real tap.
+    applyLaunchAction() {
+      let action = '';
+      try {
+        action = (new URLSearchParams(window.location.search).get('action') || '').toLowerCase();
+      } catch (e) { return; }
+      if (!action) return;
+      if (action === 'scan') {
+        this.tab = 'food';
+        this.flash('影相記錄：撳「影相」影一相就得', 3000);
+      } else if (action === 'logset') {
+        this.tab = 'gym';
+      }
     },
   };
 }
@@ -5782,6 +6066,60 @@ document.addEventListener('touchend', e => {
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+
+// v3.3.44: page side of the offline queue. Shares the 'gymbro-offline'
+// IndexedDB with the Service Worker, so whatever the page parks while
+// offline is the exact same queue the SW replays.
+const GYM_BRO_QUEUE_DB = 'gymbro-offline';
+const GYM_BRO_QUEUE_STORE = 'queue';
+
+function gymbroQueueDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(GYM_BRO_QUEUE_DB, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(GYM_BRO_QUEUE_STORE)) {
+        db.createObjectStore(GYM_BRO_QUEUE_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('idb open failed'));
+  });
+}
+
+function gymbroQueuePut(record) {
+  return gymbroQueueDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(GYM_BRO_QUEUE_STORE, 'readwrite');
+    tx.objectStore(GYM_BRO_QUEUE_STORE).put(record);
+    tx.oncomplete = () => { db.close(); resolve(record); };
+    tx.onerror = () => { db.close(); reject(tx.error || new Error('idb put failed')); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error('idb put aborted')); };
+  }));
+}
+
+function gymbroQueueAll() {
+  return gymbroQueueDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(GYM_BRO_QUEUE_STORE, 'readonly');
+    const req = tx.objectStore(GYM_BRO_QUEUE_STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error || new Error('idb read failed'));
+    tx.oncomplete = () => db.close();
+  }));
+}
+
+// The SW reports how many requests are still parked — mirror it into the
+// app badge so Jim can see there is something waiting to sync.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    const d = (e && e.data) || {};
+    if (d.type !== 'QUEUE_COUNT' || typeof d.count !== 'number') return;
+    try {
+      if (!navigator.setAppBadge) return;
+      if (d.count > 0) navigator.setAppBadge(d.count);
+      else if (navigator.clearAppBadge) navigator.clearAppBadge();
+    } catch (err) { /* badge API is optional */ }
+  });
 }
 
 // PWA install prompt — 7-day delayed bottom sheet (Jim OOB 2026-07-26 19:35 HKT).

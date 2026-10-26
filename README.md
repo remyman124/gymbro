@@ -12,6 +12,38 @@ Built around three ideas:
 
 ---
 
+## 📱 手機使用(iPhone / Android)
+
+> ⚠️ **一定要用 HTTPS 網址**:`https://alonso.tail9e2b74.ts.net/`
+> (tailscale serve → `http://127.0.0.1:7000`)。
+> 舊嘅 `http://100.114.66.125:7000/` 冇 TLS,**Web Push、定位、Service Worker
+> 全部唔會 work** —— 係瀏覽器嘅硬性要求(secure context),唔係 app 嘅選擇。
+
+**加入主畫面(建議做)**
+1. iPhone:Safari 開 `https://alonso.tail9e2b74.ts.net/` → 分享 → **加入主畫面**
+2. Android:Chrome 選單 → **安裝應用程式 / 加到主畫面**
+
+**通知(Web Push,v3.3.44)**
+- 撳 header 嘅 🔔 → 開通知
+- iOS 16.4+:**必須係加咗到主畫面嘅 PWA** 先會 work(普通 Safari 分頁唔得)
+- 收到通知撳一下 → 直接跳返 app
+
+**記位置(v3.3.44)**
+- 撳 header 嘅 📍 → 記低而家喺邊度,會顯示地標同「距離上次幾遠」
+- 定位係**你主動撳先執行**,唔會自動攞
+
+**離線使用(v3.3.44)**
+- 落 set / 取消 set / 結束 session / 拉 WHOOP / 食物文字輸入,如果當下冇網絡,
+  會自動排隊(IndexedDB),恢復網絡後由 Service Worker 自動重試
+- 圖片上傳(`scan_commit`)**唔會**排隊 —— 相太大
+
+**已知限制**
+- `gymbro_vapid.json` 入面嘅 `public_key` 同 `private_key` 對唔上,
+  app 已經喺 runtime 由 private key 推導正確嘅 public key(推導唔到就推)。
+  建議重新產生一次嗰個檔案。
+
+---
+
 ## ✨ Features
 
 - **Four-tab mobile UI** — Log · Pyramid · History · You, inspired by Uber's bottom nav

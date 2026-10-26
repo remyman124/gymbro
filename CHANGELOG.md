@@ -1,3 +1,77 @@
+## v3.3.44 — 2026-10-26 — 手機 PWA 強化:Web Push + 定位 + 背景同步(離線隊列)
+
+規格:`docs/MOBILE_PWA_SPEC_v3.3.44.md`(唯一真實來源)。branch:`feature/v3.3.44-mobile-pwa`。
+
+### 1. 新增檔案
+- `gym_web/push.py` — Web Push 工具:VAPID 金鑰讀取、subscription 儲存、發送
+  - VAPID 金鑰喺 `/home/work/.hermes/gymbro_vapid.json`(repo 之外,mode 0600),
+    **private key 唔會入 git / 唔會入 log**
+  - ⚠️ 實測發現嗰個檔案入面嘅 `public_key`(43 字元)**同 private_key 對唔上**
+    (由 private key 推導出嚟嘅係 87 字元)。所以 `vapid_public_key()` 會**由
+    private key 推導**出正確嘅 public key,並且喺 log 度出一次警告 ——
+    唔推導嘅話每次 push 都會 401/403。`/home/work/.hermes/gymbro_vapid.json`
+    應該重新產生。
+  - subscription store:`GYMBRO_PUSH_STORE`(預設
+    `/home/work/.hermes/gymbro_push_subs.json`),endpoint 做 key,原子寫
+- `gym_web/geo.py` — 位置工具:位置紀錄(上限 200 條)、Nominatim 反向地理編碼
+  (24 小時 cache,3 秒 timeout,失敗回傳空字串,**唔會編造地名**)、
+  haversine 距離、最近一筆有 label 嘅紀錄
+- `tests/qa/test_mobile_pwa_api.py` — 20 個測試(store 一律 override 去 tmp_path,
+  **唔會**寫入真實 `/home/work/.hermes/gymbro_*.json`,亦**完全唔掂** Google Sheet)
+
+### 2. 新增 7 個 endpoint(全部 fail-soft,唔會 500)
+| Route | 用途 |
+|---|---|
+| `GET /api/push/vapid_public_key` | 畀 browser `pushManager.subscribe()` 用 |
+| `POST /api/push/subscribe` | 儲存 subscription |
+| `POST /api/push/unsubscribe` | 刪除 subscription |
+| `GET /api/push/status` | subscription 數量 + VAPID 是否 ready |
+| `POST /api/push/send` | 群發通知;push service 回 404/410 → 自動剷走失效 subscription |
+| `POST /api/geo/log` | 記低位置 + 反向地理編碼 + 距離上次幾遠 |
+| `GET /api/geo/recent` | 最近 n 筆位置 |
+
+輸入驗證:經緯度範圍、endpoint ≤ 2048 字元、title/body ≤ 200 字元、payload ≤ 4 KB。
+**任何 response 都唔會包含 VAPID private key。**
+
+### 3. Service Worker(純 additive,fetch/caching 邏輯一律冇改)
+- `push` → 顯示通知;`notificationclick` → focus 現成 client 或者開新 window
+- `message` → `SKIP_WAITING` / `FLUSH_QUEUE`
+- `sync`(tag `gymbro-queue`)→ 自動重試排隊嘅 POST
+- IndexedDB(`gymbro-offline` / store `queue`)離線隊列:2xx 就刪,失敗就
+  `attempts+1`,超過 5 次就丟棄;完成後更新 app badge
+
+### 4. 前端(`templates/index.html`)
+- Header 加咗兩個 44×44 按鈕:🔔(通知開關:已開啟 / 未開啟 / 已封鎖)同 📍(記位置)
+- iOS 16.4+ 一定要加咗主畫面嘅 PWA 先有 Web Push → 唔係 standalone 就提示
+  「請先用 Safari 分享 → 加入主畫面,再開通知」;非 secure context 就直接話
+  「需要 HTTPS」
+- 通知流程:`Notification.requestPermission()` → `pushManager.subscribe()` →
+  `POST /api/push/subscribe`
+- 定位流程:`getCurrentPosition` → `POST /api/geo/log` → 顯示返地標同距離;
+  權限被拒 / 逾時 用文字講,**唔會**彈 `alert()` / `confirm()`
+- `apiPost(url, body, {queueable:true})` wrapper:`/api/log_set`、
+  `/api/cancel_last_set`、`/api/end_session`、`/api/whoop_refresh`、
+  `/api/scan_preview_text` 全部行入離線隊列;network error → 寫 IndexedDB +
+  `reg.sync.register('gymbro-queue')`(冇 Sync API 就靠 `online` event +
+  SW `FLUSH_QUEUE`)
+  - ⚠️ `scan_commit`(**唔可以** queue 住 —— 圖片上傳太大,而且係 Sheet 寫入路徑)
+- `manifest.json` 補咗 `id` / `scope` / `lang` / `dir` / `categories` +
+  2 個 shortcuts(影相記錄 → `/?action=scan`、落 set → `/?action=logset`)
+- `<main>` 底部 padding 改成 `calc(env(safe-area-inset-bottom) + 5rem)`,
+  iPhone home indicator 唔會遮住最後一行
+
+### 5. ⚠️ 一定要用 HTTPS
+Web Push / Geolocation / Service Worker 全部要求 secure context。
+Jim 手機上面要用 **`https://alonso.tail9e2b74.ts.net/`**(tailscale serve),
+舊嘅 `http://100.114.66.125:7000/` 冇 TLS,呢三樣全部唔會 work。
+
+### 6. 驗證
+- `py_compile gym_web.py gym_web/push.py gym_web/geo.py` ✅
+- `pytest tests/qa/test_mobile_pwa_api.py` → 20 passed ✅
+- Service Worker 同前端 inline script 用 `node --check` 驗過語法 ✅
+
+---
+
 ## v3.3.42 — 2026-10-25 — 語音改用 MiniMax(全局 + gymbro + 9am cheer)
 
 Jim 2026-10-25「Yes. Change to minimax for voice」。
