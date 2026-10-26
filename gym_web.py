@@ -16332,7 +16332,12 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v145';
+const CACHE = 'gym-web-v146';
+// v3.3.44 (2026-10-26, Alonso「enhance gymbro web app to be more mobile
+// friendly」):cache 版本 145 → 146。
+//   SW 新增 push / notificationclick / message / sync handler + IndexedDB
+//   'gymbro-offline' 離線隊列。舊 SW 唔識處理 push 事件,唔 bump 版本的話
+//   Jim 手機上面個 SW 唔會換新 → 通知收唔到。
 // v3.3.38 (2026-10-22, Jim OOB「The thumbnail are the same again. Pls fix the
 // thumbnail and the systemic problem」):cache 版本 144 → 145。
 //   activate 會刪晒所有舊 cache → Jim 手機上面舊嗰批「一模一樣」嘅縮圖

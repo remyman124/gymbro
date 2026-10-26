@@ -28,6 +28,9 @@ DEFAULT_GEO_STORE = "/home/work/.hermes/gymbro_geo.json"
 MAX_LOCATIONS = 200
 GEOCODE_TTL_S = 24 * 60 * 60
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+# Nominatim rate-limits shared egress IPs (HTTP 429), so Photon is the
+# fallback provider. Neither is allowed to invent a place name.
+PHOTON_URL = "https://photon.komoot.io/reverse"
 # Nominatim's usage policy requires an identifying User-Agent.
 USER_AGENT = "gymbro-pwa/1.0 (jim@local)"
 
@@ -114,6 +117,24 @@ def _label_from(payload: dict) -> str:
     return ""
 
 
+def _label_from_photon(payload: dict) -> str:
+    """Turn a Photon (komoot) response into a short human label."""
+    if not isinstance(payload, dict):
+        return ""
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        return ""
+    props = (features[0] or {}).get("properties")
+    if not isinstance(props, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("name", "street", "district", "city", "county", "state", "country"):
+        value = props.get(key)
+        if isinstance(value, str) and value and value not in parts:
+            parts.append(value)
+    return " · ".join(parts[:3])
+
+
 def reverse_geocode(lat: float, lng: float) -> str:
     """Best-effort place name for a coordinate. "" when unknown.
 
@@ -137,26 +158,32 @@ def reverse_geocode(lat: float, lng: float) -> str:
             if age < GEOCODE_TTL_S:
                 return str(hit["label"])
 
-    query = urllib.parse.urlencode({
-        "format": "jsonv2",
-        "lat": f"{lat:.6f}",
-        "lon": f"{lng:.6f}",
-        "zoom": "18",
-        "addressdetails": "1",
-    })
-    request = urllib.request.Request(
-        f"{NOMINATIM_URL}?{query}",
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=3) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[geo.reverse_geocode] lookup failed for {key}: "
-              f"{type(e).__name__}: {e}", flush=True)
+    # Provider chain. Nominatim gives the best detail but rate-limits shared
+    # egress IPs with HTTP 429, so Photon is the fallback. A failure of both
+    # just means an empty label - we never invent a place name.
+    payload = None
+    for base, extra in ((NOMINATIM_URL, "&format=jsonv2&zoom=18&addressdetails=1"),
+                        (PHOTON_URL, "")):
+        query = urllib.parse.urlencode({
+            "lat": f"{lat:.6f}",
+            "lon": f"{lng:.6f}",
+        }) + extra
+        request = urllib.request.Request(
+            f"{base}?{query}",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=3) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as e:
+            print(f"[geo.reverse_geocode] {base} failed for {key}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            payload = None
+    if payload is None:
         return ""
 
-    label = _label_from(payload)
+    label = _label_from(payload) or _label_from_photon(payload)
     if not label:
         return ""
 

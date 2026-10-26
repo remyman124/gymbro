@@ -291,7 +291,7 @@ def send_push_detailed(sub: dict, payload: str, ttl: int = 86400,
         webpush(
             subscription_info=info,
             data=payload,
-            vapid_private_key=vapid["private_key"],
+            vapid_private_key=vap["private_key"],
             vapid_claims={"sub": os.environ.get(VAPID_SUB_ENV) or DEFAULT_VAPID_SUB},
             headers={"Urgency": str(urgency)},
             ttl=int(ttl),
