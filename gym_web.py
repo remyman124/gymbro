@@ -937,7 +937,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.42"
+__version__ = "3.3.43"
 
 
 def _recovery_pct():
@@ -2690,7 +2690,17 @@ def serve_image(filename):
 
 @app.route("/static/<path:filename>")
 def serve_static(filename):
-    """Serve static assets like favicon, apple-touch-icon, PWA icons."""
+    """Serve static assets like favicon, apple-touch-icon, PWA icons.
+
+    v3.3.43: 呢啲 icon 之前淨係擺喺 `/home/work/.hermes/image_cache`
+    (一個會被 prune 嘅 cache dir),而且**從來冇 commit 落 git** ——
+    所以每次 prune 之後 PWA icon 就永久 404,iOS「加入主畫面」更加係
+    拎唔到 icon。而家 icon 放喺 repo 入面嘅 `static/`(有 git 追蹤),
+    先由 repo 搵,搵唔到先 fallback 去 image_cache。
+    """
+    repo_static = Path(__file__).resolve().parent / "static"
+    if (repo_static / filename).is_file():
+        return send_from_directory(str(repo_static), filename)
     return send_from_directory("/home/work/.hermes/image_cache", filename)
 
 

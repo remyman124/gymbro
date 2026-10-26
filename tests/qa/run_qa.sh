@@ -76,6 +76,7 @@ declare -a QA_GROUPS=(
   "bgparallel:tests/qa/test_background_parallel_scan.py"
   "bgdynamic:tests/qa/test_v3333_dynamic.py"
   "hygiene:tests/qa/test_repo_hygiene.py"
+  "pwaicons:tests/qa/test_pwa_icons.py"
   "whoopfresh:tests/qa/test_whoop_freshness.py"
   "thumbfresh:tests/qa/test_thumb_url_freshness.py"
   "renamemacro:tests/qa/test_rename_macro_reestimate.py"
