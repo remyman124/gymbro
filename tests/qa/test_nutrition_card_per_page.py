@@ -449,5 +449,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.60"' in web
-    assert "gym-web-v164" in web
+    assert '__version__ = "3.3.61"' in web
+    assert "gym-web-v165" in web

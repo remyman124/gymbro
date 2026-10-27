@@ -215,14 +215,47 @@ def test_no_legacy_modal_wrapper():
 # ---------------------------------------------------------------------------
 
 def test_footer_close_button_removed():
-    """footer 個「✕ 關閉」掣要冇咗。"""
+    """footer 個「✕ 關閉」掣要冇咗(關閉掣只喺 header)。"""
     tpl = _strip_comments(_tpl())
-    assert "✕ 關閉" not in tpl, "footer 嘅「✕ 關閉」掣已經移除"
+    assert ">✕ 關閉<" not in tpl and "✕ 關閉</" not in tpl, (
+        "footer 嘅「✕ 關閉」掣已經移除"
+    )
     # 淨係剩低 header 個 ✕(@click.self / @keydown.escape 係唔同 attribute 名)
     raw = _tpl()
     assert raw.count('@click="closeFoodCardPreview()"') == 1, (
         "只應該剩低一個 @click=\"closeFoodCardPreview()\"(header 個 ✕)"
     )
+
+
+def test_header_close_button_has_visible_label():
+    """v3.3.61:header 個關閉掣要有**可見文字**,唔係一個淨係得 ✕ 嘅細圈。
+
+    Jim OOB「Problem when finish download. No way to go back. Should there be
+    a close button?」—— 細 ✕ 圈喺真機唔夠明顯。
+    """
+    tpl = _tpl()
+    m = re.search(r'(<button[^>]*data-testid="food-card-close"[^>]*>)(.*?)</button>', tpl, re.S)
+    assert m, "搵唔到 header 關閉掣"
+    open_tag, body = m.group(1), m.group(2)
+    assert "關閉" in body, "關閉掣要有可見文字「關閉」"
+    assert "✕" in body, "關閉掣要保留 ✕ 圖示"
+    # 掣嘅 style 要有足夠 tap target(唔再係 36x36 淨圈)
+    assert "height: 34px" in open_tag or "padding: 0 12px" in open_tag, (
+        "關閉掣要有明顯啲嘅 tap target"
+    )
+
+
+def test_download_link_has_no_blank_target():
+    """v3.3.61:下載連結唔准有 target="_blank"。
+
+    iOS 會開一個新分頁蓋住個 App → 落完檔用戶**返唔到 PWA**
+    (Jim OOB「Problem when finish download. No way to go back」)。
+    同一分頁落檔 + server 送 Content-Disposition: attachment
+    → 瀏覽器根本唔會 navigate,App 一直喺度。
+    """
+    tpl = _strip_comments(_tpl())
+    assert 'target="_blank"' not in tpl, "下載連結唔可以有 target=_blank(iOS 會開新分頁)"
+    assert 'rel="noopener"' not in tpl, "冇 target 就唔需要 rel=noopener"
 
 
 def test_header_close_button_still_exists():
@@ -291,5 +324,5 @@ def test_server_download_name_format():
 def test_version_and_cache_bumped():
     """版本 + SW cache 要 bump。"""
     web = _web()
-    assert '__version__ = "3.3.60"' in web, "版本要係 3.3.57"
-    assert "gym-web-v164" in web, "SW cache 要 bump 去做 v161"
+    assert '__version__ = "3.3.61"' in web, "版本要係 3.3.57"
+    assert "gym-web-v165" in web, "SW cache 要 bump 去做 v161"

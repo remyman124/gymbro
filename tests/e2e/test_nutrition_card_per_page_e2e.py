@@ -108,9 +108,10 @@ def main():
         n_btn = page.locator("button:has-text('⬇')").count()
         check("E04b 下載掣係 <a href>(即刻落檔,唔係 JS blob)", n_btn == 0, f"button={n_btn}")
 
-        hrefs = page.evaluate("""() => Array.from(document.querySelectorAll('a'))
+        hrefs = page.evaluate(r"""() => Array.from(document.querySelectorAll('a'))
             .filter(a => (a.textContent||'').includes('⬇'))
             .map(a => ({href: a.getAttribute('href'), dl: a.getAttribute('download'),
+                        target: a.getAttribute('target'),
                         text: (a.textContent||'').trim().replace(/\s+/g,' ')}))""")
         print("   hrefs:", hrefs)
         check("E05 每個連結都標明頁碼 + 指向 /api/nutrition/card",
@@ -121,6 +122,20 @@ def main():
         check("E05c 每個連結都有 download 屬性(檔名一致)",
               all((h["dl"] or "").startswith("gymbro_foodlog_") for h in hrefs),
               str([h["dl"] for h in hrefs])[:220])
+        # 🔴 v3.3.61:唔可以有 target=_blank(iOS 開新分頁蓋住 App → 落完檔返唔到)
+        check("E05d 下載連結冇 target=_blank(唔會開新分頁)",
+              all(not h["target"] for h in hrefs),
+              str([h["target"] for h in hrefs])[:120])
+
+        # v3.3.61:關閉掣要有可見文字,而且喺 viewport 內
+        close_btn = page.locator("[data-testid='food-card-close']")
+        cb_text = (close_btn.inner_text() or "").strip() if close_btn.count() else ""
+        cb_rect = close_btn.bounding_box() if close_btn.count() else None
+        check("E05e 關閉掣有可見文字「關閉」", "關閉" in cb_text, repr(cb_text))
+        check("E05f 關閉掣喺 viewport 內(短屏都撳得到)",
+              cb_rect is not None and cb_rect["y"] >= 0
+              and cb_rect["y"] + cb_rect["height"] <= 844 + 1,
+              str(cb_rect))
         check("E05b 每個連結帶對應 page 參數",
               all(f"page={i + 1}" in (h["href"] or "") for i, h in enumerate(hrefs)),
               str([h["href"] for h in hrefs])[:220])

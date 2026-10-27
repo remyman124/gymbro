@@ -1507,12 +1507,16 @@
             <div class="text-[10px] text-gray-400"
                  x-text="`${foodCardPreview.date || ''} · ${foodCardPreview.sizeKb} KB`"></div>
           </div>
+          <!-- v3.3.61 (Jim OOB「Problem when finish download. No way to go
+               back. Should there be a close button?」):
+               細 ✕ 圈改成**有文字**嘅「✕ 關閉」掣 —— 唔加高度(喺 header
+               最上面,短屏都必見到),但一眼就睇得出可以返回。 -->
           <button @click="closeFoodCardPreview()"
-                  class="flex items-center justify-center rounded-full active:scale-95"
-                  style="height: 36px; width: 36px; line-height: 1; background: rgba(255, 255, 255, 0.10); font-size: 18px;"
-                  aria-label="關閉"
+                  class="flex items-center gap-1 rounded-full active:scale-95"
+                  style="padding: 0 12px; height: 34px; line-height: 1; background: rgba(255, 255, 255, 0.14); font-size: 13px; font-weight: 700; color: rgb(240, 240, 245); flex-shrink: 0;"
+                  aria-label="關閉食物日結"
                   data-testid="food-card-close">
-            ✕
+            <span style="font-size: 16px; line-height: 1;">✕</span><span>關閉</span>
           </button>
         </div>
         <!-- v3.3.59 (2026-10-27, Jim OOB「Still too long. ... such that I can
@@ -1543,9 +1547,13 @@
                  `<a href>`**。server 本身已經送 `Content-Disposition:
                  attachment` → 瀏覽器直接落檔,零 JS、零 blob、零多餘 round trip。
                  撳落去即刻開始下載(唔再要等 fetch + blob convert)。 -->
+            <!-- ⚠️ 唔好加 target="_blank":iOS 會開一個新分頁蓋住個 App,
+                 落完檔之後用戶就返唔到 PWA(Jim OOB「Problem when finish
+                 download. No way to go back」)。同一分頁落檔 + server 送
+                 Content-Disposition: attachment → 瀏覽器根本唔會 navigate,
+                 App 一直喺度。 -->
             <a :href="foodCardPageUrl(pn)"
                :download="foodCardFileName(pn)"
-               target="_blank" rel="noopener"
                @click="onFoodCardDownloadClick(pn)"
                :style="foodCardDlStyle(pn)"
                class="rounded-xl text-sm font-bold transition-all active:scale-95 text-center no-underline block">
@@ -6086,7 +6094,7 @@ function gymApp() {
     // v3.3.60:撳落去即刻提示(下載本身由 <a href> 觸發,唔經 JS)
     onFoodCardDownloadClick(pn) {
       try { this.haptic(12); } catch (e) {}
-      this.flash('⬇ 下載緊 ' + this.foodCardFileName(pn) + '…', 2200);
+      this.flash('⬇ 下載緊 ' + this.foodCardFileName(pn) + ' · 落完可以撳右上角「關閉」', 3000);
     },
 
     // v3.3.60:預熱所有頁 —— 令 server 早就 render 好 + 記入 cache,

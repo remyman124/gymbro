@@ -81,4 +81,4 @@ def test_context_builds_recent_workouts_zh():
 
 
 def test_version_bumped():
-    assert '__version__ = "3.3.60"' in SRC, "版本要升到 3.3.58"
+    assert '__version__ = "3.3.61"' in SRC, "版本要升到 3.3.58"
