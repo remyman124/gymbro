@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.49"
+__version__ = "3.3.50"
 
 
 def _recovery_pct():
@@ -13355,7 +13355,21 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
     latest_rec = next((r for r in recs if (r.get('score') or {}).get('recovery_score') is not None), None)
     latest_cycle = next((c for c in cycles if c.get('id')), None)
     latest_sleep = next((s for s in sleep if s.get('score')), None)
-    today_workouts = [w for w in workouts if (w.get('start') or '').startswith(today_iso())]
+    # v3.3.50:原本用 UTC 字符串 startswith(today_iso())❗—— 早上 7-8 點做
+    # gym(UTC 前一日 23:00)會漏咗❗而家用 HKT 日期計 ✅
+    from datetime import datetime as _dt_hkt, timezone as _tz_hkt, timedelta as _td_hkt
+    _hkt = _tz_hkt(_td_hkt(hours=8))
+    _today_hkt = _dt_hkt.now(_hkt).strftime("%Y-%m-%d")
+    def _is_today_hkt(w):
+        st = w.get("start") or ""
+        if not st:
+            return False
+        try:
+            _d = _dt_hkt.fromisoformat(st.replace("Z", "+00:00")).astimezone(_hkt)
+            return _d.strftime("%Y-%m-%d") == _today_hkt
+        except Exception:
+            return st.startswith(_today_hkt)
+    today_workouts = [w for w in workouts if _is_today_hkt(w)]
 
     score = (latest_rec or {}).get('score') or {}
     sleep_ss = ((latest_sleep or {}).get('score') or {}).get('stage_summary') or {}
@@ -13445,8 +13459,13 @@ def _get_recent_workouts_3d(workouts) -> list:
     cutoff = now_hkt - timedelta(days=3)
     out = []
     try:
-        # workouts_cache is list of workout dicts from Whoop
-        for w in (workouts_cache or []):
+        # v3.3.50 (Jim OOB 2026-10-27「I have done gym at noon as you can see
+        # on whoop」):原本呢度用緊 `workouts_cache` —— 呢個全域變數**從來
+        # 未定義過**❗→ NameError 被 except 吞咗 → 函數永遠回 []❗
+        # → 就算 Jim 今日做咗 gym,narrative 仍然講「過去 3 日未做運動」❗
+        # 而家改用傳入嘅 workouts 參數 ✅(global 只係 fallback ✅)
+        src = workouts if workouts else (globals().get("workouts_cache") or [])
+        for w in src:
             start_str = w.get("start") or ""
             try:
                 start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(hkt)
@@ -13617,7 +13636,18 @@ def _format_recent_workouts_3d_for_cheer(workouts: list) -> str:
             time_str = start_dt.strftime("%m-%d %H:%M")
         except Exception:
             time_str = w.get("start", "?")
-        sport = w.get("sport") or "workout"
+        # v3.3.50:WHOOP 嘅 sport_name 係英文(weightlifting / sauna)❗
+        # 直接入 prompt 會令 TTS 夾雜英文 ✅ → 呢度譯埋 ✅
+        _SPORT_ZH = {
+            "weightlifting": "舉重", "strength_training": "力量訓練",
+            "functional_fitness": "功能性訓練", "running": "跑步",
+            "cycling": "單車", "walking": "步行", "hiking": "行山",
+            "sauna": "桑拿", "swimming": "游泳", "yoga": "瑜伽",
+            "basketball": "籃球", "football": "足球", "tennis": "網球",
+            "rowing": "划艇", "boxing": "拳擊", "hiit": "高強度間歇運動",
+        }
+        _sport_raw = (w.get("sport") or "workout")
+        sport = _SPORT_ZH.get(str(_sport_raw).lower(), _sport_raw)
         strain = w.get("strain")
         dur = w.get("duration_min")
         avg_hr = w.get("avg_hr")
@@ -14082,17 +14112,29 @@ def _build_daily_context() -> dict:
     # generic filler like "食嘢方面建議清淡啲".
     try:
         ctx["whoop"]["today_nutrition"] = m.get("today_nutrition", {})
-        ctx["whoop"]["recent_workouts_zh"] = m.get("recent_workouts_zh", "")
+        # v3.3.49 (Jim OOB 2026-10-27「I have done gym at noon as you can see
+        # on whoop」):原本呢度讀 m["recent_workouts_zh"],但 `_extract_whoop_metrics`
+        # 根本冇呢個 key(只有 recent_workouts_3d 個 list)→ 永遠都係空字串 ❗
+        # → prompt 收到「(過去 3 日未做運動)」❗即使 Jim 今日中午做完 gym ✅
+        # → 所以要即場用 formatter 由 recent_workouts_3d 生成 ✅
+        _rwzh = m.get("recent_workouts_zh")
+        if not _rwzh:
+            try:
+                _rwzh = _format_recent_workouts_3d_for_cheer(m.get("recent_workouts_3d") or [])
+            except Exception:
+                _rwzh = ""
+        ctx["whoop"]["recent_workouts_zh"] = _rwzh
     except Exception:
         pass
     # v3.3.49: log 吓 prompt 真正會見到嘅數據(方便查「點解佢咁講」✅)
     try:
         _w = ctx.get("whoop") or {}
         _tn = _w.get("today_nutrition") or {}
+        _rw = (_w.get("recent_workouts_zh") or "").replace("\n", " ")[:80]
         print(f"[cheer] ctx | rec={_w.get('recovery_pct')} | sleep={_w.get('sleep_bed_hr')}h "
               f"| steps={_w.get('steps')} | strain={_w.get('strain')} "
-              f"| meals={_tn.get('meal_count')}({_tn.get('date')}/{_tn.get('day_label')})",
-              flush=True)
+              f"| meals={_tn.get('meal_count')}({_tn.get('date')}/{_tn.get('day_label')}) "
+              f"| workouts={_rw}", flush=True)
     except Exception:
         pass
     return ctx
@@ -16877,7 +16919,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v153';
+const CACHE = 'gym-web-v154';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch

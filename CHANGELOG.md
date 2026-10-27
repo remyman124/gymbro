@@ -1,4 +1,40 @@
-## v3.3.49 — 2026-10-27 — 修正:食物日期講錯 + WHOOP 指標唔咗入 prompt
+## v3.3.50 — 2026-10-27 — WHOOP 訓練紀錄真正入到 cheer + 日曆管理
+
+Jim OOB 2026-10-27:「I have done gym at noon as you can see on whoop. Pls
+manage my calendar」
+
+### 1️⃣ cheer 唔識講「做咗 gym」❗ → 而家識咗
+- **Root cause**:`_get_recent_workouts_3d()` 迭代咗一個**從未定義過**嘅全域
+  `workouts_cache` → `NameError` 被 `except` 吞咗 → 函數永遠回 `[]` ❗
+  → prompt 收到「(過去 3 日未做運動)」❗即使 Jim 今日中午做完 60.5 分鐘
+  舉重 ✅
+- **修**:用傳入嘅 `workouts` 參數(global 只做 fallback ✅)
+- `today_workouts` 原本用 UTC 字符串 `startswith(today_iso())` ❗(朝早 7-8 點
+  gym 會漏 ✅)→ 改用 HKT 日期 ✅
+- sport 名翻譯(weightlifting → 舉重 ✅、sauna → 桑拿 ✅)—— 免得 TTS 夾雜英文 ✅
+- `_build_daily_context()` 原本讀一個唔存在嘅 `recent_workouts_zh` key ❗
+  → 而家由 `recent_workouts_3d` 即場生成 ✅
+
+**實測新 narrative** ✅:
+「今日12:12完成60.5分鐘舉重,平均心跳98、最高167;13:14再蒸29分鐘桑拿,兩節
+合計89.5分鐘。連同昨日57.5分鐘舉重,你近3日完成3節操,心血管負荷唔輕…」✅
+
+### 2️⃣ 日曆管理 ✅
+- ✅ 中午 12:30 舉重 → 標成「✅ 舉重(已完成)— 上肢推(胸/肩/三頭)」+ 寫低
+  WHOOP 實測(12:12-13:13、61 分鐘、strain 12.9、均心跳 98 → 最高 167 ✅)
+- ✅ 15:00 谷步數 → 更新步數(今日 3,177 → 14:27 ✅)
+- ✅ 19:00 晚餐蛋白 → 更新最新營養(2 餐 / 252 kcal / 蛋白 24g,仲差 126g ✅)
+- ✅ 22:30 早睡 → 更新睡眠(在床 7.88h、表現 78%、效率 91% ✅)
+- ✅ 08:30 蛋白續航 → 修正「今日(10/26)」嘅日期措辭 ✅
+- ✅ push 提醒腳本:跳過標咗「✅ …已完成」嘅事件 ✅(唔會再叫你去做已做嘅嘢 ✅)
+- ⚠️ 本機 workout log / Google Sheet **冇改** ✅ —— set 紀錄要 Jim 自己落 set,
+  WHOOP 先係「有冇操」嘅真相 ✅(唔會寫 0 組嘅假 session 入生產 Sheet ✅)
+
+### 其他
+- SW cache `gym-web-v153` → `gym-web-v154` ✅、版本 3.3.50 ✅
+- 測試:`tests/qa/test_whoop_workouts_in_cheer.py`(5 個守門 ✅)
+
+## v3.3.49 — 2026-10-27 — 修正:食物日期正確性 + WHOOP 指標唔咗入 prompt
 
 Jim OOB 2026-10-27:「the voice was saying that i ate 6 food. but the food
 was actually ytd not today」
