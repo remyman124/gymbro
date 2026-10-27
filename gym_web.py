@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.51"
+__version__ = "3.3.52"
 
 
 def _recovery_pct():
@@ -4904,7 +4904,9 @@ def _download_food_image(image_url: str, slug: str) -> "Path | None":
     # Sanitize slug for filesystem
     safe_slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]+", "_", (slug or "food"))[:32].strip("_") or "food"
     now_hkt = datetime.now(timezone(timedelta(hours=8)))
-    fname = f"scan_{now_hkt.strftime('%Y%m%d_%H%M%S')}_{safe_slug}.jpg"
+    # v3.3.52: 加 uuid 短碼 —— 同一秒下載兩張「同一道菜」嘅相(好常見,
+    # 例如連續兩餐都係炒飯)都會撞名,後寫嘅覆蓋前寫嘅。
+    fname = f"scan_{now_hkt.strftime('%Y%m%d_%H%M%S')}_{safe_slug}_{uuid.uuid4().hex[:8]}.jpg"
     out_path = SCAN_CACHE_DIR / fname
     try:
         req = urllib.request.Request(image_url, headers={
@@ -6742,6 +6744,53 @@ def _thumb_path_for(scan_image_name: str) -> Path:
     return SCAN_THUMB_DIR / (p.stem + ".thumb.jpg")
 
 
+# v3.3.52 (2026-10-27, Jim OOB「For food upload, the immediate thumbnail are all
+# the same. Despite in the end, it works」):
+#
+# 根因:AI/commit 階段嘅 final 檔名淨係得**秒**精度
+#   final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+# 而 now_hkt_dt 喺 _scan_preview_core 入口賦值。掃描係**平行**跑(3 個
+# worker,見 _scan_parallel_workers),所以 3 張相好易喺同一秒開工 →
+# 同一個 final_name → shutil.copyfile 互相覆蓋。
+#
+# 2026-10-27 20:01 批次實測(4 張相,3 workers):
+#   上載 4 個唔同檔案(2259737 / 3711222 / 3880955 / 3774674 bytes)
+#   → scan_cache 只有 2 個 final 檔
+#   → 其中 2 張相喺本地**完全消失**(被覆蓋,冇任何錯誤)
+#   → 4 條 Sheet row 嘅 Drive URL 各自獨立(食物記錄啱)
+#     但 queue 縮圖全部指向同一個 /scan_img/scan_20261027_200120.jpg
+#     → 4 個縮圖一模一樣 ❗(Jim 見到嘅症狀)
+#
+# 同一類 bug v3.3.25 (2026-10-21) 已經喺 **upload** 路徑修過
+# (stored_name 加 uuid),但 AI/commit 路徑漏咗 —— 呢個就係 Jim 講嘅
+# 「systemic problem」。今次用一個集中 helper 收口,唔好再散落各處。
+#
+# 修法:final 名加 uuid 短碼 → 每張相 100% 唔撞名。而且真係會檢查
+# 檔案係咪已經存在(唔會靜靜哋吞相)。
+def _unique_scan_name(prefix: str = "scan", ext: str = ".jpg",
+                      when: "datetime | None" = None) -> str:
+    """Return a filename that is guaranteed not to collide with an existing file.
+
+    v3.3.52: 秒精度嘅檔名喺平行 AI 階段會撞名(見上面嘅註解)。呢度加 uuid
+    短碼,而且會檢查 SCAN_CACHE_DIR 係咪已經有同名檔 —— 如果有(極度唔可能,
+    但唔可以靜靜哋吞相)就再派生一個。
+
+    Args:
+        prefix: 檔名前綴(例如 "scan" / "preview")。
+        ext: 副檔名(含點)。
+        when: 時間戳,預設用而家 HKT。傳入 None 就唔會有時間部分。
+    """
+    if when is None:
+        when = datetime.now(timezone(timedelta(hours=8)))
+    stamp = when.strftime("%Y%m%d_%H%M%S")
+    for _attempt in range(50):
+        name = f"{prefix}_{stamp}_{uuid.uuid4().hex[:8]}{ext}"
+        if not (SCAN_CACHE_DIR / name).exists():
+            return name
+    # 50 次都撞(天文數字上唔可能)→ 加長前綴再嚟
+    return f"{prefix}_{stamp}_{uuid.uuid4().hex[:16]}{ext}"
+
+
 def _thumb_url_for(image_url: str) -> str:
     """Derive /scan_thumb/<name>.thumb.jpg from /scan_img/<name>.jpg. Returns "" if not a scan image URL."""
     if not image_url or not image_url.startswith("/scan_img/"):
@@ -7360,7 +7409,8 @@ def api_scan_food():
 
     # 5. Save image to scan cache (ephemeral preview buffer only — Drive is
     # the canonical store. v3.3.2: no longer write to food_scan_log.json.)
-    img_filename = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    # v3.3.52: 統一用 _unique_scan_name(),唔准再出現秒精度檔名。
+    img_filename = _unique_scan_name("scan", ".jpg", now_hkt_dt)
     img_path = SCAN_CACHE_DIR / img_filename
     img_path.write_bytes(img_bytes)
     entry["image_saved_to"] = str(img_path)
@@ -7663,7 +7713,8 @@ def api_scan_replace_image():
 
     # Build new filename (HKT timestamp, like scan_commit does)
     now_hkt_dt = datetime.now(timezone(timedelta(hours=8)))
-    new_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    # v3.3.52: 統一用 _unique_scan_name(),唔准再出現秒精度檔名。
+    new_name = _unique_scan_name("scan", ".jpg", now_hkt_dt)
     new_path = SCAN_CACHE_DIR / new_name
 
     # Save bytes
@@ -8470,7 +8521,8 @@ def _scan_preview_core(img_bytes: bytes, img_path_hint: str = "",
             print(f"[scan-core] img_path_hint missing, using bytes: "
                   f"{img_path_hint}", flush=True)
     if not keep_source:
-        img_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+        # v3.3.52: 同一秒做多張 preview 一樣會撞名。
+        img_filename = _unique_scan_name("preview", ".jpg", now_hkt_dt)
         img_path = SCAN_CACHE_DIR / img_filename
         img_path.write_bytes(img_bytes)
 
@@ -8741,7 +8793,9 @@ def _scan_preview_core(img_bytes: bytes, img_path_hint: str = "",
     # later on.') Frontend just shows the image + entries; if anything's
     # wrong, user taps ✏️ edit or 🗑️ delete on the food card.
     now_iso_str = now_iso()
-    final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+    # v3.3.52: 平行 worker 同一秒開工 → 秒精度檔名會撞名(相片被吞 +
+    # 縮圖全部一樣)。用 _unique_scan_name() 保證每張相都唔同名。
+    final_name = _unique_scan_name("scan", ".jpg", now_hkt_dt)
     final_path = SCAN_CACHE_DIR / final_name
     drive_image_url = ""  # v3.2.7.45: Golden Copy (Jim OOB 2026-08-14)
     # v3.3.25 production-write guard — a QA fixture must NEVER reach the
@@ -9865,7 +9919,8 @@ def api_scan_preview_from_path():
         preview_field_entries[f] = round(v * jim_ratio, 1) if shared else v
 
     # Copy image into scan_cache so commit can rename later
-    preview_filename = f"preview_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}_from_path.jpg"
+    # v3.3.52: 統一用 _unique_scan_name(),唔准再出現秒精度檔名。
+    preview_filename = _unique_scan_name("preview", "_from_path.jpg", now_hkt_dt)
     preview_path = SCAN_CACHE_DIR / preview_filename
     preview_path.write_bytes(img_bytes)
     # v3.2.7.46: thumbnail for the photostream scan path
@@ -10702,7 +10757,8 @@ def api_scan_commit():
     final_path = None
     image_url = ""
     if img_path is not None:
-        final_name = f"scan_{now_hkt_dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+        # v3.3.52: 見上面 _unique_scan_name() 嘅註解(平行撞名)。
+        final_name = _unique_scan_name("scan", ".jpg", now_hkt_dt)
         final_path = SCAN_CACHE_DIR / final_name
         try:
             img_path.rename(final_path)
@@ -17027,7 +17083,15 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v155';
+const CACHE = 'gym-web-v156';
+// v3.3.52 (2026-10-27, Jim OOB「For food upload, the immediate thumbnail are all
+// the same. Despite in the end, it works」):cache 版本 155 → 156。
+//   真正嘅 bug 喺 server 端(平行 AI 掃描嘅 final 檔名得秒精度 → 撞名 →
+//   4 張相變 2 個檔案 → queue 縮圖全部指向同一個 URL),v3.3.52 用
+//   _unique_scan_name() 修好。但舊 SW cache 可能仲存住舊嘅
+//   /scan_img/scan_20261027_200120.jpg 回應(而家個 URL 唔存在)→ 顯示
+//   壞圖 / 舊圖,所以照樣要 bump 版本,清走舊 cache。
+//   註:Jim 手機上面個已安裝 PWA 可能要完全關閉再開先會換新 SW。
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch
