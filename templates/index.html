@@ -1043,6 +1043,16 @@
         </div>
       </template>
 
+      <!-- v3.3.51 (2026-10-27, Jim OOB「Got an 503 error after uploaded the food
+           image」):重新識別掣 —— 網絡閃斷令前端查唔到 AI 進度時,相片其實
+           已經喺 server 度(甚至可能已經入咗賬)。呢個掣重跑 AI 識別,唔使
+           重新上載相片,亦唔會寫重複記錄(server 冪等)。 -->
+      <button x-show="scanPhotosQueue.some(i => i.path && (i.status === 'uploaded' || i.status === 'failed' || i.status === 'recognising'))"
+              @click="rescanUploadedPhotos()"
+              class="w-full rounded-xl bg-amber-500/20 px-3 py-2 text-xs font-bold text-amber-200 active:scale-95 mb-2">
+        🔄 重新識別(相片唔使再上載)
+      </button>
+
       <!-- v2.3: Clear queue button -->
       <button x-show="scanPhotosQueue.length > 0 && scanPhotosQueue.every(i => i.status === 'committed' || i.status === 'skipped' || i.status === 'failed')"
               @click="clearPhotosQueue()"
@@ -2684,7 +2694,70 @@ function gymApp() {
       this.initPushState();
       this.applyLaunchAction();
       window.addEventListener('online', () => { this.flushOfflineQueue(); });
+      // v3.3.51 (2026-10-27, Jim OOB「Got an 503 error after uploaded the food
+      // image」):如果上次個 scan 喺 server 仲跑緊(例如 Jim 喺網絡閃斷期間
+      // reload 咗個 App),攞返個 job 重新接管 → 唔好因為前端斷線就漏咗
+      // 個結果。非阻塞,唔好影響 init 速度。
+      this.reattachActiveScanJobs();
       this.haptic();
+    },
+
+    // v3.3.51: 重新接管仲喺 server 跑緊嘅 scan job。
+    //
+    // 2026-10-27 事故:synthetic 503 → 前端以為死咗 → 但 server 個 job 一路
+    // 跑完並寫入咗 Sheet。如果前端重載,更加會完全失去個 job(所以有時
+    // 明明入咗賬,food log 又要等下一 refresh 先見到)。
+    // 呢度:開 App 時問 server 有冇仲生氣嘅 job → 有就重新 poll 佢。
+    async reattachActiveScanJobs() {
+      try {
+        const r = await fetch('/api/scan_jobs/active');
+        if (!r.ok) return;
+        const d = await r.json();
+        const jobs = (d && d.jobs) || [];
+        if (!jobs.length) return;
+        // 淨係接返「仲跑緊」嘅(已完成嘅 job 已經入咗 Sheet,唔需要再 poll)
+        const live = jobs.filter(j => j.status === 'running' || j.status === 'queued');
+        if (!live.length) return;
+        const job = live[0];
+        const jobId = job.job_id;
+        if (!jobId) return;
+        if (this.scanBgJobs.some(j => j.jobId === jobId)) return;   // 已經接管緊
+        console.log('[scan] reattaching active job', jobId, job.status,
+          job.pct + '%');
+        this.scanAiJobId = jobId;
+        this.scanAiTotal = Number(job.total) || 0;
+        this.scanBgDisplayJobId = jobId;
+        this.scanBgJobs = [...this.scanBgJobs, {
+          jobId: jobId, token: null,
+          total: this.scanAiTotal, startedAt: Date.now(),
+        }];
+        this.scanPhase = 'recognising';
+        this.scanAiTitle = '🤖 接返返個 AI 識別 job…';
+        this.scanAiStageLabel = job.stage_label || 'AI 仲喺 server 度跑緊…';
+        // queue items 喺 reload 之后已經冇咗 → 用空 array,結果會照樣
+        // 寫入 Sheet,之後 loadRecentScans 會顯示出嚟。
+        this._scanPollJob(jobId, [], [], { token: null, bg: true })
+          .then(() => {
+            this.scanBgJobs = this.scanBgJobs.filter(j => j.jobId !== jobId);
+            this.scanAiPct = 100;
+            this.scanAiStageLabel = '完成';
+            this.scanAiTitle = '✅ AI 識別完成';
+            this.scanPhase = 'done';
+            this.scanBgDisplayJobId = this.scanBgJobs.length
+              ? this.scanBgJobs[this.scanBgJobs.length - 1].jobId : null;
+            this.flash('✅ 接返返個 AI 識別 job · 已經寫入 food log');
+            this.loadRecentScans().catch(() => {});
+          })
+          .catch((e) => {
+            console.error('[scan] reattach failed', e);
+            this.scanBgJobs = this.scanBgJobs.filter(j => j.jobId !== jobId);
+            this.scanAiTitle = '📶 接返 job 失敗(網絡唔穩)';
+            this.scanAiStageLabel = String((e && e.message) || '');
+            this.scanPhase = 'done';
+          });
+      } catch (e) {
+        console.error('[scan] reattach check failed', e);
+      }
     },
 
     // v3.2.8: pull-to-refresh — track touch drag from the top of <main>;
@@ -4477,20 +4550,103 @@ function gymApp() {
       };
     },
 
+    // v3.3.51 (2026-10-27, Jim OOB「Got an 503 error after uploaded the food
+    // image」):POST /api/scan_recognize 係 JSON → 會經過 Service Worker 嘅
+    // /api/ 分支 → 網絡閃斷時會攞到一個合成嘅 503❗
+    // 兩個問題要解:
+    //   (1) 唔好因為一個網絡 503 就當「AI 識別失敗」→ 重試。
+    //   (2) 重試唔可以開兩個 job(否則同一張相寫入 Sheet 兩次)→ 每次
+    //       scan 用一個穩定嘅 client_token,server 見到同一 token 就返回
+    //       原本個 job_id(冪等)✅
+    async _scanStartRecogniseJob(paths, client_indexes, clientToken) {
+      const body = JSON.stringify({
+        paths: paths, client_indexes: client_indexes,
+        client_token: clientToken || '',
+      });
+      const MAX_TRIES = 4;
+      for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+        let r = null;
+        let data = null;
+        try {
+          r = await fetch('/api/scan_recognize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body,
+          });
+        } catch (e) {
+          r = null;   // 完全連唔到 → 網絡閃斷,試多次
+        }
+        if (r) {
+          const _swOffline = (r.headers && r.headers.get('X-Gymbro-Offline') === '1');
+          if (!r.ok && _swOffline) {
+            // 網絡閃斷 → 試多次(冪等,唔會開多個 job)
+            console.warn('[scan] recognise POST offline 503, retry '
+              + attempt + '/' + MAX_TRIES);
+            await new Promise(res2 => setTimeout(res2, 1000 * attempt));
+            continue;
+          }
+          try { data = await r.json(); } catch (e) { data = null; }
+          if (!r.ok || !data || !data.ok) {
+            throw new Error((data && (data.error || data.message)) || ('啟動 AI 識別失敗 HTTP ' + r.status));
+          }
+          return data;
+        }
+        // fetch throw → 網絡閃斷
+        console.warn('[scan] recognise POST network error, retry '
+          + attempt + '/' + MAX_TRIES);
+        await new Promise(res2 => setTimeout(res2, 1000 * attempt));
+      }
+      throw new Error('啟動 AI 識別失敗(網絡唔穩)。相片已上載,試下撳「重新識別」。');
+    },
+
+    // v3.3.51: 重新識別已上載嘅相片(唔使重新上載)。
+    //
+    // 用途:如果之前因為網絡閃斷查唔到 AI 進度(前端以為失敗,但個 job 其實
+    // 可能仲喺 server 跑緊甚至已經入咗賬),Jim 可以撳呢個掣重新行 AI ——
+    // 相片已經喺 server 磁碟度,淨係重跑 AI 識別 + 寫入。
+    // ⚠️ 冪等:同一批 path 用同一個 client_token → 如果之前嗰個 job 仲喺
+    // server 跑緊,server 會返回原本個 job_id(唔會開多一個 job,唔會寫兩次)。
+    async rescanUploadedPhotos() {
+      const items = (this.scanPhotosQueue || []).filter(
+        q => q.path && (q.status === 'uploaded' || q.status === 'failed' || q.status === 'recognising'));
+      if (!items.length) {
+        this.flash('冇可以重新識別嘅相片');
+        return;
+      }
+      const uploads = items.map(q => ({
+        client_index: q.client_index,
+        path: q.path,
+        filename: q.filename || '',
+        image_url: q.image_url || '',
+        thumbnail_url: q.thumbnail_url || '',
+      }));
+      this.scanQueueToken += 1;
+      const myToken = this.scanQueueToken;
+      // 清返舊狀態,畀新 job 接手
+      items.forEach(q => { q.__done = false; q.error = null; q.status = 'uploaded'; });
+      this.scanPhotosQueue = [...this.scanPhotosQueue];
+      this.scanPhase = 'recognising';
+      this.scanAiPct = 0;
+      this.scanAiCurrent = 1;
+      this.scanAiTotal = uploads.length;
+      this.scanAiTitle = '🤖 重新識別緊…';
+      this.scanAiStageLabel = '準備緊…';
+      this.flash('🔄 重新識別緊(相片唔使再上載)…');
+      try {
+        await this._scanStartBgRecognition(uploads, this.scanPhotosQueue, myToken);
+      } catch (e) {
+        console.error('[scan] rescan failed', e);
+        this.flash('重新識別失敗：' + (e.message || '未知錯誤'));
+        this.scanPhase = 'done';
+      }
+    },
+
     // Phase 2:開 job + poll 真實進度
     async _scanRecognisePhase(uploads, queueItems) {
       const paths = uploads.map(u => u.path);
       const client_indexes = uploads.map(u => u.client_index);
-      const r = await fetch('/api/scan_recognize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths: paths, client_indexes: client_indexes }),
-      });
-      let data = null;
-      try { data = await r.json(); } catch (e) { data = null; }
-      if (!r.ok || !data || !data.ok) {
-        throw new Error((data && (data.error || data.message)) || ('啟動 AI 識別失敗 HTTP ' + r.status));
-      }
+      const data = await this._scanStartRecogniseJob(
+        paths, client_indexes, this._scanClientToken(paths));
       const jobId = data.job_id;
       if (!jobId) throw new Error('伺服器冇返 job_id');
       this.scanAiJobId = jobId;
@@ -4511,20 +4667,24 @@ function gymApp() {
     // 完成咗先 flash + 刷新 food log。Jim 上載完可以即刻繼續用。
     // ==========================================================================
 
+    // v3.3.51: 每次 scan 用嘅冪等 token — 由 paths 決定性算出嚟,令到
+    // 「同一批相片嘅重試」一定係同一個 token → server 會返回原本個 job,
+    // 唔會開多個 job(否則同一張相會寫入 Sheet 兩次)。❗
+    _scanClientToken(paths) {
+      const key = (paths || []).slice().sort().join('|');
+      let h = 5381;
+      for (let i = 0; i < key.length; i++) {
+        h = ((h * 33) ^ key.charCodeAt(i)) >>> 0;
+      }
+      return 'scan_' + h.toString(16) + '_' + (paths || []).length;
+    },
+
     // 開一個背景 AI 識別 job。**刻意唔 await 個 poll** —— 呢個就係「背景」。
     async _scanStartBgRecognition(uploads, queueItems, token) {
       const paths = uploads.map(u => u.path);
       const client_indexes = uploads.map(u => u.client_index);
-      const r = await fetch('/api/scan_recognize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths: paths, client_indexes: client_indexes }),
-      });
-      let data = null;
-      try { data = await r.json(); } catch (e) { data = null; }
-      if (!r.ok || !data || !data.ok) {
-        throw new Error((data && (data.error || data.message)) || ('啟動 AI 識別失敗 HTTP ' + r.status));
-      }
+      const data = await this._scanStartRecogniseJob(
+        paths, client_indexes, this._scanClientToken(paths));
       const jobId = data.job_id;
       if (!jobId) throw new Error('伺服器冇返 job_id');
       this.scanAiJobId = jobId;
@@ -4587,12 +4747,25 @@ function gymApp() {
       console.error('[scan] background job failed', jobId, e);
       this.scanBgJobs = this.scanBgJobs.filter(j => j.jobId !== jobId);
       const wasDisplay = (this.scanBgDisplayJobId === jobId);
+      // v3.3.51 (2026-10-27, Jim OOB「Got an 503 error after uploaded the food
+      // image」):網絡層面嘅失敗 ≠ job 死咗 ❗
+      // 2026-10-27 實測:synthetic 503 → 但 server 個 job 跑完並寫入咗 Sheet
+      // (「牛油果炒蛋碗」330 kcal 已入賬)。所以呢度唔可以將啲相標成紅色
+      // 「失敗」—— 相片已經安全上載,個 job 可能仲喺 server 跑緊,最終一樣會
+      // 入賬。改用 'uploaded' 狀態(青色 = 已上載,等緊結果)並且提供
+      // 「重新識別」按鈕 ❗
+      const _msg = String((e && e.message) || '');
+      const _isNet = /網絡|offline|network|failed to fetch|Load failed|503|閃斷/i.test(_msg);
+      const _keepUpload = _isNet && /查 AI 進度失敗/.test(_msg);
       (uploads || []).forEach((up) => {
         const item = (queueItems || []).find(x => x.client_index === up.client_index);
         if (item && !item.__done) {
           item.__done = true;
-          item.status = 'failed';
-          item.error = (e && e.message) || 'AI 識別失敗';
+          // 網絡閃斷 → 唔好當失敗(相已上載,可能仲會入賬)
+          item.status = _keepUpload ? 'uploaded' : 'failed';
+          item.error = _keepUpload
+            ? '網絡閃斷,查唔到 AI 進度(相片已上載,可能已經入咗賬)'
+            : (_msg || 'AI 識別失敗');
         }
       });
       if (wasDisplay) {
@@ -4600,10 +4773,16 @@ function gymApp() {
         // AI 撞速率限制(429)好常見,俾 Jim 一句人話,唔好淨係「未知錯誤」。
         const _m = String((e && e.message) || '');
         const _rateLimited = /429|too many|rate|限|繁忙|busy/i.test(_m);
-        this.scanAiTitle = _rateLimited ? '⏳ AI 暫時太 busy' : '❌ AI 識別失敗';
-        this.scanAiStageLabel = _rateLimited
-          ? 'AI 服務撞咗速率限制(相片已經上載咗,冇漏)。等 1 分鐘再撳「重新識別」就得。'
-          : (_m || '未知錯誤');
+        if (_keepUpload) {
+          this.scanAiTitle = '📶 網絡閃斷,查唔到進度';
+          this.scanAiStageLabel = '相片已經上載咗。AI 可能仲喺 server 跑緊,'
+            + '撳「重新識別」睇下結果,或者直接睇 food log。';
+        } else {
+          this.scanAiTitle = _rateLimited ? '⏳ AI 暫時太 busy' : '❌ AI 識別失敗';
+          this.scanAiStageLabel = _rateLimited
+            ? 'AI 服務撞咗速率限制(相片已經上載咗,冇漏)。等 1 分鐘再撳「重新識別」就得。'
+            : (_m || '未知錯誤');
+        }
         this.scanPhase = 'done';
         this.scanBgDisplayJobId = this.scanBgJobs.length
           ? this.scanBgJobs[this.scanBgJobs.length - 1].jobId : null;
@@ -4611,13 +4790,20 @@ function gymApp() {
       const _m2 = String((e && e.message) || '');
       this.flash(/429|too many|rate|限|繁忙|busy/i.test(_m2)
         ? '⏳ AI 暫時太 busy(相已上載,冇漏):等 1 分鐘再試'
-        : ('❌ 背景 AI 識別失敗:' + (_m2 || '未知錯誤')));
+        : (_keepUpload
+          ? '📶 網絡閃斷(相片已上載,可能已入賬):撳「重新識別」確認'
+          : ('❌ 背景 AI 識別失敗:' + (_m2 || '未知錯誤'))));
     },
 
     // Poll GET /api/scan_progress/<job_id> — 每次 700ms (SCAN_PROGRESS_SPEC §3.2)
     async _scanPollJob(jobId, uploads, queueItems, opts = {}) {
       const started = Date.now();
       const MAX_MS = 15 * 60 * 1000;
+      // v3.3.51: 連續幾多次網絡閃斷之後先放棄(每次 backoff 最多 4 秒,
+      // 20 次 ≈ 最多 70 秒連續離線都仲等得住 —— 2026-10-27 個 Tailscale
+      // 隧道 reset 只係幾秒,個 job 其實仲跑緊並且成功入咗賬)。
+      const MAX_NET_BLIPS = 20;
+      let _netBlips = 0;
       let lastPct = 0;
       // v3.3.33: queue 身分檢查改用 token(每次新 scan +1)。
       // 舊版靠 array reference(`queueItems === this.scanPhotosQueue`),但
@@ -4635,9 +4821,56 @@ function gymApp() {
         if (Date.now() - started > MAX_MS) {
           throw new Error('AI 識別等太耐(超過 15 分鐘),試下再 upload 一次');
         }
-        const r = await fetch('/api/scan_progress/' + encodeURIComponent(jobId));
-        if (!r.ok) throw new Error('查 AI 進度失敗 HTTP ' + r.status);
+        // v3.3.51 (2026-10-27, Jim OOB「Got an 503 error after uploaded the food
+        // image」):分得清「網絡閃斷」同「真 server 錯誤」❗
+        // 2026-10-27 實測:server access log 顯示每一次 poll 都係 200,從來冇
+        // 503。真相係 Jim 嘅 iPhone Tailscale 隧道 reset(tailscaled:「TLS
+        // handshake error … connection reset by peer」)→ response 喺返程跌咗
+        // → Service Worker 自己合成一個 HTTP 503{'error':'offline'}❗
+        // 舊版 `if (!r.ok) throw` 就當 job 死咗 → 顯示「查 AI 進度失敗 HTTP
+        // 503」。但 server 個 job 一路跑到 done,仲成功寫入咗 Sheet(「牛油果
+        // 炒蛋碗」330 kcal 已入賬 ✅)—— 即係話 Jim 見到「失敗」,但其實成功。
+        // 修:SW 嘅合成 503 帶 X-Gymbro-Offline: 1 header + body offline:true
+        // → 前端認得係網絡閃斷 → 唔好 throw,繼續 poll(個 job 仲喺 server 跑緊),
+        // 並且喺 UI 講明「網絡閃斷,等緊重連」✅
+        let r = null;
         let d = null;
+        let _offline = false;
+        try {
+          r = await fetch('/api/scan_progress/' + encodeURIComponent(jobId));
+        } catch (e) {
+          // fetch 直接 throw(完全連唔到)→ 當網絡閃斷
+          _offline = true;
+        }
+        if (r) {
+          const _swOffline = (r.headers && r.headers.get('X-Gymbro-Offline') === '1');
+          if (!r.ok) {
+            if (_swOffline) {
+              _offline = true;
+            } else {
+              // 真 server 錯誤(4xx/5xx)→ 照舊報錯
+              let _ed = null;
+              try { _ed = await r.json(); } catch (e) { _ed = null; }
+              throw new Error((_ed && (_ed.error || _ed.message)) || ('查 AI 進度失敗 HTTP ' + r.status));
+            }
+          }
+        }
+        if (_offline) {
+          // 網絡閃斷 → 唔好當 job 死咗。server 個 job 仲喺度跑緊,等佢。
+          _netBlips = (_netBlips || 0) + 1;
+          if (_netBlips > MAX_NET_BLIPS) {
+            // 連續太耐都連唔上 → 真係有問題,但要講清楚「可能已完成」
+            throw new Error('查 AI 進度失敗(網絡不穩)。相片已經上載咗,'
+              + '個 AI job 可能仲喺 server 跑緊 —— 撳「重新識別」或返 food log 睇下。');
+          }
+          if (ownsBar()) {
+            this.scanAiTitle = '📶 網絡閃斷,等緊重連…';
+            this.scanAiStageLabel = 'AI 仲喺 server 度跑緊(相片已上載,唔會漏)';
+          }
+          await new Promise(res2 => setTimeout(res2, Math.min(1000 * _netBlips, 4000)));
+          continue;
+        }
+        _netBlips = 0;
         try { d = await r.json(); } catch (e) { d = null; }
         if (!d || !d.ok) throw new Error((d && (d.error || d.message)) || '查 AI 進度失敗');
 

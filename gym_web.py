@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.50"
+__version__ = "3.3.51"
 
 
 def _recovery_pct():
@@ -9002,6 +9002,43 @@ _SCAN_JOBS_STATE_FILE = "/home/work/.hermes/scan_cache/scan_jobs_state.json"
 # poll still finds them (SPEC §2.4).
 SCAN_JOB_TTL_S = 600
 
+# v3.3.51 (2026-10-27): idempotency map for POST /api/scan_recognize.
+#
+# WHY: that endpoint is JSON, so it goes through the Service Worker's /api/
+# branch — which fabricates a synthetic HTTP 503{"error":"offline"} when the
+# network layer drops (2026-10-27: Jim's iPhone Tailscale tunnel reset
+# mid-flight; the real request had already reached the server and the job
+# was already running). If the frontend simply retried, it would start a
+# SECOND job for the same photo → the same meal written to the Sheet twice.
+#
+# Fix: the client sends a stable `client_token` per scan attempt. A repeat
+# POST with the same token returns the ORIGINAL job_id instead of creating a
+# new job — so retrying after a blip is safe and cannot double-write.
+_SCAN_IDEM_TOKENS = {}
+_SCAN_IDEM_LOCK = threading.Lock()
+_SCAN_IDEM_TTL_S = 1800
+
+
+def _scan_idem_lookup(token: str):
+    """Return the job_id previously created for this client_token (or None)."""
+    if not token:
+        return None
+    now = time.time()
+    with _SCAN_IDEM_LOCK:
+        expired = [t for t, v in _SCAN_IDEM_TOKENS.items()
+                   if (now - float(v.get("at") or 0)) > _SCAN_IDEM_TTL_S]
+        for t in expired:
+            _SCAN_IDEM_TOKENS.pop(t, None)
+        hit = _SCAN_IDEM_TOKENS.get(token)
+        return (hit or {}).get("job_id")
+
+
+def _scan_idem_store(token: str, job_id: str):
+    if not token:
+        return
+    with _SCAN_IDEM_LOCK:
+        _SCAN_IDEM_TOKENS[token] = {"job_id": job_id, "at": time.time()}
+
 
 def _scan_job_set(job_id: str, **kwargs):
     """Update one scan job in SCAN_JOBS and print the new progress."""
@@ -9487,6 +9524,24 @@ def api_scan_recognize():
     if not paths:
         return jsonify({"ok": False, "error": "no paths"}), 400
 
+    # v3.3.51 (2026-10-27): idempotent start. If the client retries this POST
+    # (because the Service Worker handed it a synthetic 503 while the real
+    # request had already reached us), return the ORIGINAL job instead of
+    # starting a second one — otherwise the same photo would be recognised
+    # twice and written to the Sheet twice.
+    client_token = str(data.get("client_token") or "").strip()[:64]
+    if client_token:
+        _prev = _scan_idem_lookup(client_token)
+        if _prev:
+            _pj = _scan_job_get(_prev)
+            if _pj:
+                print(f"[scan-job] {client_token} → reuse existing job "
+                      f"{_prev} (idempotent retry, status={_pj.get('status')})",
+                      flush=True)
+                return jsonify({"ok": True, "job_id": _prev,
+                                "total": _pj.get("total", len(paths)),
+                                "reused": True})
+
     # Safety: only accept paths under the permitted cache dirs (SPEC §2.1).
     clean_paths = []
     for p in paths:
@@ -9500,6 +9555,8 @@ def api_scan_recognize():
 
     job_id = (f"scanjob_{datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d_%H%M%S')}"
               f"_{uuid.uuid4().hex[:6]}")
+    if client_token:
+        _scan_idem_store(client_token, job_id)
     _scan_job_set(
         job_id,
         status="running",
@@ -9564,6 +9621,57 @@ def api_scan_progress(job_id: str):
         "can_resume": _can_resume,
         "resume_url": f"/api/scan_resume/{job_id}" if _can_resume else "",
     })
+
+
+@app.route("/api/scan_jobs/active", methods=["GET"])
+def api_scan_jobs_active():
+    """v3.3.51 (2026-10-27): list scan jobs that are still alive server-side.
+
+    WHY: on 2026-10-27 Jim's upload showed "Got an 503 error after uploaded
+    the food image". The 503 was NOT from the server — the access log shows
+    every /api/scan_progress poll answered 200. What happened: Jim's iPhone
+    Tailscale tunnel reset mid-flight (tailscaled: "TLS handshake error …
+    connection reset by peer"), so the poll's *response* was lost on the way
+    back. The Service Worker then fabricated a synthetic HTTP 503
+    {"error":"offline"}, and the frontend's `if (!r.ok) throw` treated it as
+    a dead job.
+
+    Meanwhile the server-side job kept running and DID commit 「牛油果炒蛋碗」
+    330 kcal to the Sheet at 14:52:34. So Jim was told "failed" for a scan
+    that actually succeeded — the worst possible failure mode.
+
+    This endpoint lets the client re-attach to a job that is still running
+    (or recently finished) so a transient network blip never loses the
+    result. It returns only job metadata — no food rows, no Sheet writes.
+    """
+    _scan_jobs_purge_expired()
+    now = time.time()
+    out = []
+    with SCAN_JOBS_LOCK:
+        for jid, j in list(SCAN_JOBS.items()):
+            status = j.get("status", "running")
+            # Only surface jobs that are still worth polling.
+            if status not in ("running", "queued", "completed"):
+                continue
+            created = float(j.get("created_at") or j.get("updated_at") or 0)
+            out.append({
+                "job_id": jid,
+                "status": status,
+                "stage": j.get("stage", ""),
+                "stage_label": j.get("stage_label", ""),
+                "pct": j.get("pct", 0),
+                "total": j.get("total", 0),
+                "current_index": j.get("current_index", 0),
+                "completed": j.get("completed", 0),
+                "created_at": created,
+                "elapsed_s": round(now - created, 1) if created else 0.0,
+                # client_indexes let the frontend rebuild its queue mapping
+                # after a reload, so results still land on the right photo.
+                "client_indexes": j.get("client_indexes") or [],
+            })
+    # Newest first.
+    out.sort(key=lambda x: float(x.get("created_at") or 0), reverse=True)
+    return jsonify({"ok": True, "jobs": out, "count": len(out)})
 
 
 @app.route("/api/scan_resume/<job_id>", methods=["POST"])
@@ -16919,7 +17027,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v154';
+const CACHE = 'gym-web-v155';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch
@@ -16992,7 +17100,15 @@ self.addEventListener('fetch', e => {
   }
   if (url.pathname.startsWith('/api/')) {
     e.respondWith(
-      fetch(e.request).then(res => res).catch(() => new Response(JSON.stringify({error:'offline'}), {status:503, headers:{'Content-Type':'application/json'}}))
+      // v3.3.51 (2026-10-27, Jim OOB「Got an 503 error after uploaded the food
+      // image」):SW 喺網絡層面失敗時會自造一個 HTTP 503{'error':'offline'}❗
+      // 前端見到 503 就當 job 死咗 → 但 server 個 job 其實仲跑緊,最後仲係
+      // 成功寫入 Sheet(2026-10-27 實測:「牛油果炒蛋碗」330 kcal 已入賬 ❗)。
+      // 修:加 X-Gymbro-Offline: 1 header → 前端可以分得清「網絡閃斷(可重試)」
+      // 同「真 server 503」,唔會再誤報失敗 ✅
+      fetch(e.request).then(res => res).catch(() => new Response(
+        JSON.stringify({error:'offline', offline:true}),
+        {status:503, headers:{'Content-Type':'application/json', 'X-Gymbro-Offline':'1'}}))
     );
     return;
   }
@@ -17003,7 +17119,8 @@ self.addEventListener('fetch', e => {
   // after user edits food macros + SW bumps cache version.
   if (url.pathname.startsWith('/nutrition_card/')) {
     e.respondWith(
-      fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response('', {status: 503}))
+      fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response(
+        '', {status: 503, headers: {'X-Gymbro-Offline': '1'}}))
     );
     return;
   }
@@ -17024,12 +17141,13 @@ self.addEventListener('fetch', e => {
         caches.open(CACHE).then(cache => cache.match(e.request).then(hit => hit || fetch(e.request).then(res => {
           if (res && res.status === 200 && res.type === 'basic') cache.put(e.request, res.clone());
           return res;
-        }).catch(() => new Response('', {status: 503}))))
+        }).catch(() => new Response('', {status: 503, headers: {'X-Gymbro-Offline': '1'}}))))
       );
       return;
     }
     e.respondWith(
-      fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response('', {status: 503}))
+      fetch(e.request, {cache: 'no-store'}).then(res => res).catch(() => new Response(
+        '', {status: 503, headers: {'X-Gymbro-Offline': '1'}}))
     );
     return;
   }
@@ -17073,7 +17191,8 @@ self.addEventListener('fetch', e => {
       return res;
     }).catch(() => (e.request.method === 'GET'
       ? caches.match(e.request)
-      : new Response(JSON.stringify({error: 'offline'}), {status: 503, headers: {'Content-Type': 'application/json'}})))
+      : new Response(JSON.stringify({error: 'offline', offline:true}),
+          {status: 503, headers: {'Content-Type': 'application/json', 'X-Gymbro-Offline': '1'}})))
   );
 });
 // Force reload when a new SW takes over (controllerchange = new SW activated).

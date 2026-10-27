@@ -228,10 +228,15 @@ def test_service_worker_has_push_handlers():
 
 
 def test_service_worker_fetch_logic_untouched():
-    """The v137 network-first /api/* rule must not have been rewritten."""
+    """The v137 network-first /api/* rule must not have been rewritten.
+
+    v3.3.51 bumped the cache to v155 so the installed iOS PWA picks up the
+    offline marker on the SW-synthesised 503 (Jim OOB 2026-10-27「Got an 503
+    error after uploaded the food image」).
+    """
     src = GYM_WEB.read_text()
     assert "if (url.pathname.startsWith('/api/')) {" in src
-    assert "const CACHE = 'gym-web-v154';" in src
+    assert "const CACHE = 'gym-web-v155';" in src
 
 
 def test_manifest_has_shortcuts_and_scope(client):

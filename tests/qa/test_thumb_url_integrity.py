@@ -170,7 +170,8 @@ def test_food_history_thumbnail_not_lazy():
 
 def test_service_worker_cache_version_bumped():
     src = (REPO / "gym_web.py").read_text()
-    assert "gym-web-v154" in src
+    # v3.3.51: v154 → v155 (SW must ship the X-Gymbro-Offline marker).
+    assert "gym-web-v155" in src
     assert "gym-web-v145" not in src
 
 
