@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.48"
+__version__ = "3.3.49"
 
 
 def _recovery_pct():
@@ -6161,6 +6161,47 @@ def _detect_shared_meal(dish_desc: str) -> bool:
     return any(indicator.lower() in desc_lower for indicator in shared_indicators)
 
 
+# v3.3.49 (Jim OOB 2026-10-27「the food was actually ytd not today」):
+# fallback window + 相對日期標籤 —— 避免 cheer 將尋日嘅餐當今日講。
+NUTRITION_FALLBACK_MAX_AGE_H = 8.0
+
+
+def _latest_meal_age_hours(rows) -> float:
+    """最新一餐距今幾多個鐘(用 row 自己的 date+time)。搵唔到回 None。"""
+    best = None
+    for r in rows or []:
+        dt = getattr(r, "dt", None)
+        if dt is None:
+            continue
+        try:
+            if getattr(dt, "tzinfo", None) is None:
+                dt = dt.replace(tzinfo=HKT)
+            age = (_dt.now(dt.tzinfo) - dt).total_seconds() / 3600.0
+        except Exception:
+            continue
+        if best is None or age < best:
+            best = age
+    return best
+
+
+def _relative_day_zh(date_str: str | None) -> str:
+    """日期 → 今日 / 尋日 / 前日 / N 日前"""
+    if not date_str:
+        return "今日"
+    try:
+        d = _dt.strptime(date_str, "%Y-%m-%d").date()
+        diff = (_dt.now(HKT).date() - d).days
+    except Exception:
+        return "今日"
+    if diff <= 0:
+        return "今日"
+    if diff == 1:
+        return "尋日"
+    if diff == 2:
+        return "前日"
+    return f"{diff} 日前"
+
+
 def _load_today_nutrition() -> dict:
     """v3.3.2: replaced the legacy nutrition_log.json file-cache read with a
     cache + Sheet query. Same return shape as before so callers don't change.
@@ -6190,7 +6231,15 @@ def _load_today_nutrition() -> dict:
         # recent meal regardless of HKT hour. This prevents cheer pipeline
         # from reporting "0 meal today" when Jim just stayed up late.
         yesterday = (now_hkt - timedelta(days=1)).strftime("%Y-%m-%d")
-        rows = cache.get_by_date(yesterday)
+        y_rows = cache.get_by_date(yesterday)
+        # v3.3.49 (Jim OOB 2026-10-27「the voice was saying that i ate 6 food.
+        # but the food was actually ytd not today」):原本呢個 fallback 係
+        # 「24 個鐘內」❗ —— 下午兩點零餐都會攞返尋日 6 餐當今日,講大話 ❗
+        # 而家收窄:淨係「最近一餐仲喺 NUTRITION_FALLBACK_MAX_AGE_H(8)個鐘
+        # 之內」(真係熬夜/啱啱過咗午夜)先 fallback ✅
+        y_age_h = _latest_meal_age_hours(y_rows)
+        rows = y_rows if (y_rows and y_age_h is not None
+                          and y_age_h <= NUTRITION_FALLBACK_MAX_AGE_H) else []
         if rows:
             today = yesterday  # so caller sees yesterday as "today"
             try:
@@ -6279,7 +6328,11 @@ def _get_today_nutrition_for_cheer() -> str:
     data = _load_today_nutrition()
     if not data["meals"]:
         return ""
-    lines = ["\n**今日飲食記錄（Alonso 主動 monitor，唔係等 Jim 講）**："]
+    # v3.3.49:標明日期(今日定尋日),免得 food coach comment 當今日 ❗
+    eff_date = data.get("date")
+    day_label = _relative_day_zh(eff_date)
+    lines = [f"\n**{day_label}飲食記錄（Alonso 主動 monitor，唔係等 Jim 講）**："]
+    lines.append(f"- 記錄日期: {eff_date}（{day_label}）")
     lines.append(f"- 已 log 餐數: {data['meal_count']} 餐")
     for m in data["meals"]:
         t = m.get("time", "??:??")
@@ -6303,7 +6356,7 @@ def _get_today_nutrition_for_cheer() -> str:
     else:
         p_status = f"仲差 {-p_delta}g 至 PT 目標 {p_target}g"
     lines.append(
-        f"- 今日累計: ~{int(t['kcal'])} kcal / P {p_g}g / C {int(t['C'])}g / F {int(t['F'])}g"
+        f"- {day_label}累計: ~{int(t['kcal'])} kcal / P {p_g}g / C {int(t['C'])}g / F {int(t['F'])}g"
     )
     lines.append(f"- 蛋白質對住 PT 目標：{p_status}")
     if data["last_meal_ts"]:
@@ -13363,8 +13416,14 @@ def _get_today_nutrition_snapshot() -> dict:
             "C": float(m.get("carbs") or 0),
             "F": float(m.get("fat") or 0),
         })
+    eff_date = data.get("date")
+    # v3.3.49:標明呢批食物係邊一日(今日定尋日)—— LLM 之前淨係見到
+    # 「已 log 6 餐」就當係今日,結果講咗「今日六餐」但其實係尋日 ❗
+    day_label = _relative_day_zh(eff_date)
     return {
-        "date": data.get("date"),
+        "date": eff_date,
+        "is_today": (eff_date == today_iso()),
+        "day_label": day_label,
         "meal_count": data.get("meal_count", 0),
         "totals": data.get("totals", {}),
         "last_meal_ts": data.get("last_meal_ts"),
@@ -13973,10 +14032,14 @@ def _build_daily_context() -> dict:
         }
     except Exception:
         pass
+    # v3.3.49 (Jim OOB 2026-10-27):原本呢度係 `ctx["whoop"] = {"steps": ...}`
+    # —— 成個 metrics dict 被**蓋走** ❗recovery / HRV / 睡眠 / 疲勞全部冇入
+    # prompt,所以 narrative 會講「身體數據未成功讀到 / 按紅燈處理」❗
+    # 而實際 recovery 係 73% ✅。而家改成 merge(加 steps,唔好抹其他嘢 ✅)
     try:
-        ctx["whoop"] = {
-            "steps": (_whoop_steps() or {}).get("steps"),
-        }
+        if not isinstance(ctx.get("whoop"), dict):
+            ctx["whoop"] = {}
+        ctx["whoop"]["steps"] = (_whoop_steps() or {}).get("steps")
     except Exception:
         pass
     # Last food timestamp
@@ -14020,6 +14083,16 @@ def _build_daily_context() -> dict:
     try:
         ctx["whoop"]["today_nutrition"] = m.get("today_nutrition", {})
         ctx["whoop"]["recent_workouts_zh"] = m.get("recent_workouts_zh", "")
+    except Exception:
+        pass
+    # v3.3.49: log 吓 prompt 真正會見到嘅數據(方便查「點解佢咁講」✅)
+    try:
+        _w = ctx.get("whoop") or {}
+        _tn = _w.get("today_nutrition") or {}
+        print(f"[cheer] ctx | rec={_w.get('recovery_pct')} | sleep={_w.get('sleep_bed_hr')}h "
+              f"| steps={_w.get('steps')} | strain={_w.get('strain')} "
+              f"| meals={_tn.get('meal_count')}({_tn.get('date')}/{_tn.get('day_label')})",
+              flush=True)
     except Exception:
         pass
     return ctx
@@ -14102,6 +14175,12 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
     meal_count = today_nutrition.get("meal_count", 0) or 0
     totals = today_nutrition.get("totals", {}) or {}
     meals = today_nutrition.get("meals", []) or []
+    # v3.3.49 (Jim OOB 2026-10-27「the food was actually ytd not today」):
+    # 呢批餐可能係「尋日」嘅(cheer 凌晨/深夜跑嘅情況)。要令 LLM 用返
+    # 正確嘅日子字眼,唔好一律當「今日」❗
+    nutrition_date = today_nutrition.get("date") or today_iso()
+    nutrition_day_label = today_nutrition.get("day_label") or "今日"
+    nutrition_is_today = bool(today_nutrition.get("is_today", True))
 
     # v3.3.23am: recent workouts (last 3 days) formatted as Chinese block.
     recent_workouts_zh = whoop.get("recent_workouts_zh") or "(過去 3 日未做運動)"
@@ -14132,7 +14211,7 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f = m.get("F", 0)
         meals_lines.append(f"  - {t} {name} ~{kcal} kcal / P{p:g} / C{c:g} / F{f:g}")
 
-    meals_block = "\n".join(meals_lines) if meals_lines else "  (今日未 log 食物)"
+    meals_block = "\n".join(meals_lines) if meals_lines else f"  ({nutrition_day_label}未 log 食物)"
 
     return (
         f"{fire_type_zh} 嘅 daily narrative 嚟喇，目標：俾 cheer voice 讀 + "
@@ -14149,7 +14228,8 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"- 今日步數：{steps} 步\n"
         f"- 最後進食：{ctx.get('last_food_ts') or '今日未 log'}\n"
         f"- 最後 gym：{ctx.get('last_gym_ts') or '今日未做 gym'}\n\n"
-        f"**今日飲食記錄（Jim OOB 2026-09-27: cheer 要引用, 唔好 generic）**：\n"
+        f"**{nutrition_day_label}飲食記錄（Jim OOB 2026-09-27: cheer 要引用, 唔好 generic）**：\n"
+        f"- 記錄日期：{nutrition_date}（{nutrition_day_label}）\n"
         f"- 已 log {meal_count} 餐\n"
         f"- 累計 ~{int(totals.get('kcal', 0))} kcal / P{int(totals.get('P', 0))}g / C{int(totals.get('C', 0))}g / F{int(totals.get('F', 0))}g\n"
         f"{meals_block}\n\n"
@@ -14161,9 +14241,15 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"{ctx.get('fund_fact') or '(本週未確認)'}\n\n"
         f"**寫作要求**：news fact 同 fund fact 要用「啱啱睇到⋯⋯」/「今朝睇新聞⋯⋯」呢類口語自然嵌入 cheer 內, "
         f"唔好直接 quote 原文, 唔好用 markdown, 唔好逐個字讀出嚟。\n"
-        f"**強制**要喺營養 section 引用今日具體 meal 名 + kcal/P/C/F 數字 (例: 「你 lunch 食咗半個 pizza 加芝士通心粉, 兩餐合共八百幾 kcal, P 落咗四十二克, 蛋白質追 PT 仲差幾十」)。**唔好 generic 寫「食嘢方面建議清淡啲」就帶過**, 要 actionable 建議。\n\n"
-        f"寫作風格：同 _synthesize_cheer_text 一致 (1500-2400 字, 6-8 段, 粵語口語, "
+        f"**強制**要喺營養 section 引用具體 meal 名 + kcal/P/C/F 數字 (例: 「你 lunch 食咗半個 pizza 加芝士通心粉, 兩餐合共八百幾 kcal, P 落咗四十二克, 蛋白質追 PT 仲差幾十」)。**唔好 generic 寫「食嘢方面建議清淡啲」就帶過**, 要 actionable 建議。"
+        + (f"\n**極重要**:呢 {meal_count} 餐嘅日期係 **{nutrition_date}（{nutrition_day_label}）**,唔係今日。"
+           if not nutrition_is_today else
+           f"\n**極重要**:呢 {meal_count} 餐係今日（{nutrition_date}）嘅,寫嘅時候用「今日」。")
+        + "\n\n"
+        f"**寫作風格**：同 _synthesize_cheer_text 一致 (1500-2400 字, 6-8 段, 粵語口語, "
         f"冇 markdown, 全繁體中文)。"
+        f"\n**數字寫法**：kcal / 克數 / 步數 / 鐘數一律用阿拉伯數字(如 2 kcal、250 kcal、3140 步),"
+        f"唔好轉中文數字(「2 kcal」唔係「兩千卡」❗)。"
     )
 
 
@@ -16791,7 +16877,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v152';
+const CACHE = 'gym-web-v153';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch

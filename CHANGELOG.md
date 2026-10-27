@@ -1,3 +1,38 @@
+## v3.3.49 — 2026-10-27 — 修正:食物日期講錯 + WHOOP 指標唔咗入 prompt
+
+Jim OOB 2026-10-27:「the voice was saying that i ate 6 food. but the food
+was actually ytd not today」
+
+### 三個 root cause + 修法
+
+**1. 營養 fallback 闊到 24 個鐘** ❗
+`_load_today_nutrition()` 嘅 late-night fallback 係「今日 0 餐 → 攞尋日」,
+但**冇時間條件** → 下午兩點零餐都會攞返尋日 6 餐當今日 ❗
+→ 收窄成 `NUTRITION_FALLBACK_MAX_AGE_H = 8`(淨係真係熬夜/啱啱過午夜先
+fallback ✅),並用 row 自己嘅 date+time 判斷(`_latest_meal_age_hours` ✅)
+
+**2. prompt 硬寫「今日飲食記錄 / 已 log N 餐」** ❗
+LLM 見到「6 餐」就當係今日 → 而家 prompt 用 `day_label`(今日 / 尋日 / 前日 /
+N 日前)+ 明確寫記錄日期,唔係今日就唔准用「今日」字眼 ✅
+
+**3. `ctx["whoop"]` 被成個蓋走** ❗❗(最嚴重)
+`_build_daily_context()` 原本 `ctx["whoop"] = {"steps": ...}` → 將
+recovery / HRV / 睡眠 / 疲勞**全部抹走** ❗所以 prompt 見到嘅復原度係
+None → narrative 講「身體數據未成功讀到 / 按紅燈處理」,但實際 recovery
+係 73% ✅ → 改成 merge(只加 steps ✅)
+
+### 其他
+- 數字用阿拉伯數字(「2 kcal」唔准寫成「兩千卡」❗)✅
+- food coach comment 都會標明日期 ✅
+- 新增 `[cheer] ctx | rec=… | sleep=… | steps=… | meals=N(date/label)` log ✅
+- SW cache `gym-web-v152` → `gym-web-v153` ✅、版本 3.3.49 ✅
+- 測試:`tests/qa/test_nutrition_date_correctness.py`(8 個守門 ✅)
+
+### 驗證
+- `ctx` log:`rec=73.0 | sleep=7.88h | steps=3177 | meals=2(2026-10-27/今日)` ✅
+- 新 narrative:「今日兩餐都係高蛋白低醣:14:07 冰黑咖啡配三文魚刺身同紅洋蔥絲,
+  合計約252 kcal、蛋白質24克…」+「瞓咗7.88個鐘,表現78%;復原73.0%…綠燈」✅
+
 ## v3.3.48 — 2026-10-27 — 語音教練升級:兩位解說員 + 每個 cheer 必拉 WHOOP
 
 Jim OOB 2026-10-27:「voice coach, can we switch to two voice commentators

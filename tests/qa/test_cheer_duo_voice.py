@@ -83,11 +83,16 @@ def test_whoop_freshness_is_recorded():
 
 
 def test_version_bumped():
-    assert '__version__ = "3.3.48"' in _src(), "版本要升到 3.3.48"
+    m = re.search(r'__version__\s*=\s*"([0-9.]+)"', _src())
+    assert m, "搵唔到 __version__"
+    parts = [int(x) for x in m.group(1).split(".")]
+    assert tuple(parts) >= (3, 3, 48), f"版本要 >= 3.3.48(而家 {m.group(1)})"
 
 
 def test_sw_cache_bumped():
-    assert "gym-web-v152" in _src(), "SW cache 要 bump 到 v152(舊 client 要換新 SW)"
+    m = re.search(r"gym-web-v(\d+)", _src())
+    assert m, "搵唔到 SW cache 名"
+    assert int(m.group(1)) >= 152, f"SW cache 要 bump 到 >= v152(而家 v{m.group(1)})"
 
 
 def test_split_segments_behaviour():
