@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.46"
+__version__ = "3.3.47"
 
 
 def _recovery_pct():
@@ -16593,7 +16593,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v150';
+const CACHE = 'gym-web-v151';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch
@@ -16793,9 +16793,18 @@ self.addEventListener('notificationclick', (e) => {
   const url = (e.notification.data && e.notification.data.url) || '/';
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (list) {
+      // v3.3.47 (Jim OOB「When I receive the notification, can I just click to
+      // enter directly to inbox」): 撳通知 → 直接去對應 tab。
+      //  - app 開住 → focus + postMessage('navigate') → 原地跳去嗰個 tab
+      //    (唔再開新窗口,iOS 開新窗口會令人以為 app 爆咗)
+      //  - app 冇開 → openWindow(url) → app 啟動時讀 ?tab= / #tab 深連結
       for (let i = 0; i < list.length; i++) {
         const c = list[i];
-        if (c.url === url && 'focus' in c) { return c.focus(); }
+        if (c.url && c.url.indexOf(self.location.origin) === 0) {
+          if ('focus' in c) { c.focus(); }
+          if (c.postMessage) { c.postMessage({ type: 'navigate', url: url }); }
+          return null;
+        }
       }
       if (self.clients.openWindow) { return self.clients.openWindow(url); }
       return null;

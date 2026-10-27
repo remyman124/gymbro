@@ -1,3 +1,28 @@
+## v3.3.47 — 2026-10-27 — 推播深連結:撳通知直接入收件箱
+
+Jim OOB 2026-10-27:「When I receive the notification, can I just click to
+enter directly to inbox. I guess some kind of deep link」。
+
+### 實作
+- **深連結格式**:`/?tab=<tab>`(同時支援 `#<tab>`)✅
+  允許 tab:`set` / `workout` / `scan` / `end` / `cheer` / `schedule` / `inbox` ✅
+- **Service Worker `notificationclick`**(v150 → v151):
+  - app 開住 → `focus()` + `postMessage({type:'navigate', url})` → **原地跳 tab**
+    (唔再開新窗口,iOS 開新窗口會令人以為 app 爆咗)✅
+  - app 冇開 → `openWindow(url)` → 啟動時讀深連結 ✅
+- **前端**:`_deepLinkTab()` / `applyDeepLink()` / `_listenSwMessages()` ✅
+  - `init()` 一開始就套用深連結(唔等 fetch 完)✅
+  - 收 SW 嘅 `navigate` message → 即刻跳 tab ✅
+  - URL 同步成 `?tab=...`(reload 都留喺同一個 tab)✅
+- **推播 cron**(`scripts/gymbro_push_notify.py`)→ 推播 url 改成 `/?tab=inbox` ✅
+- 測試:`tests/qa/test_inbox_api.py` 加深連結守門(共 17 個測試)✅
+
+### 驗證
+- Playwright(390×844):開 `/?tab=inbox` → inbox tab 即刻 active ✅、
+  panel 顯示 ✅、訊息卡載入 ✅;開 `#inbox` 一樣 ✅
+- 線上實測:推播 `url=/?tab=inbox` → **送達 1 部機** ✅、outbox 記低 url ✅
+- QA 408 passed / 4 skipped ✅
+
 ## v3.3.46 — 2026-10-27 — 收件箱改成「Gymbro 推播」
 
 Jim OOB 2026-10-27:「Just the message push from gymbro. Not our conversation.」

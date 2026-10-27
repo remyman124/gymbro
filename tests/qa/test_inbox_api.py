@@ -180,6 +180,34 @@ def test_production_outbox_has_no_test_entries():
         f"{[(b.get('ts'), b.get('title'), b.get('body')) for b in bad]}")
 
 
+# ---------------------------------------------------------------- 深連結
+
+def test_deep_link_into_inbox():
+    """v3.3.47:撳推播通知 → 直接入收件箱(deep link)。
+
+    Jim OOB 2026-10-27「When I receive the notification, can I just click to
+    enter directly to inbox. I guess some kind of deep link」。
+    """
+    html = TEMPLATE.read_text(encoding="utf-8")
+    assert "_deepLinkTab" in html
+    assert "applyDeepLink" in html
+    assert "_listenSwMessages" in html
+    assert "?tab=inbox" in html
+    assert "d.type === 'navigate'" in html
+    # 允許嘅 tab 白名單一定要包住 inbox
+    assert "'schedule', 'inbox'" in html
+
+    src = GYM_WEB.read_text(encoding="utf-8")
+    assert "c.postMessage({ type: 'navigate', url: url })" in src, \
+        "SW notificationclick 要 focus + postMessage(唔係淨係 openWindow)"
+    assert "self.location.origin" in src
+
+    cron = Path("/home/work/.hermes/scripts/gymbro_push_notify.py")
+    assert cron.exists(), "推播 cron 腳本唔見咗"
+    assert 'url="/?tab=inbox"' in cron.read_text(encoding="utf-8"), \
+        "cron 推播要 deep link 入收件箱"
+
+
 # ---------------------------------------------------------------- 接駁 + 前端
 
 def test_push_send_is_logged():

@@ -2135,6 +2135,44 @@ function gymApp() {
       return (reverse[legacyName] || []).includes(this.tab);
     },
 
+    // ---------- v3.3.47: 深連結(deep link) ----------
+    // 撳推播通知 → 直接跳去對應 tab(收件箱 / 日程 / Gym)。
+    // 支援 ?tab=inbox 同 #inbox;SW 嘅 notificationclick 亦會 postMessage 呢個。
+    _deepLinkTab(url) {
+      const raw = url || ((window.location.search || '') + (window.location.hash || ''));
+      let tab = '';
+      try {
+        const q = new URLSearchParams((raw.split('?')[1] || '').split('#')[0]).get('tab');
+        if (q) tab = q;
+      } catch (e) {}
+      if (!tab && raw.indexOf('#') >= 0) {
+        tab = (raw.split('#')[1] || '').split('&')[0].replace(/[^a-z]/gi, '');
+      }
+      const allowed = ['set', 'workout', 'scan', 'end', 'cheer', 'schedule', 'inbox'];
+      return (tab && allowed.indexOf(tab) >= 0) ? tab : '';
+    },
+    async applyDeepLink(url) {
+      const tab = this._deepLinkTab(url);
+      if (!tab) return false;
+      this.tab = tab;
+      if (tab === 'inbox') { try { await this.loadInbox(true); } catch (e) {} }
+      try {
+        history.replaceState(null, '', location.pathname + '?tab=' + tab);
+      } catch (e) {}
+      return true;
+    },
+    _listenSwMessages() {
+      try {
+        if (!('serviceWorker' in navigator)) return;
+        navigator.serviceWorker.addEventListener('message', (e) => {
+          const d = e.data || {};
+          if (d.type === 'navigate' || d.type === 'open-url') {
+            this.applyDeepLink(d.url || '');
+          }
+        });
+      } catch (e) {}
+    },
+
     // ---------- v3.3.45: 訊息收件箱 ----------
     // Jim OOB 2026-10-26「In gymbro, there should be an inbox showing all the
     // historical messages received」。資料:GET /api/inbox/messages(唯讀
@@ -2534,6 +2572,9 @@ function gymApp() {
     ],
 
     async init() {
+      // v3.3.47: 深連結 —— 撳推播通知直接入對應 tab(要先做,唔好等 fetch 完)
+      this._listenSwMessages();
+      try { await this.applyDeepLink(); } catch (e) {}
       // Try wake lock
       try {
         if ('wakeLock' in navigator) await navigator.wakeLock.request('screen');
