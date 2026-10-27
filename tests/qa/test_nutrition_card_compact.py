@@ -39,6 +39,12 @@ def _tpl():
     return TPL.read_text(encoding="utf-8")
 
 
+def _strip_comments(text):
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    text = re.sub(r"(?m)^\s*//.*$", "", text)
+    return text
+
+
 # ---------------------------------------------------------------------------
 # 1. compact 係 opt-in
 # ---------------------------------------------------------------------------
@@ -153,19 +159,30 @@ def test_compact_download_filename():
 # 4/5. 前端
 # ---------------------------------------------------------------------------
 
-def test_frontend_has_compact_toggle():
-    """前端要有 toggle。
+def test_frontend_compact_toggle_removed():
+    """v3.3.59:個 toggle row 由 modal **移除**。
 
-    v3.3.55: 個 toggle 改名做「檔案細啲(高度 ≤ 1280px)」——
-    因為「縮細」唔等於「變短」(比例唔變 → 手機顯示高度唔變),
-    真正令圖變短嘅係新嘅「每頁餐數」選擇器。呢個 toggle 而家淨係
-    控制**檔案大小**。
+    Jim OOB 2026-10-27「Remove the toggle row ... such that I can see the
+    button download button」—— 佢喺 modal 底部佔 ~42pt,真機短屏會將
+    下載掣推落視窗外(Playwright 量到喺 375x667 掣 bottom=621,喺
+    viewport 內;但 Jim 實際部機嘅可見 app 視窗更矮,iOS 底條 /
+    home indicator / Slide Over 都会食高度)。
+
+    後端 `?compact=1` 仍然支援(舊 URL 唔會壞),只係冇 UI 開關。
     """
-    tpl = _tpl()
-    assert "foodCardPreview.compact = !foodCardPreview.compact" in tpl, (
-        "前端要有切換矮身版嘅 toggle"
+    tpl = _strip_comments(_tpl())
+    assert "foodCardPreview.compact = !foodCardPreview.compact" not in tpl, (
+        "仲有「檔案細啲」toggle handler(應該移除)"
     )
-    assert "檔案細啲" in tpl, "toggle 要有中文標籤(檔案細啲)"
+    assert "檔案細啲" not in tpl, "仲有「檔案細啲」toggle row(應該移除)"
+
+
+def test_frontend_compact_state_still_exists():
+    """state 同參數邏輯要留(後端仲支援 compact=1,舊 URL 要 work)。"""
+    tpl = _tpl()
+    assert "compact: false" in tpl, "state 要保留 compact"
+    assert "&compact=1" in tpl, "前端仲要識送 &compact=1(後端仍然支援)"
+    assert "const _cq = _compact ? '&compact=1' : ''" in tpl
 
 
 def test_frontend_reload_method_exists():

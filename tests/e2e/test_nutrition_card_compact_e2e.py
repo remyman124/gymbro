@@ -1,7 +1,12 @@
 """E2E — v3.3.53 日結 JPG「矮身版」toggle(唯讀,唔碰 Sheet)。
 
 只做 GET(預覽圖),唔觸發任何 scan / commit → 唔會污染生產表。
-目標:確認前端真係有 toggle、撳完會用 compact=1 重新載入、下載檔名帶 _compact。
+目標:確認後端 `?compact=1` 仍然 work(矮身版渲染、獨立 cache、獨立檔名)。
+
+v3.3.59 (Jim OOB「Remove the toggle row ... such that I can see the button
+download button」):「檔案細啲」toggle row 已由 modal **移除** —— 佢喺底部
+佔 ~42pt,真機短屏會將下載掣推落視窗外。後端仍然支援 compact=1(舊 URL
+唔會壞),所以本測試改用 API 直接驗證,唔再靠 UI toggle。
 """
 import json
 import os
@@ -71,10 +76,7 @@ def main():
             el.click(force=True)
             opened = True
         page.wait_for_timeout(3500)
-        # v3.3.55: toggle 改名做「檔案細啲(高度 ≤ 1280px)」
-        check("E01 modal 打得開",
-              opened and page.locator("button:has-text('檔案細啲')").count() > 0,
-              f"opened={opened}")
+        check("E01 modal 打得開", opened, f"opened={opened}")
 
         # ⚠️ `window.gymApp()` 係 **factory function** —— 叫佢會攞返一個全新嘅
         #    初始 state 嘅物件(唔係 live Alpine data)。
@@ -84,65 +86,31 @@ def main():
         st = page.evaluate(live + ".foodCardPreview")
         check("E01b modal 狀態係開住", st.get("visible") is True, json.dumps(st)[:120])
 
-        # 搵 toggle
-        # v3.3.55: 個 toggle 由「矮身版(高度 ≤ 1280px)」改名做
-        # 「檔案細啲(高度 ≤ 1280px)」(因為「縮細」唔等於「變短」,
-        # 真正令圖變短嘅係「每頁餐數」)。
-        toggle = page.locator("button:visible:has-text('檔案細啲')").first
-        has_toggle = toggle.count() > 0
-        check("E02 有「矮身版」toggle", has_toggle)
+        # ── v3.3.59:「檔案細啲」toggle row 已由 modal 移除 ─────────────
+        # Jim OOB「Remove the toggle row ... such that I can see the button
+        # download button」—— 佢喺底部佔 ~42pt,真機短屏會將下載掣推落視窗外。
+        # 後端 `?compact=1` 仍然支援(舊 URL 唔會壞),所以以下改用 API 直接驗證。
+        has_toggle = page.locator("button:visible:has-text('檔案細啲')").count() > 0
+        check("E02 「檔案細啲」toggle row 已移除", not has_toggle, f"has_toggle={has_toggle}")
 
-        if not has_toggle:
-            browser.close()
-            return 1
-
-        # 撳 toggle → 應該重新 fetch(帶 compact=1)
-        # ⚠️ 唔好用固定 wait:server 第一次 render 呢個 per_page 組合可能要
-        #    幾秒(Drive thumb fetch)→ 固定等待會好隨機咁 miss 個 request。
-        #    改成輪詢到 request 出現為止(最多 20 秒)。
-        before = len(calls)
-        toggle.scroll_into_view_if_needed()
-        toggle.click(force=True)
-        compact_calls = []
-        after_calls = []
-        for _ in range(80):
-            page.wait_for_timeout(250)
-            after_calls = calls[before:]
-            compact_calls = [c for c in after_calls if "compact=1" in c]
-            if compact_calls:
-                break
-        check("E03 撳完 toggle 有帶 compact=1 嘅請求", len(compact_calls) > 0,
-              f"{len(compact_calls)}/{len(after_calls)}")
-
-        # 圖片實際高度(由 live state 嘅 url 抽,再量真實 img)
-        # 等圖真係 load 咗(naturalHeight > 0)先量
-        for _ in range(80):
-            h_now = page.evaluate("""() => {
-                const img = Array.from(document.querySelectorAll('img'))
-                    .find(i => (i.src||'').includes('/nutrition_card/'));
-                return img ? img.naturalHeight : 0;
-            }""")
-            if h_now:
-                break
-            page.wait_for_timeout(250)
-        dims = page.evaluate("""() => {
-            const a = Alpine.$data(document.body);
-            const url = a.foodCardPreview.url || '';
-            const imgs = Array.from(document.querySelectorAll('img'))
-                .filter(i => (i.src||'').includes('compact'));
-            return {stateUrl: url, compact: a.foodCardPreview.compact,
-                    imgs: imgs.map(i => ({src: i.src, w: i.naturalWidth, h: i.naturalHeight}))};
-        }""")
+        # 直接打 API 攞 compact 版,量真實像素高度
+        dims = page.evaluate("""async () => {
+            const r = await fetch('/api/nutrition/card?date=__D__&compact=1', {cache:'no-store'});
+            const b = await r.blob();
+            const bmp = await createImageBitmap(b);
+            const r2 = await fetch('/api/nutrition/card?date=__D__', {cache:'no-store'});
+            const b2 = await r2.blob();
+            const bmp2 = await createImageBitmap(b2);
+            return {cw: bmp.width, ch: bmp.height, cs: b.size,
+                    pw: bmp2.width, ph: bmp2.height, ps: b2.size};
+        }""".replace("__D__", DATE))
         print("   dims:", json.dumps(dims, ensure_ascii=False)[:300])
-        check("E04a live state compact = true", dims.get("compact") is True, str(dims.get("compact")))
-        check("E04b 預覽 URL 指向 _compact 檔", "_compact" in (dims.get("stateUrl") or ""),
-              (dims.get("stateUrl") or "")[:80])
-        imgs = dims.get("imgs") or []
-        if imgs:
-            h = imgs[0]["h"]
-            check("E04c 預覽圖高度 ≤ 1280", h <= 1280, f"h={h}")
-        else:
-            check("E04c 預覽圖搵唔到", False, str(imgs)[:120])
+        check("E03 compact 版高度 ≤ 1280", dims.get("ch", 9999) <= 1280,
+              f"{dims.get('cw')}x{dims.get('ch')}")
+        check("E04a compact 版細過原版", dims.get("ch", 9999) < dims.get("ph", 0),
+              f"{dims.get('ch')} < {dims.get('ph')}")
+        check("E04b compact 版檔案細過原版", dims.get("cs", 999999) < dims.get("ps", 0),
+              f"{dims.get('cs')} < {dims.get('ps')}")
 
         # 原始尺寸版仍然要用得 (未 toggle 嘅話)
         plain = page.evaluate("""async () => {

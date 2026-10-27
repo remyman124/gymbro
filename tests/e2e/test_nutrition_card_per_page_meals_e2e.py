@@ -35,7 +35,8 @@ PROBE_JS = """() => {
     const vis = el => { const r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0 && el.offsetParent !== null; };
     const btns = Array.from(modal.querySelectorAll('button')).filter(vis)
-        .filter(b => (b.innerText||'').includes('第'))
+        .filter(b => { const t = (b.innerText||'');
+            return t.includes('第') || t.includes('下載 JPG'); })
         .map(b => { const r = b.getBoundingClientRect();
             return {t:(b.innerText||'').trim().replace(/\\s+/g,' '),
                     top:r.y, bottom:r.y+r.height, left:r.left, right:r.right}; });
@@ -43,10 +44,13 @@ PROBE_JS = """() => {
     const a = Alpine.$data(document.body);
     const img = Array.from(document.querySelectorAll('img'))
         .find(i => (i.src||'').includes('/nutrition_card/'));
+    // v3.3.59:預覽圖嘅位置(用嚟證明下載掣喺圖**上面**)
+    const prev = img ? img.getBoundingClientRect() : null;
     return {btns, modalTop: mr.y, modalBottom: mr.y + mr.height,
             vh: window.innerHeight, vw: window.innerWidth,
             pageTotal: a.foodCardPreview.pageTotal, perPage: a.foodCardPreview.perPage,
             url: a.foodCardPreview.url,
+            imgTop: prev ? prev.top : null, imgBottom: prev ? prev.bottom : null,
             natW: img ? img.naturalWidth : 0, natH: img ? img.naturalHeight : 0,
             hint: (document.querySelector('[x-show="foodCardPreview.visible"]')||{}).innerText || ''};
 }"""
@@ -71,6 +75,12 @@ def check_visibility(tag, d, page_total):
     check(f"{tag} modal 本身喺 viewport 內",
           d["modalBottom"] <= d["vh"] + 1 and d["modalTop"] >= -1,
           f"top={round(d['modalTop'])} bottom={round(d['modalBottom'])} vh={d['vh']}")
+    # 🔴 v3.3.59:下載掣一定要喺預覽圖**上面** —— 咁樣無論畫面幾矮都見到
+    check(f"{tag} 下載掣喺預覽圖上面(唔會被圖推落視窗外)",
+          d["btns"] and d["imgTop"] is not None
+          and max(b["bottom"] for b in d["btns"]) <= d["imgTop"] + 1,
+          f"掣 bottom={max((b['bottom'] for b in d['btns']), default=0):.0f} "
+          f"圖 top={d['imgTop']}")
 
 
 def main():
@@ -101,8 +111,38 @@ def main():
             const b = document.getElementById('pwa-install-banner');
             if (b) { b.style.display = 'none'; b.remove(); }
         }""")
-        page.locator("button:visible:has-text('下載日結')").first.click(force=True)
-        page.wait_for_timeout(4000)
+
+        # ⚠️ 唔好寫死日期 —— 日子一轉(今日 2026-10-28 仲未食嘢)就會 0 餐
+        #    → pageTotal=1、冇圖 → 全部斷言失效。
+        #    反而搵返最近一個「餐數 >= 6」嘅日期(5 餐/頁 → 至少 2 頁)。
+        import urllib.request
+        import json as _json
+        import datetime as _dt
+        today = _dt.date.today()
+        target_date, meal_count = None, 0
+        for back in range(0, 8):
+            d = (today - _dt.timedelta(days=back)).isoformat()
+            try:
+                with urllib.request.urlopen(
+                        f"{BASE}/api/nutrition/card_url?date={d}&per_page=5", timeout=30) as rr:
+                    data = _json.loads(rr.read().decode())
+            except Exception:
+                continue
+            mc = data.get("meal_count") or 0
+            if mc >= 6:
+                target_date, meal_count = d, mc
+                break
+        check("E00 搵到有 ≥6 餐嘅日期(唔係今日 0 餐)", target_date is not None,
+              f"{target_date} ({meal_count} 餐)")
+        if target_date is None:
+            browser.close()
+            print("=== 0/1 passed ===  (連續 8 日都冇 6 餐以上)")
+            return 1
+        print(f"   用緊日期: {target_date} ({meal_count} 餐)")
+
+        # 直接叫 showFoodCardPreview(date) —— modal 支援傳日期
+        page.evaluate("(d) => Alpine.$data(document.body).showFoodCardPreview(d)", target_date)
+        page.wait_for_timeout(5000)
 
         # ── 1. chip row 已移除 ────────────────────────────────────────
         labels = page.evaluate("""() => Array.from(document.querySelectorAll('button'))
@@ -111,13 +151,15 @@ def main():
 
         # ── 2. 預設 = 5 餐/頁 ─────────────────────────────────────────
         check("E02 預設 request 帶 per_page=5",
-              any("per_page=5" in c for c in calls), str(calls[:2]))
+              any(f"date={target_date}" in c and "per_page=5" in c for c in calls),
+              str(calls[:2]))
         d = probe(page)
         check("E03 每頁固定 5 餐(state perPage == 5)", d["perPage"] == 5, str(d["perPage"]))
         check("E04 圖係 1080 闊", d["natW"] == 1080, f"{d['natW']}x{d['natH']}")
         check("E05 5 餐高度 ≈ 1496", 1400 <= d["natH"] <= 1550, f"{d['natW']}x{d['natH']}")
-        check("E06 page_total 正確(7 餐 ÷ 5 = 2 頁)", d["pageTotal"] == 2,
-              str(d["pageTotal"]))
+        exp_pages = (meal_count + 4) // 5
+        check(f"E06 page_total 正確({meal_count} 餐 ÷ 5 = {exp_pages} 頁)",
+              d["pageTotal"] == exp_pages, str(d["pageTotal"]))
 
         # ── 3. 全部頁面下載掣(正常屏) ─────────────────────────────────
         check_visibility("E07 (390x844)", d, d["pageTotal"])
@@ -161,7 +203,7 @@ def main():
         for pp, expect_h in ((4, 1256), (3, 1016)):
             try:
                 with urllib.request.urlopen(
-                        f"{BASE}/api/nutrition/card_url?date=2026-10-27&per_page={pp}",
+                        f"{BASE}/api/nutrition/card_url?date={target_date}&per_page={pp}",
                         timeout=30) as resp:
                     data = _json.loads(resp.read().decode())
                 pages = data.get("pages") or []

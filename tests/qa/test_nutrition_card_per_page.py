@@ -243,23 +243,59 @@ def test_footer_rows_cannot_be_shrunk():
     """
     tpl = _strip_comments(_tpl())
     # 直接比對每行嘅開頭 class(每個都係 modal 入面嘅唯一 signature)
+    # v3.3.59:矮身版 toggle row 已移除(4 行,唔係 5 行)
     for sig, label in (
         ("flex items-center justify-between px-4 flex-shrink-0", "header"),
         ("flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0", "頁碼導航 row"),
-        ("px-4 py-2 flex items-center justify-between gap-2 flex-shrink-0", "矮身版 row"),
         ("px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0", "說明 row"),
-        ("px-4 pb-3 flex flex-wrap gap-2 flex-shrink-0", "下載掣 row"),
+        ("px-4 pb-2 flex flex-wrap gap-2 flex-shrink-0", "下載掣 row"),
     ):
         assert sig in tpl, f"搵唔到 {label} 嘅開頭 div(class signature 唔啱): {sig}"
         assert "flex-shrink-0" in sig, f"{label} 唔係 flex-shrink-0"
 
-    # modal 內最少要有 5 個 flex-shrink-0(header + 頁碼 + 矮身版 + 說明 + 下載掣)
+    # modal 內最少要有 4 個 flex-shrink-0(header + 頁碼 + 說明 + 下載掣)
     m = re.search(r'x-show="foodCardPreview\.visible".*?\n      </div>\n    </div>', tpl, re.S)
     assert m, "搵唔到食物日結 modal block"
-    assert m.group(0).count("flex-shrink-0") >= 5, (
-        f"modal 內最少要 5 個 flex-shrink-0,而家只有 "
+    assert m.group(0).count("flex-shrink-0") >= 4, (
+        f"modal 內最少要 4 個 flex-shrink-0,而家只有 "
         f"{m.group(0).count('flex-shrink-0')}"
     )
+
+
+def test_download_buttons_are_above_the_preview():
+    """v3.3.59:所有操作掣(下載 + 頁碼導航)一定要喺**預覽圖之前**。
+
+    Jim OOB「Still too long ... such that I can see the button download button」
+    —— Playwright 量到喺 375x667 / 320x568 掣 bottom(621 / 527)其實喺
+    viewport 之內,即係話 Jim 實際部機嘅可見 app 視窗更矮(iOS 底條 /
+    home indicator / Slide Over 食高度)。
+    → 掣擺喺底部唔保證見到;搬到 modal 最上面就**保證**見到。
+    """
+    tpl = _strip_comments(_tpl())
+    i_dl = tpl.find('x-for="pn in (foodCardPreview.pageTotal || 1)"')
+    i_nav = tpl.find('x-show="foodCardPreview.pageTotal > 1"')
+    i_prev = tpl.find("flex-1 min-h-0 overflow-y-auto")
+    assert i_dl != -1 and i_nav != -1 and i_prev != -1, "搵唔到相關 block"
+    assert i_dl < i_prev, "下載掣一定要喺預覽圖之前"
+    assert i_nav < i_prev, "頁碼導航一定要喺預覽圖之前"
+    # 而且 preview 一定係**最後**(搣之後)
+    assert i_prev > max(i_dl, i_nav)
+
+
+def test_compact_toggle_row_removed_from_modal():
+    """v3.3.59:「檔案細啲」toggle row 由 modal 移除。
+
+    Jim OOB「Remove the toggle row ... such that I can see the button
+    download button」—— 佢喺底部佔 ~42pt,真機短屏會將下載掣推落視窗外。
+    """
+    tpl = _strip_comments(_tpl())
+    assert "檔案細啲" not in tpl, "仲有「檔案細啲」toggle row(應該移除)"
+    assert "foodCardPreview.compact = !foodCardPreview.compact" not in tpl, (
+        "仲有 toggle handler(應該移除)"
+    )
+    # 但後端仍然支援 compact=1(舊 URL 唔會壞)
+    web = _web()
+    assert "compact" in web, "後端仲要支援 compact"
 
 
 def test_frontend_pp_suffix_helper():
@@ -400,5 +436,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.58"' in web
-    assert "gym-web-v162" in web
+    assert '__version__ = "3.3.59"' in web
+    assert "gym-web-v163" in web

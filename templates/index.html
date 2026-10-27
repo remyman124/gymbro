@@ -1515,6 +1515,58 @@
             ✕
           </button>
         </div>
+        <!-- v3.3.59 (2026-10-27, Jim OOB「Still too long. ... such that I can
+             see the button download button」):
+
+             **下載掣由 modal 底部搬到 header 正下面。**
+             量測發現:喺 375x667 / 320x568 呢啲 viewport,掣嘅 bottom
+             (621 / 527)其實**喺 viewport 之內** —— 即係話 Jim 實際部機嘅
+             可見 app 視窗比 Playwright 嘅 viewport 更矮(iOS Safari 底條 /
+             home indicator / Slide Over 都會食高度)。
+             → 掣擺喺底部就**唔保證**見到;擺喺最上面就**保證**見到。
+
+             順帶:preview 變成最後一個 flex item(`flex-1 min-h-0`),
+             圖嘅 `object-fit:contain` + `max-height:100%` 會**自動縮細**
+             去填滿剩餘空間 —— 所以「太長」嘅問題自動消失,唔使再靠改餐數。 -->
+        <div class="px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0"
+             style="background: rgba(28, 25, 46, 0.95); color: rgb(180, 180, 195);">
+          逐頁下載 ——
+          <span class="font-normal text-gray-400"
+                x-text="`全部 ${foodCardPreview.pageTotal || 1} 頁,撳一個落一張(唔會一次過落晒)`"></span>
+        </div>
+        <div class="px-4 pb-2 flex flex-wrap gap-2 flex-shrink-0"
+             style="background: rgba(28, 25, 46, 0.95); border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
+          <template x-for="pn in (foodCardPreview.pageTotal || 1)" :key="'dl' + pn">
+            <button @click="downloadFoodCardPage(pn)"
+                    :disabled="foodCardPreview.loading || foodCardPreview.downloading"
+                    :style="foodCardDlStyle(pn)"
+                    class="rounded-xl text-sm font-bold transition-all active:scale-95 disabled:opacity-40 text-center">
+              <span x-show="(foodCardPreview.pageTotal || 1) <= 1">⬇ 下載 JPG</span>
+              <span x-show="(foodCardPreview.pageTotal || 1) > 1" x-text="'⬇ 第 ' + pn + ' 頁'"></span>
+            </button>
+          </template>
+        </div>
+        <!-- v3.3.59:頁碼導航同樣搬上來(原本喺 modal 最底,短屏會被視窗切走)。
+             目標:**所有操作掣都喺上半部**,圖喺下面自動縮細。 -->
+        <!-- v3.3.23ax: page navigation (only shown for multi-page days) -->
+        <div x-show="foodCardPreview.pageTotal > 1"
+             class="flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0"
+             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
+          <button @click="switchFoodCardPage(-1)"
+                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum <= 1"
+                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
+                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
+            ‹ 上一頁
+          </button>
+          <div class="text-xs text-gray-300"
+               x-text="`第 ${foodCardPreview.pageNum} / ${foodCardPreview.pageTotal} 頁`"></div>
+          <button @click="switchFoodCardPage(1)"
+                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum >= foodCardPreview.pageTotal"
+                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
+                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
+            下一頁 ›
+          </button>
+        </div>
         <!-- JPG preview (v3.3.23q: max-height + object-fit contain
              so the JPG scales down to fit modal — no more button overlap) -->
         <!-- v3.3.58:min-h-0 令 preview 可以喺 footer 變高時縮細;
@@ -1550,25 +1602,6 @@
             ❌ JPG 唔見咗 — 撳「關閉」再試過
           </div>
         </div>
-        <!-- v3.3.23ax: page navigation (only shown for multi-page days) -->
-        <div x-show="foodCardPreview.pageTotal > 1"
-             class="flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
-          <button @click="switchFoodCardPage(-1)"
-                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum <= 1"
-                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
-                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
-            ‹ 上一頁
-          </button>
-          <div class="text-xs text-gray-300"
-               x-text="`第 ${foodCardPreview.pageNum} / ${foodCardPreview.pageTotal} 頁`"></div>
-          <button @click="switchFoodCardPage(1)"
-                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum >= foodCardPreview.pageTotal"
-                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
-                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
-            下一頁 ›
-          </button>
-        </div>
         <!-- v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」):
              「每頁餐數」選擇器(6/4/3 chip)已移除 —— 每頁固定 **5 餐**
              (v3.3.57 嘅「Make it 5 meals max per screen」)。
@@ -1579,26 +1612,12 @@
              上面一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。真正令圖
              變短嘅係改**比例**(即係每頁少啲餐),唔係縮細。
 
-        <!-- v3.3.53:矮身版 toggle(縮細檔案用)。同「每頁餐數」正交:
-             每頁餐數 = 令圖變短;矮身版 = 令檔案再細啲。 -->
-        <div class="px-4 py-2 flex items-center justify-between gap-2 flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
-          <button @click="foodCardPreview.compact = !foodCardPreview.compact; reloadFoodCardPreview()"
-                  class="flex items-center gap-2 text-xs font-bold transition-all active:scale-95"
-                  :style="foodCardPreview.compact
-                    ? 'color: rgb(251, 191, 36);'
-                    : 'color: rgb(180, 180, 195);'">
-            <span class="inline-block rounded-md px-2 py-1"
-                  :style="foodCardPreview.compact
-                    ? 'background: rgba(251, 191, 36, 0.22); border: 1.5px solid rgba(251, 191, 36, 0.6);'
-                    : 'background: rgba(255, 255, 255, 0.08); border: 1.5px solid rgba(255, 255, 255, 0.18);'">
-              <span x-text="foodCardPreview.compact ? '☑' : '☐'"></span>
-            </span>
-            <span>檔案細啲(高度 ≤ 1280px)</span>
-          </button>
-          <div class="text-[10px] text-gray-400"
-               x-text="foodCardPreview.compact ? '已開' : '關'"></div>
-        </div>
+        <!-- v3.3.59:「檔案細啲(高度 ≤ 1280px)」toggle row 已移除
+             (Jim OOB「Remove the toggle row ... such that I can see the
+             button download button」)—— 佢喺 modal 底部佔咗 ~42pt,
+             而且喺真機短屏會將下載掣推落視窗外。
+             後端 `?compact=1` 仍然支援(舊 URL 唔會壞),只係唔再有 UI 開關。 -->
+
         <!-- v3.3.54 (2026-10-27, Jim OOB「Don't download multiple image at the
              same time. Show multiple download button to download. Remove
              second button」):
@@ -1607,28 +1626,6 @@
                 瀏覽器同時下載限制 → 改為**每頁一個掣,撳一個只落一張**。
              ② 第二個「✕ 關閉」掣已移除 —— 右上角 ✕ / Esc / 點背景一樣
                 可以閂 modal,唔需要喺 footer 佔位。 -->
-        <!-- v3.3.57 (2026-10-27, Jim OOB「But show me all the page button to
-             download one by one」):明確講清楚「全部頁面」+「逐頁下載」。
-             掣本身就係每頁一個(全部顯示,唔會藏喺第 2 頁)——
-             呢行字淨係講明點用,免得 Jim 以为仲要撳「下載全部」。 -->
-        <div class="px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); color: rgb(180, 180, 195);">
-          逐頁下載 ——
-          <span class="font-normal text-gray-400"
-                x-text="`全部 ${foodCardPreview.pageTotal || 1} 頁,撳一個落一張(唔會一次過落晒)`"></span>
-        </div>
-        <div class="px-4 pb-3 flex flex-wrap gap-2 flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
-          <template x-for="pn in (foodCardPreview.pageTotal || 1)" :key="'dl' + pn">
-            <button @click="downloadFoodCardPage(pn)"
-                    :disabled="foodCardPreview.loading || foodCardPreview.downloading"
-                    :style="foodCardDlStyle(pn)"
-                    class="rounded-xl text-sm font-bold transition-all active:scale-95 disabled:opacity-40 text-center">
-              <span x-show="(foodCardPreview.pageTotal || 1) <= 1">⬇ 下載 JPG</span>
-              <span x-show="(foodCardPreview.pageTotal || 1) > 1" x-text="'⬇ 第 ' + pn + ' 頁'"></span>
-            </button>
-          </template>
-        </div>
       </div>
     </div>
 
