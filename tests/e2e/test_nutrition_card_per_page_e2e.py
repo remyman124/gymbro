@@ -48,7 +48,7 @@ def main():
         }""")
 
         # 開 modal
-        page.locator("button:has-text('下載日結')").first.click(force=True)
+        page.locator("button:visible:has-text('下載日結')").first.click(force=True)
         page.wait_for_timeout(4000)
 
         live = "() => Alpine.$data(document.body)"

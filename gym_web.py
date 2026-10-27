@@ -2491,7 +2491,13 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
     # 圖真係矮咗 —— iPhone 睇/存都方便好多,檔案細啲。
     if compact:
         try:
-            target_h = int(CARD_COMPACT_MAX_H)
+            # v3.3.55: 目標高度 = min(絕對上限, 原高 * 0.75)
+            #   6 餐/頁 1736 → min(1280, 1302) = 1280(同 v3.3.53 一致)
+            #   4 餐/頁 1256 → min(1280,  942) =  942(真係有效果)
+            #   3 餐/頁 1016 → min(1280,  762) =  762(真係有效果)
+            # 之前淨係用絕對 1280 → 4/3 餐嘅卡本身就矮過 1280 → toggle
+            # 變成 no-op(撳落去冇反應)。
+            target_h = min(int(CARD_COMPACT_MAX_H), int(img.height * 0.75))
             if img.height > target_h:
                 ratio = target_h / float(img.height)
                 new_w = max(1, int(round(img.width * ratio)))

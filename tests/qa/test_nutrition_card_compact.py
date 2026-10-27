@@ -154,12 +154,18 @@ def test_compact_download_filename():
 # ---------------------------------------------------------------------------
 
 def test_frontend_has_compact_toggle():
-    """前端要有 toggle。"""
+    """前端要有 toggle。
+
+    v3.3.55: 個 toggle 改名做「檔案細啲(高度 ≤ 1280px)」——
+    因為「縮細」唔等於「變短」(比例唔變 → 手機顯示高度唔變),
+    真正令圖變短嘅係新嘅「每頁餐數」選擇器。呢個 toggle 而家淨係
+    控制**檔案大小**。
+    """
     tpl = _tpl()
     assert "foodCardPreview.compact = !foodCardPreview.compact" in tpl, (
         "前端要有切換矮身版嘅 toggle"
     )
-    assert "矮身版" in tpl, "toggle 要有中文標籤"
+    assert "檔案細啲" in tpl, "toggle 要有中文標籤(檔案細啲)"
 
 
 def test_frontend_reload_method_exists():

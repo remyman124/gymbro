@@ -55,22 +55,18 @@ def main():
         page.wait_for_timeout(300)
 
         # 開日結 modal
+        # ⚠️ 一定要用 `:visible` —— 頁面有 3 個「📸下載日結」掣,部分喺
+        #    隱藏 tab 入面(x-show → display:none 但**仍然喺 DOM**)。
+        #    count() > 0 唔代表睇得到,撳落去會撳中隔籬嘢。
         opened = False
-        for sel in [
-            "button:has-text('下載日結')",
-            "text=下載日結",
-            "button:has-text('下載')",
-        ]:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0 and el.is_visible():
-                    el.click()
-                    opened = True
-                    break
-            except Exception:
-                continue
-        page.wait_for_timeout(3000)
-        check("E01 modal 打得開", opened and page.locator("text=矮身版").count() > 0,
+        el = page.locator("button:visible:has-text('下載日結')").first
+        if el.count() > 0:
+            el.click(force=True)
+            opened = True
+        page.wait_for_timeout(3500)
+        # v3.3.55: toggle 改名做「檔案細啲(高度 ≤ 1280px)」
+        check("E01 modal 打得開",
+              opened and page.locator("button:has-text('檔案細啲')").count() > 0,
               f"opened={opened}")
 
         # ⚠️ `window.gymApp()` 係 **factory function** —— 叫佢會攞返一個全新嘅
@@ -82,7 +78,10 @@ def main():
         check("E01b modal 狀態係開住", st.get("visible") is True, json.dumps(st)[:120])
 
         # 搵 toggle
-        toggle = page.locator("text=矮身版").first
+        # v3.3.55: 個 toggle 由「矮身版(高度 ≤ 1280px)」改名做
+        # 「檔案細啲(高度 ≤ 1280px)」(因為「縮細」唔等於「變短」,
+        # 真正令圖變短嘅係「每頁餐數」)。
+        toggle = page.locator("button:visible:has-text('檔案細啲')").first
         has_toggle = toggle.count() > 0
         check("E02 有「矮身版」toggle", has_toggle)
 
@@ -91,15 +90,34 @@ def main():
             return 1
 
         # 撳 toggle → 應該重新 fetch(帶 compact=1)
+        # ⚠️ 唔好用固定 wait:server 第一次 render 呢個 per_page 組合可能要
+        #    幾秒(Drive thumb fetch)→ 固定等待會好隨機咁 miss 個 request。
+        #    改成輪詢到 request 出現為止(最多 20 秒)。
         before = len(calls)
+        toggle.scroll_into_view_if_needed()
         toggle.click(force=True)
-        page.wait_for_timeout(4000)
-        after_calls = calls[before:]
-        compact_calls = [c for c in after_calls if "compact=1" in c]
+        compact_calls = []
+        after_calls = []
+        for _ in range(80):
+            page.wait_for_timeout(250)
+            after_calls = calls[before:]
+            compact_calls = [c for c in after_calls if "compact=1" in c]
+            if compact_calls:
+                break
         check("E03 撳完 toggle 有帶 compact=1 嘅請求", len(compact_calls) > 0,
               f"{len(compact_calls)}/{len(after_calls)}")
 
         # 圖片實際高度(由 live state 嘅 url 抽,再量真實 img)
+        # 等圖真係 load 咗(naturalHeight > 0)先量
+        for _ in range(80):
+            h_now = page.evaluate("""() => {
+                const img = Array.from(document.querySelectorAll('img'))
+                    .find(i => (i.src||'').includes('/nutrition_card/'));
+                return img ? img.naturalHeight : 0;
+            }""")
+            if h_now:
+                break
+            page.wait_for_timeout(250)
         dims = page.evaluate("""() => {
             const a = Alpine.$data(document.body);
             const url = a.foodCardPreview.url || '';
