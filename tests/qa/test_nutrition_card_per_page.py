@@ -202,13 +202,63 @@ def test_frontend_sends_per_page_everywhere():
     assert "per_page=${_pp}${_cq}" in tpl, "切頁/下載 fetch 要同時帶 per_page 同 compact"
 
 
-def test_frontend_chip_row():
-    """要有每頁餐數嘅選擇器。"""
-    tpl = _tpl()
-    assert "每頁餐數" in tpl, "要有「每頁餐數」標籤"
-    assert 'x-for="opt in [5, 4, 3]"' in tpl, "要有 5/4/3 三個選項(上限 5)"
-    assert "@click=\"foodCardPreview.perPage = opt; reloadFoodCardPreview()\"" in tpl, (
-        "撳 chip 要即時重新載入"
+def test_page_size_buttons_removed():
+    """v3.3.58 (Jim OOB「Remove page size buttons」):每頁餐數 chip 要完全移除。
+
+    每頁固定 5 餐(v3.3.57 嘅「Make it 5 meals max per screen」),
+    所以前端唔應該再畀用戶揀餐數。
+    """
+    tpl = _strip_comments(_tpl())
+    assert "每頁餐數" not in tpl, "仲有「每頁餐數」標籤(應該移除)"
+    assert 'x-for="opt in [5, 4, 3]"' not in tpl, "仲有 5/4/3 chip row(應該移除)"
+    assert "foodCardPreview.perPage = opt" not in tpl, "仲有改 perPage 嘅 chip handler"
+    # 但 state 仍然要存在(用嚟砌檔名),而且固定 5
+    assert "perPage: 5" in tpl, "state 要保留 perPage(用嚟砌 _pp5 檔名)"
+
+
+def test_modal_uses_definite_height_for_short_screens():
+    """v3.3.58 (Jim OOB「My screen height is very short. Can't see the download
+    buttons」):modal 要用**確定高度** h-[90dvh],preview 用 flex-1 min-h-0。
+
+    舊做法 `max-h-[90dvh]` + preview 寫死 `max-height: calc(90dvh - 56px - 76px)`
+    → 個 76px 假設 footer 只有一行,但實際 footer ≈ 114px(加埋 chip row 更到
+    ~166px)→ 短屏(iPhone SE 667pt)時 56 + preview + 114 > 90dvh(600)
+    → modal 撞上限 + overflow:hidden → **下載掣被裁走**,Jim 撳唔到。
+    """
+    tpl = _strip_comments(_tpl())
+    assert 'h-[90dvh]' in tpl, "modal 要用 h-[90dvh](確定高度,flexbox 先分配到剩餘空間)"
+    assert "flex-1 min-h-0" in tpl, "preview 要 min-h-0(可以喺 footer 變高時縮細)"
+    assert "calc(90dvh - 56px - 76px)" not in tpl, (
+        "舊嘅錯 max-height 仲喺度 —— 個 76px 假設係短屏裁走下載掣嘅元凶"
+    )
+
+
+def test_footer_rows_cannot_be_shrunk():
+    """header / footer 每行都要 flex-shrink-0,否則 flexbox 會壓扁佢哋。
+
+    用 `rfind('<div', 0, idx)` 抽返每行嘅**開頭 div tag** —— 唔可以用
+    `tpl.find(marker)` 嘅前 400 字窗口:同一個 marker 可能喺更早嘅錯誤
+    提示 block 出現過(例如 `x-show="foodCardPreview.pageTotal > 1"` 喺
+    「JPG 唔見咗」嗰個錯誤提示都出現),窗口就會搵錯 div。
+    """
+    tpl = _strip_comments(_tpl())
+    # 直接比對每行嘅開頭 class(每個都係 modal 入面嘅唯一 signature)
+    for sig, label in (
+        ("flex items-center justify-between px-4 flex-shrink-0", "header"),
+        ("flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0", "頁碼導航 row"),
+        ("px-4 py-2 flex items-center justify-between gap-2 flex-shrink-0", "矮身版 row"),
+        ("px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0", "說明 row"),
+        ("px-4 pb-3 flex flex-wrap gap-2 flex-shrink-0", "下載掣 row"),
+    ):
+        assert sig in tpl, f"搵唔到 {label} 嘅開頭 div(class signature 唔啱): {sig}"
+        assert "flex-shrink-0" in sig, f"{label} 唔係 flex-shrink-0"
+
+    # modal 內最少要有 5 個 flex-shrink-0(header + 頁碼 + 矮身版 + 說明 + 下載掣)
+    m = re.search(r'x-show="foodCardPreview\.visible".*?\n      </div>\n    </div>', tpl, re.S)
+    assert m, "搵唔到食物日結 modal block"
+    assert m.group(0).count("flex-shrink-0") >= 5, (
+        f"modal 內最少要 5 個 flex-shrink-0,而家只有 "
+        f"{m.group(0).count('flex-shrink-0')}"
     )
 
 
@@ -350,5 +400,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.57"' in web
-    assert "gym-web-v161" in web
+    assert '__version__ = "3.3.58"' in web
+    assert "gym-web-v162" in web

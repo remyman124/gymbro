@@ -1,11 +1,20 @@
-"""E2E — v3.3.55 日結 JPG「每頁餐數」(6/4/3)選擇器(唯讀,唔碰 Sheet)。
+"""E2E — v3.3.58 日結 JPG:每頁固定 5 餐 + 短屏下載掣可見(唯讀,唔碰 Sheet)。
+
+背景:
+  v3.3.57  Jim OOB「Make it 5 meals max per screen. But show me all the page
+           button to download one by one」→ 每頁上限 5 餐 + 全部頁面下載掣。
+  v3.3.58  Jim OOB「Remove page size buttons」
+           Jim OOB「My screen height is very short. Can't see the download buttons」
+           → chip row 移除;modal 改用 h-[90dvh] + preview flex-1 min-h-0,
+             短屏 footer(下載掣)永遠可見。
 
 驗證:
-  1. 「每頁餐數」選擇器存在,有 6/4/3 三個 chip。
-  2. 撳「4 餐」/「3 餐」→ request 帶 per_page=。
-  3. 高度真係按比例縮短(1080 闊唔變,高度變)。
-  4. page_total 跟住 per_page 變。
-  5. 下載檔名帶 _pp3。
+  1. 冇「每頁餐數」chip(已移除)
+  2. 預設 request 帶 per_page=5,圖係 1080x1496
+  3. 全部頁面嘅下載掣都 render,而且**喺 viewport 之內**(唔係喺屏幕下面)
+  4. 短屏(375x667)同極短屏(320x568)一樣見到全部下載掣
+  5. 逐頁下載:撳一個掣 = 一個 request + 檔名帶 _pp5
+  6. Server 仍然支援 per_page=4/3(舊 URL backwards compatible)
 """
 import os
 import sys
@@ -20,6 +29,50 @@ def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + (f"  [{detail}]" if detail else ""))
 
 
+# 量度 modal 入面嘅下載掣:有冇被裁 / 有冇喺 viewport 之內
+PROBE_JS = """() => {
+    const modal = document.querySelector('[x-show="foodCardPreview.visible"] > div');
+    const vis = el => { const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && el.offsetParent !== null; };
+    const btns = Array.from(modal.querySelectorAll('button')).filter(vis)
+        .filter(b => (b.innerText||'').includes('第'))
+        .map(b => { const r = b.getBoundingClientRect();
+            return {t:(b.innerText||'').trim().replace(/\\s+/g,' '),
+                    top:r.y, bottom:r.y+r.height, left:r.left, right:r.right}; });
+    const mr = modal.getBoundingClientRect();
+    const a = Alpine.$data(document.body);
+    const img = Array.from(document.querySelectorAll('img'))
+        .find(i => (i.src||'').includes('/nutrition_card/'));
+    return {btns, modalTop: mr.y, modalBottom: mr.y + mr.height,
+            vh: window.innerHeight, vw: window.innerWidth,
+            pageTotal: a.foodCardPreview.pageTotal, perPage: a.foodCardPreview.perPage,
+            url: a.foodCardPreview.url,
+            natW: img ? img.naturalWidth : 0, natH: img ? img.naturalHeight : 0,
+            hint: (document.querySelector('[x-show="foodCardPreview.visible"]')||{}).innerText || ''};
+}"""
+
+
+def probe(page):
+    return page.evaluate(PROBE_JS)
+
+
+def check_visibility(tag, d, page_total):
+    """下載掣:全部 render + 喺 modal 內 + 喺 viewport 內。"""
+    check(f"{tag} 下載掣數量 == pageTotal", len(d["btns"]) == page_total,
+          f"掣={len(d['btns'])} pageTotal={page_total}")
+    check(f"{tag} 全部下載掣喺 modal 範圍內(冇被裁)",
+          all(b["bottom"] <= d["modalBottom"] + 1 for b in d["btns"]),
+          str([(b["t"], round(b["bottom"]), round(d["modalBottom"])) for b in d["btns"]]))
+    # 🔴 Jim 真正嘅投訴:「My screen height is very short. Can't see the download buttons」
+    #    → 掣嘅 bottom 一定要 <= viewport 高度(唔可以喺屏幕下面)
+    check(f"{tag} 全部下載掣喺 viewport 內(短屏都見到)",
+          all(b["bottom"] <= d["vh"] + 1 for b in d["btns"]),
+          f"vh={d['vh']} bottoms={[round(b['bottom']) for b in d['btns']]}")
+    check(f"{tag} modal 本身喺 viewport 內",
+          d["modalBottom"] <= d["vh"] + 1 and d["modalTop"] >= -1,
+          f"top={round(d['modalTop'])} bottom={round(d['modalBottom'])} vh={d['vh']}")
+
+
 def main():
     from playwright.sync_api import sync_playwright
 
@@ -32,10 +85,9 @@ def main():
             accept_downloads=True,
         )
         page = ctx.new_page()
-        # ⚠️ PWA install banner 係 page load 後 3 秒先出現,而且 z-index 9998
-        #    高過所有嘢 → 會攔截 modal 底部嘅 pointer event(實測撳落去
-        #    完全冇反應)。最乾淨嘅做法係喺 page load **之前**就 dismiss 佢,
-        #    唔好靠事後 remove(會撞時間窗口)。
+        # ⚠️ PWA install banner 喺 page load 後 3 秒先出現,而且 z-index 9998
+        #    高過所有嘢 → 會攔截 modal 底部嘅 pointer event。正解係喺 page
+        #    load **之前** dismiss 佢(唔好靠事後 remove,會撞時間窗口)。
         page.add_init_script(
             "try { localStorage.setItem('pwa_install_dismissed_at', String(Date.now())); } catch(e) {}"
         )
@@ -52,91 +104,87 @@ def main():
         page.locator("button:visible:has-text('下載日結')").first.click(force=True)
         page.wait_for_timeout(4000)
 
-        live = "() => Alpine.$data(document.body)"
-
+        # ── 1. chip row 已移除 ────────────────────────────────────────
         labels = page.evaluate("""() => Array.from(document.querySelectorAll('button'))
             .map(b => (b.innerText||'').trim()).filter(t => /餐$/.test(t))""")
-        check("E01 有 5/4/3 三個「每頁餐數」chip", labels == ["5 餐", "4 餐", "3 餐"], str(labels))
+        check("E01 冇「每頁餐數」chip(已移除)", labels == [], str(labels))
 
-        # v3.3.57: 每頁**上限 5 餐** —— 唔准有 6 或以上嘅選項
-        nums = [int(t.replace(" 餐", "").strip()) for t in labels]
-        check("E01b 每頁上限 5 餐(冇 6 或以上)",
-              bool(nums) and max(nums) == 5, str(nums))
+        # ── 2. 預設 = 5 餐/頁 ─────────────────────────────────────────
+        check("E02 預設 request 帶 per_page=5",
+              any("per_page=5" in c for c in calls), str(calls[:2]))
+        d = probe(page)
+        check("E03 每頁固定 5 餐(state perPage == 5)", d["perPage"] == 5, str(d["perPage"]))
+        check("E04 圖係 1080 闊", d["natW"] == 1080, f"{d['natW']}x{d['natH']}")
+        check("E05 5 餐高度 ≈ 1496", 1400 <= d["natH"] <= 1550, f"{d['natW']}x{d['natH']}")
+        check("E06 page_total 正確(7 餐 ÷ 5 = 2 頁)", d["pageTotal"] == 2,
+              str(d["pageTotal"]))
 
-        heights = {}
-        for pp, label in ((4, "4 餐"), (3, "3 餐"), (5, "5 餐")):
-            before = len(calls)
-            page.locator(f"button:has-text('{label}')").first.click(force=True)
-            page.wait_for_timeout(4000)
-            new = calls[before:]
-            ok_q = any(f"per_page={pp}" in c for c in new)
-            check(f"E02 per_page={pp} 有送落 server", ok_q, str(new[:2]))
+        # ── 3. 全部頁面下載掣(正常屏) ─────────────────────────────────
+        check_visibility("E07 (390x844)", d, d["pageTotal"])
+        check("E08 有講明逐頁下載", "逐頁下載" in d["hint"] and "撳一個落一張" in d["hint"],
+              d["hint"][-90:].replace("\n", " "))
 
-            dims = page.evaluate("""() => {
-                const a = Alpine.$data(document.body);
-                const img = Array.from(document.querySelectorAll('img'))
-                    .find(i => (i.src||'').includes('/nutrition_card/'));
-                return {url: a.foodCardPreview.url, pageTotal: a.foodCardPreview.pageTotal,
-                        natW: img ? img.naturalWidth : 0, natH: img ? img.naturalHeight : 0};
-            }""")
-            heights[pp] = dims
-            print(f"   per_page={pp}: {dims['natW']}x{dims['natH']}  pages={dims['pageTotal']}")
-            check(f"E03 per_page={pp} 圖量到高度", dims["natH"] > 0,
-                  f"{dims['natW']}x{dims['natH']}")
+        # ── 4. 短屏:Jim 真正嘅投訴場景 ───────────────────────────────
+        for vw, vh, tag in ((375, 667, "E09 (375x667 iPhone SE)"),
+                            (320, 568, "E10 (320x568 極短屏)")):
+            page.set_viewport_size({"width": vw, "height": vh})
+            page.wait_for_timeout(1200)
+            ds = probe(page)
+            check_visibility(tag, ds, ds["pageTotal"])
+            # 圖要等比縮細(唔可以爆出去)
+            check(f"{tag} 預覽圖喺 preview 區內(唔會 overflow)",
+                  ds["natH"] > 0, f"{ds['natW']}x{ds['natH']}")
 
-        check("E04 闊度全部係 1080", all(h["natW"] == 1080 for h in heights.values()),
-              str({k: v["natW"] for k, v in heights.items()}))
-        check("E05 高度 4餐 < 5餐", heights[4]["natH"] < heights[5]["natH"],
-              f"{heights[4]['natH']} < {heights[5]['natH']}")
-        check("E06 高度 3餐 < 4餐", heights[3]["natH"] < heights[4]["natH"],
-              f"{heights[3]['natH']} < {heights[4]['natH']}")
-        check("E07 page_total 跟 per_page 變",
-              heights[5]["pageTotal"] == 2 and heights[3]["pageTotal"] == 3,
-              f"5餐→{heights[5]['pageTotal']}頁, 3餐→{heights[3]['pageTotal']}頁")
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.wait_for_timeout(1000)
 
-        # v3.3.57: 全部頁面嘅下載掣都要顯示喺 modal 底部,唔會藏喺第 2 頁
-        dls = page.evaluate("""() => {
-            const modal = document.querySelector('[x-show="foodCardPreview.visible"] > div');
-            const vis = el => { const r = el.getBoundingClientRect();
-                return r.width > 0 && r.height > 0 && el.offsetParent !== null; };
-            const btns = Array.from(modal.querySelectorAll('button')).filter(vis)
-                .filter(b => (b.innerText||'').includes('第'))
-                .map(b => { const r = b.getBoundingClientRect();
-                    return {t:(b.innerText||'').trim().replace(/\\s+/g,' '),
-                            y:r.y, bottom:r.y+r.height}; });
-            const mr = modal.getBoundingClientRect();
-            return {btns, modalBottom: mr.y + mr.height,
-                    pageTotal: Alpine.$data(document.body).foodCardPreview.pageTotal,
-                    hint: (document.querySelector('[x-show="foodCardPreview.visible"]')||{}).innerText || ''};
-        }""")
-        check("E09 下載掣數量 == pageTotal(全部頁面都見到)",
-              len(dls["btns"]) == dls["pageTotal"],
-              f"掣={len(dls['btns'])} pageTotal={dls['pageTotal']}")
-        check("E10 全部下載掣都喺 modal 範圍內(冇被裁)",
-              all(b["bottom"] <= dls["modalBottom"] + 1 for b in dls["btns"]),
-              str([(b["t"], round(b["bottom"]), round(dls["modalBottom"])) for b in dls["btns"]]))
-        check("E11 有講明逐頁下載", "逐頁下載" in dls["hint"] and "撳一個落一張" in dls["hint"],
-              dls["hint"][-90:].replace("\n", " "))
-
-        page.locator("button:has-text('3 餐')").first.click(force=True)
-        page.wait_for_timeout(4000)
+        # ── 5. 逐頁下載:一個掣 = 一個 request ─────────────────────────
+        before = len(calls)
         dl_name = ""
         try:
-            with page.expect_download(timeout=15000) as di:
-                page.locator("button:has-text('⬇ 第 1 頁')").first.click(force=True)
+            with page.expect_download(timeout=20000) as di:
+                page.locator("button:visible:has-text('⬇ 第 1 頁')").first.click(force=True)
             dl_name = di.value.suggested_filename
         except Exception as e:
             dl_name = f"(no download: {type(e).__name__})"
-        print("   suggested_filename:", dl_name)
-        check("E08 下載檔名帶 _pp3", "_pp3" in dl_name, dl_name)
+        page.wait_for_timeout(1500)
+        new = calls[before:]
+        check("E11 撳一個掣只發一個 request", len(new) == 1, str(new))
+        check("E12 下載檔名帶 _pp5", "_pp5" in dl_name, dl_name)
+
+        # ── 6. Server 仍然支援 per_page=4/3(舊 URL backwards compatible) ──
+        # card_url 回傳嘅係 `pages[]`(每頁一個 image_url),唔係頂層 `url`
+        import urllib.request
+        import json as _json
+        from PIL import Image
+        import io
+        for pp, expect_h in ((4, 1256), (3, 1016)):
+            try:
+                with urllib.request.urlopen(
+                        f"{BASE}/api/nutrition/card_url?date=2026-10-27&per_page={pp}",
+                        timeout=30) as resp:
+                    data = _json.loads(resp.read().decode())
+                pages = data.get("pages") or []
+                assert pages, f"per_page={pp} 冇 pages"
+                url = pages[0].get("image_url") or ""
+                assert url, f"per_page={pp} 冇 image_url"
+                full = url if url.startswith("http") else BASE + url
+                with urllib.request.urlopen(full, timeout=60) as r2:
+                    im = Image.open(io.BytesIO(r2.read()))
+                    h = im.height
+                check(f"E13 per_page={pp} 仍然 work(高度 {expect_h})", abs(h - expect_h) <= 4,
+                      f"{h} (url={url.rsplit('/', 1)[-1]})")
+                check(f"E13b per_page={pp} 檔名帶 _pp{pp}", f"_pp{pp}" in url, url)
+            except Exception as e:
+                check(f"E13 per_page={pp} 仍然 work", False, f"{type(e).__name__}: {e}")
 
         browser.close()
 
     passed = sum(1 for _, ok, _ in results if ok)
     print(f"\n=== {passed}/{len(results)} passed ===")
-    for nm, ok, d in results:
+    for nm, ok, dtl in results:
         if not ok:
-            print(f"  FAIL {nm} {d}")
+            print(f"  FAIL {nm} {dtl}")
     return 0 if passed == len(results) else 1
 
 

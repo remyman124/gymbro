@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.57"
+__version__ = "3.3.58"
 
 
 def _recovery_pct():
@@ -17191,7 +17191,11 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v161';
+const CACHE = 'gym-web-v162';
+// v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
+// is very short. Can't see the download buttons」):
+//   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1
+//   min-h-0 → 短屏 footer(下載掣)永遠可見。
 // v3.3.57 (2026-10-27, Jim OOB「Make it 5 meals max per screen. But show me
 // all the page button to download one by one」):
 //   日結 modal 每頁上限改成 5 餐(6 唔再係選項,只留做 legacy 檔名相容),

@@ -1481,10 +1481,26 @@
          style="z-index: 10000; background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(6px);"
          @click.self="closeFoodCardPreview()"
          @keydown.escape.window="closeFoodCardPreview()">
-      <div class="w-full max-w-md max-h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
+      <!-- v3.3.58 (2026-10-27, Jim OOB「My screen height is very short.
+           Can't see the download buttons」):
+
+           **舊做法有真 bug**:`max-h-[90dvh]` + preview 區寫死
+           `max-height: calc(90dvh - 56px - 76px)` —— 個 76px 係假設
+           footer 只有一行。但實際 footer 有「檔案細啲」toggle + 下載掣
+           ≈ 114px(加埋 chip row 更到 ~166px)。
+           → 短屏(iPhone SE 667pt)時:56 + preview + 114 > 90dvh(600)
+           → modal 撞上限、`overflow:hidden` → **下載掣被裁走**,Jim 撳唔到。
+
+           **正確做法**:modal 用**確定高度** `h-[90dvh]`,preview 用
+           `flex-1 min-h-0`(可以縮細)→ flexbox 自動將剩餘空間分俾
+           preview,footer 永遠完整可見。圖用 `object-fit: contain` +
+           `max-height:100%` → 高度唔夠就等比縮細,唔會爆。
+           (`max-h-[90dvh]` 唔夠 —— auto 高度嘅 flex container 冇
+           「剩餘空間」可以分配,preview 會 collapse 成 0 高。) -->
+      <div class="w-full max-w-md h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
            style="background: linear-gradient(180deg, rgb(28, 25, 46) 0%, rgb(12, 10, 24) 100%); border: 1.5px solid rgba(251, 191, 36, 0.45); box-shadow: 0 0 40px rgba(251, 191, 36, 0.18);">
         <!-- Header (fixed alignment via inline-block + line-height) -->
-        <div class="flex items-center justify-between px-4"
+        <div class="flex items-center justify-between px-4 flex-shrink-0"
              style="height: 56px; background: rgba(251, 191, 36, 0.08); border-bottom: 1px solid rgba(251, 191, 36, 0.25);">
           <div style="line-height: 1.2;">
             <div class="text-sm font-black" style="color: rgb(251, 191, 36); letter-spacing: 0.02em;">📸 食物日結</div>
@@ -1501,8 +1517,11 @@
         </div>
         <!-- JPG preview (v3.3.23q: max-height + object-fit contain
              so the JPG scales down to fit modal — no more button overlap) -->
-        <div class="flex-1 overflow-y-auto"
-             style="background: rgba(0, 0, 0, 0.4); max-height: calc(90dvh - 56px - 76px);">
+        <!-- v3.3.58:min-h-0 令 preview 可以喺 footer 變高時縮細;
+             拎走舊嘅 `max-height: calc(90dvh - 56px - 76px)`
+             (個 76px 係錯嘅假設,短屏就係因此裁走下載掣)。 -->
+        <div class="flex-1 min-h-0 overflow-y-auto"
+             style="background: rgba(0, 0, 0, 0.4);">
           <!-- Loading spinner -->
           <div x-show="foodCardPreview.loading"
                class="flex flex-col items-center justify-center"
@@ -1533,7 +1552,7 @@
         </div>
         <!-- v3.3.23ax: page navigation (only shown for multi-page days) -->
         <div x-show="foodCardPreview.pageTotal > 1"
-             class="flex items-center justify-between gap-2 px-4 py-2"
+             class="flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0"
              style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
           <button @click="switchFoodCardPage(-1)"
                   :disabled="foodCardPreview.loading || foodCardPreview.pageNum <= 1"
@@ -1550,40 +1569,19 @@
             下一頁 ›
           </button>
         </div>
-        <!-- v3.3.55 (2026-10-27, Jim OOB「Jpg download even shorter pls.
-             I'm using iPhone duo」):每頁餐數選擇器。
-             **點解唔係「縮細」而係「每頁少啲餐」** ——
-             等比縮細(1080x1736 → 796x1280)比例一樣(1.607),喺 iPhone 上面
-             一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。改用「每頁餐數」,
-             行同一套排版(零 layout 風險),但每張圖真係矮咗。
-             v3.3.57 (Jim OOB「Make it 5 meals max per screen」):
-             上限改成 **5 餐/頁**(6 唔再係選項):
-               5 餐/頁 → 1080x1456(顯示 ~527pt)
-               4 餐/頁 → 1080x1256(顯示 ~454pt,-28%)
-               3 餐/頁 → 1080x1016(顯示 ~367pt,-41%) -->
-        <div class="px-4 py-2 flex flex-col gap-2"
-             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
-          <div class="flex items-center justify-between gap-2">
-            <div class="text-[10px] font-bold text-gray-300">每頁餐數</div>
-            <div class="text-[10px] text-gray-400"
-                 x-text="foodCardPreview.perPage === 5 ? '最多 5 餐'
-                        : (foodCardPreview.perPage === 4 ? '短一截' : '最短')"></div>
-          </div>
-          <div class="flex gap-2">
-            <template x-for="opt in [5, 4, 3]" :key="'pp'+opt">
-              <button @click="foodCardPreview.perPage = opt; reloadFoodCardPreview()"
-                      class="flex-1 rounded-lg text-xs font-bold transition-all active:scale-95"
-                      :style="foodCardPreview.perPage === opt
-                        ? 'padding: 9px 0; background: rgba(251,191,36,0.30); border: 1.5px solid rgba(251,191,36,0.75); color: rgb(251,191,36);'
-                        : 'padding: 9px 0; background: rgba(255,255,255,0.08); border: 1.5px solid rgba(255,255,255,0.18); color: rgb(180,180,195);'">
-                <span x-text="opt + ' 餐'"></span>
-              </button>
-            </template>
-          </div>
-        </div>
+        <!-- v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」):
+             「每頁餐數」選擇器(6/4/3 chip)已移除 —— 每頁固定 **5 餐**
+             (v3.3.57 嘅「Make it 5 meals max per screen」)。
+             順帶慳返 ~52pt 嘅 footer 高度,短屏終於見到下載掣。
+
+             v3.3.55 嘅洞察仍然成立(留低做參考):
+             等比縮細(1080x1736 → 796x1280)比例一樣(1.607)→ 喺 iPhone
+             上面一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。真正令圖
+             變短嘅係改**比例**(即係每頁少啲餐),唔係縮細。
+
         <!-- v3.3.53:矮身版 toggle(縮細檔案用)。同「每頁餐數」正交:
              每頁餐數 = 令圖變短;矮身版 = 令檔案再細啲。 -->
-        <div class="px-4 py-2 flex items-center justify-between gap-2"
+        <div class="px-4 py-2 flex items-center justify-between gap-2 flex-shrink-0"
              style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
           <button @click="foodCardPreview.compact = !foodCardPreview.compact; reloadFoodCardPreview()"
                   class="flex items-center gap-2 text-xs font-bold transition-all active:scale-95"
@@ -1613,13 +1611,13 @@
              download one by one」):明確講清楚「全部頁面」+「逐頁下載」。
              掣本身就係每頁一個(全部顯示,唔會藏喺第 2 頁)——
              呢行字淨係講明點用,免得 Jim 以为仲要撳「下載全部」。 -->
-        <div class="px-4 pt-2 pb-1 text-[10px] font-bold"
+        <div class="px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0"
              style="background: rgba(28, 25, 46, 0.95); color: rgb(180, 180, 195);">
           逐頁下載 ——
           <span class="font-normal text-gray-400"
                 x-text="`全部 ${foodCardPreview.pageTotal || 1} 頁,撳一個落一張(唔會一次過落晒)`"></span>
         </div>
-        <div class="px-4 pb-3 flex flex-wrap gap-2"
+        <div class="px-4 pb-3 flex flex-wrap gap-2 flex-shrink-0"
              style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
           <template x-for="pn in (foodCardPreview.pageTotal || 1)" :key="'dl' + pn">
             <button @click="downloadFoodCardPage(pn)"
