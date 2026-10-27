@@ -61,6 +61,8 @@ from gym_web.food_image import (
 # v3.3.44: Mobile PWA — Web Push (VAPID + subscription store) + Geolocation.
 from gym_web import push as _push
 from gym_web import geo as _geo
+# v3.3.45: 訊息收件箱(唯讀 state.db;見 gym_web/inbox.py)。
+from gym_web import inbox as _inbox
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -695,6 +697,58 @@ def api_health():
     })
 
 
+# ---------- v3.3.45: 訊息收件箱 ----------
+# Jim OOB 2026-10-26「In gymbro, there should be an inbox showing all the
+# historical messages received」。資料來源:Hermes state.db(唯讀)。
+# 兩個 endpoint 全部 fail-soft:DB 唔存在 → 200 + 空結果,唔會 500。
+
+
+@app.route("/api/inbox/messages", methods=["GET"])
+def api_inbox_messages():
+    """收件箱訊息清單(新 → 舊)。
+
+    參數:
+      limit  — 每次幾多條(1..200,預設 50)
+      before — 游標(上一頁最後一條嘅 id),用嚟「載入更多」
+      dir    — all / in(收到) / out(發出)
+      q      — 全文搜索(走 SQLite FTS,失效時自動退返 LIKE)
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    before = request.args.get("before")
+    direction = (request.args.get("dir") or "all").lower()
+    q = (request.args.get("q") or "").strip()[:120]
+    chat_id = request.args.get("chat_id") or None
+    if not chat_id:
+        chat_id = _inbox.default_chat_id() or None
+    try:
+        data = _inbox.list_messages(chat_id=chat_id, limit=limit, before=before,
+                                    direction=direction, query=q)
+    except Exception as e:   # fail-soft: 收件箱掛咗唔應該影響成個 app
+        print(f"[inbox] /api/inbox/messages failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "inbox_unavailable", "messages": [],
+                        "count": 0, "has_more": False, "next_before": None}), 200
+    data["ok"] = True
+    return jsonify(data)
+
+
+@app.route("/api/inbox/stats", methods=["GET"])
+def api_inbox_stats():
+    """收件箱統計:收到 / 發出 / 總數 / session 數 / 最後一條時間。"""
+    chat_id = request.args.get("chat_id") or None
+    if not chat_id:
+        chat_id = _inbox.default_chat_id() or None
+    try:
+        data = _inbox.stats(chat_id=chat_id)
+    except Exception as e:
+        print(f"[inbox] /api/inbox/stats failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "inbox_unavailable"}), 200
+    data["ok"] = True
+    return jsonify(data)
+
+
 @app.route("/api/state")
 def api_state():
     """Return full session state for client sync."""
@@ -960,7 +1014,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.44"
+__version__ = "3.3.45"
 
 
 def _recovery_pct():
@@ -16516,7 +16570,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v148';
+const CACHE = 'gym-web-v149';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch

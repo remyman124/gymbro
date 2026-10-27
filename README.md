@@ -192,3 +192,17 @@ gymbro/
 ├── requirements-dev.txt        # + pytest
 └── .github/workflows/python-ci.yml
 ```
+## 📥 訊息收件箱(v3.3.45)
+
+App 最底多咗一個 **📥 收件** tab —— 顯示你同我所有歷史訊息:
+
+- **↓ 收到** = 你講嘅 / **↑ 發出** = 我回覆嘅
+- 撳搜尋框可以全文搜索(行 SQLite FTS,好快)
+- 「全部 / 收到 / 發出」filter
+- 時間以 HKT 顯示
+- 資料來自 Hermes `state.db`(**唯讀**)—— 收件箱唔會改動任何訊息,
+  亦**完全唔掂** Google Sheet / 食相路徑
+
+API:`GET /api/inbox/messages`(`limit` / `before` / `dir` / `q`)、
+`GET /api/inbox/stats`。
+

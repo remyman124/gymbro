@@ -1,3 +1,31 @@
+## v3.3.45 — 2026-10-27 — 訊息收件箱(Telegram 歷史訊息)
+
+Jim OOB 2026-10-27:「In gymbro, there should be an inbox showing all the
+historical messages received」。
+
+### 新增
+- `gym_web/inbox.py` — 收件箱讀取層(**唯讀** `state.db`)
+  - `list_messages()` — 分頁(before cursor)+ 方向 filter + FTS 全文搜索
+    (FTS 壞咗自動退返 LIKE)
+  - `stats()` — 收到 / 發出 / 總數 / session 數 / 最後一條時間
+  - 過濾:role='tool'(工具輸出)、系統注入式 user 訊息(壓縮摘要 /
+    gateway / skill 提示)、display_kind = internal_notification / hidden /
+    failed_turn
+  - 去重:同一段內容重複寫入過(session fork / resume)→ 只留最新嗰條
+  - OOB 包裝拆封 → 顯示 Jim 原本嘅說話
+- `GET /api/inbox/messages` — 參數 `limit` / `before` / `dir`(all|in|out)/
+  `q`;fail-soft(DB 掛咗 → 200 + 空結果)
+- `GET /api/inbox/stats`
+- 前端新增第 5 個 tab **📥 收件箱**(tab bar 由 4 欄變 5 欄):搜尋框、
+  方向 filter、訊息卡(↓收到 / ↑發出 + 時間)、載入更多
+- `tests/qa/test_inbox_api.py` — 12 個守門測試(唯讀 / 過濾 / 去重 /
+  分頁 / 搜索 / 前端 + 路由)
+
+### 安全
+- 收件箱**只讀** `state.db`(SQLite `mode=ro`),唔會寫入任何訊息
+- **完全唔掂** Google Sheet / food-scan / vision 路徑
+- 測試用自己造嘅 tmp SQLite fixture,唔讀唔寫生產 state.db
+
 ## v3.3.44 — 2026-10-26 — 手機 PWA 強化:Web Push + 定位 + 背景同步(離線隊列)
 
 規格:`docs/MOBILE_PWA_SPEC_v3.3.44.md`(唯一真實來源)。branch:`feature/v3.3.44-mobile-pwa`。
