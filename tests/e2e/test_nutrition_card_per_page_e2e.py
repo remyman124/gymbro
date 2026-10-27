@@ -34,6 +34,13 @@ def main():
             accept_downloads=True,
         )
         page = ctx.new_page()
+        # ⚠️ PWA install banner 係 page load 後 3 秒先出現,而且 z-index 9998
+        #    高過所有嘢 → 會攔截 modal 底部嘅 pointer event(實測撳落去
+        #    完全冇反應)。最乾淨嘅做法係喺 page load **之前**就 dismiss 佢,
+        #    唔好靠事後 remove(會撞時間窗口)。
+        page.add_init_script(
+            "try { localStorage.setItem('pwa_install_dismissed_at', String(Date.now())); } catch(e) {}"
+        )
         card_calls = []
         page.on("request", lambda r: card_calls.append(r.url)
                 if "/api/nutrition/card" in r.url else None)

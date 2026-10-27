@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.55"
+__version__ = "3.3.56"
 
 
 def _recovery_pct():
@@ -17181,7 +17181,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v159';
+const CACHE = 'gym-web-v160';
 // v3.3.55 (2026-10-27, Jim OOB「Jpg download even shorter pls. I'm using
 // iPhone duo」):cache 158 → 159。
 //   日結 modal 加咗「每頁餐數」(6/4/3)選擇器 —— 每張 JPG 真正變矮

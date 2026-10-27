@@ -244,10 +244,48 @@ def test_ppq_variable_is_built_correctly():
 
 
 # ---------------------------------------------------------------------------
-# 5. 版本
+# 5. PWA install banner 唔可以遮住 modal(真 bug,2026-10-27 實測)
+# ---------------------------------------------------------------------------
+
+def test_foodcard_modal_above_pwa_banner():
+    """PWA install banner 唔可以蓋住 modal 底部嗰行掣。
+
+    實測:banner 係 `position:fixed; bottom:80px; z-index:9999`,
+    modal 原本係 `z-50` → banner 蓋住「每頁餐數 chip / 檔案細啲 /
+    ⬇ 下載掣」嗰行,真機上撳落去完全冇反應(elementFromPoint 實測
+    撳落去係 banner 而唔係掣)。
+    """
+    tpl = _tpl()
+    m = re.search(r'x-show="foodCardPreview\.visible".*?style="([^"]*)"', tpl, re.S)
+    assert m, "搵唔到食物日結 modal"
+    zm = re.search(r"z-index:\s*(\d+)", m.group(1))
+    assert zm, f"modal 要用 inline z-index(唔好靠 Tailwind class): {m.group(1)}"
+    modal_z = int(zm.group(1))
+    assert modal_z >= 10000, f"modal z-index 要 >= 10000(高過 banner),而家係 {modal_z}"
+
+
+def test_pwa_banner_below_modals():
+    """banner z-index 要低過 modal。"""
+    tpl = _tpl()
+    m = re.search(r"banner\.style\.cssText = '[^']*z-index:(\d+)", tpl)
+    assert m, "搵唔到 banner z-index"
+    banner_z = int(m.group(1))
+    assert banner_z < 10000, f"banner z-index 要低過 modal(10000),而家係 {banner_z}"
+
+
+def test_modal_opens_hides_banner():
+    """打開 modal 時要收埋 banner(唔好喺半透明 overlay 底下若隱若現)。"""
+    tpl = _tpl()
+    assert "document.getElementById('pwa-install-banner')" in tpl, (
+        "showFoodCardPreview 要收埋 PWA banner"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. 版本
 # ---------------------------------------------------------------------------
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.55"' in web
-    assert "gym-web-v159" in web
+    assert '__version__ = "3.3.56"' in web
+    assert "gym-web-v160" in web

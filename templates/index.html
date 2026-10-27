@@ -1477,8 +1477,8 @@
            (5) Replaced single x-show chain with explicit onerror handler
                so if image fails, we surface the error immediately. -->
     <div x-show="foodCardPreview.visible"
-         class="fixed inset-0 z-50 flex items-center justify-center p-4"
-         style="background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(6px);"
+         class="fixed inset-0 flex items-center justify-center p-4"
+         style="z-index: 10000; background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(6px);"
          @click.self="closeFoodCardPreview()"
          @keydown.escape.window="closeFoodCardPreview()">
       <div class="w-full max-w-md max-h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
@@ -5909,6 +5909,15 @@ function gymApp() {
 
     async showFoodCardPreview(date) {
       if (!date) return;
+      // v3.3.55: 收埋 PWA install banner。
+      // 佢係 position:fixed; bottom:80px; z-index:9999 → 會蓋住 modal
+      // 底部嗰行(每頁餐數 chip + 檔案細啲 toggle + ⬇ 下載掣)。
+      // modal 本身已經改成 z-index:10000 高過佢,但個 banner 仲會
+      // 喺半透明 overlay 底下若隱若現 → 索性收埋。
+      try {
+        const _pb = document.getElementById('pwa-install-banner');
+        if (_pb) _pb.remove();
+      } catch (e) { /* noop */ }
       // v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all
       // record. Make it multiple jpg if overflow'): query /card_url
       // first to detect whether the day spans multiple pages. If so,
@@ -6735,7 +6744,12 @@ if ('serviceWorker' in navigator) {
     setTimeout(() => {
       const banner = document.createElement('div');
       banner.id = 'pwa-install-banner';
-      banner.style.cssText = 'position:fixed;left:16px;right:16px;bottom:80px;z-index:9999;background:#1f2937;color:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.4);font-family:system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5;';
+      // v3.3.55: z-index 9999 → 9998。
+      // 原本 9999 高過所有 modal(z-50)→ PWA 安裝 banner 會蓋住
+      // 「食物日結」modal 底部嗰行(每頁餐數 chip / 檔案細啲 / ⬇ 下載掣),
+      // 真機上撳唔到。modal 而家係 z-index:10000,呢個降到 9998 就喺
+      // modal 之下,唔會再遮住任何嘢。
+      banner.style.cssText = 'position:fixed;left:16px;right:16px;bottom:80px;z-index:9998;background:#1f2937;color:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.4);font-family:system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5;';
       const steps = isIos
         ? '1. 撳底下 Share掣 (□↑)<br>2. 揀「加到主畫面」<br>3. 撳「加入」'
         : '1. 撳 Chrome menu (⋮)<br>2. 揀「加到主畫面」<br>3. 撳「加入」';
@@ -7022,7 +7036,8 @@ setTimeout(checkLandscapeFood, 500);
          calendar to see full activity list with sport + strain + time. -->
     <div x-show="scheduleSelectedDay"
          x-transition.opacity
-         class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+         class="fixed inset-0 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+         style="z-index: 10000;"
          @click.self="scheduleSelectedDay = null"
          @keydown.escape.window="scheduleSelectedDay = null">
       <div class="w-full max-w-md rounded-3xl bg-gradient-to-b from-zinc-900 to-black border border-white/10 p-5 pb-8 max-h-[70dvh] overflow-y-auto"
