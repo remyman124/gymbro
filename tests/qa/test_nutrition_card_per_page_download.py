@@ -149,10 +149,11 @@ def test_download_filename_per_page():
     tpl = _tpl()
     m = re.search(r"async downloadFoodCardPage\(pageNum\)\s*\{(.*?)\n    \},", tpl, re.S)
     body = m.group(1)
-    assert "gymbro_foodlog_${p.date}${_cSfx}_p${target}.jpg" in body, (
+    # v3.3.55: 檔名加咗每頁餐數 suffix `${_ppSfx}`
+    assert "gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${target}.jpg" in body, (
         "多頁下載檔名要帶 _p<頁碼>"
     )
-    assert "gymbro_foodlog_${p.date}${_cSfx}.jpg" in body, "單頁下載檔名唔使帶頁碼"
+    assert "gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg" in body, "單頁下載檔名唔使帶頁碼"
 
 
 def test_modal_wrapper_downloads_current_page_only():
@@ -244,5 +245,5 @@ def test_server_download_name_format():
 def test_version_and_cache_bumped():
     """版本 + SW cache 要 bump。"""
     web = _web()
-    assert '__version__ = "3.3.54"' in web, "版本要係 3.3.54"
-    assert "gym-web-v158" in web, "SW cache 要 bump 去做 v158"
+    assert '__version__ = "3.3.55"' in web, "版本要係 3.3.55"
+    assert "gym-web-v159" in web, "SW cache 要 bump 去做 v159"

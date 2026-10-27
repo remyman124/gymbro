@@ -108,9 +108,12 @@ def test_compact_uses_target_height_constant():
 def test_compact_has_separate_cache_key():
     """cache key 一定要分開,唔可以共用。"""
     web = _web()
-    assert re.search(r'cache_key\s*=\s*f"\{_ck\}_compact"\s*if\s+compact\s*else\s+_ck', web), (
-        "cache key 一定要為矮身版分開(否則會互相覆蓋)"
-    )
+    # v3.3.55: cache key 格式改成 `f"{_ck}{_pp_sfx}" + ("_compact" if compact else "")`
+    #   (_pp_sfx = 每頁餐數 suffix,避免唔同 per_page 互相覆蓋)
+    assert re.search(
+        r'cache_key\s*=\s*f"\{_ck\}\{_pp_sfx\}"\s*\+\s*\("_compact"\s+if\s+compact\s+else\s+""\)',
+        web,
+    ), "cache key 一定要為矮身版分開(否則會互相覆蓋)"
 
 
 def test_compact_uses_distinct_filenames():
@@ -179,9 +182,11 @@ def test_frontend_preview_and_download_both_use_compact():
     """預覽同下載都要支援矮身版(唔可以得一個)。"""
     tpl = _tpl()
     # 預覽 fetch
-    assert re.search(r"/api/nutrition/card\?date=\$\{encodeURIComponent\(date\)\}&page=1\$\{_cq\}", tpl), (
-        "預覽 fetch 要帶 _cq"
-    )
+    # v3.3.55: preview fetch 變成 `&page=1${_ppQ}${_cq}`(加咗 per_page)
+    assert re.search(
+        r"/api/nutrition/card\?date=\$\{encodeURIComponent\(date\)\}&page=1\$\{_ppQ\}\$\{_cq\}",
+        tpl,
+    ), "預覽 fetch 要帶 _cq"
     # 下載 fetch(單頁 + 多頁)
     assert tpl.count("${_cq}") >= 3, (
         "compact 參數要出現喺:預覽 fetch、單頁下載、多頁下載(3 處)"
@@ -222,4 +227,8 @@ def test_card_render_pipeline_intact():
     web = _web()
     for fn in ("_render_nutrition_card_pil", "_make_thumb", "_upload_to_drive"):
         assert f"def {fn}" in web, f"{fn} 唔見咗"
-    assert "MEALS_PER_PAGE = 6" in web, "分頁邏輯唔可以改"
+    # v3.3.55: MEALS_PER_PAGE 變成可調(per_page),但預設仍然係 6
+    assert "CARD_PER_PAGE_DEFAULT = 6" in web, "每頁餐數預設一定要係 6"
+    assert "MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_CHOICES" in web, (
+        "分頁邏輯唔可以改(只係加咗 per_page 參數)"
+    )

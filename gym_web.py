@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.54"
+__version__ = "3.3.55"
 
 
 def _recovery_pct():
@@ -1888,8 +1888,41 @@ def api_nutrition_today():
 # iPhone 上面睇同存都舒服好多,檔案亦細咗。
 CARD_COMPACT_MAX_H = 1280
 
+# v3.3.55 (2026-10-27, Jim OOB「Jpg download even shorter pls. I'm using
+# iPhone duo」):每頁餐數(每張 JPG 放幾多餐)。
+#
+# **點解縮細唔算「短」**
+# 等比縮細(1080x1736 → 796x1280)比例一樣(1.607)→ 喺 iPhone 上面
+# 一樣係撐滿螢幕闊度 → 顯示高度**完全一樣**(627pt)。縮細只係令檔案細啲,
+# 畫面長度冇變。所以要真正「短」,必須**改變 h/w 比例**。
+#
+# 做法:**每頁少啲餐**。行同一套排版(零 layout 風險、零 overlap 風險),
+# 只係每張圖放少啲餐 → 圖自然矮咗,文字仲係原本 40px(唔會變糊)。
+#
+#   每頁餐數   6 餐/頁  1080 x 1736   比例 1.607   手機顯示 ~627pt 高
+#              4 餐/頁  1080 x 1256   比例 1.163   手機顯示 ~453pt 高 (-28%)
+#              3 餐/頁  1080 x 1016   比例 0.941   手機顯示 ~367pt 高 (-41%)
+#
+# 6 = 舊預設(檔名唔變,保持 backwards compatible);4/3 加 `_pp4` / `_pp3` suffix。
+CARD_PER_PAGE_DEFAULT = 6
+CARD_PER_PAGE_CHOICES = (6, 4, 3)
 
-def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1, compact: bool = False) -> "Path | None":
+
+def _card_per_page(raw) -> int:
+    """Parse ?per_page= → 6 / 4 / 3(default 6)。其他值一律當 6。"""
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return CARD_PER_PAGE_DEFAULT
+    return v if v in CARD_PER_PAGE_CHOICES else CARD_PER_PAGE_DEFAULT
+
+
+def _card_pp_suffix(per_page: int) -> str:
+    """per_page=6 → '' (舊檔名保持不變);其他 → '_pp4' / '_pp3'。"""
+    return "" if per_page == CARD_PER_PAGE_DEFAULT else f"_pp{int(per_page)}"
+
+
+def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1, compact: bool = False, per_page: int = CARD_PER_PAGE_DEFAULT) -> "Path | None":
     """Render today's food log as a shareable JPG using PIL.
 
     v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
@@ -1909,7 +1942,8 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
     # thumb pool only fetches thumbs for the page being rendered, not all pages.
     # Each page is bounded by MEALS_PER_PAGE so image height stays under
     # ~1700px and renders cleanly across Telegram, WhatsApp, image hosts.
-    MEALS_PER_PAGE = 6
+    # v3.3.55: 每頁餐數可調(6/4/3)→ 圖真正變矮,比例變短。
+    MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_CHOICES else CARD_PER_PAGE_DEFAULT
     page_start = (page_num - 1) * MEALS_PER_PAGE
     page_end = page_start + MEALS_PER_PAGE
     page_meals = meals[page_start:page_end]
@@ -2424,10 +2458,12 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
     # v3.3.53:矮身版用獨立檔名(compact suffix),唔會覆蓋原版張卡 ——
     # 否則 Jim 撳一次「矮身版」就永久冇咗原尺寸版本。
     _c_suffix = "_compact" if compact else ""
+    # v3.3.55: 每頁餐數唔同 → 檔名唔同(避免互相覆蓋)
+    _pp_suffix = _card_pp_suffix(MEALS_PER_PAGE)
     if page_total > 1:
-        out_path = out_dir / f"nutrition_{date_iso}{_c_suffix}_p{page_num}.jpg"
+        out_path = out_dir / f"nutrition_{date_iso}{_c_suffix}{_pp_suffix}_p{page_num}.jpg"
     else:
-        out_path = out_dir / f"nutrition_{date_iso}{_c_suffix}.jpg"
+        out_path = out_dir / f"nutrition_{date_iso}{_c_suffix}{_pp_suffix}.jpg"
     # v3.3.23ax: also save page 1 under the legacy filename (nutrition_{date}.jpg)
     # so existing PWA code that references /nutrition_card/nutrition_${date}.jpg
     # still works for both single-page and multi-page days.
@@ -2581,7 +2617,8 @@ def api_nutrition_card():
     # meal count exceeds MEALS_PER_PAGE (6). Each page stays within ~1700px
     # tall so all viewers (Telegram preview, WhatsApp, image hosts) can
     # display it without resizing/cropping.
-    MEALS_PER_PAGE = 6
+    # v3.3.55: 每頁餐數(6/4/3)→ 每張 JPG 真正變矮
+    MEALS_PER_PAGE = _card_per_page(request.args.get("per_page"))
     page_num = max(1, int((request.args.get("page") or "1")))
     total_meals = len(meals)
     page_total = (total_meals + MEALS_PER_PAGE - 1) // MEALS_PER_PAGE  # ceil div
@@ -2601,17 +2638,20 @@ def api_nutrition_card():
     from gym_web.image_proxy import _jpg_cache_get, _jpg_cache_put
     _ck = f"{target_date}_p{page_num}" if page_total > 1 else target_date
     # v3.3.53: 矮身版用獨立 cache key(唔會撞原尺寸版本)
-    cache_key = f"{_ck}_compact" if compact else _ck
+    # v3.3.55: 每頁餐數唔同 → 都要獨立 cache key(唔會撞)
+    _pp_sfx = _card_pp_suffix(MEALS_PER_PAGE)
+    cache_key = f"{_ck}{_pp_sfx}" + ("_compact" if compact else "")
     cached_bytes = _jpg_cache_get(cache_key)
     if cached_bytes is not None:
         # v3.3.53: 矮身版檔名加 _compact,避免同原尺寸版本撞名
         # v3.3.54: 檔名格式統一 —— `gymbro_foodlog_<date>[_compact]_p<N>.jpg`
         #   (之前係 `_p1_compact.jpg`,同 preview 嘅 `_compact_p1.jpg` 唔一致)
+        # v3.3.55: 加 `_pp<N>` suffix(每頁餐數唔同 → 檔名唔同)
+        _dsfx = f"{'_compact' if compact else ''}{_pp_sfx}"
         if page_total > 1:
-            download_name = (f"gymbro_foodlog_{target_date}"
-                             f"{'_compact' if compact else ''}_p{page_num}.jpg")
+            download_name = f"gymbro_foodlog_{target_date}{_dsfx}_p{page_num}.jpg"
         else:
-            download_name = f"gymbro_foodlog_{target_date}{'_compact' if compact else ''}.jpg"
+            download_name = f"gymbro_foodlog_{target_date}{_dsfx}.jpg"
         return Response(
             cached_bytes,
             mimetype="image/jpeg",
@@ -2624,8 +2664,8 @@ def api_nutrition_card():
     # v3.3.53: 矮身版用獨立檔名(同 renderer 嗰邊一致)
     _c_sfx = "_compact" if compact else ""
     out_path = (
-        out_dir / f"nutrition_{target_date}{_c_sfx}_p{page_num}.jpg" if page_total > 1
-        else out_dir / f"nutrition_{target_date}{_c_sfx}.jpg"
+        out_dir / f"nutrition_{target_date}{_c_sfx}{_pp_sfx}_p{page_num}.jpg" if page_total > 1
+        else out_dir / f"nutrition_{target_date}{_c_sfx}{_pp_sfx}.jpg"
     )
     download_name = out_path.name.replace("nutrition_", "gymbro_foodlog_")
     # Tier 2: disk cache (fresh if < 5 min old)
@@ -2645,7 +2685,9 @@ def api_nutrition_card():
                 )
     except Exception:
         pass  # fall through to re-render
-    out_path = _render_nutrition_card_pil(target_date, meals, totals, page_num=page_num, page_total=page_total, compact=compact)
+    out_path = _render_nutrition_card_pil(target_date, meals, totals, page_num=page_num,
+                                          page_total=page_total, compact=compact,
+                                          per_page=MEALS_PER_PAGE)
     if not out_path or not out_path.exists():
         return jsonify({"ok": False, "error": "render_failed (PIL missing?)"}), 500
     # Tier 3: re-rendered — also populate in-memory cache for next call
@@ -2675,7 +2717,9 @@ def api_nutrition_card_url():
     out_dir = Path("/home/work/.hermes/nutrition_card_cache")
     # Compute page count based on meal count in cache
     cache = get_cache()
-    MEALS_PER_PAGE = 6
+    # v3.3.55: 每頁餐數(6/4/3)→ 同 /api/nutrition/card 一致,否則前端
+    # 會收到錯誤嘅 page_total(例如 card 話 3 頁,card_url 話 2 頁)。
+    MEALS_PER_PAGE = _card_per_page(request.args.get("per_page"))
     page_total = 1
     meal_count = 0
     pages: list = []
@@ -2685,8 +2729,11 @@ def api_nutrition_card_url():
         if meal_count > MEALS_PER_PAGE:
             page_total = (meal_count + MEALS_PER_PAGE - 1) // MEALS_PER_PAGE
 
+    # v3.3.55: 檔名要同 renderer 一致(加 _pp<N> suffix)
+    _pp_sfx = _card_pp_suffix(MEALS_PER_PAGE)
     for p in range(1, page_total + 1):
-        fname = f"nutrition_{target_date}_p{p}.jpg" if page_total > 1 else f"nutrition_{target_date}.jpg"
+        fname = (f"nutrition_{target_date}{_pp_sfx}_p{p}.jpg" if page_total > 1
+                 else f"nutrition_{target_date}{_pp_sfx}.jpg")
         path = out_dir / fname
         pages.append({
             "page": p,
@@ -2701,6 +2748,8 @@ def api_nutrition_card_url():
         "date": target_date,
         "page_total": page_total,
         "meal_count": meal_count,
+        # v3.3.55: 回傳每頁餐數,前端 preview / download 要用同一個值
+        "per_page": MEALS_PER_PAGE,
         "pages": pages,
     })
 
@@ -17126,7 +17175,12 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v158';
+const CACHE = 'gym-web-v159';
+// v3.3.55 (2026-10-27, Jim OOB「Jpg download even shorter pls. I'm using
+// iPhone duo」):cache 158 → 159。
+//   日結 modal 加咗「每頁餐數」(6/4/3)選擇器 —— 每張 JPG 真正變矮
+//   (比例由 1.607 降到 1.163 / 0.941),手機上面明顯短咗。
+//   Template 有變 → bump 版本清走舊 cache。
 // v3.3.54 (2026-10-27, Jim OOB「Don't download multiple image at the same
 // time. Show multiple download button to download. Remove second button」):
 // cache 157 → 158。
