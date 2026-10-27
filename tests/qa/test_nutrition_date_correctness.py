@@ -65,7 +65,7 @@ def test_food_coach_block_uses_day_label():
 
 def test_version_bumped():
     import re as _re
-    m = _re.search(r'__version__\s*=\s*"([0-9.]+)"', _src())
+    m = _re.search(r'__version__\s*=\s*"([0-9.]+)"', SRC)
     assert m, "搵唔到 __version__"
     parts = [int(x) for x in m.group(1).split(".")]
     assert tuple(parts) >= (3, 3, 49), f"版本要 >= 3.3.49(而家 {m.group(1)})"
