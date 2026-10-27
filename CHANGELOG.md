@@ -1,4 +1,34 @@
-## v3.3.45 — 2026-10-27 — 訊息收件箱(Telegram 歷史訊息)
+## v3.3.46 — 2026-10-27 — 收件箱改成「Gymbro 推播」
+
+Jim OOB 2026-10-27:「Just the message push from gymbro. Not our conversation.」
+→ 收件箱唔再顯示 Hermes Telegram 對話,改為顯示 **Gymbro 自己推出去嘅訊息**。
+
+### 改動
+- 新增 `gym_web/outbox.py` — 出站訊息紀錄(append-only JSON,最多 500 條,
+  store = `/home/work/.hermes/gymbro_outbox.json`)
+  - `log_message()` / `list_messages()` / `stats()`
+  - kind: `push`(Web Push 推播) / `cheer`(打氣訊息)
+  - **只記錄,永遠唔會阻礙原本嘅推播**(寫 log 失敗一律 swallow + print)
+- `POST /api/push/send` → 每次推播都記低(送咗幾多部機 / 失敗原因 /
+  「冇 subscription」)
+- cheer pipeline 完成 → 記低 cheer 文字 + 有冇語音 / 圖
+- `/api/inbox/messages` + `/api/inbox/stats` → 改讀 outbox
+  (參數 `kind` = all / push / cheer,取代原本嘅 dir)
+- 前端:tab 改名「📥 推播收件箱」,filter 改成 全部 / 📲 推播 / 🔥 Cheer,
+  卡片顯示 標題 + 內容 + ✅已送出 / ⚠️失敗 + 送達部機數
+- **刪除** `gym_web/inbox.py`(Hermes state.db 對話讀取層)
+- `tests/qa/test_inbox_api.py` 改寫成 outbox guard(15 個測試)
+- sw.js cache v149 → v150
+
+### 安全
+- outbox 只寫自己嘅 store,**唔讀** Hermes state.db(唔再係對話收件箱)
+- 完全唔掂 Google Sheet / food-scan / vision 路徑
+
+## v3.3.45 — 2026-10-27 — 訊息收件箱(Telegram 歷史訊息)⚠️ 已被 v3.3.46 取代
+
+> Jim 澄清:收件箱要嘅係「Gymbro 推出去嘅訊息」,唔係對話紀錄。
+> 呢版讀 Hermes `state.db` 嘅對話讀取層已喺 v3.3.46 刪走。
+
 
 Jim OOB 2026-10-27:「In gymbro, there should be an inbox showing all the
 historical messages received」。

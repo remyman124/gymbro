@@ -61,8 +61,8 @@ from gym_web.food_image import (
 # v3.3.44: Mobile PWA — Web Push (VAPID + subscription store) + Geolocation.
 from gym_web import push as _push
 from gym_web import geo as _geo
-# v3.3.45: 訊息收件箱(唯讀 state.db;見 gym_web/inbox.py)。
-from gym_web import inbox as _inbox
+# v3.3.46: 出站訊息紀錄(Gymbro 自己推出去嘅訊息;見 gym_web/outbox.py)。
+from gym_web import outbox as _outbox
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -705,27 +705,27 @@ def api_health():
 
 @app.route("/api/inbox/messages", methods=["GET"])
 def api_inbox_messages():
-    """收件箱訊息清單(新 → 舊)。
+    """Gymbro 出站訊息清單(新 → 舊)。
+
+    v3.3.46 (Jim OOB「Just the message push from gymbro. Not our conversation.」)
+    → 呢度**唔係** Hermes Telegram 對話,而係 **Gymbro 自己推出去嘅訊息**
+    (Web Push 推播 + cheer)。
 
     參數:
       limit  — 每次幾多條(1..200,預設 50)
       before — 游標(上一頁最後一條嘅 id),用嚟「載入更多」
-      dir    — all / in(收到) / out(發出)
-      q      — 全文搜索(走 SQLite FTS,失效時自動退返 LIKE)
+      kind   — all / push / cheer
+      q      — 搜索(title / body / detail)
     """
     try:
         limit = int(request.args.get("limit", 50))
     except (TypeError, ValueError):
         limit = 50
     before = request.args.get("before")
-    direction = (request.args.get("dir") or "all").lower()
+    kind = (request.args.get("kind") or "all").lower()
     q = (request.args.get("q") or "").strip()[:120]
-    chat_id = request.args.get("chat_id") or None
-    if not chat_id:
-        chat_id = _inbox.default_chat_id() or None
     try:
-        data = _inbox.list_messages(chat_id=chat_id, limit=limit, before=before,
-                                    direction=direction, query=q)
+        data = _outbox.list_messages(limit=limit, before=before, kind=kind, query=q)
     except Exception as e:   # fail-soft: 收件箱掛咗唔應該影響成個 app
         print(f"[inbox] /api/inbox/messages failed: {type(e).__name__}: {e}", flush=True)
         return jsonify({"ok": False, "error": "inbox_unavailable", "messages": [],
@@ -736,12 +736,9 @@ def api_inbox_messages():
 
 @app.route("/api/inbox/stats", methods=["GET"])
 def api_inbox_stats():
-    """收件箱統計:收到 / 發出 / 總數 / session 數 / 最後一條時間。"""
-    chat_id = request.args.get("chat_id") or None
-    if not chat_id:
-        chat_id = _inbox.default_chat_id() or None
+    """出站訊息統計:總數 / push / cheer / 最後一條。"""
     try:
-        data = _inbox.stats(chat_id=chat_id)
+        data = _outbox.stats()
     except Exception as e:
         print(f"[inbox] /api/inbox/stats failed: {type(e).__name__}: {e}", flush=True)
         return jsonify({"ok": False, "error": "inbox_unavailable"}), 200
@@ -1014,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.45"
+__version__ = "3.3.46"
 
 
 def _recovery_pct():
@@ -2949,6 +2946,16 @@ def api_push_send():
                 removed = _push.remove_subscription(sub.get("endpoint"))
                 print(f"[push] dropped dead subscription "
                       f"(status={status}, removed={removed})", flush=True)
+        # v3.3.46: 每一條推播都記低 → 收件箱(只記錄,唔影響推播結果)。
+        try:
+            _outbox.log_message(
+                "push", title=title, body=body, url=url,
+                ok=(failed == 0), sent=sent, failed=failed,
+                detail=("; ".join(errors[:3])[:400] if errors else
+                        (f"已送 {sent} 部機" if sent else "冇 subscription(手機未開通知)")),
+            )
+        except Exception as e:
+            print(f"[push] outbox log failed: {type(e).__name__}: {e}", flush=True)
         return jsonify({
             "ok": True,
             "sent": sent,
@@ -2959,6 +2966,11 @@ def api_push_send():
         print(f"[push] send failed: {type(e).__name__}: {e}", flush=True)
         import traceback
         traceback.print_exc()
+        try:
+            _outbox.log_message("push", title=title, body=body, url=url,
+                                ok=False, detail=f"{type(e).__name__}: {str(e)[:300]}")
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(e)})
 
 
@@ -15361,6 +15373,17 @@ def _background_cheer_job(job_id: str, fire_type: str):
         log = log[-100:]
         _save_cheer_log(log)
 
+        # v3.3.46: cheer 訊息記低 → 收件箱
+        try:
+            _outbox.log_message(
+                "cheer", title=f"🔥 Cheer · {fire_type}", body=(text or "")[:1200],
+                url="/", ok=True,
+                detail=("語音 ✅ 圖 ✅" if (voice_path and image_path)
+                        else ("語音 ✅" if voice_path else ("圖 ✅" if image_path else "純文字"))),
+            )
+        except Exception as e:
+            print(f"[cheer] outbox log failed: {type(e).__name__}: {e}", flush=True)
+
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id]["status"] = "done"
             CHEER_JOBS[job_id]["finished_at"] = now_iso()
@@ -16570,7 +16593,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v149';
+const CACHE = 'gym-web-v150';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch

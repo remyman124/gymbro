@@ -192,17 +192,19 @@ gymbro/
 ├── requirements-dev.txt        # + pytest
 └── .github/workflows/python-ci.yml
 ```
-## 📥 訊息收件箱(v3.3.45)
+## 📥 推播收件箱(v3.3.46)
 
-App 最底多咗一個 **📥 收件** tab —— 顯示你同我所有歷史訊息:
+App 最底多咗一個 **📥 收件** tab —— 顯示 **Gymbro 自己推出去嘅訊息**
+(唔係對話紀錄):
 
-- **↓ 收到** = 你講嘅 / **↑ 發出** = 我回覆嘅
-- 撳搜尋框可以全文搜索(行 SQLite FTS,好快)
-- 「全部 / 收到 / 發出」filter
-- 時間以 HKT 顯示
-- 資料來自 Hermes `state.db`(**唯讀**)—— 收件箱唔會改動任何訊息,
-  亦**完全唔掂** Google Sheet / 食相路徑
+- **📲 推播** = Web Push 通知(訓練 / 瞓覺提醒等)
+- **🔥 Cheer** = app 內產生嘅打氣訊息(文字 + 語音 + 圖)
+- 每張卡顯示:標題、內容、送出結果(✅ 已送出 / ⚠️ 失敗)、送達幾多部機、時間(HKT)
+- 撳搜尋框可以搜標題 / 內容;filter:全部 / 推播 / Cheer;仲有「載入更多」
+- 紀錄 store:`/home/work/.hermes/gymbro_outbox.json`(最多 500 條)
+- 記錄**唔會**阻礙原本嘅推播(寫 log 失敗一律吞掉)
+- 完全唔掂 Google Sheet / 食相路徑
 
-API:`GET /api/inbox/messages`(`limit` / `before` / `dir` / `q`)、
+API:`GET /api/inbox/messages`(`limit` / `before` / `kind` / `q`)、
 `GET /api/inbox/stats`。
 

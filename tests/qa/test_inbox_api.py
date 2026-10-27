@@ -1,27 +1,22 @@
-"""v3.3.45 — 訊息收件箱 API guard。
+"""v3.3.46 — Gymbro 推播收件箱(outbox)guard。
 
-背景:Jim OOB 2026-10-26「In gymbro, there should be an inbox showing all the
-historical messages received」。收件箱讀 Hermes 嘅 `state.db`(唯讀)。
+背景:Jim OOB 2026-10-27:「Just the message push from gymbro. Not our
+conversation.」→ 收件箱 = **Gymbro 自己推出去嘅訊息**(Web Push 推播 + cheer),
+唔係 Hermes Telegram 對話。
 
 呢個檔案守住 4 樣嘢:
 
-  1. `gym_web/inbox.py` **永遠唔會寫入** state.db(冇 INSERT/UPDATE/DELETE/
-     COMMIT),亦唔會掂 Google Sheet / food-scan 路徑
-  2. list / stats 嘅過濾邏輯正確:
-     - role='tool'(工具執行結果)唔會入收件箱
-     - 系統注入式 user 訊息(壓縮摘要 / gateway / skill 提示)唔會入收件箱
-     - display_kind = internal_notification / hidden / failed_turn 唔會入
-     - 同一段內容重複寫入過(session fork)→ 只留最新嗰條
-  3. 分頁(before cursor)+ 方向 filter(dir=in/out)+ 全文搜索正常
-  4. 前端有「收件箱」tab、搜尋框、方向 filter、載入更多按鈕 + API 路由
+  1. `gym_web/outbox.py` **唔會**讀 Hermes `state.db`(唔再係對話收件箱)
+  2. `log_message()` 只寫自己嘅 store(tmp_path),**唔會**掂生產 store
+  3. list / stats / kind filter / 搜索 / 分頁 正常
+  4. `/api/push/send` 同 cheer 完成**一定會**記低一條 outbox
 
-⛔ 測試用**自己造嘅 tmp SQLite fixture**,唔會讀亦唔會寫生產 state.db,
-   亦**絕對唔會**寫入生產 Google Sheet `Nutrition` tab。
+⛔ 呢啲測試**絕對唔可以**寫入生產 Google Sheet `Nutrition` tab
+   (見 `test_no_test_pollution.py`)。呢個檔案完全唔掂 food-scan / Sheet 路徑。
 """
 from __future__ import annotations
 
 import importlib
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -30,181 +25,152 @@ import pytest
 REPO = Path("/home/work/projects/gymbro")
 TEMPLATE = REPO / "templates" / "index.html"
 GYM_WEB = REPO / "gym_web.py"
-INBOX = REPO / "gym_web" / "inbox.py"
+OUTBOX = REPO / "gym_web" / "outbox.py"
 
-sys.path.insert(0, str(REPO))
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 
-def _load_inbox():
-    """Load gym_web.inbox by path(避免 `import gym_web` 解析到 package)。"""
-    if str(REPO) not in sys.path:
-        sys.path.insert(0, str(REPO))
-    mod = importlib.import_module("gym_web.inbox")
+def _load_outbox():
+    mod = importlib.import_module("gym_web.outbox")
     return importlib.reload(mod)
 
 
 @pytest.fixture
-def inbox_db(tmp_path, monkeypatch):
-    """造一個細細嘅 SQLite fixture,模擬 Hermes state.db。"""
-    path = tmp_path / "state.db"
-    con = sqlite3.connect(path)
-    con.executescript(
-        """
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            source TEXT,
-            chat_id TEXT,
-            chat_type TEXT,
-            display_name TEXT,
-            started_at TEXT,
-            message_count INTEGER,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            role TEXT,
-            content TEXT,
-            timestamp REAL,
-            platform_message_id TEXT,
-            display_kind TEXT,
-            display_metadata TEXT,
-            api_content TEXT,
-            tool_call_id TEXT,
-            tool_name TEXT,
-            tool_calls TEXT
-        );
-        CREATE VIRTUAL TABLE messages_fts USING fts5(content, tool_name, tool_calls);
-        """
-    )
-    con.execute(
-        "INSERT INTO sessions (id, source, chat_id, display_name) VALUES (?,?,?,?)",
-        ("sess1", "telegram", "1424782299", "J M"),
-    )
-    rows = [
-        # (role, content, kind)
-        ("user", "我要去 gym", None),
-        ("assistant", "收到,加油", None),
-        ("tool", '{"tool": "output"}', None),                      # 工具輸出 → 唔入
-        ("user", "[CONTEXT COMPACTION — REFERENCE ONLY] blah", None),  # 系統注入 → 唔入
-        ("user", "[IMPORTANT: You are running as a scheduled cron job.]", None),  # 唔入
-        ("user", "[OUT-OF-BAND USER MESSAGE — direct]\n真正嘅說話", None),  # 拆封 → 入
-        ("user", "收到,加油", None),                                 # 同上 → 唔入
-        ("assistant", "完全一樣嘅回覆", None),
-        ("assistant", "完全一樣嘅回覆", None),                       # 重複 → 唔入
-        ("assistant", "唔應該出現", "internal_notification"),        # 系統 → 唔入
-        ("assistant", "唔應該出現 2", "failed_turn"),                # 唔入
-    ]
-    ts = 1793000000.0
-    for i, (role, content, kind) in enumerate(rows):
-        cur = con.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp, display_kind)"
-            " VALUES (?,?,?,?,?)",
-            ("sess1", role, content, ts + i * 60, kind),
-        )
-        con.execute("INSERT INTO messages_fts (rowid, content) VALUES (?,?)",
-                    (cur.lastrowid, content))
-    con.commit()
-    con.close()
-
-    mod = _load_inbox()
-    monkeypatch.setattr(mod, "STATE_DB", str(path))
-    mod._cache = {}
-    mod._cache_ts = 0.0
+def outbox(tmp_path, monkeypatch):
+    """Outbox store 指去 tmp file —— 永遠唔碰真實 store。"""
+    mod = _load_outbox()
+    monkeypatch.setattr(mod, "STORE", str(tmp_path / "outbox.json"))
     return mod
 
 
-# ---------------------------------------------------------------- 唯讀守門
+# ---------------------------------------------------------------- 範圍守門
 
-def test_inbox_module_is_read_only():
-    src = INBOX.read_text(encoding="utf-8")
-    upper = src.upper()
-    for bad in ("INSERT INTO", "UPDATE MESSAGES", "UPDATE SESSIONS", "DELETE FROM",
-                "COMMIT", "REPLACE INTO", "DROP TABLE"):
-        assert bad not in upper, f"inbox.py 唔可以有寫入 SQL: {bad}"
-    assert "mode=ro" in src, "inbox.py 必須用 SQLite 唯讀模式開 state.db"
+def test_outbox_does_not_read_conversation_db():
+    """v3.3.46:收件箱唔再係「我哋嘅對話」→ 唔准讀 state.db。"""
+    src = OUTBOX.read_text(encoding="utf-8")
+    assert "state.db" not in src, "outbox 唔准讀 Hermes state.db(對話歷史)"
+    assert "messages_fts" not in src
 
 
-def test_inbox_does_not_touch_sheet_or_scan():
-    src = INBOX.read_text(encoding="utf-8")
+def test_outbox_does_not_touch_sheet_or_scan():
+    src = OUTBOX.read_text(encoding="utf-8")
     for bad in ("sheets", "SPREADSHEET", "scan_commit", "minimax", "nutrition"):
-        assert bad.lower() not in src.lower(), f"inbox.py 唔准掂 {bad}"
+        assert bad.lower() not in src.lower(), f"outbox.py 唔准掂 {bad}"
 
 
-# ---------------------------------------------------------------- 過濾邏輯
-
-def test_list_filters_tool_rows_and_system_noise(inbox_db):
-    d = inbox_db.list_messages(chat_id="1424782299", limit=50)
-    texts = [m["text"] for m in d["messages"]]
-    assert not any("tool" in t for t in texts), "role='tool' 唔應該入收件箱"
-    assert not any("CONTEXT COMPACTION" in t for t in texts)
-    assert not any("scheduled cron job" in t for t in texts)
-    assert not any("唔應該出現" in t for t in texts), "internal_notification/failed_turn 要濾走"
-    # 真正嘅訊息一定要喺度
-    assert any("我要去 gym" in t for t in texts)
-    assert any("收到,加油" in t for t in texts)
+def test_no_state_db_reader_left():
+    """舊嘅 state.db 讀取層要刪咗。"""
+    assert not (REPO / "gym_web" / "inbox.py").exists(), "gym_web/inbox.py 應該刪走"
+    src = GYM_WEB.read_text(encoding="utf-8")
+    assert "from gym_web import inbox as _inbox" not in src
+    assert "from gym_web import outbox as _outbox" in src
 
 
-def test_oob_wrapper_is_stripped(inbox_db):
-    d = inbox_db.list_messages(chat_id="1424782299", limit=50)
-    oob = [m for m in d["messages"] if "真正嘅說話" in m["text"]]
-    assert len(oob) == 1
-    assert "OUT-OF-BAND" not in oob[0]["text"], "OOB 包裝應該拆走,留返 Jim 原本嘅說話"
+# ---------------------------------------------------------------- outbox 邏輯
+
+def test_log_and_list(outbox):
+    rec = outbox.log_message("push", title="訓練時間到", body="12:00 健身",
+                              url="/", ok=True, sent=1)
+    assert rec["id"]
+    d = outbox.list_messages(limit=10)
+    assert d["count"] == 1
+    m = d["messages"][0]
+    assert m["kind"] == "push"
+    assert m["title"] == "訓練時間到"
+    assert m["body"] == "12:00 健身"
+    assert m["sent"] == 1
+    assert m["ok"] is True
+    assert m["ts"]
 
 
-def test_duplicate_content_deduped(inbox_db):
-    d = inbox_db.list_messages(chat_id="1424782299", limit=50)
-    same = [m for m in d["messages"] if m["text"] == "完全一樣嘅回覆"]
-    assert len(same) == 1, "同一段內容重複寫入過 → 只留最新嗰條"
+def test_store_is_json_file(outbox, tmp_path):
+    outbox.log_message("cheer", title="🔥 Cheer · morning", body="加油")
+    store = tmp_path / "outbox.json"
+    assert store.exists()
+    import json
+    data = json.loads(store.read_text(encoding="utf-8"))
+    assert isinstance(data, list) and len(data) == 1
 
 
-def test_direction_filter(inbox_db):
-    only_in = inbox_db.list_messages(chat_id="1424782299", limit=50, direction="in")
-    assert only_in["messages"], "dir=in 應該有嘢"
-    assert all(m["direction"] == "in" for m in only_in["messages"])
-    only_out = inbox_db.list_messages(chat_id="1424782299", limit=50, direction="out")
-    assert all(m["direction"] == "out" for m in only_out["messages"])
+def test_kind_filter(outbox):
+    outbox.log_message("push", title="A", body="push")
+    outbox.log_message("cheer", title="B", body="cheer")
+    pushes = outbox.list_messages(kind="push")
+    assert [m["kind"] for m in pushes["messages"]] == ["push"]
+    cheers = outbox.list_messages(kind="cheer")
+    assert [m["kind"] for m in cheers["messages"]] == ["cheer"]
+    allm = outbox.list_messages(kind="all")
+    assert allm["count"] == 2
 
 
-def test_pagination_cursor(inbox_db):
-    p1 = inbox_db.list_messages(chat_id="1424782299", limit=2)
-    assert p1["has_more"] is True
-    assert p1["next_before"] is not None
-    p2 = inbox_db.list_messages(chat_id="1424782299", limit=2, before=p1["next_before"])
-    ids1 = {m["id"] for m in p1["messages"]}
+def test_search(outbox):
+    outbox.log_message("push", title="訓練時間到", body="12:00 健身")
+    outbox.log_message("push", title="瞓覺時間到", body="22:30 瞓覺")
+    hits = outbox.list_messages(query="健身")
+    assert hits["count"] == 1
+    assert "健身" in hits["messages"][0]["body"]
+
+
+def test_newest_first_and_pagination(outbox):
+    for i in range(5):
+        outbox.log_message("push", title=f"T{i}", body=f"b{i}")
+    d = outbox.list_messages(limit=2)
+    assert d["count"] == 2
+    assert d["messages"][0]["title"] == "T4"      # 最新喺最前
+    assert d["has_more"] is True
+    p2 = outbox.list_messages(limit=2, before=d["next_before"])
+    ids1 = {m["id"] for m in d["messages"]}
     ids2 = {m["id"] for m in p2["messages"]}
-    assert not (ids1 & ids2), "第二頁唔應該重疊第一頁"
+    assert not (ids1 & ids2)
 
 
-def test_fulltext_search(inbox_db):
-    d = inbox_db.list_messages(chat_id="1424782299", limit=50, query="gym")
-    assert any("我要去 gym" in m["text"] for m in d["messages"]), "FTS 搜索要搵到嘢"
+def test_stats(outbox):
+    outbox.log_message("push", title="A")
+    outbox.log_message("cheer", title="B")
+    st = outbox.stats()
+    assert st["total"] == 2
+    assert st["push"] == 1
+    assert st["cheer"] == 1
+    assert st["last_title"] == "B"
 
 
-def test_stats_counts(inbox_db):
-    st = inbox_db.stats(chat_id="1424782299")
-    assert st["total_in"] >= 2
-    assert st["total_out"] >= 1
-    assert st["error"] == ""
+def test_log_message_never_raises(outbox, monkeypatch):
+    """寫 log 失敗唔可以阻礙推播 → log_message 要 swallow 住。"""
+    def boom():
+        raise RuntimeError("boom")
+    monkeypatch.setattr(outbox, "_load", boom)
+    rec = outbox.log_message("push", title="X")
+    assert rec["id"] and rec["title"] == "X"      # 唔拋 exception
 
 
-def test_missing_db_is_fail_soft(inbox_db, monkeypatch):
-    monkeypatch.setattr(inbox_db, "STATE_DB", "/nonexistent/does-not-exist.db")
-    inbox_db._cache = {}
-    d = inbox_db.list_messages(limit=5)
-    assert d["messages"] == []
-    assert d.get("error"), "DB 唔存在 → 應該回 error 欄位而唔係拋 exception"
-    st = inbox_db.stats()
-    assert st["error"]
+def test_trim_to_max_items(outbox, monkeypatch):
+    monkeypatch.setattr(outbox, "MAX_ITEMS", 3)
+    for i in range(6):
+        outbox.log_message("push", title=f"T{i}")
+    items = outbox._load()
+    assert len(items) == 3
+    assert items[-1]["title"] == "T5"
 
 
-# ---------------------------------------------------------------- 前端 + 路由
+# ---------------------------------------------------------------- 接駁 + 前端
+
+def test_push_send_is_logged():
+    src = GYM_WEB.read_text(encoding="utf-8")
+    assert "_outbox.log_message(" in src, "/api/push/send 一定要記低 outbox"
+    assert '"push", title=title, body=body, url=url' in src
+
+
+def test_cheer_is_logged():
+    src = GYM_WEB.read_text(encoding="utf-8")
+    assert '"cheer", title=f"🔥 Cheer · {fire_type}"' in src
+
 
 def test_routes_exist():
     src = GYM_WEB.read_text(encoding="utf-8")
     assert '@app.route("/api/inbox/messages"' in src
     assert '@app.route("/api/inbox/stats"' in src
-    assert "from gym_web import inbox as _inbox" in src
+    assert "from gym_web import outbox as _outbox" in src
 
 
 def test_frontend_has_inbox_tab():
@@ -212,11 +178,13 @@ def test_frontend_has_inbox_tab():
     assert "inbox-tab-btn" in html
     assert "isTabVisible('inbox')" in html
     assert "inbox-search" in html
-    assert "inbox-dir" in html
+    assert "inbox-kind" in html
     assert "inbox-more-btn" in html
     assert "/api/inbox/messages" in html
     assert "/api/inbox/stats" in html
     assert "openInboxTab" in html
     assert "loadInbox" in html
-    # tab bar 由 4 欄變 5 欄(新增收件箱)
     assert "grid-cols-5" in html
+    # 方向 filter(direction)已經唔存在 —— 收件箱唔再顯示對話
+    assert "inboxDir" not in html
+    assert "inboxKind" in html
