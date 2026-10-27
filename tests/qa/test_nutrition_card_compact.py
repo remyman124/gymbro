@@ -1,0 +1,220 @@
+"""QA — v3.3.53: 日結 JPG「矮身版」(compact) — 高度降低,iPhone 友好。
+
+Jim OOB 2026-10-27「My iPhone is duo now. Pls assist the jpg download image
+with lower height」。
+
+實測背景:2026-10-27 嘅日結卡係 1080 x 1736(237 KB)。喺 iPhone 上面
+睇同存都唔方便 → 想要**更矮**嘅版本。
+
+修法(唔重寫版面!):先用原本 1080px 闊嘅排版完整渲染,再等比縮到
+目標高度(1280px)。零 layout 風險,但真係矮咗:
+  原版  1080 x 1736  237 KB
+  矮身版 796 x 1280  156 KB
+
+呢個 suite 守住:
+  1. compact 係 opt-in(預設一定要係原尺寸,唔可以靜靜哋改變大家
+     已經習慣嘅排版)。
+  2. 矮身版高度一定 ≤ CARD_COMPACT_MAX_H。
+  3. 矮身版用**獨立** cache key + 獨立檔名 —— 唔可以覆蓋原尺寸版本
+     (否則 Jim 撳一次矮身版就永久冇咗原版)。
+  4. 前端 toggle + reload 流程完整。
+  5. 下載檔名 / URL 要帶 _compact,唔可以撞原版。
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+WEB = ROOT / "gym_web.py"
+TPL = ROOT / "templates" / "index.html"
+
+
+def _web():
+    return WEB.read_text(encoding="utf-8")
+
+
+def _tpl():
+    return TPL.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 1. compact 係 opt-in
+# ---------------------------------------------------------------------------
+
+def test_compact_is_opt_in():
+    """預設(無 compact 參數)一定要行原本嗰條路徑。"""
+    web = _web()
+    assert re.search(
+        r'compact\s*=\s*\(request\.args\.get\("compact"\).*?in\s*\(\s*"1"', web, re.S
+    ), "compact 必須由 query param 決定,唔可以預設開"
+
+
+def test_render_default_is_not_compact():
+    """_render_nutrition_card_pil 嘅 compact 預設值一定要係 False。"""
+    web = _web()
+    m = re.search(r"def _render_nutrition_card_pil\((.*?)\)\s*->", web, re.S)
+    assert m, "搵唔到 _render_nutrition_card_pil"
+    assert "compact: bool = False" in m.group(1), (
+        "compact 預設值一定要 False:%s" % m.group(1)
+    )
+
+
+def test_non_compact_path_unchanged():
+    """非 compact 時,輸出檔名一定要同原本一樣(唔加 suffix)。"""
+    web = _web()
+    assert re.search(r'_c_suffix\s*=\s*"_compact"\s*if\s+compact\s*else\s*""', web), (
+        "要用 suffix 變數,唔好喺 non-compact 路徑加任何嘢"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. 高度上限
+# ---------------------------------------------------------------------------
+
+def test_compact_max_height_constant():
+    """一定要有一個目標高度常數。"""
+    web = _web()
+    m = re.search(r"CARD_COMPACT_MAX_H\s*=\s*(\d+)", web)
+    assert m, "搵唔到 CARD_COMPACT_MAX_H"
+    assert 800 <= int(m.group(1)) <= 1600, (
+        "目標高度 %s 唔合理(太矮睇唔清,太高就冇意思)" % m.group(1)
+    )
+
+
+def test_compact_downscaling_applied():
+    """compact 一定要真係縮圖,唔係只係改個檔名。"""
+    web = _web()
+    assert re.search(r"if\s+compact\s*:", web), "搵唔到 compact 縮圖邏輯"
+    assert re.search(r"img\.resize\(", web), "compact 版一定要做 resize"
+    assert "Image.LANCZOS" in web, "resize 一定要用 LANCZOS(質素好過預設 NEAREST)"
+
+
+def test_compact_uses_target_height_constant():
+    """縮圖目標高度一定要用常數,唔可以 hardcode 另一個數。"""
+    web = _web()
+    assert "CARD_COMPACT_MAX_H" in web, "目標高度應該用常數"
+    seg = web[web.index("if compact:"):web.index("if compact:") + 800]
+    assert "CARD_COMPACT_MAX_H" in seg, (
+        "縮圖邏輯內部要用 CARD_COMPACT_MAX_H,唔好再寫死另一個數"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. 獨立 cache / 檔名(唔可以覆蓋原尺寸版本)
+# ---------------------------------------------------------------------------
+
+def test_compact_has_separate_cache_key():
+    """cache key 一定要分開,唔可以共用。"""
+    web = _web()
+    assert re.search(r'cache_key\s*=\s*f"\{_ck\}_compact"\s*if\s+compact\s*else\s+_ck', web), (
+        "cache key 一定要為矮身版分開(否則會互相覆蓋)"
+    )
+
+
+def test_compact_uses_distinct_filenames():
+    """輸出檔名一定要帶 _compact。"""
+    web = _web()
+    assert re.search(r'_c_sfx\s*=\s*"_compact"\s*if\s+compact\s*else\s*""', web), (
+        "API 層嘅輸出檔名要帶 _compact"
+    )
+    assert 'nutrition_{date_iso}{_c_suffix}' in web, (
+        "renderer 層嘅輸出檔名要帶 _compact"
+    )
+
+
+def test_compact_does_not_overwrite_legacy():
+    """矮身版唔可以寫 legacy 檔(會覆蓋原尺寸版本)。"""
+    web = _web()
+    seg = web[web.index("legacy_write_path = None"):web.index("legacy_write_path = None") + 400]
+    assert "not compact" in seg, (
+        "legacy 檔寫入要加 `not compact` 保護,否則矮身版會蓋咗原版"
+    )
+
+
+def test_compact_download_filename():
+    """下載檔名要帶 _compact,唔可以撞原版。"""
+    web = _web()
+    assert '_dn.replace(".jpg", "_compact.jpg") if compact else _dn' in web, (
+        "Content-Disposition 嘅檔名要區分矮身版"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4/5. 前端
+# ---------------------------------------------------------------------------
+
+def test_frontend_has_compact_toggle():
+    """前端要有 toggle。"""
+    tpl = _tpl()
+    assert "foodCardPreview.compact = !foodCardPreview.compact" in tpl, (
+        "前端要有切換矮身版嘅 toggle"
+    )
+    assert "矮身版" in tpl, "toggle 要有中文標籤"
+
+
+def test_frontend_reload_method_exists():
+    """切換之後要重新載入預覽。"""
+    tpl = _tpl()
+    assert "async reloadFoodCardPreview()" in tpl, "缺少 reloadFoodCardPreview()"
+    assert "reloadFoodCardPreview()" in tpl, "toggle 要叫 reloadFoodCardPreview()"
+
+
+def test_frontend_sends_compact_param():
+    """前端要送 compact=1 俾 server。"""
+    tpl = _tpl()
+    assert "&compact=1" in tpl, "前端要送 &compact=1"
+    assert re.search(r"const\s+_cq\s*=\s*_compact\s*\?\s*'&compact=1'\s*:\s*''", tpl), (
+        "要用 _cq 變數統一帶參數(預覽 + 下載兩條路徑都要)"
+    )
+
+
+def test_frontend_preview_and_download_both_use_compact():
+    """預覽同下載都要支援矮身版(唔可以得一個)。"""
+    tpl = _tpl()
+    # 預覽 fetch
+    assert re.search(r"/api/nutrition/card\?date=\$\{encodeURIComponent\(date\)\}&page=1\$\{_cq\}", tpl), (
+        "預覽 fetch 要帶 _cq"
+    )
+    # 下載 fetch(單頁 + 多頁)
+    assert tpl.count("${_cq}") >= 3, (
+        "compact 參數要出現喺:預覽 fetch、單頁下載、多頁下載(3 處)"
+    )
+
+
+def test_frontend_compact_state_persists():
+    """關閉再打開,toggle 狀態要保留(唔好每次都要重新撳)。"""
+    tpl = _tpl()
+    assert "_keepCompact" in tpl, "重新開啟時要保留 compact 狀態"
+    assert "compact: this.foodCardPreview.compact === true" in tpl, (
+        "closeFoodCardPreview 要保留 compact 狀態"
+    )
+
+
+def test_frontend_compact_server_url():
+    """預覽嘅 server URL 要指向矮身版檔名。"""
+    tpl = _tpl()
+    assert re.search(r"const\s+_cSfx\s*=\s*_keepCompact\s*\?\s*'_compact'\s*:\s*''", tpl), (
+        "預覽 URL 要按 compact 狀態揀檔名"
+    )
+
+
+def test_frontend_fallback_url_respects_compact():
+    """fallback URL 都要跟 compact。"""
+    tpl = _tpl()
+    assert "foodCardPreview.compact ? '_compact' : ''" in tpl, (
+        "fallback URL 要跟 compact 狀態"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 回歸守衛
+# ---------------------------------------------------------------------------
+
+def test_card_render_pipeline_intact():
+    """呢次修正唔准改壞 render pipeline。"""
+    web = _web()
+    for fn in ("_render_nutrition_card_pil", "_make_thumb", "_upload_to_drive"):
+        assert f"def {fn}" in web, f"{fn} 唔見咗"
+    assert "MEALS_PER_PAGE = 6" in web, "分頁邏輯唔可以改"

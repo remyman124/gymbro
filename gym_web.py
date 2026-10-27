@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.52"
+__version__ = "3.3.53"
 
 
 def _recovery_pct():
@@ -1882,7 +1882,14 @@ def api_nutrition_today():
 # + same path exposed via /nutrition_card/<filename> for the frontend
 # to download. Daily cache (one card per day) — overwrites if exists
 # so the user always gets the latest view.
-def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1) -> "Path | None":
+# v3.3.53 (2026-10-27, Jim OOB「My iPhone is duo now. Pls assist the jpg
+# download image with lower height」):矮身版嘅目標高度(px)。
+# 原本張卡係 1080 x 1736(6 餐)。縮到 1280 高 → 大約 1080x1280,
+# iPhone 上面睇同存都舒服好多,檔案亦細咗。
+CARD_COMPACT_MAX_H = 1280
+
+
+def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1, compact: bool = False) -> "Path | None":
     """Render today's food log as a shareable JPG using PIL.
 
     v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
@@ -2414,16 +2421,21 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
     # fit on one page (max MEALS_PER_PAGE), split into multiple page JPGs
     # so each stays within image-height limits (~1700px) for all viewers.
     # Page filename pattern: nutrition_{date}_p1.jpg, _p2.jpg, ...
+    # v3.3.53:矮身版用獨立檔名(compact suffix),唔會覆蓋原版張卡 ——
+    # 否則 Jim 撳一次「矮身版」就永久冇咗原尺寸版本。
+    _c_suffix = "_compact" if compact else ""
     if page_total > 1:
-        out_path = out_dir / f"nutrition_{date_iso}_p{page_num}.jpg"
+        out_path = out_dir / f"nutrition_{date_iso}{_c_suffix}_p{page_num}.jpg"
     else:
-        out_path = out_dir / f"nutrition_{date_iso}.jpg"
+        out_path = out_dir / f"nutrition_{date_iso}{_c_suffix}.jpg"
     # v3.3.23ax: also save page 1 under the legacy filename (nutrition_{date}.jpg)
     # so existing PWA code that references /nutrition_card/nutrition_${date}.jpg
     # still works for both single-page and multi-page days.
     legacy_path = out_dir / f"nutrition_{date_iso}.jpg"
     legacy_write_path = None
-    if page_total > 1 and page_num == 1 and legacy_path != out_path:
+    # v3.3.53: 矮身版唔可以寫 legacy 檔(會覆蓋原尺寸版本)。
+    if (page_total > 1 and page_num == 1 and legacy_path != out_path
+            and not compact):
         legacy_write_path = legacy_path
 
     # v3.3.23ax: draw page indicator on footer when there are multiple pages
@@ -2435,6 +2447,24 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
             draw.text((W - PAD - lw, H - PAGE - 4), page_label, fill=ACCENT, font=f_foot)
         except Exception:
             pass
+
+    # v3.3.53 (2026-10-27, Jim OOB「My iPhone is duo now. Pls assist the jpg
+    # download image with lower height」):矮身版。
+    # 做法:先用原本 1080px 闊嘅排版**完整渲染**,再等比縮到目標高度。
+    # 好處:唔會重寫任何 hardcoded 像素版面(零 layout 風險),但出嚟嘅
+    # 圖真係矮咗 —— iPhone 睇/存都方便好多,檔案細啲。
+    if compact:
+        try:
+            target_h = int(CARD_COMPACT_MAX_H)
+            if img.height > target_h:
+                ratio = target_h / float(img.height)
+                new_w = max(1, int(round(img.width * ratio)))
+                img = img.resize((new_w, target_h), Image.LANCZOS)
+                print(f"[card] compact render: {W}x{H} -> {new_w}x{target_h}",
+                      flush=True)
+        except Exception as e:
+            print(f"[card] compact downscale failed: {type(e).__name__}: {e}",
+                  flush=True)
 
     img.save(out_path, "JPEG", quality=92, optimize=True)
     # v3.3.23ax: also save page 1 under legacy filename for backwards compat
@@ -2558,19 +2588,26 @@ def api_nutrition_card():
     page_num = min(page_num, max(1, page_total))
 
     from flask import Response
+    # v3.3.53 (Jim OOB「My iPhone is duo now. Pls assist the jpg download
+    # image with lower height」):?compact=1 → 輸出矮身版(高度 ≤ 1280px)。
+    # 原尺寸版本完全唔受影響(獨立 cache key + 獨立檔名)。
+    compact = (request.args.get("compact") or "").strip().lower() in (
+        "1", "true", "yes", "on")
     # v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
     # win'): 3-tier JPG card cache (per-page).
     #  Tier 1: in-memory LRU (10ms, served from RAM)
     #  Tier 2: on-disk cache (<5 min old, served from disk via send_file)
     #  Tier 3: re-render via PIL (150-230ms with local thumbs)
     from gym_web.image_proxy import _jpg_cache_get, _jpg_cache_put
-    cache_key = f"{target_date}_p{page_num}" if page_total > 1 else target_date
+    _ck = f"{target_date}_p{page_num}" if page_total > 1 else target_date
+    # v3.3.53: 矮身版用獨立 cache key(唔會撞原尺寸版本)
+    cache_key = f"{_ck}_compact" if compact else _ck
     cached_bytes = _jpg_cache_get(cache_key)
     if cached_bytes is not None:
-        download_name = (
-            f"gymbro_foodlog_{target_date}_p{page_num}.jpg" if page_total > 1
-            else f"gymbro_foodlog_{target_date}.jpg"
-        )
+        # v3.3.53: 矮身版檔名加 _compact,避免同原尺寸版本撞名
+        _dn = (f"gymbro_foodlog_{target_date}_p{page_num}.jpg" if page_total > 1
+               else f"gymbro_foodlog_{target_date}.jpg")
+        download_name = _dn.replace(".jpg", "_compact.jpg") if compact else _dn
         return Response(
             cached_bytes,
             mimetype="image/jpeg",
@@ -2580,9 +2617,11 @@ def api_nutrition_card():
             },
         )
     out_dir = Path("/home/work/.hermes/nutrition_card_cache")
+    # v3.3.53: 矮身版用獨立檔名(同 renderer 嗰邊一致)
+    _c_sfx = "_compact" if compact else ""
     out_path = (
-        out_dir / f"nutrition_{target_date}_p{page_num}.jpg" if page_total > 1
-        else out_dir / f"nutrition_{target_date}.jpg"
+        out_dir / f"nutrition_{target_date}{_c_sfx}_p{page_num}.jpg" if page_total > 1
+        else out_dir / f"nutrition_{target_date}{_c_sfx}.jpg"
     )
     download_name = out_path.name.replace("nutrition_", "gymbro_foodlog_")
     # Tier 2: disk cache (fresh if < 5 min old)
@@ -2602,7 +2641,7 @@ def api_nutrition_card():
                 )
     except Exception:
         pass  # fall through to re-render
-    out_path = _render_nutrition_card_pil(target_date, meals, totals, page_num=page_num, page_total=page_total)
+    out_path = _render_nutrition_card_pil(target_date, meals, totals, page_num=page_num, page_total=page_total, compact=compact)
     if not out_path or not out_path.exists():
         return jsonify({"ok": False, "error": "render_failed (PIL missing?)"}), 500
     # Tier 3: re-rendered — also populate in-memory cache for next call
@@ -17083,7 +17122,12 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v156';
+const CACHE = 'gym-web-v157';
+// v3.3.53 (2026-10-27, Jim OOB「My iPhone is duo now. Pls assist the jpg
+// download image with lower height」):cache 版本 156 → 157。
+//   日結 JPG 加咗「矮身版」toggle(高度 ≤ 1280px, iPhone 友好)。
+//   Template 有變 → 舊 SW cache 嘅 index.html 係舊版(冇 toggle),
+//   所以要 bump 版本清走舊 cache。
 // v3.3.52 (2026-10-27, Jim OOB「For food upload, the immediate thumbnail are all
 // the same. Despite in the end, it works」):cache 版本 155 → 156。
 //   真正嘅 bug 喺 server 端(平行 AI 掃描嘅 final 檔名得秒精度 → 撞名 →

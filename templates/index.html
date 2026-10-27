@@ -1515,7 +1515,7 @@
           <img x-show="!foodCardPreview.loading && foodCardPreview.url"
                :src="foodCardPreview.url"
                :alt="foodCardPreview.fileName"
-               @error="if (foodCardPreview.date) foodCardPreview.fallbackUrl = '/nutrition_card/nutrition_' + foodCardPreview.date + '.jpg?v=2'"
+               @error="if (foodCardPreview.date) foodCardPreview.fallbackUrl = '/nutrition_card/nutrition_' + foodCardPreview.date + (foodCardPreview.compact ? '_compact' : '') + '.jpg?v=2'"
                @load="foodCardPreview.imageLoaded = true"
                style="display: block; width: 100%; max-width: 100%; height: auto; max-height: 100%; object-fit: contain; background: rgba(0, 0, 0, 0.6); padding: 12px; box-sizing: border-box; -webkit-appearance: none; appearance: none;" />
           <!-- Fallback (v3.3.23g): alternate server URL with cache-buster -->
@@ -1549,6 +1549,28 @@
                   style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
             下一頁 ›
           </button>
+        </div>
+        <!-- v3.3.53 (2026-10-27, Jim OOB「My iPhone is duo now. Pls assist the
+             jpg download image with lower height」):矮身版 toggle。
+             預設關閉(原尺寸照舊),撳一下就下載高度 ≤ 1280px 嘅版本,
+             iPhone 睇同存都方便好多。 -->
+        <div class="px-4 py-2 flex items-center justify-between gap-2"
+             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
+          <button @click="foodCardPreview.compact = !foodCardPreview.compact; reloadFoodCardPreview()"
+                  class="flex items-center gap-2 text-xs font-bold transition-all active:scale-95"
+                  :style="foodCardPreview.compact
+                    ? 'color: rgb(251, 191, 36);'
+                    : 'color: rgb(180, 180, 195);'">
+            <span class="inline-block rounded-md px-2 py-1"
+                  :style="foodCardPreview.compact
+                    ? 'background: rgba(251, 191, 36, 0.22); border: 1.5px solid rgba(251, 191, 36, 0.6);'
+                    : 'background: rgba(255, 255, 255, 0.08); border: 1.5px solid rgba(255, 255, 255, 0.18);'">
+              <span x-text="foodCardPreview.compact ? '☑' : '☐'"></span>
+            </span>
+            <span>矮身版(高度 ≤ 1280px)</span>
+          </button>
+          <div class="text-[10px] text-gray-400"
+               x-text="foodCardPreview.compact ? '適合 iPhone' : '原尺寸'"></div>
         </div>
         <!-- Action bar -->
         <div class="grid grid-cols-2 gap-2 px-4 py-3"
@@ -2552,6 +2574,8 @@ function gymApp() {
       fileName: '',    // gymbro_foodlog_YYYY-MM-DD.jpg
       sizeKb: 0,
       loading: false,
+      // v3.3.53: 矮身版 toggle(高度 ≤ 1280px,iPhone 友好)
+      compact: false,
       // v3.3.23e (Jim OOB 2026-09-12 'Not displaying the image'): blob
       // URLs can fail on iOS PWA standalone mode. The fallback chain
       // loads the same JPG from the server-side cache (/nutrition_card/)
@@ -5828,6 +5852,17 @@ function gymApp() {
     // in the current tab, leaving a blank page with no back button),
     // the JPG is now shown inside an in-PWA modal with explicit 下載 +
     // 關閉 buttons. User always has a way back.
+    // v3.3.53 (Jim OOB「My iPhone is duo now. Pls assist the jpg download
+    // image with lower height」):切換矮身版之後重新載入預覽圖。
+    // 保留 modal 喺度(唔好閂咗),淨係換張圖。
+    async reloadFoodCardPreview() {
+      const date = this.foodCardPreview.date;
+      if (!date) return;
+      const wasVisible = this.foodCardPreview.visible;
+      await this.showFoodCardPreview(date);
+      this.foodCardPreview.visible = wasVisible;
+    },
+
     async showFoodCardPreview(date) {
       if (!date) return;
       // v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all
@@ -5837,11 +5872,14 @@ function gymApp() {
       // each page separately. For single-page days, behavior is
       // unchanged.
       const fileName = `gymbro_foodlog_${date}.jpg`;
+      // v3.3.53: 保留目前嘅矮身版 toggle 狀態(撳完「關閉」再開都記得)
+      const _keepCompact = this.foodCardPreview.compact === true;
       this.foodCardPreview = {
         visible: true, date, url: '', fileName,
         sizeKb: 0, loading: true,
         fallbackUrl: '', imageLoaded: false,
         pageNum: 1, pageTotal: 1, pages: [],
+        compact: _keepCompact,
       };
       try {
         // First check page count
@@ -5853,7 +5891,9 @@ function gymApp() {
         const pages = metaData.pages || [];
 
         // Fetch page 1 (or the only page) for preview
-        const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=1`, {
+        // v3.3.53: 矮身版 → &compact=1(高度 ≤ 1280px,iPhone 友好)
+        const _cq = _keepCompact ? '&compact=1' : '';
+        const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=1${_cq}`, {
           headers: { 'Accept': 'image/jpeg' },
           cache: 'no-store',
         });
@@ -5872,7 +5912,11 @@ function gymApp() {
         // v3.3.23ax: URL pattern depends on page count
         // single page: nutrition_{date}.jpg (legacy compat)
         // multi page: nutrition_{date}_p1.jpg
-        const page1File = pageTotal > 1 ? `nutrition_${date}_p1.jpg` : `nutrition_${date}.jpg`;
+        // v3.3.53: 矮身版嘅 server 檔名多一個 _compact
+        const _cSfx = _keepCompact ? '_compact' : '';
+        const page1File = pageTotal > 1
+          ? `nutrition_${date}${_cSfx}_p1.jpg`
+          : `nutrition_${date}${_cSfx}.jpg`;
         const serverUrl = `/nutrition_card/${page1File}?t=${cacheBuster}`;
         this.foodCardPreview = {
           visible: true, date, url: serverUrl, fileName,
@@ -5880,6 +5924,7 @@ function gymApp() {
           loading: false,
           fallbackUrl: '', imageLoaded: false,
           pageNum: 1, pageTotal, pages,
+          compact: _keepCompact,
         };
         if (pageTotal > 1) {
           this.flash(`✓ ${pageTotal} 頁 (${this.foodCardPreview.sizeKb} KB 第 1 頁) · 「下載全部」儲存所有頁`);
@@ -5928,10 +5973,14 @@ function gymApp() {
       const date = this.foodCardPreview.date;
       const pageTotal = this.foodCardPreview.pageTotal || 1;
       const currentPage = this.foodCardPreview.pageNum || 1;
+      // v3.3.53: 矮身版 → &compact=1,下載檔名加 _compact
+      const _compact = this.foodCardPreview.compact === true;
+      const _cq = _compact ? '&compact=1' : '';
+      const _cSfx = _compact ? '_compact' : '';
       try {
         if (pageTotal === 1) {
           // Single page — original behavior
-          const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}`, {
+          const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}${_cq}`, {
             headers: { 'Accept': 'image/jpeg' },
             cache: 'no-store',
           });
@@ -5940,7 +5989,7 @@ function gymApp() {
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
-          a.download = `gymbro_foodlog_${date}.jpg`;
+          a.download = `gymbro_foodlog_${date}${_cSfx}.jpg`;
           a.style.display = 'none';
           document.body.appendChild(a);
           a.click();
@@ -5953,7 +6002,7 @@ function gymApp() {
           // Multi-page — download all pages. Each page is a separate file.
           this.flash(`開始下載 ${pageTotal} 頁...`);
           for (let p = 1; p <= pageTotal; p++) {
-            const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=${p}`, {
+            const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=${p}${_cq}`, {
               headers: { 'Accept': 'image/jpeg' },
               cache: 'no-store',
             });
@@ -5965,7 +6014,7 @@ function gymApp() {
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `gymbro_foodlog_${date}_p${p}.jpg`;
+            a.download = `gymbro_foodlog_${date}${_cSfx}_p${p}.jpg`;
             a.style.display = 'none';
             document.body.appendChild(a);
             a.click();
@@ -5994,6 +6043,8 @@ function gymApp() {
         visible: false, date: null, url: '', fileName: '',
         sizeKb: 0, loading: false,
         fallbackUrl: '', imageLoaded: false,
+        // v3.3.53: 保留矮身版 toggle(下次打開都係同一個設定)
+        compact: this.foodCardPreview.compact === true,
       };
     },
 
