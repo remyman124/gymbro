@@ -1,16 +1,20 @@
-"""E2E — v3.3.54 日結 JPG「逐頁下載」(唯讀,唔碰 Sheet)。
+"""E2E — v3.3.60 日結 JPG「逐頁下載」:直接 <a href> 即刻落檔(唯讀,唔碰 Sheet)。
 
 驗證:
   1. footer 冇「✕ 關閉」掣(第二個按鈕已移除)。
   2. 右上角 ✕ 仲喺度(仲閂得到)。
-  3. 每頁一個下載掣,數量 == pageTotal。
-  4. 撳其中一個掣 → **只發一個** request(唔會一次過載多張)。
-  5. 撳第 2 頁嘅掣 → request 係 page=2(唔係 page=1)。
-  6. 檔名帶 _p2。
+  3. 每頁一個下載連結,數量 == pageTotal,而且係 **<a href>**(唔係 <button>)。
+  4. 撳其中一個連結 → **只觸發一個下載事件**,而且係 page=2(唔係 page=1)。
+  5. 檔名帶 _p2。
+  6. 🔴 **下載係即刻開始**(click → download event < 2.5 秒),
+     唔係等 fetch → blob → objectURL → click 嗰條慢路徑。
 """
+import datetime as dt
 import json
 import os
 import sys
+import time
+import urllib.request
 
 BASE = os.environ.get("GYMBRO_TEST_BASE", "http://127.0.0.1:7000")
 
@@ -20,6 +24,22 @@ results = []
 def check(name, ok, detail=""):
     results.append((name, bool(ok), detail))
     print(("PASS " if ok else "FAIL ") + name + (f"  [{detail}]" if detail else ""))
+
+
+def pick_date(min_meals=6):
+    """搵最近一個餐數夠多嘅日期(唔好寫死 —— 日子轉咗就 0 餐)。"""
+    today = dt.date.today()
+    for back in range(0, 8):
+        d = (today - dt.timedelta(days=back)).isoformat()
+        try:
+            with urllib.request.urlopen(
+                    f"{BASE}/api/nutrition/card_url?date={d}&per_page=5", timeout=30) as rr:
+                data = json.loads(rr.read().decode())
+        except Exception:
+            continue
+        if (data.get("meal_count") or 0) >= min_meals:
+            return d, data.get("meal_count") or 0
+    return None, 0
 
 
 def main():
@@ -34,16 +54,17 @@ def main():
             accept_downloads=True,
         )
         page = ctx.new_page()
-        # ⚠️ PWA install banner 係 page load 後 3 秒先出現,而且 z-index 9998
-        #    高過所有嘢 → 會攔截 modal 底部嘅 pointer event(實測撳落去
-        #    完全冇反應)。最乾淨嘅做法係喺 page load **之前**就 dismiss 佢,
-        #    唔好靠事後 remove(會撞時間窗口)。
+        # ⚠️ PWA install banner 喺 page load 後 3 秒先出現,而且 z-index 9998
+        #    高過所有嘢 → 會攔截 modal 底部嘅 pointer event。正解係喺 page
+        #    load **之前**就 dismiss 佢(唔好靠事後 remove,會撞時間窗口)。
         page.add_init_script(
             "try { localStorage.setItem('pwa_install_dismissed_at', String(Date.now())); } catch(e) {}"
         )
         card_calls = []
         page.on("request", lambda r: card_calls.append(r.url)
                 if "/api/nutrition/card" in r.url else None)
+        downloads = []
+        page.on("download", lambda d: downloads.append(d))
 
         page.goto(BASE + "/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
@@ -54,9 +75,17 @@ def main():
             if (b) { b.style.display = 'none'; b.remove(); }
         }""")
 
-        # 開 modal
-        page.locator("button:visible:has-text('下載日結')").first.click(force=True)
-        page.wait_for_timeout(4000)
+        # ⚠️ 唔好靠「撳今日嘅下載日結」—— 今日可能一餐都未食。
+        target_date, meals = pick_date(6)
+        check("E00 搵到有 ≥6 餐嘅日期", target_date is not None, f"{target_date} ({meals} 餐)")
+        if target_date is None:
+            browser.close()
+            print("=== 0/1 passed ===")
+            return 1
+        print("   用緊日期:", target_date)
+
+        page.evaluate("(d) => Alpine.$data(document.body).showFoodCardPreview(d)", target_date)
+        page.wait_for_timeout(5000)
 
         live = "() => Alpine.$data(document.body)"
         st = page.evaluate(live + ".foodCardPreview")
@@ -72,41 +101,54 @@ def main():
         hdr = page.locator("[data-testid='food-card-close']").count()
         check("E03 右上角 ✕ 仲喺度", hdr == 1, f"count={hdr}")
 
-        # 3. 下載掣數量 == pageTotal
-        dl_btns = page.locator("button:has-text('⬇')")
-        n = dl_btns.count()
-        check("E04 下載掣數量 == pageTotal", n == total, f"buttons={n} pageTotal={total}")
+        # 3. 下載連結數量 == pageTotal(而且係 <a>)
+        links = page.locator("a:has-text('⬇')")
+        n = links.count()
+        check("E04 下載連結數量 == pageTotal", n == total, f"links={n} pageTotal={total}")
+        n_btn = page.locator("button:has-text('⬇')").count()
+        check("E04b 下載掣係 <a href>(即刻落檔,唔係 JS blob)", n_btn == 0, f"button={n_btn}")
 
-        labels = page.evaluate("""() => Array.from(document.querySelectorAll('button'))
-            .map(b => (b.textContent||'').trim())
-            .filter(t => t.includes('⬇'))""")
-        print("   labels:", labels)
-        check("E05 每個掣都標明頁碼",
-              all(("第" in t and "頁" in t) or ("下載 JPG" in t) for t in labels),
-              str(labels))
+        hrefs = page.evaluate("""() => Array.from(document.querySelectorAll('a'))
+            .filter(a => (a.textContent||'').includes('⬇'))
+            .map(a => ({href: a.getAttribute('href'), dl: a.getAttribute('download'),
+                        text: (a.textContent||'').trim().replace(/\s+/g,' ')}))""")
+        print("   hrefs:", hrefs)
+        check("E05 每個連結都標明頁碼 + 指向 /api/nutrition/card",
+              all(("第" in h["text"] and "頁" in h["text"]) or ("下載 JPG" in h["text"])
+                  for h in hrefs)
+              and all("/api/nutrition/card" in (h["href"] or "") for h in hrefs),
+              str([h["text"] for h in hrefs])[:220])
+        check("E05c 每個連結都有 download 屬性(檔名一致)",
+              all((h["dl"] or "").startswith("gymbro_foodlog_") for h in hrefs),
+              str([h["dl"] for h in hrefs])[:220])
+        check("E05b 每個連結帶對應 page 參數",
+              all(f"page={i + 1}" in (h["href"] or "") for i, h in enumerate(hrefs)),
+              str([h["href"] for h in hrefs])[:220])
 
-        # 4/5. 撳第 2 頁嘅掣 → 只有一個 request,而且係 page=2
+        # 4/5/6. 撳第 2 頁嘅連結 → 只觸發一個下載,而且即刻
         if total >= 2:
-            before = len(card_calls)
-            page.locator("button:has-text('⬇ 第 2 頁')").first.click(force=True)
-            page.wait_for_timeout(4000)
-            new = card_calls[before:]
-            # 排除 modal 開啟時嘅背景 refresh(只計撳掣之後)
-            check("E06 撳一下只發一個 request", len(new) == 1, f"{len(new)} 個: {new}")
-            if new:
-                check("E07 request 係 page=2", "page=2" in new[0], new[0][:110])
-
-            # 下載事件
-            dl_name = ""
+            before_calls = len(card_calls)
+            before_dl = len(downloads)
+            t0 = time.time()
             try:
-                with page.expect_download(timeout=15000) as di:
-                    page.locator("button:has-text('⬇ 第 2 頁')").first.click(force=True)
+                with page.expect_download(timeout=20000) as di:
+                    page.locator("a:visible:has-text('⬇ 第 2 頁')").first.click(force=True)
                 d = di.value
+                elapsed = time.time() - t0
                 dl_name = d.suggested_filename
+                dl_url = d.url
             except Exception as e:
+                elapsed = time.time() - t0
                 dl_name = f"(no download event: {type(e).__name__})"
-            print("   suggested_filename:", dl_name)
+                dl_url = ""
+            page.wait_for_timeout(1500)
+            new_dl = downloads[before_dl:]
+            print(f"   suggested_filename: {dl_name}  ({elapsed:.2f}s)")
+            check("E06 撳一下只觸發一個下載", len(new_dl) == 1, f"{len(new_dl)} 個")
+            check("E07 下載 URL 係 page=2", "page=2" in (dl_url or ""), (dl_url or "")[:120])
             check("E08 下載檔名帶 _p2", "_p2" in dl_name, dl_name)
+            # 🔴 即刻性:click → download event 應該好快(唔使等 fetch+blob)
+            check("E09 下載即刻開始(< 2.5s,唔係等 blob 路徑)", elapsed < 2.5, f"{elapsed:.2f}s")
         else:
             print("   (單頁日,跳過 page=2 測試)")
 

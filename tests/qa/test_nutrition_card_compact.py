@@ -182,7 +182,11 @@ def test_frontend_compact_state_still_exists():
     tpl = _tpl()
     assert "compact: false" in tpl, "state 要保留 compact"
     assert "&compact=1" in tpl, "前端仲要識送 &compact=1(後端仍然支援)"
-    assert "const _cq = _compact ? '&compact=1' : ''" in tpl
+    # v3.3.60:downloadFoodCardPage() 已剷走(改直接 <a href>),
+    # 而家 compact 參數由 foodCardPageUrl() 負責
+    assert "const _cq = p.compact === true ? '&compact=1' : ''" in tpl, (
+        "foodCardPageUrl 要帶 compact 參數"
+    )
 
 
 def test_frontend_reload_method_exists():
@@ -196,8 +200,8 @@ def test_frontend_sends_compact_param():
     """前端要送 compact=1 俾 server。"""
     tpl = _tpl()
     assert "&compact=1" in tpl, "前端要送 &compact=1"
-    assert re.search(r"const\s+_cq\s*=\s*_compact\s*\?\s*'&compact=1'\s*:\s*''", tpl), (
-        "要用 _cq 變數統一帶參數(預覽 + 下載兩條路徑都要)"
+    assert re.search(r"const\s+_cq\s*=\s*p\.compact\s*===\s*true\s*\?\s*'&compact=1'\s*:\s*''", tpl), (
+        "要用 _cq 變數統一帶參數(預覽 + 切頁 + 下載 URL 三條路徑都要)"
     )
 
 

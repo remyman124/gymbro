@@ -317,9 +317,9 @@ def test_frontend_preview_url_has_pp_suffix():
 
 
 def test_frontend_download_filename_has_pp_suffix():
-    """下載檔名要帶 pp suffix。"""
+    """下載檔名要帶 pp suffix(v3.3.60:改由 foodCardFileName() 負責)。"""
     tpl = _tpl()
-    assert "`gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${target}.jpg`" in tpl
+    assert "`gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${t}.jpg`" in tpl
     assert "`gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg`" in tpl
 
 
@@ -340,7 +340,11 @@ def test_no_stale_per_page_omission():
     """唔准有 fetch 食緊 date 但漏咗 per_page(會拿到唔同分頁)。
 
     per_page 可以用字面 `per_page=` 或者變數 `${_ppQ}` / `${_pp}`
-    (preview fetch 用 `_ppQ`,切頁/下載用 `_pp` + literal)。
+    (preview fetch 用 `_ppQ`,切頁 fetch 用 `_pp` + literal)。
+
+    v3.3.60:下載**唔再係 fetch**(改直接 `<a href>`),所以 fetch 數目由 3
+    變 2(preview + 切頁);下載嗰條路徑要另外驗(見
+    `test_frontend_page_url_has_per_page`)。
     """
     tpl = _strip_comments(_tpl())
     found = 0
@@ -350,7 +354,16 @@ def test_no_stale_per_page_omission():
         assert ("per_page" in q) or ("_ppQ" in q) or ("_pp" in q), (
             f"呢個 card fetch 漏咗 per_page: {q}"
         )
-    assert found >= 3, f"應該有至少 3 個 card fetch(preview/切頁/下載),搵到 {found}"
+    assert found >= 2, f"應該有至少 2 個 card fetch(preview/切頁),搵到 {found}"
+
+
+def test_frontend_page_url_has_per_page():
+    """v3.3.60:下載 URL(直接 <a href>)要帶 per_page。"""
+    tpl = _tpl()
+    m = re.search(r"foodCardPageUrl\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m, "搵唔到 foodCardPageUrl()"
+    body = m.group(1)
+    assert "per_page=${_pp}" in body, "下載 URL 要帶 per_page"
 
 
 def test_ppq_variable_is_built_correctly():
@@ -371,7 +384,7 @@ def test_all_page_buttons_rendered():
     assert 'x-for="pn in (foodCardPreview.pageTotal || 1)"' in tpl, (
         "下載掣一定要按 pageTotal 全部 render"
     )
-    assert "downloadFoodCardPage(pn)" in tpl, "每個掣要對應自己嗰頁"
+    assert ':href="foodCardPageUrl(pn)"' in tpl, "每個掣要對應自己嗰頁"
 
 
 def test_download_row_has_hint():
@@ -436,5 +449,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.59"' in web
-    assert "gym-web-v163" in web
+    assert '__version__ = "3.3.60"' in web
+    assert "gym-web-v164" in web

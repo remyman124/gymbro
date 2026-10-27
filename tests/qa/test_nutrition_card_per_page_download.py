@@ -66,11 +66,47 @@ def test_page_buttons_use_x_for():
     assert ":key=\"'dl' + pn\"" in tpl, "x-for 要有 :key(Alpine 必需)"
 
 
-def test_each_page_button_calls_download_page():
-    """每個掣都要叫 downloadFoodCardPage(pn)。"""
+def test_page_buttons_are_direct_anchor_links():
+    """v3.3.60:下載掣係**直接 <a href> 連結**,唔係 JS blob 路徑。
+
+    Jim OOB「The download buttons. Can they trigger download immediately?」
+    —— 舊路徑係 fetch → blob → objectURL → a.click(),要等一個 round trip
+    + blob convert 先落檔。server 本身已經送 `Content-Disposition:
+    attachment` → 直接 <a href> 就即刻落檔。
+    """
     tpl = _tpl()
-    assert '@click="downloadFoodCardPage(pn)"' in tpl, (
-        "下載掣要叫 downloadFoodCardPage(pn)"
+    assert ':href="foodCardPageUrl(pn)"' in tpl, "下載掣要用 :href=foodCardPageUrl(pn)"
+    assert ':download="foodCardFileName(pn)"' in tpl, "要用 :download= 指定檔名"
+    assert '@click="onFoodCardDownloadClick(pn)"' in tpl, "click 只需要提示(唔負責落檔)"
+
+
+def test_no_blob_download_path():
+    """唔准再用 fetch → blob → objectURL → click 嘅慢路徑。"""
+    tpl = _strip_comments(_tpl())
+    assert "URL.createObjectURL" not in tpl, (
+        "唔准再用 createObjectURL(落檔要即刻,唔好經 blob)"
+    )
+    assert "downloadFoodCardPage" not in tpl, "legacy blob 下載函式應該已經移除"
+    assert "downloadFoodCardFromModal" not in tpl, "legacy wrapper 應該已經移除"
+
+
+def test_prewarm_all_pages_when_modal_opens():
+    """v3.3.60:modal 打開時要預熱所有頁。
+
+    預熱 = server 早就 render 好 + 記入 3-tier cache → 撳下載掣就係
+    pure cache hit(唔使等 PIL render + Drive thumb fetch)。
+    """
+    tpl = _tpl()
+    assert "prewarmFoodCardPages()" in tpl, "要有 prewarmFoodCardPages()"
+    m = re.search(r"prewarmFoodCardPages\(\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m, "搵唔到 prewarmFoodCardPages()"
+    body = m.group(1)
+    assert "for (let n = 1; n <= total; n++)" in body, "要 loop 晒所有頁"
+    assert "fetch(this.foodCardPageUrl(n)" in body, "要 fetch 每頁 URL"
+    # 而且 showFoodCardPreview 要叫佢
+    m2 = re.search(r"async showFoodCardPreview\(date\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m2 and "this.prewarmFoodCardPages()" in m2.group(1), (
+        "showFoodCardPreview 要叫 prewarmFoodCardPages()"
     )
 
 
@@ -113,57 +149,65 @@ def test_no_legacy_dead_code():
 # 3. 一次只發一個 request
 # ---------------------------------------------------------------------------
 
-def test_download_page_fetches_single_page():
-    """downloadFoodCardPage 只 fetch 一頁。"""
+def test_page_url_points_to_single_page():
+    """foodCardPageUrl 要明確帶 page=N(一個掣 = 一頁)。"""
     tpl = _tpl()
-    m = re.search(r"async downloadFoodCardPage\(pageNum\)\s*\{(.*?)\n    \},", tpl, re.S)
-    assert m, "搵唔到 downloadFoodCardPage()"
+    m = re.search(r"foodCardPageUrl\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m, "搵唔到 foodCardPageUrl()"
     body = m.group(1)
-    fetches = re.findall(r"await fetch\(", body)
-    assert len(fetches) == 1, f"downloadFoodCardPage 只准 fetch 一次,搵到 {len(fetches)} 次"
-    assert "&page=${target}" in body, "要明確帶 page=target"
+    assert "&page=${t}" in body, "要明確帶 page="
+    assert "/api/nutrition/card?date=" in body, "要指向 /api/nutrition/card"
+    assert "per_page=" in body, "要帶 per_page"
+    # 一個掣一個 request(唔准 loop 落多頁)
+    assert "for (" not in body, "foodCardPageUrl 唔准 loop(一個掣 = 一頁)"
 
 
-def test_download_page_clamps_target():
+def test_page_url_clamps_target():
     """要 clamp 頁碼,唔可以越界。"""
     tpl = _tpl()
-    m = re.search(r"async downloadFoodCardPage\(pageNum\)\s*\{(.*?)\n    \},", tpl, re.S)
+    m = re.search(r"foodCardPageUrl\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
     body = m.group(1)
     assert "Math.min" in body and "Math.max" in body, "頁碼要 clamp 喺 1..pageTotal"
 
 
-def test_download_page_has_reentrancy_guard():
-    """防連撳 / 防重複下載。"""
+def test_download_state_still_exists():
+    """state 仍然要有 downloading 欄位(預熱 / 提示用)。"""
     tpl = _tpl()
-    m = re.search(r"async downloadFoodCardPage\(pageNum\)\s*\{(.*?)\n    \},", tpl, re.S)
-    body = m.group(1)
-    assert "if (p.downloading) return;" in body, "要有防重入 guard"
-    assert "p.downloading = true;" in body and "p.downloading = false;" in body, (
-        "downloading flag 要成對 set"
+    assert "downloading: false" in tpl, "state 要有 downloading: false"
+
+
+def test_server_sends_attachment_content_disposition():
+    """server 一定要送 Content-Disposition: attachment —— 直接 <a href>
+    靠呢個 header 先會即刻落檔(唔係喺 browser 入面開 preview)。"""
+    web = _web()
+    assert '"Content-Disposition": f"attachment; filename={download_name}"' in web, (
+        "server 要送 Content-Disposition: attachment"
     )
-    assert "downloading: false" in tpl, "初始 state 要有 downloading: false"
+    assert "as_attachment=True" in web, "send_file 都要 as_attachment=True"
 
 
 def test_download_filename_per_page():
     """下載檔名要帶頁碼(多頁日)。"""
     tpl = _tpl()
-    m = re.search(r"async downloadFoodCardPage\(pageNum\)\s*\{(.*?)\n    \},", tpl, re.S)
+    m = re.search(r"foodCardFileName\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m, "搵唔到 foodCardFileName()"
     body = m.group(1)
     # v3.3.55: 檔名加咗每頁餐數 suffix `${_ppSfx}`
-    assert "gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${target}.jpg" in body, (
+    assert "gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${t}.jpg" in body, (
         "多頁下載檔名要帶 _p<頁碼>"
     )
     assert "gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg" in body, "單頁下載檔名唔使帶頁碼"
 
 
-def test_modal_wrapper_downloads_current_page_only():
-    """downloadFoodCardFromModal() 而家只落當前頁。"""
-    tpl = _tpl()
-    m = re.search(r"async downloadFoodCardFromModal\(\)\s*\{(.*?)\n    \},", tpl, re.S)
-    assert m, "搵唔到 downloadFoodCardFromModal()"
-    body = m.group(1)
-    assert "downloadFoodCardPage" in body, "應該 delegate 去 downloadFoodCardPage"
-    assert "for" not in body, "唔准有 loop"
+def test_no_legacy_modal_wrapper():
+    """v3.3.60:舊嘅 modal wrapper(blob 路徑)應該已經剷走。
+
+    改用直接 <a href> 之後,`downloadFoodCardFromModal()` 冇存在嘅理由 ——
+    留低就係 legacy 死代碼(會令下一個改呢個 feature 嘅人搞唔清
+    邊條路徑仲生效)。
+    """
+    tpl = _strip_comments(_tpl())
+    assert "downloadFoodCardFromModal" not in tpl, "legacy wrapper 應該移除"
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +253,15 @@ def test_switch_page_respects_compact():
     assert "_cSfx" in body, "切頁嘅檔名要用 _cSfx"
 
 
-def test_download_page_respects_compact():
-    """逐頁下載都要尊重矮身版 toggle。"""
+def test_download_url_respects_compact():
+    """逐頁下載都要尊重矮身版 toggle(URL 同檔名都要)。"""
     tpl = _tpl()
-    m = re.search(r"async downloadFoodCardPage\(pageNum\)\s*\{(.*?)\n    \},", tpl, re.S)
+    m = re.search(r"foodCardPageUrl\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m, "搵唔到 foodCardPageUrl()"
     body = m.group(1)
-    assert "&compact=1" in body, "下載 fetch 要帶 compact=1"
-    assert "_cSfx" in body, "下載檔名要用 _cSfx"
+    assert "&compact=1" in body, "下載 URL 要帶 compact=1"
+    m2 = re.search(r"foodCardFileName\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
+    assert m2 and "_cSfx" in m2.group(1), "下載檔名要用 _cSfx"
 
 
 def test_page_button_style_helper_exists():
@@ -245,5 +291,5 @@ def test_server_download_name_format():
 def test_version_and_cache_bumped():
     """版本 + SW cache 要 bump。"""
     web = _web()
-    assert '__version__ = "3.3.59"' in web, "版本要係 3.3.57"
-    assert "gym-web-v163" in web, "SW cache 要 bump 去做 v161"
+    assert '__version__ = "3.3.60"' in web, "版本要係 3.3.57"
+    assert "gym-web-v164" in web, "SW cache 要 bump 去做 v161"

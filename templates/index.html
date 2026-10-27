@@ -1537,13 +1537,21 @@
         <div class="px-4 pb-2 flex flex-wrap gap-2 flex-shrink-0"
              style="background: rgba(28, 25, 46, 0.95); border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
           <template x-for="pn in (foodCardPreview.pageTotal || 1)" :key="'dl' + pn">
-            <button @click="downloadFoodCardPage(pn)"
-                    :disabled="foodCardPreview.loading || foodCardPreview.downloading"
-                    :style="foodCardDlStyle(pn)"
-                    class="rounded-xl text-sm font-bold transition-all active:scale-95 disabled:opacity-40 text-center">
+            <!-- v3.3.60 (Jim OOB「The download buttons. Can they trigger
+                 download immediately?」):
+                 由 `<button>` + JS(fetch→blob→objectURL→click)改成**直接
+                 `<a href>`**。server 本身已經送 `Content-Disposition:
+                 attachment` → 瀏覽器直接落檔,零 JS、零 blob、零多餘 round trip。
+                 撳落去即刻開始下載(唔再要等 fetch + blob convert)。 -->
+            <a :href="foodCardPageUrl(pn)"
+               :download="foodCardFileName(pn)"
+               target="_blank" rel="noopener"
+               @click="onFoodCardDownloadClick(pn)"
+               :style="foodCardDlStyle(pn)"
+               class="rounded-xl text-sm font-bold transition-all active:scale-95 text-center no-underline block">
               <span x-show="(foodCardPreview.pageTotal || 1) <= 1">⬇ 下載 JPG</span>
               <span x-show="(foodCardPreview.pageTotal || 1) > 1" x-text="'⬇ 第 ' + pn + ' 頁'"></span>
-            </button>
+            </a>
           </template>
         </div>
         <!-- v3.3.59:頁碼導航同樣搬上來(原本喺 modal 最底,短屏會被視窗切走)。
@@ -5995,6 +6003,9 @@ function gymApp() {
           pageNum: 1, pageTotal, pages,
           compact: _keepCompact, perPage: _pp,
         };
+        // v3.3.60:預熱所有頁 —— 令 server 早就 render 好 + 記入 cache,
+        // 撳下載掣就係 pure cache hit(唔使等 PIL render)。
+        this.prewarmFoodCardPages();
         if (pageTotal > 1) {
           // v3.3.54: 冇咗「下載全部」掣 → 提示改成「逐頁下載」
           this.flash(`✓ ${pageTotal} 頁 (${this.foodCardPreview.sizeKb} KB 第 1 頁) · 下面逐頁下載`);
@@ -6033,7 +6044,7 @@ function gymApp() {
         p.url = `/nutrition_card/${fname}?t=${cacheBuster}`;
         p.sizeKb = Math.round(blob.size / 1024);
         p.pageNum = newPage;
-        p.fileName = `gymbro_foodlog_${p.date}${_cSfx}_p${newPage}.jpg`;
+        p.fileName = `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${newPage}.jpg`;
         p.loading = false;
       } catch (e) {
         this.flash('切頁失敗：' + e.message);
@@ -6048,47 +6059,49 @@ function gymApp() {
     // `a.click()` download —— iOS Safari 會當成「多檔下載」要逐個撳
     // 「允許」,而且撞瀏覽器同時下載限制。所以改成每頁一個掣,
     // 撳邊個掣就只落嗰一頁。
-    async downloadFoodCardPage(pageNum) {
+    // v3.3.60:直接下載 URL(server 會送 Content-Disposition: attachment)
+    foodCardPageUrl(pn) {
+      const p = this.foodCardPreview;
+      if (!p || !p.date) return '#';
+      const total = p.pageTotal || 1;
+      const t = Math.min(Math.max(parseInt(pn, 10) || 1, 1), total);
+      const _pp = p.perPage || 5;
+      const _cq = p.compact === true ? '&compact=1' : '';
+      return `/api/nutrition/card?date=${encodeURIComponent(p.date)}&page=${t}&per_page=${_pp}${_cq}`;
+    },
+
+    // v3.3.60:下載檔名(要同 server 嘅 Content-Disposition 一致)
+    foodCardFileName(pn) {
+      const p = this.foodCardPreview;
+      if (!p || !p.date) return '';
+      const total = p.pageTotal || 1;
+      const t = Math.min(Math.max(parseInt(pn, 10) || 1, 1), total);
+      const _ppSfx = this._cardPpSuffix(p.perPage || 5);
+      const _cSfx = p.compact === true ? '_compact' : '';
+      return total > 1
+        ? `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${t}.jpg`
+        : `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg`;
+    },
+
+    // v3.3.60:撳落去即刻提示(下載本身由 <a href> 觸發,唔經 JS)
+    onFoodCardDownloadClick(pn) {
+      try { this.haptic(12); } catch (e) {}
+      this.flash('⬇ 下載緊 ' + this.foodCardFileName(pn) + '…', 2200);
+    },
+
+    // v3.3.60:預熱所有頁 —— 令 server 早就 render 好 + 記入 cache,
+    // 撳下載掣就係 pure cache hit(server 端 10ms,唔使等 PIL render)。
+    prewarmFoodCardPages() {
       const p = this.foodCardPreview;
       if (!p || !p.date) return;
-      if (p.downloading) return;          // 防連撳 / 防重複下載
       const total = p.pageTotal || 1;
-      let target = parseInt(pageNum, 10);
-      if (!target || isNaN(target)) target = p.pageNum || 1;
-      target = Math.min(Math.max(target, 1), total);
-      // v3.3.53: 矮身版 → &compact=1,下載檔名加 _compact
-      const _compact = p.compact === true;
-      const _cq = _compact ? '&compact=1' : '';
-      const _cSfx = _compact ? '_compact' : '';
-      // v3.3.55: 每頁餐數(6/4/3)
-      const _pp = p.perPage || 5;
-      const _ppSfx = this._cardPpSuffix(_pp);
-      try {
-        p.downloading = true;
-        const r = await fetch(
-          `/api/nutrition/card?date=${encodeURIComponent(p.date)}&page=${target}&per_page=${_pp}${_cq}`,
-          { headers: { 'Accept': 'image/jpeg' }, cache: 'no-store' }
-        );
-        if (!r.ok) { this.flash(`第 ${target} 頁下載失敗：${r.status}`); return; }
-        const blob = await r.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = total > 1
-          ? `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${target}.jpg`
-          : `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg`;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => {
-          if (a.parentNode) a.parentNode.removeChild(a);
-          URL.revokeObjectURL(url);
-        }, 2000);
-        this.flash(`✓ 已下載 ${a.download} (${Math.round(blob.size / 1024)} KB)`);
-      } catch (e) {
-        this.flash('下載失敗：' + e.message);
-      } finally {
-        p.downloading = false;
+      for (let n = 1; n <= total; n++) {
+        try {
+          fetch(this.foodCardPageUrl(n), {
+            headers: { 'Accept': 'image/jpeg' },
+            cache: 'force-cache',
+          }).catch(() => {});
+        } catch (e) { /* 預熱失敗唔影響下載 */ }
       }
     },
 
@@ -6107,12 +6120,6 @@ function gymApp() {
             + 'border: 1.5px solid rgba(251,191,36,0.85); color: rgb(28,25,46);'
           : 'background: rgba(255,255,255,0.10);'
             + 'border: 1.5px solid rgba(251,191,36,0.30); color: rgb(251,191,36);');
-    },
-
-    // v3.3.23b: download the in-memory blob to device.
-    // v3.3.54: 而家只下載「當前頁」(逐頁下載),唔再一次過載晒。
-    async downloadFoodCardFromModal() {
-      return this.downloadFoodCardPage(this.foodCardPreview.pageNum || 1);
     },
 
     // v3.3.23b: close the modal and release the blob URL. User is back

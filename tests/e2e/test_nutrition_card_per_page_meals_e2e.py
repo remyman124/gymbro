@@ -34,7 +34,7 @@ PROBE_JS = """() => {
     const modal = document.querySelector('[x-show="foodCardPreview.visible"] > div');
     const vis = el => { const r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0 && el.offsetParent !== null; };
-    const btns = Array.from(modal.querySelectorAll('button')).filter(vis)
+    const btns = Array.from(modal.querySelectorAll('a, button')).filter(vis)
         .filter(b => { const t = (b.innerText||'');
             return t.includes('第') || t.includes('下載 JPG'); })
         .map(b => { const r = b.getBoundingClientRect();
@@ -180,18 +180,18 @@ def main():
         page.set_viewport_size({"width": 390, "height": 844})
         page.wait_for_timeout(1000)
 
-        # ── 5. 逐頁下載:一個掣 = 一個 request ─────────────────────────
-        before = len(calls)
+        # ── 5. 逐頁下載:一個掣 = 一個下載(v3.3.60 直接 <a href>) ───────
+        dls = []
+        page.on("download", lambda d: dls.append(d))
         dl_name = ""
         try:
             with page.expect_download(timeout=20000) as di:
-                page.locator("button:visible:has-text('⬇ 第 1 頁')").first.click(force=True)
+                page.locator("a:visible:has-text('⬇ 第 1 頁')").first.click(force=True)
             dl_name = di.value.suggested_filename
         except Exception as e:
             dl_name = f"(no download: {type(e).__name__})"
         page.wait_for_timeout(1500)
-        new = calls[before:]
-        check("E11 撳一個掣只發一個 request", len(new) == 1, str(new))
+        check("E11 撳一個掣只觸發一個下載", len(dls) == 1, f"{len(dls)} 個")
         check("E12 下載檔名帶 _pp5", "_pp5" in dl_name, dl_name)
 
         # ── 6. Server 仍然支援 per_page=4/3(舊 URL backwards compatible) ──
