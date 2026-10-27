@@ -39,6 +39,15 @@ def push_store(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def outbox_store(tmp_path, monkeypatch):
+    """v3.3.46: /api/push/send 會記低 outbox → 測試一定要指去 tmp,
+    唔可以污染生產 store(`/home/work/.hermes/gymbro_outbox.json`)。"""
+    path = tmp_path / "outbox.json"
+    monkeypatch.setenv("GYMBRO_OUTBOX_STORE", str(path))
+    return path
+
+
+@pytest.fixture
 def geo_store(tmp_path, monkeypatch):
     """Point the geo store at a temp file — never the real one."""
     path = tmp_path / "geo.json"
@@ -111,7 +120,7 @@ def test_unsubscribe_removes_subscription(client, push_store):
     assert r.get_json() == {"ok": True, "removed": False}
 
 
-def test_push_send_with_fake_endpoint_does_not_raise(client, push_store):
+def test_push_send_with_fake_endpoint_does_not_raise(client, push_store, outbox_store):
     """A dead endpoint must come back as a soft error, never a 500."""
     client.post("/api/push/subscribe", json={"endpoint": FAKE_ENDPOINT, "keys": FAKE_KEYS})
     r = client.post("/api/push/send",
@@ -124,7 +133,7 @@ def test_push_send_with_fake_endpoint_does_not_raise(client, push_store):
     assert isinstance(data["errors"], list)
 
 
-def test_push_send_without_subscriptions_is_not_an_error(client, push_store):
+def test_push_send_without_subscriptions_is_not_an_error(client, push_store, outbox_store):
     r = client.post("/api/push/send", json={"title": "hi", "body": "there"})
     assert r.status_code == 200
     data = r.get_json()
@@ -132,7 +141,7 @@ def test_push_send_without_subscriptions_is_not_an_error(client, push_store):
     assert data["sent"] == 0
 
 
-def test_push_send_never_leaks_the_private_key(client, push_store):
+def test_push_send_never_leaks_the_private_key(client, push_store, outbox_store):
     client.post("/api/push/subscribe", json={"endpoint": FAKE_ENDPOINT, "keys": FAKE_KEYS})
     r = client.post("/api/push/send", json={"title": "t", "body": "b"})
     body = r.get_data(as_text=True)

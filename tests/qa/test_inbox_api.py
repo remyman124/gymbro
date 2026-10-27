@@ -153,6 +153,33 @@ def test_trim_to_max_items(outbox, monkeypatch):
     assert items[-1]["title"] == "T5"
 
 
+# ---------------------------------------------------------------- 生產污染守門
+
+def test_production_outbox_has_no_test_entries():
+    """QA suite 唔准寫入生產 outbox store。
+
+    背景:v3.3.46 加咗 outbox 記錄之後,`test_mobile_pwa_api.py` 嘅
+    push-send 測試(POST /api/push/send)會令生產 store 多咗
+    「hi / there」「t / b」「測試 / 測試」三條垃圾 → 測試要用
+    `GYMBRO_OUTBOX_STORE` 指去 tmp。
+    """
+    import json
+    prod = Path("/home/work/.hermes/gymbro_outbox.json")
+    if not prod.exists():
+        return
+    try:
+        data = json.loads(prod.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    bad_titles = {"hi", "t", "測試", "test", "Test"}
+    bad = [i for i in data
+           if (i.get("title") or "").strip() in bad_titles
+           or (i.get("body") or "").strip() in {"there", "b", "測試"}]
+    assert not bad, (
+        "生產 outbox store 有測試條目(要用 GYMBRO_OUTBOX_STORE 隔離): "
+        f"{[(b.get('ts'), b.get('title'), b.get('body')) for b in bad]}")
+
+
 # ---------------------------------------------------------------- 接駁 + 前端
 
 def test_push_send_is_logged():

@@ -32,11 +32,18 @@ def _now_iso() -> str:
     return datetime.now(tz=HKT).isoformat()
 
 
+def _path() -> str:
+    """實際 store 路徑。環境變數每次都生效 → 測試可以用 runtime 覆蓋,
+    QA suite 唔會污染生產 store。"""
+    return os.environ.get("GYMBRO_OUTBOX_STORE") or STORE
+
+
 def _load() -> list:
     try:
-        if not os.path.exists(STORE):
+        path = _path()
+        if not os.path.exists(path):
             return []
-        with open(STORE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
     except Exception as e:
@@ -45,17 +52,18 @@ def _load() -> list:
 
 
 def _save(items: list) -> bool:
+    path = _path()
     try:
-        d = os.path.dirname(STORE)
+        d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        tmp = f"{STORE}.tmp"
+        tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(items[-MAX_ITEMS:], f, ensure_ascii=False, indent=1)
-        os.replace(tmp, STORE)
+        os.replace(tmp, path)
         return True
     except Exception as e:
-        print(f"[outbox] save failed ({STORE}): {type(e).__name__}: {e}", flush=True)
+        print(f"[outbox] save failed ({path}): {type(e).__name__}: {e}", flush=True)
         return False
 
 
