@@ -208,3 +208,9 @@ App 最底多咗一個 **📥 收件** tab —— 顯示 **Gymbro 自己推出�
 API:`GET /api/inbox/messages`(`limit` / `before` / `kind` / `q`)、
 `GET /api/inbox/stats`。
 
+
+### 語音教練(v3.3.48)
+兩個解說員輪流講(A 聲 = `Cantonese_crisp_news_anchor_vv2`,B 聲 =
+`Cantonese_resonant_host_vv2`),每個 cheer routine 開頭都會 force 拉一次
+WHOOP(記低 `whoop_fresh` 旗標,睇得見啱唔啱新鮮)。
+

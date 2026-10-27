@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.47"
+__version__ = "3.3.48"
 
 
 def _recovery_pct():
@@ -14642,6 +14642,10 @@ def _synthesize_cheer_voice(text: str) -> str:
         # - v3.3.24c (2026-10-17 21:42): edge-tts primary again (edge-tts
         #   upgraded 7.2.8 → 7.3.1 to fix the 403)
         # - v3.3.42 (2026-10-25): MiniMax primary (Jim directive) ← current
+        # v3.3.48:兩位解說員優先(duo 掛咗 → 單聲 → edge-tts)
+        duo_path = _synthesize_cheer_voice_duo(voice_text)
+        if duo_path:
+            return duo_path
         min_path = _synthesize_cheer_voice_new(voice_text)
         if min_path:
             return min_path
@@ -14656,27 +14660,26 @@ def _synthesize_cheer_voice(text: str) -> str:
         return ""
 
 
-def _synthesize_cheer_voice_new(voice_text: str) -> str:
-    """Generate MiniMax TTS voice MP3 from cheer text — FALLBACK ONLY.
+# v3.3.48 (Jim OOB 2026-10-27「voice coach, can we switch to two voice
+# commentators that will not be too boring」):兩位解說員嘅聲。
+#   A 聲 = Cantonese_crisp_news_anchor_vv2(Jim locked choice,主講)
+#   B 聲 = Cantonese_resonant_host_vv2(另一把聲,副講)
+#   B 聲掛咗 → edge-tts zh-HK-HiuMaanNeural(曉曼)做後備
+CHEER_VOICE_A = "Cantonese_crisp_news_anchor_vv2"
+CHEER_VOICE_B = "Cantonese_resonant_host_vv2"
+CHEER_VOICE_B_EDGE = "zh-HK-HiuMaanNeural"
 
-    Jim OOB 2026-09-04「for gymbro, please use edge tts instead. wanlun
-    voice is better than minimax tts」: MiniMax TTS demoted from primary
-    to fallback. Edge-TTS WanLungNeural (雲龍) is primary now. This
-    function retained so cheer pipeline still has a backup if edge-tts
-    fails (network outage, edge 5xx, voice unavailable).
 
-    Earlier history:
-    - v3.3.11 (Jim OOB 2026-09-01「please switch all voice to minimax
-      audio - Cantonese_crisp_news_anchor_vv2」): this function was
-      promoted to PRIMARY voice path.
-    - v3.3.14: added language_boost="Chinese,Yue" + Jyutping tone hints
-      so MiniMax TTS actually pronounced Cantonese text properly
-      (without it, MiniMax defaulted to Mandarin auto-detect).
+def _minimax_tts_render(text: str, voice_id: str, out_mp3_path: str,
+                         speed: float = 0.95, label: str = "minimax") -> str:
+    """MiniMax TTS → 指定路徑嘅 MP3。失敗回 ""(唔會拋)。
+
+    v3.3.48:由 _synthesize_cheer_voice_new 抽出嚟,等兩個解說員可以用
+    同一段 API 邏輯但用唔同 voice_id + 唔同輸出檔。
     """
     api_key = _minimax_api_key()
     if not api_key:
-        # No MiniMax key available — try edge-tts as last resort
-        return _synthesize_cheer_voice_edge_tts(voice_text)
+        return ""
     try:
         # MiniMax TTS REST endpoint: POST /v1/audio/speech
         # Returns MP3 binary (or OGG depending on response_format)
@@ -14686,10 +14689,10 @@ def _synthesize_cheer_voice_new(voice_text: str) -> str:
         req_url = "https://api.minimax.io/v1/t2a_v2"
         payload = {
             "model": "speech-02-hd",
-            "text": voice_text,
+            "text": text,
             "voice_setting": {
-                "voice_id": "Cantonese_crisp_news_anchor_vv2",
-                "speed": 0.95,
+                "voice_id": voice_id,
+                "speed": speed,
                 "vol": 1.0,
                 "pitch": 0,
             },
@@ -14753,18 +14756,17 @@ def _synthesize_cheer_voice_new(voice_text: str) -> str:
                 pass
             return ""
         # Save directly to output MP3 path
-        today_iso_str = today_iso()
-        out_mp3 = CHEER_AUDIO_CACHE / f"cheer_{today_iso_str}.mp3"
+        out_mp3 = Path(out_mp3_path)
         out_mp3.parent.mkdir(parents=True, exist_ok=True)
         out_mp3.write_bytes(mp3_bytes)
         # Post-flight duration check
         actual_dur = _probe_audio_duration(str(out_mp3))
         try:
             with open("/tmp/cheer_durations.log", "a") as f:
-                f.write(
-                    f"{now_iso()} | text_chars={len(voice_text)} | "
+                _f.write(
+                    f"{now_iso()} | text_chars={len(text)} | "
                     f"est_dur={text_estimated_dur}s | actual_dur={actual_dur:.1f}s | "
-                    f"provider=minimax | mp3={out_mp3.name}\n"
+                    f"provider={label} | voice={voice_id} | mp3={out_mp3.name}\n"
                 )
         except Exception:
             pass
@@ -14776,7 +14778,184 @@ def _synthesize_cheer_voice_new(voice_text: str) -> str:
                 f.write(f"\n=== minimax tts error at {now_iso()}: {type(e).__name__}: {str(e)[:200]} ===\n")
         except Exception:
             pass
-        return _synthesize_cheer_voice_edge_tts(voice_text)
+        return ""
+
+
+def _split_voice_segments(text: str, n_segments: int = 4) -> list:
+    """把 cheer 文本按句子切成 n 段(唔會喺半句中間斬開)。
+
+    v3.3.48: 兩位解說員一來一回 → 需要幾段。
+    """
+    import re as _re_seg
+    sentences = [s for s in _re_seg.split(r"(?<=[。！？!?])", text) if s and s.strip()]
+    if not sentences:
+        return []
+    if len(sentences) <= n_segments:
+        return ["".join(sentences)]
+    # 平均分配句子到 n 段 —— **順序一定要保留** ✅
+    # (commentator 輪流講,但內容唔可以倒轉 ✅,否則會講到一頭一尾唔連貫 ✅)
+    per = max(1, len(sentences) // n_segments)
+    buckets = [[] for _ in range(n_segments)]
+    for i, s in enumerate(sentences):
+        buckets[min(i // per, n_segments - 1)].append(s)
+    out = ["".join(b).strip() for b in buckets if b]
+    # 太短嘅段併返去上一段(門檻要窄 —— 咁先保留得返 A/B 輪流嘅節奏 ✅)
+    merged = []
+    for seg in out:
+        if merged and len(seg) < 8:
+            merged[-1] += seg
+        else:
+            merged.append(seg)
+    return merged
+
+
+def _edge_tts_render(text: str, voice: str, out_mp3_path: str,
+                      rate: str = "+0%") -> str:
+    """edge-tts → 指定路徑嘅 MP3(失敗回 "")。"""
+    try:
+        tmp_ogg = str(Path(out_mp3_path).with_suffix(".ogg"))
+        result = _sp.run([
+            "edge-tts", "--voice", voice, "--rate", rate, "--text", text,
+            "--write-media", tmp_ogg,
+        ], capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            return ""
+        _sp.run([
+            "ffmpeg", "-y", "-i", tmp_ogg, "-vn", "-c:a", "libmp3lame",
+            "-b:a", "128k", "-ar", "44100", "-ac", "1", out_mp3_path,
+        ], capture_output=True, timeout=60)
+        try:
+            os.unlink(tmp_ogg)
+        except Exception:
+            pass
+        return out_mp3_path if os.path.exists(out_mp3_path) else ""
+    except Exception as e:
+        print(f"[cheer] edge-tts {voice} failed: {type(e).__name__}: {e}", flush=True)
+        return ""
+
+
+def _synthesize_cheer_voice_duo(voice_text: str) -> str:
+    """v3.3.48 — 兩位解說員(commentators)嘅 cheer 語音。
+
+    Jim OOB 2026-10-27「voice coach, can we switch to two voice commentators
+    that will not be too boring?」
+
+    點做:
+      1. 文本切成 4 段(按句子 ✅,唔會斬爛半句 ✅)
+      2. 單數段俾 A 聲、雙數段俾 B 聲 → 一來一回(似兩個講評員輪流講 ✅)
+      3. A = MiniMax Cantonese_crisp_news_anchor_vv2(Jim locked choice ✅)
+         B = MiniMax Cantonese_resonant_host_vv2(另一把聲 ✅)
+         B 掛咗 → edge-tts zh-HK-HiuMaanNeural(曉曼 ✅)
+      4. ffmpeg concat,段與段之間 0.35 秒停頓(似真實交接 ✅)
+
+    任何一步失敗 → 回 "" → dispatcher 自動退回單聲(唔會靜靜哋死 ✅)。
+    """
+    segs = _split_voice_segments(voice_text, n_segments=4)
+    if len(segs) < 2:
+        return ""            # 文本太短 → 交俾單聲
+    stamp = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    tmp_dir = CHEER_AUDIO_CACHE / "_duo"
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return ""
+    rendered = []
+    for idx, seg in enumerate(segs):
+        is_a = (idx % 2 == 0)
+        seg_out = tmp_dir / f"seg_{stamp}_{idx}.mp3"
+        path = ""
+        if is_a:
+            path = _minimax_tts_render(seg, CHEER_VOICE_A, str(seg_out),
+                                       label="minimax-duo-A")
+        else:
+            path = _minimax_tts_render(seg, CHEER_VOICE_B, str(seg_out),
+                                       label="minimax-duo-B")
+            if not path:
+                # B 聲掛咗 → edge-tts 曉曼頂上
+                path = _edge_tts_render(seg, CHEER_VOICE_B_EDGE, str(seg_out))
+        if not path:
+            print(f"[cheer] duo segment {idx} failed → fall back to single voice",
+                  flush=True)
+            return ""
+        rendered.append(path)
+        # MiniMax RPM 限制(1002)→ 每次之間停一停
+        try:
+            time.sleep(2.0)
+        except Exception:
+            pass
+
+    # ffmpeg concat(中間插 0.35s 停頓)
+    today_iso_str = today_iso()
+    out_mp3 = CHEER_AUDIO_CACHE / f"cheer_{today_iso_str}.mp3"
+    try:
+        gap = tmp_dir / f"gap_{stamp}.mp3"
+        _sp.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                 "-t", "0.35", "-q:a", "9", str(gap)],
+                capture_output=True, timeout=30)
+        list_file = tmp_dir / f"concat_{stamp}.txt"
+        lines = []
+        for i, p in enumerate(rendered):
+            lines.append(f"file '{p}'")
+            if i < len(rendered) - 1 and gap.exists():
+                lines.append(f"file '{gap}'")
+        list_file.write_text("\n".join(lines), encoding="utf-8")
+        out_mp3.parent.mkdir(parents=True, exist_ok=True)
+        r = _sp.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                     "-c:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
+                     str(out_mp3)], capture_output=True, text=True, timeout=180)
+        if r.returncode != 0 or not out_mp3.exists():
+            print(f"[cheer] duo concat failed: {r.stderr[:200] if r.stderr else r.returncode}",
+                  flush=True)
+            return ""
+        actual_dur = _probe_audio_duration(str(out_mp3))
+        try:
+            with open("/tmp/cheer_durations.log", "a") as f:
+                f.write(f"{now_iso()} | duo | segments={len(rendered)} | "
+                        f"text_chars={len(voice_text)} | actual_dur={actual_dur:.1f}s | "
+                        f"A={CHEER_VOICE_A} B={CHEER_VOICE_B} | mp3={out_mp3.name}\n")
+        except Exception:
+            pass
+        print(f"[cheer] duo voice OK: {len(rendered)} segments, {actual_dur:.1f}s",
+              flush=True)
+        return str(out_mp3)
+    except Exception as e:
+        print(f"[cheer] duo exception: {type(e).__name__}: {e}", flush=True)
+        return ""
+    finally:
+        try:
+            for p in tmp_dir.glob(f"*{stamp}*"):
+                p.unlink()
+        except Exception:
+            pass
+
+
+def _synthesize_cheer_voice_new(voice_text: str) -> str:
+    """Generate MiniMax TTS voice MP3 from cheer text (單聲 · 舊路徑)。
+
+    v3.3.48: 主力行 _synthesize_cheer_voice_duo() 嘅雙解說員;呢個 function
+    保留做 fallback(duo 任何一步失敗 → 呢度接手)。
+
+    Jim OOB 2026-09-04「for gymbro, please use edge tts instead. wanlun
+    voice is better than minimax tts」: MiniMax TTS demoted from primary
+    to fallback. Edge-TTS WanLungNeural (雲龍) is primary now. This
+    function retained so cheer pipeline still has a backup if edge-tts
+    fails (network outage, edge 5xx, voice unavailable).
+
+    Earlier history:
+    - v3.3.11 (Jim OOB 2026-09-01「please switch all voice to minimax
+      audio - Cantonese_crisp_news_anchor_vv2」): this function was
+      promoted to PRIMARY voice path.
+    - v3.3.14: added language_boost="Chinese,Yue" + Jyutping tone hints
+      so MiniMax TTS actually pronounced Cantonese text properly
+      (without it, MiniMax defaulted to Mandarin auto-detect).
+    """
+    today_iso_str = today_iso()
+    out_mp3 = CHEER_AUDIO_CACHE / f"cheer_{today_iso_str}.mp3"
+    path = _minimax_tts_render(voice_text, CHEER_VOICE_A, str(out_mp3))
+    if path:
+        return path
+    # MiniMax 掛咗(冇 key / 429 / 網絡)→ edge-tts
+    return _synthesize_cheer_voice_edge_tts(voice_text)
 
 
 def _synthesize_cheer_voice_edge_tts(voice_text: str) -> str:
@@ -14831,7 +15010,7 @@ def _synthesize_cheer_voice_edge_tts(voice_text: str) -> str:
             return ""
         # Post-flight duration check (Rule 39: 130-160s target window)
         actual_dur = _probe_audio_duration(str(out_mp3))
-        text_estimated_dur = _cheer_duration_s(len(voice_text))
+        text_estimated_dur = _cheer_duration_s(len(text))
         try:
             with open("/tmp/cheer_durations.log", "a") as f:
                 f.write(
@@ -15203,12 +15382,29 @@ def _background_cheer_job(job_id: str, fire_type: str):
             pass
         metrics = _extract_whoop_metrics(whoop)
         metrics["whoop_pulled_at"] = whoop_pulled_at
+        # v3.3.48 (Jim OOB 2026-10-27「please pull whoop data once to get the
+        # most update data in every cheer routine」):明確記低今次 pull 有冇
+        # 真係更新到 cache —— 拉完之後 cache mtime 應該就係而家。
+        whoop_cache_age_s = -1.0
+        whoop_fresh = False
+        try:
+            if WHOOP_CACHE_PATH.exists():
+                whoop_cache_age_s = time.time() - WHOOP_CACHE_PATH.stat().st_mtime
+                whoop_fresh = whoop_cache_age_s < 300      # 5 分鐘內 pull 過
+        except Exception:
+            pass
+        metrics["whoop_fresh"] = whoop_fresh
+        metrics["whoop_cache_age_s"] = round(whoop_cache_age_s, 1)
+        print(f"[cheer] whoop pull | fresh={whoop_fresh} | age={whoop_cache_age_s:.1f}s "
+              f"| rec={metrics.get('recovery_pct')} | sleep_bed={metrics.get('sleep_bed_hr')}h "
+              f"| strain={metrics.get('strain')} | at={whoop_pulled_at}", flush=True)
         with CHEER_JOBS_LOCK:
             CHEER_JOBS[job_id].update({
                 "step": "whoop_body",
                 "step_at": now_iso(),
                 "metrics": metrics,
                 "whoop_pulled_at": whoop_pulled_at,
+                "whoop_fresh": whoop_fresh,
             })
 
         # Read fresh body weight + fat + steps from the Withings helpers.
@@ -15348,6 +15544,8 @@ def _background_cheer_job(job_id: str, fire_type: str):
                 "has_image": bool(image_path),
                 "text_path": str(artifact_dir / "cheer_text.txt"),
                 "voice_path": voice_path,
+                "whoop_fresh": metrics.get("whoop_fresh"),
+                "whoop_pulled_at": metrics.get("whoop_pulled_at"),
                 "text": text,
                 "ok": True,
                 "status": "done",
@@ -16593,7 +16791,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v151';
+const CACHE = 'gym-web-v152';
 // v3.3.44a (2026-10-26, Jim OOB「It's showing blank page somehow today」+
 // 「Image upload is error」):cache 版本 146 → 147。
 //   同一個 push/sync handler,但改咗 static asset 嘅取用規則(見下面 fetch

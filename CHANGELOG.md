@@ -1,3 +1,31 @@
+## v3.3.48 — 2026-10-27 — 語音教練升級:兩位解說員 + 每個 cheer 必拉 WHOOP
+
+Jim OOB 2026-10-27:「voice coach, can we switch to two voice commentators
+that will not be too boring? Moreover, please pull whoop data once to get
+the most update data in every cheer routine.」
+
+### 1️⃣ 兩位解說員(commentators)嘅語音
+- **A 聲(主講)**:MiniMax `Cantonese_crisp_news_anchor_vv2`(Jim locked choice ✅)
+- **B 聲(副講)**:MiniMax `Cantonese_resonant_host_vv2`(另一把聲 ✅)
+  B 聲掛咗 → edge-tts `zh-HK-HiuMaanNeural`(曉曼 ✅)做後備
+- **點樣夾**:文本按句子切成 4 段(**順序保留 ✅**,唔會倒轉內容 ✅)
+  → 單數段俾 A、雙數段俾 B → 一來一回,似兩個講評員輪流講 ✅
+- **合併**:ffmpeg concat(段與段之間 0.35 秒停頓 ✅,似真實交接 ✅)
+- **安全網**:任何一步失敗 → 回 `""` → dispatcher 自動轉單聲 → 再 fallback
+  edge-tts(唔會靜靜哋死 ✅)
+
+### 2️⃣ 每個 cheer routine 都拉一次最新 WHOOP
+- `_run_whoop_pull_cached(force=True)` ✅ 喺每個 cheer job 開頭行 ✅
+- 新增 `whoop_fresh` 旗標:睇 pull 完之後 cache mtime 係咪喺 5 分鐘內 ✅
+  → 睇得見今次用嘅係咪真・最新數據 ✅
+- 日誌:`[cheer] whoop pull | fresh=True | age=0.3s | rec=25 | sleep=4.37h ...` ✅
+
+### 其他
+- SW cache `gym-web-v151` → `gym-web-v152` ✅(舊 client 要換新 SW 先有 duo 同
+  新 deep link ✅)
+- 影片沿用 `cheer_{today}.mp3` → duo 語音自動入片 ✅
+- 測試:`tests/qa/test_cheer_duo_voice.py`(12 個守門 ✅)
+
 ## v3.3.47 — 2026-10-27 — 推播深連結:撳通知直接入收件箱
 
 Jim OOB 2026-10-27:「When I receive the notification, can I just click to
