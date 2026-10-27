@@ -52,10 +52,27 @@ def _strip_comments(text):
 # ---------------------------------------------------------------------------
 
 def test_per_page_choices_and_default():
-    """只准 6/4/3,預設 6。"""
+    """v3.3.57:上限 5 餐 —— 選項 5/4/3,預設 5。
+
+    6 唔再係選項,但仍然喺 ALLOWED 入面(要繼續支援 v3.3.55 之前
+    6 餐/頁 嗰啲無 suffix 嘅 legacy 檔名)。
+    """
     web = _web()
-    assert "CARD_PER_PAGE_DEFAULT = 6" in web
-    assert "CARD_PER_PAGE_CHOICES = (6, 4, 3)" in web
+    assert "CARD_PER_PAGE_DEFAULT = 5" in web
+    assert "CARD_PER_PAGE_CHOICES = (5, 4, 3)" in web
+    assert "CARD_PER_PAGE_LEGACY = 6" in web
+    assert "CARD_PER_PAGE_ALLOWED = (6, 5, 4, 3)" in web
+
+
+def test_per_page_max_is_five():
+    """Jim OOB 2026-10-27「Make it 5 meals max per screen」—— 任何選項都唔准 >5。"""
+    web = _web()
+    import re as _re
+    m = _re.search(r"CARD_PER_PAGE_CHOICES = \(([^)]*)\)", web)
+    assert m, "搵唔到 CARD_PER_PAGE_CHOICES"
+    vals = [int(v.strip()) for v in m.group(1).split(",") if v.strip()]
+    assert max(vals) == 5, f"每頁上限一定要係 5,而家係 {max(vals)}"
+    assert 6 not in vals, "6 唔再可以係 UI 選項(只可以留喺 ALLOWED 做 legacy)"
 
 
 def test_per_page_parser_clamps():
@@ -65,14 +82,14 @@ def test_per_page_parser_clamps():
     assert m, "搵唔到 _card_per_page()"
     body = m.group(0)
     assert "except (TypeError, ValueError)" in body, "非法值唔可以 raise"
-    assert "return v if v in CARD_PER_PAGE_CHOICES else CARD_PER_PAGE_DEFAULT" in body
+    assert "return v if v in CARD_PER_PAGE_ALLOWED else CARD_PER_PAGE_DEFAULT" in body
 
 
 def test_renderer_uses_per_page():
     """renderer 一定要用 per_page 切片。"""
     web = _web()
     assert "per_page: int = CARD_PER_PAGE_DEFAULT" in web, "renderer 要有 per_page 參數"
-    assert "MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_CHOICES else CARD_PER_PAGE_DEFAULT" in web
+    assert "MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_ALLOWED else CARD_PER_PAGE_DEFAULT" in web
     assert "page_start = (page_num - 1) * MEALS_PER_PAGE" in web
 
 
@@ -119,7 +136,8 @@ def test_pp_suffix_helper():
     web = _web()
     m = re.search(r"def _card_pp_suffix\(per_page: int\).*?\n\n\ndef ", web, re.S)
     assert m, "搵唔到 _card_pp_suffix()"
-    assert '"" if per_page == CARD_PER_PAGE_DEFAULT else f"_pp{int(per_page)}"' in m.group(0)
+    # v3.3.57:只有 legacy(6 餐/頁)用無 suffix 檔名;5/4/3 一律帶 suffix
+    assert '"" if int(per_page) == CARD_PER_PAGE_LEGACY else f"_pp{int(per_page)}"' in m.group(0)
 
 
 def test_renderer_filename_has_pp_suffix():
@@ -144,13 +162,25 @@ def test_card_url_filenames_have_pp_suffix():
 
 
 def test_default_keeps_legacy_filename():
-    """per_page=6 一定要保持舊檔名(backwards compatible)。"""
+    """per_page=6(legacy)一定要保持舊檔名(backwards compatible)。"""
     web = _web()
-    # 舊 URL(/nutrition_card/nutrition_2026-10-27_p1.jpg)一定要仲 work
     assert 'f"nutrition_{target_date}{_pp_sfx}_p{p}.jpg"' in web
-    assert "CARD_PER_PAGE_DEFAULT = 6" in web, "預設一定要係 6"
-    # legacy 檔寫入條件:per_page=6 嗰陣先寫
+    assert "CARD_PER_PAGE_LEGACY = 6" in web, "legacy 值一定要係 6"
+    assert "CARD_PER_PAGE_DEFAULT = 5" in web, "新預設一定要係 5"
     assert "and not compact" in web, "legacy 檔寫入條件(要留意 per_page)"
+
+
+def test_new_default_does_not_collide_with_legacy():
+    """新預設(5 餐)唔可以撞 legacy(6 餐)嘅檔名 —— suffix 唔可以空。"""
+    import re as _re
+    web = _web()
+    m = _re.search(r"def _card_pp_suffix\(per_page: int\).*?\n\n\ndef ", web, _re.S)
+    assert m, "搵唔到 _card_pp_suffix()"
+    body = m.group(0)
+    assert "CARD_PER_PAGE_LEGACY" in body
+    assert "CARD_PER_PAGE_DEFAULT" not in body, (
+        "suffix 唔可以跟 default(預設改成 5 之後會撞 legacy 6 餐嘅檔名)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +189,7 @@ def test_default_keeps_legacy_filename():
 
 def test_frontend_has_per_page_state():
     tpl = _tpl()
-    assert "perPage: 6" in tpl, "state 要有 perPage"
+    assert "perPage: 5" in tpl, "state 要有 perPage(預設 5)"
 
 
 def test_frontend_sends_per_page_everywhere():
@@ -176,7 +206,7 @@ def test_frontend_chip_row():
     """要有每頁餐數嘅選擇器。"""
     tpl = _tpl()
     assert "每頁餐數" in tpl, "要有「每頁餐數」標籤"
-    assert 'x-for="opt in [6, 4, 3]"' in tpl, "要有 6/4/3 三個選項"
+    assert 'x-for="opt in [5, 4, 3]"' in tpl, "要有 5/4/3 三個選項(上限 5)"
     assert "@click=\"foodCardPreview.perPage = opt; reloadFoodCardPreview()\"" in tpl, (
         "撳 chip 要即時重新載入"
     )
@@ -188,7 +218,9 @@ def test_frontend_pp_suffix_helper():
     m = re.search(r"_cardPpSuffix\(pp\)\s*\{(.*?)\n    \},", tpl, re.S)
     assert m, "搵唔到 _cardPpSuffix()"
     assert "'_pp' + v" in m.group(1)
-    assert "v === 4 || v === 3" in m.group(1), "只 4 同 3 要有 suffix(6 保持舊名)"
+    assert "v === 5 || v === 4 || v === 3" in m.group(1), (
+        "5/4/3 要有 suffix(6 先係 legacy 舊名)"
+    )
 
 
 def test_frontend_preview_url_has_pp_suffix():
@@ -215,7 +247,7 @@ def test_frontend_preserves_per_page_across_reopen():
     """關閉再打開要保留選擇。"""
     tpl = _tpl()
     assert "_keepPP" in tpl, "重新開啟要保留 perPage"
-    assert "perPage: this.foodCardPreview.perPage || 6" in tpl
+    assert "perPage: this.foodCardPreview.perPage || 5" in tpl
 
 
 def test_no_stale_per_page_omission():
@@ -241,6 +273,37 @@ def test_ppq_variable_is_built_correctly():
     assert "const _ppQ = `&per_page=${_pp}`;" in tpl, (
         "_ppQ 要係 &per_page=<值>"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4b. 全部頁面嘅下載掣都要顯示(v3.3.57 Jim OOB)
+# ---------------------------------------------------------------------------
+
+def test_all_page_buttons_rendered():
+    """下載掣要 x-for 晒 pageTotal —— 全部頁面都見到,唔會藏喺第 2 頁。"""
+    tpl = _tpl()
+    assert 'x-for="pn in (foodCardPreview.pageTotal || 1)"' in tpl, (
+        "下載掣一定要按 pageTotal 全部 render"
+    )
+    assert "downloadFoodCardPage(pn)" in tpl, "每個掣要對應自己嗰頁"
+
+
+def test_download_row_has_hint():
+    """要有文字講明「全部 N 頁,撳一個落一張」。"""
+    tpl = _tpl()
+    assert "逐頁下載" in tpl
+    assert "撳一個落一張" in tpl, "要講明係逐個下載,唔係一次過"
+
+
+def test_no_bulk_download_left():
+    """唔准有「一次過落晒」嘅 bulk 下載路徑。
+
+    ⚠️ 要先剝走註解 —— 註解入面會提到舊做法「⬇ 下載全部 N 頁」(用嚟
+    解釋點解改成逐頁),唔係實際 code。
+    """
+    tpl = _strip_comments(_tpl())
+    for bad in ("下載全部", "downloadAllFoodCardPages", "_downloadFoodCardFromModalLegacy"):
+        assert bad not in tpl, f"仲有殘留嘅 bulk 下載路徑: {bad}"
 
 
 # ---------------------------------------------------------------------------
@@ -287,5 +350,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.56"' in web
-    assert "gym-web-v160" in web
+    assert '__version__ = "3.3.57"' in web
+    assert "gym-web-v161" in web

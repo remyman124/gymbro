@@ -56,10 +56,15 @@ def main():
 
         labels = page.evaluate("""() => Array.from(document.querySelectorAll('button'))
             .map(b => (b.innerText||'').trim()).filter(t => /餐$/.test(t))""")
-        check("E01 有 6/4/3 三個「每頁餐數」chip", len(labels) == 3, str(labels))
+        check("E01 有 5/4/3 三個「每頁餐數」chip", labels == ["5 餐", "4 餐", "3 餐"], str(labels))
+
+        # v3.3.57: 每頁**上限 5 餐** —— 唔准有 6 或以上嘅選項
+        nums = [int(t.replace(" 餐", "").strip()) for t in labels]
+        check("E01b 每頁上限 5 餐(冇 6 或以上)",
+              bool(nums) and max(nums) == 5, str(nums))
 
         heights = {}
-        for pp, label in ((4, "4 餐"), (3, "3 餐"), (6, "6 餐")):
+        for pp, label in ((4, "4 餐"), (3, "3 餐"), (5, "5 餐")):
             before = len(calls)
             page.locator(f"button:has-text('{label}')").first.click(force=True)
             page.wait_for_timeout(4000)
@@ -81,13 +86,37 @@ def main():
 
         check("E04 闊度全部係 1080", all(h["natW"] == 1080 for h in heights.values()),
               str({k: v["natW"] for k, v in heights.items()}))
-        check("E05 高度 4餐 < 6餐", heights[4]["natH"] < heights[6]["natH"],
-              f"{heights[4]['natH']} < {heights[6]['natH']}")
+        check("E05 高度 4餐 < 5餐", heights[4]["natH"] < heights[5]["natH"],
+              f"{heights[4]['natH']} < {heights[5]['natH']}")
         check("E06 高度 3餐 < 4餐", heights[3]["natH"] < heights[4]["natH"],
               f"{heights[3]['natH']} < {heights[4]['natH']}")
         check("E07 page_total 跟 per_page 變",
-              heights[6]["pageTotal"] == 2 and heights[3]["pageTotal"] == 3,
-              f"6餐→{heights[6]['pageTotal']}頁, 3餐→{heights[3]['pageTotal']}頁")
+              heights[5]["pageTotal"] == 2 and heights[3]["pageTotal"] == 3,
+              f"5餐→{heights[5]['pageTotal']}頁, 3餐→{heights[3]['pageTotal']}頁")
+
+        # v3.3.57: 全部頁面嘅下載掣都要顯示喺 modal 底部,唔會藏喺第 2 頁
+        dls = page.evaluate("""() => {
+            const modal = document.querySelector('[x-show="foodCardPreview.visible"] > div');
+            const vis = el => { const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && el.offsetParent !== null; };
+            const btns = Array.from(modal.querySelectorAll('button')).filter(vis)
+                .filter(b => (b.innerText||'').includes('第'))
+                .map(b => { const r = b.getBoundingClientRect();
+                    return {t:(b.innerText||'').trim().replace(/\\s+/g,' '),
+                            y:r.y, bottom:r.y+r.height}; });
+            const mr = modal.getBoundingClientRect();
+            return {btns, modalBottom: mr.y + mr.height,
+                    pageTotal: Alpine.$data(document.body).foodCardPreview.pageTotal,
+                    hint: (document.querySelector('[x-show="foodCardPreview.visible"]')||{}).innerText || ''};
+        }""")
+        check("E09 下載掣數量 == pageTotal(全部頁面都見到)",
+              len(dls["btns"]) == dls["pageTotal"],
+              f"掣={len(dls['btns'])} pageTotal={dls['pageTotal']}")
+        check("E10 全部下載掣都喺 modal 範圍內(冇被裁)",
+              all(b["bottom"] <= dls["modalBottom"] + 1 for b in dls["btns"]),
+              str([(b["t"], round(b["bottom"]), round(dls["modalBottom"])) for b in dls["btns"]]))
+        check("E11 有講明逐頁下載", "逐頁下載" in dls["hint"] and "撳一個落一張" in dls["hint"],
+              dls["hint"][-90:].replace("\n", " "))
 
         page.locator("button:has-text('3 餐')").first.click(force=True)
         page.wait_for_timeout(4000)

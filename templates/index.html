@@ -1555,20 +1555,22 @@
              **點解唔係「縮細」而係「每頁少啲餐」** ——
              等比縮細(1080x1736 → 796x1280)比例一樣(1.607),喺 iPhone 上面
              一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。改用「每頁餐數」,
-             行同一套排版(零 layout 風險),但每張圖真係矮咗:
-               6 餐/頁 → 1080x1736(顯示 ~627pt)
-               4 餐/頁 → 1080x1256(顯示 ~453pt,-28%)
+             行同一套排版(零 layout 風險),但每張圖真係矮咗。
+             v3.3.57 (Jim OOB「Make it 5 meals max per screen」):
+             上限改成 **5 餐/頁**(6 唔再係選項):
+               5 餐/頁 → 1080x1456(顯示 ~527pt)
+               4 餐/頁 → 1080x1256(顯示 ~454pt,-28%)
                3 餐/頁 → 1080x1016(顯示 ~367pt,-41%) -->
         <div class="px-4 py-2 flex flex-col gap-2"
              style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
           <div class="flex items-center justify-between gap-2">
             <div class="text-[10px] font-bold text-gray-300">每頁餐數</div>
             <div class="text-[10px] text-gray-400"
-                 x-text="foodCardPreview.perPage === 6 ? '原尺寸'
+                 x-text="foodCardPreview.perPage === 5 ? '最多 5 餐'
                         : (foodCardPreview.perPage === 4 ? '短一截' : '最短')"></div>
           </div>
           <div class="flex gap-2">
-            <template x-for="opt in [6, 4, 3]" :key="'pp'+opt">
+            <template x-for="opt in [5, 4, 3]" :key="'pp'+opt">
               <button @click="foodCardPreview.perPage = opt; reloadFoodCardPreview()"
                       class="flex-1 rounded-lg text-xs font-bold transition-all active:scale-95"
                       :style="foodCardPreview.perPage === opt
@@ -1607,7 +1609,17 @@
                 瀏覽器同時下載限制 → 改為**每頁一個掣,撳一個只落一張**。
              ② 第二個「✕ 關閉」掣已移除 —— 右上角 ✕ / Esc / 點背景一樣
                 可以閂 modal,唔需要喺 footer 佔位。 -->
-        <div class="px-4 py-3 flex flex-wrap gap-2"
+        <!-- v3.3.57 (2026-10-27, Jim OOB「But show me all the page button to
+             download one by one」):明確講清楚「全部頁面」+「逐頁下載」。
+             掣本身就係每頁一個(全部顯示,唔會藏喺第 2 頁)——
+             呢行字淨係講明點用,免得 Jim 以为仲要撳「下載全部」。 -->
+        <div class="px-4 pt-2 pb-1 text-[10px] font-bold"
+             style="background: rgba(28, 25, 46, 0.95); color: rgb(180, 180, 195);">
+          逐頁下載 ——
+          <span class="font-normal text-gray-400"
+                x-text="`全部 ${foodCardPreview.pageTotal || 1} 頁,撳一個落一張(唔會一次過落晒)`"></span>
+        </div>
+        <div class="px-4 pb-3 flex flex-wrap gap-2"
              style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
           <template x-for="pn in (foodCardPreview.pageTotal || 1)" :key="'dl' + pn">
             <button @click="downloadFoodCardPage(pn)"
@@ -2607,7 +2619,7 @@ function gymApp() {
       // v3.3.54: 下載中鎖(防連撳造成重複下載)
       downloading: false,
       // v3.3.55: 每頁餐數(6/4/3)→ 每張 JPG 真正變矮(比例變短)
-      perPage: 6,
+      perPage: 5,
       // v3.3.53: 矮身版 toggle(高度 ≤ 1280px,iPhone 友好)
       compact: false,
       // v3.3.23e (Jim OOB 2026-09-12 'Not displaying the image'): blob
@@ -5892,8 +5904,10 @@ function gymApp() {
     //   per_page=4 → '_pp4'
     //   per_page=3 → '_pp3'
     _cardPpSuffix(pp) {
+      // v3.3.57: 每頁 5/4/3 餐都帶 suffix;6(legacy)先係無 suffix。
+      // 一定要同 server 嘅 `_card_pp_suffix()` 一致。
       const v = parseInt(pp, 10);
-      return (v === 4 || v === 3) ? ('_pp' + v) : '';
+      return (v === 5 || v === 4 || v === 3) ? ('_pp' + v) : '';
     },
 
     // v3.3.53 (Jim OOB「My iPhone is duo now. Pls assist the jpg download
@@ -5928,7 +5942,7 @@ function gymApp() {
       // v3.3.53: 保留目前嘅矮身版 toggle 狀態(撳完「關閉」再開都記得)
       const _keepCompact = this.foodCardPreview.compact === true;
       // v3.3.55: 保留每頁餐數選擇
-      const _keepPP = this.foodCardPreview.perPage || 6;
+      const _keepPP = this.foodCardPreview.perPage || 5;
       this.foodCardPreview = {
         visible: true, date, url: '', fileName,
         sizeKb: 0, loading: true, downloading: false,
@@ -6010,7 +6024,7 @@ function gymApp() {
       // v3.3.55: 切頁都要帶 per_page(每頁餐數)
       const _cq = p.compact === true ? '&compact=1' : '';
       const _cSfx = p.compact === true ? '_compact' : '';
-      const _pp = p.perPage || 6;
+      const _pp = p.perPage || 5;
       const _ppSfx = this._cardPpSuffix(_pp);
       try {
         const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(p.date)}&page=${newPage}&per_page=${_pp}${_cq}`, {
@@ -6052,7 +6066,7 @@ function gymApp() {
       const _cq = _compact ? '&compact=1' : '';
       const _cSfx = _compact ? '_compact' : '';
       // v3.3.55: 每頁餐數(6/4/3)
-      const _pp = p.perPage || 6;
+      const _pp = p.perPage || 5;
       const _ppSfx = this._cardPpSuffix(_pp);
       try {
         p.downloading = true;
@@ -6120,7 +6134,7 @@ function gymApp() {
         // v3.3.53: 保留矮身版 toggle(下次打開都係同一個設定)
         compact: this.foodCardPreview.compact === true,
         // v3.3.55: 保留每頁餐數選擇
-        perPage: this.foodCardPreview.perPage || 6,
+        perPage: this.foodCardPreview.perPage || 5,
       };
     },
 

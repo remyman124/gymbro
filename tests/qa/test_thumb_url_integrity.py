@@ -170,8 +170,8 @@ def test_food_history_thumbnail_not_lazy():
 
 def test_service_worker_cache_version_bumped():
     src = (REPO / "gym_web.py").read_text()
-    # v3.3.56: v159 → v160 (日結 JPG 每頁餐數 + modal z-index → 清走舊 template).
-    assert "gym-web-v160" in src
+    # v3.3.57: v160 → v161 (日結 JPG 每頁上限 5 餐 → 清走舊 template).
+    assert "gym-web-v161" in src
     assert "gym-web-v145" not in src
 
 

@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.56"
+__version__ = "3.3.57"
 
 
 def _recovery_pct():
@@ -1904,8 +1904,16 @@ CARD_COMPACT_MAX_H = 1280
 #              3 餐/頁  1080 x 1016   比例 0.941   手機顯示 ~367pt 高 (-41%)
 #
 # 6 = 舊預設(檔名唔變,保持 backwards compatible);4/3 加 `_pp4` / `_pp3` suffix。
-CARD_PER_PAGE_DEFAULT = 6
-CARD_PER_PAGE_CHOICES = (6, 4, 3)
+# v3.3.57 (2026-10-27, Jim OOB「Make it 5 meals max per screen. But show me
+# all the page button to download one by one」):
+#   每頁**最多 5 餐**。UI 選項 5 / 4 / 3。
+#   6 唔再係選項,但仍然**合法**(CARD_PER_PAGE_ALLOWED)—— 因為 v3.3.55
+#   之前嘅預設係 6 餐/頁,嗰啲已生成嘅檔名(無 suffix)要繼續 work,
+#   所以 `_card_pp_suffix(6)` 依然返 ''(legacy 檔名)。
+CARD_PER_PAGE_DEFAULT = 5
+CARD_PER_PAGE_CHOICES = (5, 4, 3)          # UI 俾用戶揀嘅值
+CARD_PER_PAGE_LEGACY = 6                    # v3.3.55 之前嘅預設(legacy 檔名)
+CARD_PER_PAGE_ALLOWED = (6, 5, 4, 3)        # 全部合法值(6 只為 legacy 相容)
 
 
 def _card_per_page(raw) -> int:
@@ -1914,12 +1922,14 @@ def _card_per_page(raw) -> int:
         v = int(str(raw).strip())
     except (TypeError, ValueError):
         return CARD_PER_PAGE_DEFAULT
-    return v if v in CARD_PER_PAGE_CHOICES else CARD_PER_PAGE_DEFAULT
+    return v if v in CARD_PER_PAGE_ALLOWED else CARD_PER_PAGE_DEFAULT
 
 
 def _card_pp_suffix(per_page: int) -> str:
     """per_page=6 → '' (舊檔名保持不變);其他 → '_pp4' / '_pp3'。"""
-    return "" if per_page == CARD_PER_PAGE_DEFAULT else f"_pp{int(per_page)}"
+    # v3.3.57: 只有 legacy(6 餐/頁)用無 suffix 檔名;5/4/3 一律帶 suffix,
+    #   免得新嘅 5 餐卡覆蓋咗舊嘅 6 餐 legacy 檔。
+    return "" if int(per_page) == CARD_PER_PAGE_LEGACY else f"_pp{int(per_page)}"
 
 
 def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1, compact: bool = False, per_page: int = CARD_PER_PAGE_DEFAULT) -> "Path | None":
@@ -1943,7 +1953,7 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
     # Each page is bounded by MEALS_PER_PAGE so image height stays under
     # ~1700px and renders cleanly across Telegram, WhatsApp, image hosts.
     # v3.3.55: 每頁餐數可調(6/4/3)→ 圖真正變矮,比例變短。
-    MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_CHOICES else CARD_PER_PAGE_DEFAULT
+    MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_ALLOWED else CARD_PER_PAGE_DEFAULT
     page_start = (page_num - 1) * MEALS_PER_PAGE
     page_end = page_start + MEALS_PER_PAGE
     page_meals = meals[page_start:page_end]
@@ -17181,7 +17191,12 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v160';
+const CACHE = 'gym-web-v161';
+// v3.3.57 (2026-10-27, Jim OOB「Make it 5 meals max per screen. But show me
+// all the page button to download one by one」):
+//   日結 modal 每頁上限改成 5 餐(6 唔再係選項,只留做 legacy 檔名相容),
+//   而且下載區明確標示「全部 N 頁,撳一個落一張」——
+//   全部頁面嘅掣都一直顯示喺 modal 底部,唔會藏喺第 2 頁。
 // v3.3.55 (2026-10-27, Jim OOB「Jpg download even shorter pls. I'm using
 // iPhone duo」):cache 158 → 159。
 //   日結 modal 加咗「每頁餐數」(6/4/3)選擇器 —— 每張 JPG 真正變矮

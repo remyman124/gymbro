@@ -245,5 +245,5 @@ def test_server_download_name_format():
 def test_version_and_cache_bumped():
     """版本 + SW cache 要 bump。"""
     web = _web()
-    assert '__version__ = "3.3.56"' in web, "版本要係 3.3.56"
-    assert "gym-web-v160" in web, "SW cache 要 bump 去做 v160"
+    assert '__version__ = "3.3.57"' in web, "版本要係 3.3.57"
+    assert "gym-web-v161" in web, "SW cache 要 bump 去做 v161"

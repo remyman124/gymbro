@@ -234,7 +234,8 @@ def test_card_render_pipeline_intact():
     for fn in ("_render_nutrition_card_pil", "_make_thumb", "_upload_to_drive"):
         assert f"def {fn}" in web, f"{fn} 唔見咗"
     # v3.3.55: MEALS_PER_PAGE 變成可調(per_page),但預設仍然係 6
-    assert "CARD_PER_PAGE_DEFAULT = 6" in web, "每頁餐數預設一定要係 6"
-    assert "MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_CHOICES" in web, (
+    # v3.3.57: 每頁預設由 6 改成 5(Jim OOB「Make it 5 meals max per screen」)
+    assert "CARD_PER_PAGE_DEFAULT = 5" in web, "每頁餐數預設一定要係 5"
+    assert "MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_ALLOWED" in web, (
         "分頁邏輯唔可以改(只係加咗 per_page 參數)"
     )
