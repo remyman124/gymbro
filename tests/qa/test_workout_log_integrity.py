@@ -85,6 +85,79 @@ def test_save_log_is_atomic():
         "唔可以直接 write_text 落 WORKOUT_LOG(會截斷)")
 
 
+def test_save_log_tmp_name_is_writer_unique():
+    """tmp 檔名一定要帶 pid + thread id,唔可以用固定名。
+
+    2026-10-26 事故:`save_log()` 寫去固定嘅 `.whoop_workout_log.json.tmp`。
+    兩個 request 同時 call(Flask 每個 request 都可能叫
+    `get_or_create_session()` → `save_log()`):
+      甲 write tmp → 乙 write tmp(蓋咗甲) → 甲 os.replace(攞走 tmp)
+      → 乙 os.replace() → FileNotFoundError → `/api/state` 500。
+    實測 v3.3.44.log 出咗 4 次。
+
+    修法:tmp 名加 pid + thread ident(每個 writer 用自己嘅 tmp)。
+    """
+    tree = ast.parse(_gym_web_src())
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == "save_log"), None)
+    assert fn is not None, "搵唔到 save_log"
+    src = ast.get_source_segment(_gym_web_src(), fn)
+    assert "os.getpid()" in src, (
+        "save_log 嘅 tmp 名要帶 os.getpid() —— 固定名會令多個進程/線程互搶")
+    assert "threading.get_ident()" in src, (
+        "save_log 嘅 tmp 名要帶 threading.get_ident() —— "
+        "同一進程嘅多線程都會互搶")
+    assert 'with_suffix(".json.tmp")' not in src, (
+        "唔可以用固定嘅 .json.tmp 名(會撞)")
+
+
+def test_save_log_concurrent_writers_do_not_collide(tmp_path, gym_web_module,
+                                                    monkeypatch):
+    """8 個線程同時 save_log() → 一個都唔可以 raise,檔案必須係完整合法 JSON。
+
+    呢個係 2026-10-26 `/api/state` 500 嘅直接捉測試:舊嘅固定 tmp 名
+    喺呢個情況下必然有線程 `FileNotFoundError`。
+    """
+    import threading
+
+    log_path = tmp_path / "workout_log.json"
+    monkeypatch.setattr(gym_web_module, "WORKOUT_LOG", log_path)
+
+    errors: list[str] = []
+    barrier = threading.Barrier(8, timeout=15)
+
+    def writer(i: int):
+        try:
+            barrier.wait()          # 盡量令 8 個 writer 同時衝過 write tmp
+            gym_web_module.save_log({
+                "2026-10-27": {
+                    "date": "2026-10-27",
+                    "exercises": [],
+                    "writer": i,
+                }
+            })
+        except Exception as e:      # noqa: BLE001 — 測試要捉住所有例外
+            errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, (
+        f"並行 save_log() 有例外 —— 固定 tmp 名令 writer 互搶:{errors}")
+
+    # 落地嘅檔案必須係完整合法 JSON(唔係半截)
+    data = json.loads(log_path.read_text())
+    assert isinstance(data, dict), f"落地檔案唔係 dict:{data!r}"
+    assert "2026-10-27" in data
+
+    # 每個 writer 用自己嘅 tmp → 換入之後唔應該留低任何 .tmp 殘留
+    leftovers = [p.name for p in tmp_path.iterdir() if ".tmp" in p.name]
+    assert not leftovers, f"有 .tmp 殘留檔(每次 write 用固定名會撞):{leftovers}"
+
+
 # ── 4. 真實 log 檔 key ↔ inner date 一致性(只讀) ───────────────────────────
 
 @pytest.mark.skipif(not REAL_LOG.exists(), reason="本機 log 未存在(乾淨機)")

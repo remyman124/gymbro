@@ -158,10 +158,30 @@ def save_log(log):
     之前用 `write_text()` 直寫 —— 寫到一半撞去(重啟/OOM)會截斷成半個
     JSON,成個 log 就冇晒。呢個檔係 Jim 唯一嘅本機訓練鏡像,唔可以
     因為一次 crash 就全失。所以:寫去 .tmp 再 `os.replace()` 原子換入。
+
+    v3.3.45: tmp 檔名要帶 pid + thread id,唔可以用固定名。
+    之前 tmp 名係固定嘅 `.whoop_workout_log.json.tmp`,但 `save_log()`
+    係 read-modify-write,Flask 每個 request 都可能叫
+    `get_or_create_session()` → `save_log()`。兩個 request 同時跑:
+      甲 write tmp → 乙 write tmp(蓋咗甲份) → 甲 os.replace(攞走個 tmp)
+      → 乙 os.replace() → FileNotFoundError → `/api/state` 直接 500。
+    實測 2026-10-26 喺 gymbro_v3.3.44.log 出咗 4 次:
+      FileNotFoundError: [Errno 2] No such file or directory:
+      '/home/work/.whoop_workout_log.json.tmp' -> '.../whoop_workout_log.json'
+    修法:tmp 名加 pid + thread ident(同 `_persist_scan_jobs_state()` 一致),
+    每個 writer 用自己嘅 tmp,`os.replace()` 唔會再撞。
     """
-    tmp = WORKOUT_LOG.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(log, indent=2, ensure_ascii=False))
-    os.replace(tmp, WORKOUT_LOG)
+    tmp = f"{WORKOUT_LOG}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        Path(tmp).write_text(json.dumps(log, indent=2, ensure_ascii=False))
+        os.replace(tmp, WORKOUT_LOG)
+    except Exception as e:
+        print(f"[save-log] atomic write failed: {type(e).__name__}: {e}", flush=True)
+        try:
+            os.unlink(tmp)
+        except OSError as cleanup_err:
+            print(f"[save-log] tmp cleanup failed: {cleanup_err}", flush=True)
+        raise
 
 
 def get_or_create_session(session_date=None):
