@@ -134,11 +134,16 @@ def test_compact_does_not_overwrite_legacy():
 
 
 def test_compact_download_filename():
-    """下載檔名要帶 _compact,唔可以撞原版。"""
+    """下載檔名要帶 _compact,唔可以撞原版。
+
+    v3.3.54: 格式統一做 `gymbro_foodlog_<date>[_compact]_p<N>.jpg`
+    (之前係 `_p1_compact.jpg`,同 preview 嘅 `_compact_p1.jpg` 唔一致)。
+    """
     web = _web()
-    assert '_dn.replace(".jpg", "_compact.jpg") if compact else _dn' in web, (
+    assert "'_compact' if compact else ''" in web, (
         "Content-Disposition 嘅檔名要區分矮身版"
     )
+    assert "gymbro_foodlog_{target_date}" in web, "server 檔名要有 gymbro_foodlog_ 前綴"
 
 
 # ---------------------------------------------------------------------------

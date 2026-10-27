@@ -170,8 +170,8 @@ def test_food_history_thumbnail_not_lazy():
 
 def test_service_worker_cache_version_bumped():
     src = (REPO / "gym_web.py").read_text()
-    # v3.3.53: v156 → v157 (日結 JPG 矮身版 toggle → 清走舊 template).
-    assert "gym-web-v157" in src
+    # v3.3.54: v157 → v158 (日結 JPG 逐頁下載掣 → 清走舊 template).
+    assert "gym-web-v158" in src
     assert "gym-web-v145" not in src
 
 

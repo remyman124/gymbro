@@ -1011,7 +1011,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.53"
+__version__ = "3.3.54"
 
 
 def _recovery_pct():
@@ -2605,9 +2605,13 @@ def api_nutrition_card():
     cached_bytes = _jpg_cache_get(cache_key)
     if cached_bytes is not None:
         # v3.3.53: 矮身版檔名加 _compact,避免同原尺寸版本撞名
-        _dn = (f"gymbro_foodlog_{target_date}_p{page_num}.jpg" if page_total > 1
-               else f"gymbro_foodlog_{target_date}.jpg")
-        download_name = _dn.replace(".jpg", "_compact.jpg") if compact else _dn
+        # v3.3.54: 檔名格式統一 —— `gymbro_foodlog_<date>[_compact]_p<N>.jpg`
+        #   (之前係 `_p1_compact.jpg`,同 preview 嘅 `_compact_p1.jpg` 唔一致)
+        if page_total > 1:
+            download_name = (f"gymbro_foodlog_{target_date}"
+                             f"{'_compact' if compact else ''}_p{page_num}.jpg")
+        else:
+            download_name = f"gymbro_foodlog_{target_date}{'_compact' if compact else ''}.jpg"
         return Response(
             cached_bytes,
             mimetype="image/jpeg",
@@ -17122,7 +17126,13 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v157';
+const CACHE = 'gym-web-v158';
+// v3.3.54 (2026-10-27, Jim OOB「Don't download multiple image at the same
+// time. Show multiple download button to download. Remove second button」):
+// cache 157 → 158。
+//   日結 modal 改成「每頁一個下載掣」(逐頁下載),並移除 footer 個
+//   「✕ 關閉」掣。Template 有變 → 舊 SW cache 嘅 index.html 冇新掣,
+//   所以要 bump 版本清走舊 cache。
 // v3.3.53 (2026-10-27, Jim OOB「My iPhone is duo now. Pls assist the jpg
 // download image with lower height」):cache 版本 156 → 157。
 //   日結 JPG 加咗「矮身版」toggle(高度 ≤ 1280px, iPhone 友好)。

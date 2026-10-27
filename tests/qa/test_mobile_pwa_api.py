@@ -236,8 +236,8 @@ def test_service_worker_fetch_logic_untouched():
     """
     src = GYM_WEB.read_text()
     assert "if (url.pathname.startsWith('/api/')) {" in src
-    # v3.3.53: v156 → v157(日結 JPG 矮身版 toggle)
-    assert "const CACHE = 'gym-web-v157';" in src
+    # v3.3.54: v157 → v158(日結 JPG 逐頁下載掣)
+    assert "const CACHE = 'gym-web-v158';" in src
 
 
 def test_manifest_has_shortcuts_and_scope(client):
