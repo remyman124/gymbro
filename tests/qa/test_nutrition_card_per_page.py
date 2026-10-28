@@ -217,12 +217,18 @@ def test_modal_uses_definite_height_for_short_screens():
     ~166px)→ 短屏(iPhone SE 667pt)時 56 + preview + 114 > 90dvh(600)
     → modal 撞上限 + overflow:hidden → **下載掣被裁走**,Jim 撳唔到。
     """
+    # v3.3.64 (Jim OOB「No viewing. Just immediate share」):modal 冇預覽區
+    # → 個 modal 本身好矮(≈160px)→ **唔使** h-[90dvh]。
+    # (用 90dvh 反而會變成一個大大個空 modal,掣飄喺中間)
     tpl = _strip_comments(_tpl())
-    assert 'h-[90dvh]' in tpl, "modal 要用 h-[90dvh](確定高度,flexbox 先分配到剩餘空間)"
-    assert "flex-1 min-h-0" in tpl, "preview 要 min-h-0(可以喺 footer 變高時縮細)"
+    assert 'h-[90dvh]' not in tpl, "冇預覽區,唔使再鎖死 90dvh"
+    assert "flex-1 min-h-0" not in tpl, "冇 preview flex item"
     assert "calc(90dvh - 56px - 76px)" not in tpl, (
         "舊嘅錯 max-height 仲喺度 —— 個 76px 假設係短屏裁走下載掣嘅元凶"
     )
+    # 兩粒分享掣一定要喺 modal 入面
+    assert 'data-testid="food-card-jpg-share"' in tpl
+    assert 'data-testid="food-card-pdf-share"' in tpl
 
 
 
@@ -333,5 +339,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.63"' in web
-    assert "gym-web-v167" in web
+    assert '__version__ = "3.3.64"' in web
+    assert "gym-web-v168" in web

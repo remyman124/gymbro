@@ -98,16 +98,33 @@ def test_scan_persists_ai_description():
 # ─────────────────────────────────────────────────────────────
 # 2. 前端:單一下載掣
 # ─────────────────────────────────────────────────────────────
-def test_single_pdf_download_anchor():
+def test_two_share_buttons_jpg_left_pdf_right():
+    """v3.3.64 (Jim OOB「I want two buttons only. Left side is sharing a jpg.
+    Right side is sharing an pdf.」):淨係兩粒掣 —— 左 JPG / 右 PDF。"""
     tpl = _src(TPL)
-    assert 'data-testid="food-card-pdf-download"' in tpl
-    assert '⬇ 下載 PDF' in tpl
-    # 一個 PDF 掣就夠
-    assert tpl.count('data-testid="food-card-pdf-download"') == 1
+    assert 'data-testid="food-card-jpg-share"' in tpl
+    assert 'data-testid="food-card-pdf-share"' in tpl
+    assert "shareFoodLog('jpg')" in tpl
+    assert "shareFoodLog('pdf')" in tpl
+    # 舊嘅下載掣要收埋
+    assert 'data-testid="food-card-pdf-download"' not in tpl
+    assert tpl.count('data-testid="food-card-jpg-share"') == 1
+    assert tpl.count('data-testid="food-card-pdf-share"') == 1
+    # JPG 掣一定要喺 PDF 掣之前(左邊)
+    assert (tpl.find('data-testid="food-card-jpg-share"')
+            < tpl.find('data-testid="food-card-pdf-share"'))
+
+
+def test_no_preview_viewing_step():
+    """v3.3.64 (Jim OOB「No viewing. Just immediate share」):冇預覽圖。"""
+    tpl = _src(TPL)
+    assert ':src="foodCardPreview.pdfPreviewUrl"' not in tpl
+    assert "img[alt*='PDF 第 1 頁']" not in tpl
+    assert "營養日結 PDF 第 1 頁" not in tpl
 
 
 def test_old_per_page_jpg_buttons_removed():
-    """逐頁 JPG 下載掣要完全收埋(而家得一粒 PDF 掣)。"""
+    """逐頁 JPG 下載掣要完全收埋(而家淨係兩粒分享掣)。"""
     tpl = _src(TPL)
     assert "foodCardPageUrl" not in tpl
     assert "switchFoodCardPage" not in tpl
@@ -118,30 +135,38 @@ def test_old_per_page_jpg_buttons_removed():
 
 def test_pdf_helpers_exist():
     tpl = _src(TPL)
-    assert "foodCardPdfUrl()" in tpl
+    assert "foodLogFileSpec(" in tpl
     assert "foodCardPdfFileName()" in tpl
-    assert "onFoodCardPdfDownload()" in tpl
     assert "refreshFoodCardPdfInfo(" in tpl
+    assert "prefetchFoodLogFiles()" in tpl
 
 
-def test_pdf_button_above_preview():
-    """短屏(iPhone Duo)都要見到下載掣 → 掣喺 preview 上面。"""
+def test_share_buttons_are_the_only_controls():
+    """冇 preview 之後,modal 入面得兩粒分享掣(+ 右上角關閉)。"""
     tpl = _src(TPL)
-    i_btn = tpl.find('data-testid="food-card-pdf-download"')
-    # ⚠️ v3.3.62:modal 搬咗去 <body> 直接子元素(修 stacking context),
-    #    所以 JS(喺 script 入面,行數早過 markup)會出現
-    #    `foodCardPreview.pdfPreviewUrl` 字樣 → 要搵 <img> 嘅 :src,
-    #    唔係搵變數名。
-    i_prev = tpl.find(':src="foodCardPreview.pdfPreviewUrl"')
-    assert i_btn > 0 and i_prev > 0
-    assert i_btn < i_prev, "PDF 下載掣一定要喺 preview 之前"
+    modal = tpl[tpl.find('x-show="foodCardPreview.visible"'):]
+    modal = modal[:modal.find('</body>')]
+    assert modal.count('data-testid="food-card-jpg-share"') == 1
+    assert modal.count('data-testid="food-card-pdf-share"') == 1
+    assert modal.count('data-testid="food-card-close"') == 1
+    # 唔准再有逐頁/下載掣
+    assert 'data-testid="food-card-pdf-download"' not in modal
+    assert "switchFoodCardPage" not in modal
 
 
-def test_auto_close_after_download():
-    """落完自動閂 modal → Jim 撳「關閉」iOS share sheet 就返返主介面。"""
+def test_modal_not_auto_closed_after_share():
+    """v3.3.64:share sheet 開咗之後**唔可以**自動閂 modal
+    (Jim OOB「No viewing. Just immediate share」→ 佢自己收埋個 sheet)。"""
     tpl = _src(TPL)
-    assert "_pdfCloseTimer" in tpl
+    # 分享流程入面唔准有自動 close 嘅 setTimeout
+    i = tpl.find("async shareFoodLog(kind)")
+    end = tpl.find("\n    },", i)
+    seg = tpl[i:end]
+    assert "closeFoodCardPreview()" not in seg
+    assert "setTimeout" not in seg
+    # 關閉掣仍然喺度(用戶自己收埋 share sheet 之後撳返去)
     assert "closeFoodCardPreview()" in tpl
+    assert 'data-testid="food-card-close"' in tpl
 
 
 def test_close_button_visible_text():
@@ -149,9 +174,11 @@ def test_close_button_visible_text():
     assert "✕ 關閉" in tpl
 
 
-def test_pdf_hint_mentions_close():
+def test_pdf_hint_mentions_continuous_share():
+    """提示要講明「連續長版 + 撳即刻分享」。"""
     tpl = _src(TPL)
-    assert "落完撳右上角「關閉」返去" in tpl
+    assert "連續長版(冇分頁)" in tpl
+    assert "撳即刻分享" in tpl
 
 
 def test_pdf_info_polling():
@@ -201,8 +228,8 @@ def test_live_pdf_download_headers():
 # ─────────────────────────────────────────────────────────────
 def test_version_pins():
     web = _src(WEB)
-    assert '__version__ = "3.3.63"' in web
-    assert "gym-web-v167" in web
+    assert '__version__ = "3.3.64"' in web
+    assert "gym-web-v168" in web
 
 
 # ─────────────────────────────────────────────────────────────
@@ -361,36 +388,49 @@ def test_pdf_inline_mode_still_serves_pdf():
     assert 'mimetype="application/pdf"' in src
 
 
-def test_frontend_download_anchor_uses_dl_mode():
-    """前端下載掣一定要指去 ?dl=1,唔係淨 pdf URL。"""
+def test_share_fallback_uses_dl_mode():
+    """冇 share sheet 嘅瀏覽器(桌面)→ fallback 用 `&dl=1`(octet-stream)。"""
     tpl = _src(TPL)
-    assert ":href=\"foodCardPdfDownloadUrl()\"" in tpl
-    assert "foodCardPdfDownloadUrl()" in tpl
-    assert "&dl=1" in tpl
-    # 下載掣唔可以再指住裸 pdf URL(要睇 <a ...> 個 opening tag)
-    m = re.search(r'<a[^>]*data-testid="food-card-pdf-download"[^>]*>', tpl, re.S)
-    assert m, "搵唔到下載掣"
-    assert "foodCardPdfDownloadUrl()" in m.group(0)
-    assert "foodCardPdfUrl()" not in m.group(0)
+    assert "sp.url + '&dl=1'" in tpl
+    assert "a.download = sp.name" in tpl
 
 
 def test_frontend_has_native_share_button():
-    """要有原生分享掣(navigator.share + canShare)—— 即係 Jim 講嘅 share 功能。"""
+    """原生分享:navigator.canShare + navigator.share + File。"""
     tpl = _src(TPL)
-    assert 'data-testid="food-card-pdf-share"' in tpl
     assert "navigator.canShare" in tpl
     assert "navigator.share(" in tpl
-    assert "shareFoodCardPdf()" in tpl
     assert "new File([blob]" in tpl
+    assert "shareFoodLog(kind)" in tpl
 
 
-def test_share_button_does_not_break_pdf_inline_url():
-    """分享流程要攞 inline PDF(唔係 dl=1),先可以砌出 File 嚟 share。"""
+def test_share_files_prefetched_for_ios_activation():
+    """iOS 要求 navigator.share 喺 user gesture 內**同步**叫 →
+    檔案一定要預先載好(唔可以 await 完先叫)。"""
     tpl = _src(TPL)
-    i = tpl.find("async shareFoodCardPdf()")
-    seg = tpl[i:i + 1200]
-    assert "/api/nutrition/pdf?date=" in seg
-    assert "&dl=1" not in seg
+    assert "prefetchFoodLogFiles" in tpl
+    assert "this.foodCardPreview.files" in tpl
+    # 分享流程要先攞預載好嘅 file,先至 call share
+    i = tpl.find("async shareFoodLog(kind)")
+    seg = tpl[i:i + 1600]
+    assert "this.foodCardPreview.files || {})[kind]" in seg
+    assert seg.index("this.foodCardPreview.files || {})[kind]") < seg.index("navigator.share(")
+
+
+def test_continuous_urls_used_by_share_buttons():
+    """JPG 用 ?all=1(長圖)、PDF 用 ?continuous=1(單頁長版)→ 冇分頁。"""
+    tpl = _src(TPL)
+    assert "&all=1" in tpl
+    assert "&continuous=1" in tpl
+
+
+def test_share_uses_continuous_pdf_url():
+    """分享攞嘅係連續長版 PDF(唔係多頁版)。"""
+    tpl = _src(TPL)
+    i = tpl.find("foodLogFileSpec(kind, date)")
+    seg = tpl[i:i + 900]
+    assert "&continuous=1" in seg
+    assert "&all=1" in seg
 
 
 def test_live_pdf_dl_headers():
@@ -419,3 +459,129 @@ def test_live_pdf_inline_still_pdf():
     low = out.lower()
     assert "content-type: application/pdf" in low
     assert "content-disposition: attachment" in low
+
+
+# ─────────────────────────────────────────────────────────────
+# 7. v3.3.64 — 連續長版(JPG 一張長圖 + PDF 單頁長版)
+#    Jim OOB 2026-10-28「Both jpg and pdf have no page limit
+#    (continuous scrolling)」+「No viewing. Just immediate share」
+# ─────────────────────────────────────────────────────────────
+def test_card_continuous_mode_no_page_limit():
+    """?all=1 → 一張長圖,全部餐,冇分頁。"""
+    src = _src(WEB)
+    assert 'continuous = (request.args.get("all")' in src
+    assert "MEALS_PER_PAGE = max(1, total_meals)" in src
+    assert "page_total = 1" in src
+    # renderer 要識 continuous
+    assert "continuous: bool = False" in src
+    assert "if continuous:" in src
+
+
+def test_card_continuous_filename_has_meal_count():
+    """連續版檔名帶餐數(_all8)→ 內容變咗自然唔會撞舊檔。"""
+    src = _src(WEB)
+    assert '_mode_sfx = f"_all{total_meals}" if continuous else ""' in src
+
+
+def test_pdf_continuous_mode_single_page():
+    """?continuous=1 → 單一長頁(摘要 + 全部餐)。"""
+    src = _src(WEB)
+    assert 'continuous = (request.args.get("continuous")' in src
+    assert "render_nutrition_pdf(target_date, meals, totals, meta," in src
+    assert "continuous=continuous" in src
+
+
+def test_pdf_report_has_continuous_renderer():
+    p = os.path.join(ROOT, "gym_web", "pdf_report.py")
+    src = _src(p)
+    assert "def _draw_continuous" in src
+    assert "def _continuous_height" in src
+    assert "continuous: bool = False" in src
+    assert "CONT_MAX_H" in src
+
+
+def test_card_dl_mode_sends_octet_stream():
+    """?dl=1 → application/octet-stream(iOS 真・落本機)。"""
+    src = _src(WEB)
+    assert 'dl_mode = (request.args.get("dl")' in src
+    assert 'content_type="application/octet-stream"' in src
+    assert '"X-Content-Type-Options": "nosniff"' in src
+
+
+def _live_pdf_bytes(url):
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=180) as r:
+            return r.read(), dict(r.headers)
+    except Exception:
+        return None, {}
+
+
+def test_live_continuous_jpg_is_one_long_image():
+    """實測:?all=1 → 一張圖,高度 == 70 + 130 + N*240 + 60(全部餐)。"""
+    import json as _json
+    out = subprocess.run(
+        ["curl", "-s", "-m", "120", BASE + "/api/nutrition/pdf_info?date=2026-10-27"],
+        capture_output=True, text=True).stdout
+    if not out.strip():
+        pytest.skip("server 未行")
+    n = (_json.loads(out) or {}).get("meal_count") or 0
+    if n < 1:
+        pytest.skip("嗰日冇餐")
+    r = subprocess.run(
+        ["curl", "-s", "-m", "180", "-D", "-", "-o", "/dev/null",
+         BASE + "/api/nutrition/card?date=2026-10-27&all=1"],
+        capture_output=True, text=True).stdout
+    assert "_all%d.jpg" % n in r, r[:400]
+    assert "content-type: image/jpeg" in r.lower()
+
+    tmp = "/tmp/gymbro_qa_continuous.jpg"
+    subprocess.run(["curl", "-s", "-m", "180", "-o", tmp,
+                    BASE + "/api/nutrition/card?date=2026-10-27&all=1"],
+                   capture_output=True)
+    try:
+        from PIL import Image
+        w, h = Image.open(tmp).size
+        assert w == 1080
+        assert h == 70 + 130 + n * 240 + 60, (h, n)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def test_live_continuous_pdf_is_single_page():
+    """實測:?continuous=1 → 只有 1 頁,而且高度 > A4(連續長頁)。"""
+    import re as _re
+    data, headers = _live_pdf_bytes(
+        BASE + "/api/nutrition/pdf?date=2026-10-27&continuous=1")
+    if not data:
+        pytest.skip("server 未行")
+    assert "gymbro_foodlog_2026-10-27_continuous.pdf" in (
+        headers.get("Content-Disposition") or "")
+    tmp = "/tmp/gymbro_qa_continuous.pdf"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        info = subprocess.run(["pdfinfo", tmp], capture_output=True,
+                              text=True).stdout
+        pages = int(_re.search(r"Pages:\s+(\d+)", info).group(1))
+        h = float(_re.search(r"Page size:\s+[\d.]+ x ([\d.]+)", info).group(1))
+        assert pages == 1, info[:300]
+        assert h > 900, info[:300]
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def test_live_card_dl_headers():
+    """實測:?dl=1 → octet-stream + attachment + nosniff。"""
+    r = subprocess.run(
+        ["curl", "-s", "-m", "180", "-D", "-", "-o", "/dev/null",
+         BASE + "/api/nutrition/card?date=2026-10-27&all=1&dl=1"],
+        capture_output=True, text=True).stdout
+    if not r.strip():
+        pytest.skip("server 未行")
+    low = r.lower()
+    assert "content-type: application/octet-stream" in low
+    assert "content-disposition: attachment" in low
+    assert "x-content-type-options: nosniff" in low

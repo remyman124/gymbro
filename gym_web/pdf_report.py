@@ -566,18 +566,93 @@ def _draw_meal_card(c, font, meal, y_top, totals_kcal):
     return bot
 
 
+CONT_MAX_H = 14000.0   # PDF 單頁高度上限(200 inch = 14400pt),超咗就跌返多頁
+
+
+def _continuous_height(meals, font) -> float:
+    """一頁連續版需要幾高(精簡摘要 + 全部餐 + footer)。"""
+    h = 300.0
+    for m in meals:
+        h += _meal_card_height(m, font) + 18
+    return h
+
+
+def _draw_continuous(c, font, date_iso, meals, totals, meta, page_h):
+    """v3.3.64 (Jim OOB 2026-10-28「Both jpg and pdf have no page limit
+    (continuous scrolling)」):一頁過 —— 摘要 + 全部餐,唔分頁,
+    淨係一路 scroll 落去。"""
+    _gradient(c, PAGE_W, page_h, BG_TOP, BG_BOT)
+    y = page_h - 40
+
+    # ── 摘要 header(精簡封面)──────────────────────────────
+    _rrect(c, MARGIN, y - 26, 168, 26, 13, fill=(0.19, 0.17, 0.31))
+    _draw(c, MARGIN + 14, y - 18, "gymbro · 營養日結", 11, ACCENT, font,
+          bold=True)
+    _draw(c, PAGE_W - MARGIN, y - 18, date_iso, 10, TEXT_DIM, font, align="r")
+    y -= 44
+
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d")
+        wd = ["星期一", "星期二", "星期三", "星期四", "星期五",
+              "星期六", "星期日"][d.weekday()]
+        date_label = "%d年%d月%d日 %s" % (d.year, d.month, d.day, wd)
+    except Exception:
+        date_label = date_iso
+    _draw(c, MARGIN, y - 26, date_label, 24, TEXT, font, bold=True)
+    y -= 34
+
+    kcal = int(round(totals.get("kcal", 0) or 0))
+    _draw(c, MARGIN, y - 40, str(kcal), 46, ACCENT, font, bold=True)
+    _draw(c, MARGIN + 132, y - 40, "kcal", 16, TEXT_DIM, font, bold=True)
+    p = totals.get("P", 0) or 0
+    cb = totals.get("C", 0) or 0
+    f = totals.get("F", 0) or 0
+    _draw(c, MARGIN + 210, y - 26, "蛋白 %.0f g" % p, 11, TEXT, font)
+    _draw(c, MARGIN + 210, y - 44, "碳水 %.0f g" % cb, 11, TEXT, font)
+    _draw(c, MARGIN + 320, y - 26, "脂肪 %.0f g" % f, 11, TEXT, font)
+    _draw(c, MARGIN + 320, y - 44, "%d 餐 · 連續頁(冇分頁)" % len(meals), 11,
+          TEXT_DIM, font)
+    y -= 62
+
+    _draw(c, MARGIN, y - 14, "逐餐詳情", 15, TEXT, font, bold=True)
+    y -= 32
+
+    totals_kcal = totals.get("kcal", 0) or 0
+    for m in meals:
+        y = _draw_meal_card(c, font, m, y, totals_kcal) - 14
+
+    _draw(c, MARGIN, 30, "gymbro · AI 視覺描述 + 私人教練判詞", 7.5,
+          (0.45, 0.43, 0.55), font)
+
+
 def render_nutrition_pdf(date_iso: str, meals: list, totals: dict,
-                         meta: dict | None = None) -> bytes:
+                         meta: dict | None = None,
+                         continuous: bool = False) -> bytes:
     """Render the nutrition report PDF. Returns the PDF bytes.
 
     `meals` entries: time, name, restaurant, meal_type, kcal, p, c, f,
                      grade, description, verdict, image_bytes.
+
+    v3.3.64: `continuous=True` → **單一長頁**(摘要 + 全部餐,冇分頁),
+    方便連續滾動睇。太高(> CONT_MAX_H)自動跌返多頁版。
     """
     from reportlab.pdfgen import canvas
     meta = meta or {}
     font = _register_font()
 
     buf = io.BytesIO()
+    if continuous:
+        need = _continuous_height(meals, font)
+        if need <= CONT_MAX_H:
+            page_h = max(PAGE_H, need)
+            c = canvas.Canvas(buf, pagesize=(PAGE_W, page_h))
+            c.setTitle("gymbro 營養日結 %s(連續)" % date_iso)
+            c.setAuthor("gymbro")
+            c.setSubject("營養日結 + AI 視覺描述 + 教練判詞(連續版)")
+            _draw_continuous(c, font, date_iso, meals, totals, meta, page_h)
+            c.save()
+            return buf.getvalue()
+        # 太高 → 用多頁版(唔好硬塞)
     c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     c.setTitle("gymbro 營養日結 %s" % date_iso)
     c.setAuthor("gymbro")

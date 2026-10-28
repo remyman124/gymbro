@@ -125,8 +125,12 @@ def test_compact_has_separate_cache_key():
 def test_compact_uses_distinct_filenames():
     """輸出檔名一定要帶 _compact。"""
     web = _web()
-    assert re.search(r'_c_sfx\s*=\s*"_compact"\s*if\s+compact\s*else\s*""', web), (
-        "API 層嘅輸出檔名要帶 _compact"
+    # v3.3.64:suffix 改成 f-string(多咗 _mode_sfx 連續版 suffix),
+    # 但 _compact 一定要仲喺入面。
+    m = re.search(r'_c_sfx\s*=\s*f"\{_mode_sfx\}\{[^}]*_compact[^}]*\}"', web)
+    assert m, "API 層嘅輸出檔名要帶 _compact"
+    assert "_compact' if compact else ''" in web, (
+        "連續版 suffix 之後仍然要跟 _compact"
     )
     assert 'nutrition_{date_iso}{_c_suffix}' in web, (
         "renderer 層嘅輸出檔名要帶 _compact"

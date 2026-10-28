@@ -1012,7 +1012,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.63"
+__version__ = "3.3.64"
 
 
 def _recovery_pct():
@@ -1933,7 +1933,7 @@ def _card_pp_suffix(per_page: int) -> str:
     return "" if int(per_page) == CARD_PER_PAGE_LEGACY else f"_pp{int(per_page)}"
 
 
-def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1, compact: bool = False, per_page: int = CARD_PER_PAGE_DEFAULT) -> "Path | None":
+def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_num: int = 1, page_total: int = 1, compact: bool = False, per_page: int = CARD_PER_PAGE_DEFAULT, continuous: bool = False) -> "Path | None":
     """Render today's food log as a shareable JPG using PIL.
 
     v3.3.23al (Jim OOB 2026-09-27 'Pls fix all of them. Not just quick
@@ -1954,7 +1954,11 @@ def _render_nutrition_card_pil(date_iso: str, meals: list, totals: dict, page_nu
     # Each page is bounded by MEALS_PER_PAGE so image height stays under
     # ~1700px and renders cleanly across Telegram, WhatsApp, image hosts.
     # v3.3.55: 每頁餐數可調(6/4/3)→ 圖真正變矮,比例變短。
-    MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_ALLOWED else CARD_PER_PAGE_DEFAULT
+    # v3.3.64: 連續模式 → 一張圖全部餐(冇分頁、冇頁碼指示)
+    if continuous:
+        MEALS_PER_PAGE = max(1, len(meals))
+    else:
+        MEALS_PER_PAGE = per_page if per_page in CARD_PER_PAGE_ALLOWED else CARD_PER_PAGE_DEFAULT
     page_start = (page_num - 1) * MEALS_PER_PAGE
     page_end = page_start + MEALS_PER_PAGE
     page_meals = meals[page_start:page_end]
@@ -2638,8 +2642,21 @@ def api_nutrition_card():
     MEALS_PER_PAGE = _card_per_page(request.args.get("per_page"))
     page_num = max(1, int((request.args.get("page") or "1")))
     total_meals = len(meals)
-    page_total = (total_meals + MEALS_PER_PAGE - 1) // MEALS_PER_PAGE  # ceil div
-    page_num = min(page_num, max(1, page_total))
+    # v3.3.64 (Jim OOB 2026-10-28「Both jpg and pdf have no page limit
+    # (continuous scrolling)」):
+    #   ?all=1 → 一張長圖,全部餐,冇分頁(一路 scroll 落去)
+    #   ?dl=1  → application/octet-stream(iOS 落本機,唔開預覽 pop-up)
+    continuous = (request.args.get("all") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    dl_mode = (request.args.get("dl") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if continuous:
+        MEALS_PER_PAGE = max(1, total_meals)
+        page_total = 1
+        page_num = 1
+    else:
+        page_total = (total_meals + MEALS_PER_PAGE - 1) // MEALS_PER_PAGE  # ceil div
+        page_num = min(page_num, max(1, page_total))
 
     from flask import Response
     # v3.3.53 (Jim OOB「My iPhone is duo now. Pls assist the jpg download
@@ -2652,11 +2669,40 @@ def api_nutrition_card():
     #  Tier 1: in-memory LRU (10ms, served from RAM)
     #  Tier 2: on-disk cache (<5 min old, served from disk via send_file)
     #  Tier 3: re-render via PIL (150-230ms with local thumbs)
+    def _jpg_response(data: bytes, name: str):
+        """v3.3.64: ?dl=1 → octet-stream(iOS 真・落本機);
+        冇 dl → 正常 image/jpeg。"""
+        if dl_mode:
+            return Response(
+                data,
+                content_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{name}"; '
+                        f"filename*=UTF-8''{name}"
+                    ),
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "private, max-age=60",
+                },
+            )
+        return Response(
+            data,
+            mimetype="image/jpeg",
+            headers={
+                "Content-Disposition": f"attachment; filename={name}",
+                "Cache-Control": "public, max-age=300",
+            },
+        )
+
     from gym_web.image_proxy import _jpg_cache_get, _jpg_cache_put
-    _ck = f"{target_date}_p{page_num}" if page_total > 1 else target_date
+    # v3.3.64: 連續版獨立 suffix(帶餐數 → 內容變咗自然唔會撞舊檔)
+    _mode_sfx = f"_all{total_meals}" if continuous else ""
+    _ck = f"{target_date}{_mode_sfx}"
+    if page_total > 1:
+        _ck = f"{target_date}_p{page_num}"
     # v3.3.53: 矮身版用獨立 cache key(唔會撞原尺寸版本)
     # v3.3.55: 每頁餐數唔同 → 都要獨立 cache key(唔會撞)
-    _pp_sfx = _card_pp_suffix(MEALS_PER_PAGE)
+    _pp_sfx = "" if continuous else _card_pp_suffix(MEALS_PER_PAGE)
     cache_key = f"{_ck}{_pp_sfx}" + ("_compact" if compact else "")
     cached_bytes = _jpg_cache_get(cache_key)
     if cached_bytes is not None:
@@ -2664,22 +2710,15 @@ def api_nutrition_card():
         # v3.3.54: 檔名格式統一 —— `gymbro_foodlog_<date>[_compact]_p<N>.jpg`
         #   (之前係 `_p1_compact.jpg`,同 preview 嘅 `_compact_p1.jpg` 唔一致)
         # v3.3.55: 加 `_pp<N>` suffix(每頁餐數唔同 → 檔名唔同)
-        _dsfx = f"{'_compact' if compact else ''}{_pp_sfx}"
+        _dsfx = f"{_mode_sfx}{'_compact' if compact else ''}{_pp_sfx}"
         if page_total > 1:
             download_name = f"gymbro_foodlog_{target_date}{_dsfx}_p{page_num}.jpg"
         else:
             download_name = f"gymbro_foodlog_{target_date}{_dsfx}.jpg"
-        return Response(
-            cached_bytes,
-            mimetype="image/jpeg",
-            headers={
-                "Content-Disposition": f"attachment; filename={download_name}",
-                "Cache-Control": "public, max-age=300",
-            },
-        )
+        return _jpg_response(cached_bytes, download_name)
     out_dir = Path("/home/work/.hermes/nutrition_card_cache")
     # v3.3.53: 矮身版用獨立檔名(同 renderer 嗰邊一致)
-    _c_sfx = "_compact" if compact else ""
+    _c_sfx = f"{_mode_sfx}{'_compact' if compact else ''}"
     out_path = (
         out_dir / f"nutrition_{target_date}{_c_sfx}{_pp_sfx}_p{page_num}.jpg" if page_total > 1
         else out_dir / f"nutrition_{target_date}{_c_sfx}{_pp_sfx}.jpg"
@@ -2692,34 +2731,23 @@ def api_nutrition_card():
             if file_age_s < 300:
                 jpg_bytes = out_path.read_bytes()
                 _jpg_cache_put(cache_key, jpg_bytes)
-                return Response(
-                    jpg_bytes,
-                    mimetype="image/jpeg",
-                    headers={
-                        "Content-Disposition": f"attachment; filename={download_name}",
-                        "Cache-Control": "public, max-age=300",
-                    },
-                )
+                return _jpg_response(jpg_bytes, download_name)
     except Exception:
         pass  # fall through to re-render
     out_path = _render_nutrition_card_pil(target_date, meals, totals, page_num=page_num,
                                           page_total=page_total, compact=compact,
-                                          per_page=MEALS_PER_PAGE)
+                                          per_page=MEALS_PER_PAGE,
+                                          continuous=continuous)
     if not out_path or not out_path.exists():
         return jsonify({"ok": False, "error": "render_failed (PIL missing?)"}), 500
     # Tier 3: re-rendered — also populate in-memory cache for next call
+    jpg_bytes = b""
     try:
         jpg_bytes = out_path.read_bytes()
         _jpg_cache_put(cache_key, jpg_bytes)
     except Exception:
         pass
-    return send_file(
-        str(out_path),
-        mimetype="image/jpeg",
-        as_attachment=True,
-        download_name=download_name,
-        max_age=0,
-    )
+    return _jpg_response(jpg_bytes, download_name)
 
 
 @app.route("/api/nutrition/card_url", methods=["GET"])
@@ -2951,8 +2979,14 @@ def _pdf_fetch_thumbs(meals: list) -> None:
 _pdf_gen_locks: dict = {}
 
 
-def _generate_pdf_bytes(target_date: str, allow_ai: bool = True):
-    """Build (or rebuild) the day's PDF. Returns bytes or None."""
+def _generate_pdf_bytes(target_date: str, allow_ai: bool = True,
+                        continuous: bool = False):
+    """Build (or rebuild) the day's PDF. Returns bytes or None.
+
+    v3.3.64: `continuous=True` → **單頁長版**(摘要 + 全部餐,冇分頁),
+    對應 Jim OOB「Both jpg and pdf have no page limit (continuous scrolling)」。
+    獨立檔名 + 獨立 cache key,唔會撞多頁版。
+    """
     meals, totals = _build_nutrition_meals(target_date)
     if not meals:
         return None
@@ -2973,27 +3007,39 @@ def _generate_pdf_bytes(target_date: str, allow_ai: bool = True):
     try:
         from gym_web.pdf_report import render_nutrition_pdf
         meta = {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M HKT")}
-        data = render_nutrition_pdf(target_date, meals, totals, meta)
+        data = render_nutrition_pdf(target_date, meals, totals, meta,
+                                    continuous=continuous)
     except Exception as e:
         print(f"[pdf] render failed: {type(e).__name__}: {e}", flush=True)
         return None
     try:
         PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = (PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf").with_suffix(".pdf.tmp")
+        out_name = (f"gymbro_foodlog_{target_date}_continuous.pdf" if continuous
+                    else f"gymbro_foodlog_{target_date}.pdf")
+        out_pdf = PDF_CACHE_DIR / out_name
+        tmp = out_pdf.with_suffix(".pdf.tmp")
         tmp.write_bytes(data)
-        tmp.replace(PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf")
+        tmp.replace(out_pdf)
     except Exception as e:
         print(f"[pdf] disk cache write failed: {type(e).__name__}: {e}", flush=True)
-    _pdf_cache_put(target_date, data)
-    try:
-        _pdf_render_preview(target_date)
-    except Exception as e:
-        print(f"[pdf] preview render skipped: {type(e).__name__}: {e}",
-              flush=True)
+    _pdf_cache_put(_pdf_cache_key(target_date, continuous), data)
+    if not continuous:
+        # 連續版唔使預覽圖(Jim OOB「No viewing. Just immediate share」)
+        try:
+            _pdf_render_preview(target_date)
+        except Exception as e:
+            print(f"[pdf] preview render skipped: {type(e).__name__}: {e}",
+                  flush=True)
     return data
 
 
-def _pdf_warm_async(target_date: str, allow_ai: bool = True) -> bool:
+def _pdf_cache_key(target_date: str, continuous: bool = False) -> str:
+    """cache key:多頁版 = <date>;連續版 = <date>_cont。"""
+    return f"{target_date}_cont" if continuous else target_date
+
+
+def _pdf_warm_async(target_date: str, allow_ai: bool = True,
+                    continuous: bool = False) -> bool:
     """Kick off PDF generation in the background. Returns True if started."""
     with _pdf_cache_lock:
         lock = _pdf_gen_locks.get(target_date)
@@ -3004,10 +3050,10 @@ def _pdf_warm_async(target_date: str, allow_ai: bool = True) -> bool:
     def _worker():
         try:
             with lock:
-                if _pdf_cache_get(target_date) is not None:
+                if _pdf_cache_get(_pdf_cache_key(target_date, continuous)) is not None:
                     return
                 t0 = time.time()
-                data = _generate_pdf_bytes(target_date, allow_ai)
+                data = _generate_pdf_bytes(target_date, allow_ai, continuous)
                 print(f"[pdf] warm done date={target_date} "
                       f"ok={bool(data)} {time.time() - t0:.1f}s", flush=True)
         except Exception as e:
@@ -3078,12 +3124,20 @@ def api_nutrition_pdf():
     #   dl=1 → 真・落本機模式(見下面 Response 嘅註解)
     dl_mode = (request.args.get("dl") or "").strip().lower() in (
         "1", "true", "yes", "on")
+    # v3.3.64 (Jim OOB 2026-10-28「Both jpg and pdf have no page limit
+    # (continuous scrolling)」):continuous=1 → **單頁長版**(全部餐一頁,
+    # 連續滾動,冇分頁)。獨立檔名 + 獨立 cache key。
+    continuous = (request.args.get("continuous") or "").strip().lower() in (
+        "1", "true", "yes", "on")
 
     PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf"
+    out_path = PDF_CACHE_DIR / (
+        f"gymbro_foodlog_{target_date}_continuous.pdf" if continuous
+        else f"gymbro_foodlog_{target_date}.pdf")
     download_name = out_path.name
+    _ckey = _pdf_cache_key(target_date, continuous)
 
-    cached = _pdf_cache_get(target_date)
+    cached = _pdf_cache_get(_ckey)
     if cached is None and out_path.exists():
         try:
             age = (datetime.now().timestamp() - out_path.stat().st_mtime)
@@ -3091,21 +3145,23 @@ def api_nutrition_pdf():
             # 所以 TTL 可以長啲,唔使每次都重 render)
             if age < 21600:
                 cached = out_path.read_bytes()
-                _pdf_cache_put(target_date, cached)
-                try:
-                    _pdf_render_preview(target_date)
-                except Exception:
-                    pass
+                _pdf_cache_put(_ckey, cached)
+                if not continuous:
+                    try:
+                        _pdf_render_preview(target_date)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
     if cached is None:
         if warm_only:
             # 背景生成(唔阻塞 request)—— 前端預熱用
-            _pdf_warm_async(target_date, allow_ai)
+            _pdf_warm_async(target_date, allow_ai, continuous)
             return jsonify({"ok": True, "date": target_date,
-                            "generating": True, "size_kb": 0})
-        cached = _generate_pdf_bytes(target_date, allow_ai)
+                            "generating": True, "size_kb": 0,
+                            "continuous": continuous})
+        cached = _generate_pdf_bytes(target_date, allow_ai, continuous)
         if cached is None:
             return jsonify({"ok": False, "error": "render_failed",
                             "date": target_date}), 500
@@ -3113,7 +3169,7 @@ def api_nutrition_pdf():
     if warm_only:
         return jsonify({"ok": True, "date": target_date,
                         "size_kb": int(len(cached) / 1024), "warmed": True,
-                        "generating": False})
+                        "generating": False, "continuous": continuous})
 
     # v3.3.63 (Jim OOB 2026-10-28「The pdf download button is not really
     # download. It is wrongly showing a pop up that does not have a share
@@ -17688,7 +17744,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v167';
+const CACHE = 'gym-web-v168';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1

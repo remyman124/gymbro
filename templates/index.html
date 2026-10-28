@@ -5794,11 +5794,15 @@ function gymApp() {
         pageNum: 1, pageTotal: 1, pages: [],
         compact: false, perPage: 5,
         pdfReady: false, pdfMealCount: 0, pdfPages: 1, pdfSizeKb: 0,
-        pdfHint: '準備緊…', pdfPreviewUrl: '',
+        pdfHint: '⏳ 準備緊檔案…', pdfPreviewUrl: '',
         pdfTotals: { kcal: 0, P: 0, C: 0, F: 0 },
         aiDescRows: 0, aiVerdictRows: 0,
+        // v3.3.64:預載兩個檔案(JPG 長圖 + PDF 長頁),share 就可以同步叫
+        files: {}, readyKinds: [],
       };
       await this.refreshFoodCardPdfInfo(true);
+      // v3.3.64:唔使等 —— 預載完先有得即刻分享
+      this.prefetchFoodLogFiles();
     },
 
     // 查 PDF 狀態;未 ready 就叫 server 背景生成,再輪詢
@@ -5819,19 +5823,19 @@ function gymApp() {
         const ready = !!d.ready;
         this.foodCardPreview.pdfReady = ready;
         this.foodCardPreview.loading = false;
+        // v3.3.64:冇預覽圖(Jim OOB「No viewing. Just immediate share」)
+        this.foodCardPreview.pdfPreviewUrl = '';
         if (ready) {
-          this.foodCardPreview.pdfPreviewUrl =
-            `/nutrition_pdf/gymbro_foodlog_${date}_p1.png?t=${Date.now()}`;
           this.foodCardPreview.pdfHint =
-            `${d.size_kb} KB · ${d.meal_count} 餐 · 撳「⬇ 下載」落去「檔案」App`;
+            `${d.meal_count} 餐 · JPG + PDF 都係連續長版(冇分頁) · 撳即刻分享`;
         } else {
-          this.foodCardPreview.pdfPreviewUrl = '';
-          this.foodCardPreview.pdfHint =
-            '第一次生成要用 AI 分析(約 20 秒),之後就即落';
+          this.foodCardPreview.pdfHint = '⏳ 第一次生成要用 AI 分析(約 20 秒)…';
           if (warm) {
             try {
-              await fetch(`/api/nutrition/pdf?date=${encodeURIComponent(date)}&warm=1`,
-                          { cache: 'no-store' });
+              // v3.3.64:預熱**連續長版**(唔係多頁版)
+              await fetch(
+                `/api/nutrition/pdf?date=${encodeURIComponent(date)}&continuous=1&warm=1`,
+                { cache: 'no-store' });
             } catch (e) { /* 預熱失敗唔阻手 */ }
             clearTimeout(this._pdfPollTimer);
             this._pdfPollTimer = setTimeout(() => this.refreshFoodCardPdfInfo(false), 6000);
@@ -5850,37 +5854,75 @@ function gymApp() {
       return `/api/nutrition/pdf?date=${encodeURIComponent(date)}`;
     },
 
-    // v3.3.63 (Jim OOB 2026-10-28「Pls make it download to local」):
-    // 真・落本機下載 URL。`?dl=1` → server 送 `application/octet-stream`
-    // + `X-Content-Type-Options: nosniff` → iOS 當普通檔案落去「檔案」App。
-    // (冇 `?dl=1` 送 `application/pdf` → iOS 會開 Quick Look pop-up 預覽,
-    //  嗰個 pop-up 冇分享掣 → Jim 話「唔係真下載」。)
-    foodCardPdfDownloadUrl() {
-      const date = this.foodCardPreview.date;
-      if (!date) return '#';
-      return `/api/nutrition/pdf?date=${encodeURIComponent(date)}&dl=1`;
+    // v3.3.64 (Jim OOB 2026-10-28「I want two buttons only. Left side is
+    // sharing a jpg. Right side is sharing an pdf. Both jpg and pdf have no
+    // page limit (continuous scrolling)」+「No viewing. Just immediate share」):
+    //
+    // 淨係兩粒掣 —— 左 JPG / 右 PDF,撳落去即刻開原生 share sheet。
+    // JPG = `?all=1`(一張長圖,全部餐,冇分頁)
+    // PDF = `?continuous=1`(單頁長版,全部餐,冇分頁)
+    foodLogFileSpec(kind, date) {
+      if (kind === 'jpg') {
+        return {url: `/api/nutrition/card?date=${encodeURIComponent(date)}&all=1`,
+                name: `gymbro_foodlog_${date}.jpg`, type: 'image/jpeg'};
+      }
+      return {url: `/api/nutrition/pdf?date=${encodeURIComponent(date)}&continuous=1`,
+              name: `gymbro_foodlog_${date}.pdf`, type: 'application/pdf'};
     },
 
-    // v3.3.63:原生分享掣(iOS 15+ `navigator.share({files})`)。
-    // 會開真正嘅 native share sheet —— 入面有「儲存到檔案」/ WhatsApp /
-    // 郵件 / AirDrop,即係 Jim 想要嗰個「有 share 功能」嘅流程。
-    async shareFoodCardPdf() {
-      try { this.haptic(12); } catch (e) {}
+    // 預載兩個檔案 → 撳掣嗰陣 `navigator.share()` 係**同步**喺 user
+    // gesture 度叫(iOS 要求 gesture 內同步叫,await 完先叫會被拒)。
+    async prefetchFoodLogFiles() {
       const date = this.foodCardPreview.date;
       if (!date) return;
+      await Promise.all(['jpg', 'pdf'].map(async (k) => {
+        try {
+          const sp = this.foodLogFileSpec(k, date);
+          const res = await fetch(sp.url, {cache: 'no-store'});
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const blob = await res.blob();
+          const file = new File([blob], sp.name, {type: sp.type});
+          this.foodCardPreview.files = {
+            ...(this.foodCardPreview.files || {}), [k]: file};
+          this.foodCardPreview.readyKinds = [...new Set(
+            [...(this.foodCardPreview.readyKinds || []), k])];
+        } catch (e) {
+          console.warn('[foodlog] prefetch failed:', k, e);
+        }
+      }));
+      this.foodCardPreview.pdfHint =
+        `${this.foodCardPreview.pdfMealCount || 0} 餐 · JPG + PDF 都係連續長版(冇分頁) · 撳即刻分享`;
+    },
+
+    // 撳即刻分享(冇預覽步驟)
+    async shareFoodLog(kind) {
+      const date = this.foodCardPreview.date;
+      if (!date) return;
+      try { this.haptic(12); } catch (e) {}
+      const sp = this.foodLogFileSpec(kind, date);
       try {
-        const res = await fetch(`/api/nutrition/pdf?date=${encodeURIComponent(date)}`,
-                               {cache: 'force-cache'});
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const blob = await res.blob();
-        const file = new File([blob], this.foodCardPdfFileName(),
-                              {type: 'application/pdf'});
+        let file = (this.foodCardPreview.files || {})[kind];
+        if (!file) {
+          const res = await fetch(sp.url, {cache: 'no-store'});
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const blob = await res.blob();
+          file = new File([blob], sp.name, {type: sp.type});
+          this.foodCardPreview.files = {
+            ...(this.foodCardPreview.files || {}), [kind]: file};
+        }
         if (navigator.canShare && navigator.canShare({files: [file]})) {
           await navigator.share({files: [file],
                                 title: `Gymbro 食物日結 ${date}`});
           this.flash('📤 分享掣已開 · 撳「儲存到檔案」就落咗本機', 3500);
         } else {
-          this.flash('呢部機唔支援分享檔案 · 請用「⬇ 下載 PDF」', 3500);
+          // 冇 share sheet(桌面 Chromium)→ 直接落本機(?dl=1 → octet-stream)
+          const a = document.createElement('a');
+          a.href = sp.url + '&dl=1';
+          a.download = sp.name;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          this.flash('⬇ 落緊 ' + sp.name, 3000);
         }
       } catch (e) {
         if (e && e.name === 'AbortError') return;   // 用戶自己收埋個 sheet
@@ -5891,17 +5933,6 @@ function gymApp() {
     foodCardPdfFileName() {
       const date = this.foodCardPreview.date;
       return date ? `gymbro_foodlog_${date}.pdf` : 'gymbro_foodlog.pdf';
-    },
-
-    // v3.3.62:落完自動閂 modal → Jim 撳「關閉」iOS share sheet 就直接返主介面
-    onFoodCardPdfDownload() {
-      try { this.haptic(12); } catch (e) {}
-      this.flash('⬇ 落緊 ' + this.foodCardPdfFileName() +
-                 ' 去「檔案」App · 落完撳右上角「關閉」返去', 3500);
-      clearTimeout(this._pdfCloseTimer);
-      // v3.3.63:等耐少少先閂 modal —— iOS 收到 octet-stream 會彈
-      // 下載確認,太早閂會連個 <a> 一齊拎走(有可能中断下載)。
-      this._pdfCloseTimer = setTimeout(() => this.closeFoodCardPreview(), 1600);
     },
 
     // v3.3.23ax: navigate between pages in multi-page preview
@@ -6985,7 +7016,7 @@ setTimeout(checkLandscapeFood, 500);
              `max-height:100%` → 高度唔夠就等比縮細,唔會爆。
              (`max-h-[90dvh]` 唔夠 —— auto 高度嘅 flex container 冇
              「剩餘空間」可以分配,preview 會 collapse 成 0 高。) -->
-        <div class="w-full max-w-md h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
+        <div class="w-full max-w-md flex flex-col rounded-3xl overflow-hidden"
              style="background: linear-gradient(180deg, rgb(28, 25, 46) 0%, rgb(12, 10, 24) 100%); border: 1.5px solid rgba(251, 191, 36, 0.45); box-shadow: 0 0 40px rgba(251, 191, 36, 0.18);">
           <!-- Header (fixed alignment via inline-block + line-height) -->
           <div class="flex items-center justify-between px-4 flex-shrink-0"
@@ -7020,130 +7051,37 @@ setTimeout(checkLandscapeFood, 500);
                順帶:preview 變成最後一個 flex item(`flex-1 min-h-0`),
                圖嘅 `object-fit:contain` + `max-height:100%` 會**自動縮細**
                去填滿剩餘空間 —— 所以「太長」嘅問題自動消失,唔使再靠改餐數。 -->
-          <!-- v3.3.62 (Jim OOB 2026-10-27「As we use pdf. Just one click
-               download pdf and allow me to close the share such that I can
-               be back to gymbro interface after download.」):
-  
-               **由「逐頁 JPG」改成「單一 PDF」。**
-               PDF 嘅頁係流動嘅 → 唔使 5 餐上限,而且每餐可以寫齊
-               AI 視覺描述 + 教練判詞(之前張 JPG 只有 240px 高,
-               塞唔落,淨係得返 grade 字母同 kcal 丸)。
-  
-               掣喺**最上面**(短屏一見到),落完自動閂 modal →
-               Jim 撳「關閉」iOS 個 share sheet 就直接返返 GymBro 主介面。 -->
-          <div class="px-4 pt-3 pb-1 flex-shrink-0"
+          <!-- v3.3.64 (Jim OOB 2026-10-28「I want two buttons only. Left side
+               is sharing a jpg. Right side is sharing an pdf. Both jpg and pdf
+               have no page limit (continuous scrolling)」+「No viewing. Just
+               immediate share」):
+
+               **淨係兩粒掣:左 = JPG / 右 = PDF。**
+               1. 冇預覽圖 —— 撳落去即刻開原生 share sheet(有「儲存到檔案」)。
+               2. JPG = `?all=1` → 一張長圖,全部餐,冇分頁(連續滾動)。
+               3. PDF = `?continuous=1` → 單頁長版,全部餐,冇分頁(連續滾動)。
+               4. 兩個檔案喺 modal 開嗰陣已經預載 → `navigator.share()` 係
+                  同步喺 user gesture 度叫(iOS 要求),唔會 "not allowed"。 -->
+          <div class="px-4 pt-3 pb-4 flex-shrink-0"
                style="background: rgba(28, 25, 46, 0.95);">
-            <!-- 單一下載掣 + 分享掣 -->
-            <!-- v3.3.63 (Jim OOB 2026-10-28「The pdf download button is not
-                 really download. It is wrongly showing a pop up that does not
-                 have a share feature. Pls make it download to local」):
-
-                 1. 下載掣改指 `?dl=1` → server 送 `application/octet-stream`
-                    + `X-Content-Type-Options: nosniff`。iOS 見到呢種
-                    未知二進位就會當普通檔案落去「檔案」App;
-                    之前送 `application/pdf` 嘅話,iOS 會開 Quick Look
-                    預覽 pop-up(冇分享掣)—— 就係 Jim 見到嗰個「唔似下載」嘅
-                    視窗。
-                 2. 加「📤 分享」掣 → `navigator.share({files:[...]})`
-                    (iOS 15+ 支援)→ 開真正嘅 native share sheet,入面有
-                    「儲存到檔案」/ WhatsApp / 郵件。
-
-                 兩個掣同一行(唔會加高,短屏一樣見到)。 -->
             <div class="flex gap-2 items-stretch">
-              <a x-show="foodCardPreview.pdfReady"
-                 :href="foodCardPdfDownloadUrl()"
-                 :download="foodCardPdfFileName()"
-                 @click="onFoodCardPdfDownload()"
-                 data-testid="food-card-pdf-download"
-                 class="flex-1 rounded-2xl text-center text-base font-black active:scale-95 no-underline"
-                 style="padding: 15px 16px; background: linear-gradient(135deg, rgb(167,139,250) 0%, rgb(251,191,36) 100%); color: rgb(20,18,32);">
-                ⬇ 下載 PDF
-              </a>
-              <button x-show="foodCardPreview.pdfReady"
-                      @click="shareFoodCardPdf()"
-                      data-testid="food-card-pdf-share"
-                      class="rounded-2xl text-sm font-black active:scale-95"
-                      style="padding: 15px 12px; background: rgba(255,255,255,0.10); color: rgb(235,235,245); white-space: nowrap;">
-                📤 分享
+              <button @click="shareFoodLog('jpg')"
+                      data-testid="food-card-jpg-share"
+                      class="flex-1 rounded-2xl text-base font-black active:scale-95"
+                      style="padding: 16px 10px; background: linear-gradient(135deg, rgb(167,139,250) 0%, rgb(251,191,36) 100%); color: rgb(20,18,32);">
+                🖼️ 分享 JPG
               </button>
-            </div>
-            <div x-show="!foodCardPreview.pdfReady"
-                 data-testid="food-card-pdf-generating"
-                 class="w-full rounded-2xl text-center text-sm font-black"
-                 style="padding: 15px 16px; background: rgba(255,255,255,0.07); color: rgb(180,180,195);">
-              ⏳ 生成緊 PDF…
+              <button @click="shareFoodLog('pdf')"
+                      data-testid="food-card-pdf-share"
+                      class="flex-1 rounded-2xl text-base font-black active:scale-95"
+                      style="padding: 16px 10px; background: rgba(255,255,255,0.12); color: rgb(240,240,245);">
+                📄 分享 PDF
+              </button>
             </div>
             <div class="text-[10px] text-center mt-2"
                  style="color: rgb(150,150,170);"
                  x-text="foodCardPreview.pdfHint"></div>
           </div>
-          <!-- PDF 內容預覽(第 1 頁 PNG)+ 摘要 -->
-          <div class="flex-1 min-h-0 overflow-y-auto"
-               style="background: rgba(0, 0, 0, 0.45);">
-            <div x-show="foodCardPreview.loading"
-                 class="flex flex-col items-center justify-center"
-                 style="min-height: 200px; padding: 40px 0;">
-              <div style="font-size: 32px; margin-bottom: 10px; animation: spin 1.2s linear infinite; display: inline-block;">⏳</div>
-              <div class="text-xs text-gray-300">生成緊營養日結 PDF…</div>
-            </div>
-            <!-- 第 1 頁預覽 -->
-            <img x-show="!foodCardPreview.loading && foodCardPreview.pdfPreviewUrl"
-                 :src="foodCardPreview.pdfPreviewUrl"
-                 :alt="'營養日結 PDF 第 1 頁'"
-                 style="display: block; width: 100%; max-width: 100%; height: auto; max-height: 100%; object-fit: contain; background: rgba(0,0,0,0.6); padding: 10px; box-sizing: border-box;" />
-            <!-- 摘要(冇預覽圖時都見到) -->
-            <div x-show="!foodCardPreview.loading"
-                 class="px-4 py-3 text-xs"
-                 style="color: rgb(200,200,215);">
-              <div class="flex flex-wrap gap-x-4 gap-y-1 mb-2"
-                   style="font-weight: 700; color: rgb(240,240,245);">
-                <span x-text="`${foodCardPreview.pdfMealCount || 0} 餐`"></span>
-                <span x-text="`${foodCardPreview.pdfPages || 1} 頁`"></span>
-                <span x-text="`${foodCardPreview.pdfSizeKb || 0} KB`"></span>
-                <span x-text="`${foodCardPreview.pdfTotals.kcal || 0} kcal`"></span>
-              </div>
-              <div class="flex flex-wrap gap-x-4 gap-y-1 mb-2"
-                   style="color: rgb(160,160,180);">
-                <span x-text="`蛋白 ${foodCardPreview.pdfTotals.P || 0}g`"></span>
-                <span x-text="`碳水 ${foodCardPreview.pdfTotals.C || 0}g`"></span>
-                <span x-text="`脂肪 ${foodCardPreview.pdfTotals.F || 0}g`"></span>
-              </div>
-              <div x-show="foodCardPreview.aiDescRows > 0"
-                   style="color: rgb(74,222,128);"
-                   x-text="`✓ ${foodCardPreview.aiDescRows}/${foodCardPreview.pdfMealCount || 0} 餐有 AI 視覺描述`"></div>
-              <div x-show="foodCardPreview.aiVerdictRows > 0"
-                   style="color: rgb(251,191,36);"
-                   x-text="`✓ ${foodCardPreview.aiVerdictRows}/${foodCardPreview.pdfMealCount || 0} 餐有教練判詞`"></div>
-              <div class="mt-2" style="color: rgb(120,120,140); line-height: 1.6;">
-                PDF 內含封面摘要 + 逐餐詳情(相、AI 描述、教練判詞、佔全日熱量%)。
-                落完檔之後撳右上角「關閉」就返返 GymBro。
-              </div>
-            </div>
-          </div>
-          <!-- v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」):
-               「每頁餐數」選擇器(6/4/3 chip)已移除 —— 每頁固定 **5 餐**
-               (v3.3.57 嘅「Make it 5 meals max per screen」)。
-               順帶慳返 ~52pt 嘅 footer 高度,短屏終於見到下載掣。
-  
-               v3.3.55 嘅洞察仍然成立(留低做參考):
-               等比縮細(1080x1736 → 796x1280)比例一樣(1.607)→ 喺 iPhone
-               上面一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。真正令圖
-               變短嘅係改**比例**(即係每頁少啲餐),唔係縮細。
-  
-          <!-- v3.3.59:「檔案細啲(高度 ≤ 1280px)」toggle row 已移除
-               (Jim OOB「Remove the toggle row ... such that I can see the
-               button download button」)—— 佢喺 modal 底部佔咗 ~42pt,
-               而且喺真機短屏會將下載掣推落視窗外。
-               後端 `?compact=1` 仍然支援(舊 URL 唔會壞),只係唔再有 UI 開關。 -->
-  
-          <!-- v3.3.54 (2026-10-27, Jim OOB「Don't download multiple image at the
-               same time. Show multiple download button to download. Remove
-               second button」):
-               ① 之前一個「⬇ 下載全部 N 頁」掣 → 一次過發 N 個 download。
-                  iOS Safari 會當成「多檔下載」(要逐個撳「允許」),而且撞
-                  瀏覽器同時下載限制 → 改為**每頁一個掣,撳一個只落一張**。
-               ② 第二個「✕ 關閉」掣已移除 —— 右上角 ✕ / Esc / 點背景一樣
-                  可以閂 modal,唔需要喺 footer 佔位。 -->
         </div>
       </div>
 </body>
