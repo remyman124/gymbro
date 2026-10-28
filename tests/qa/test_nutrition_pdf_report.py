@@ -201,8 +201,8 @@ def test_live_pdf_download_headers():
 # ─────────────────────────────────────────────────────────────
 def test_version_pins():
     web = _src(WEB)
-    assert '__version__ = "3.3.62"' in web
-    assert "gym-web-v166" in web
+    assert '__version__ = "3.3.63"' in web
+    assert "gym-web-v167" in web
 
 
 # ─────────────────────────────────────────────────────────────
@@ -324,3 +324,98 @@ def test_meal_card_height_matches_draw():
         "繪製同高度函數都要用同一個段落闊度"
     # 唔准再用右欄窄闊度 wrap 段落
     assert "font, tw - 0," not in src
+
+
+# ─────────────────────────────────────────────────────────────
+# 6. v3.3.63 — 真・落本機下載(Jim OOB 2026-10-28)
+#    「The pdf download button is not really download. It is wrongly showing
+#     a pop up that does not have a share feature. Pls make it download to
+#     local」
+#
+#    病根:iOS Safari / iOS PWA 收到 `Content-Type: application/pdf`
+#    + `Content-Disposition: attachment`,唔會落檔 —— 佢會開 Quick Look
+#    預覽 pop-up(而且嗰個 pop-up 冇分享掣)。
+#    修法:`?dl=1` → `application/octet-stream` + `X-Content-Type-Options:
+#    nosniff` → iOS 當普通檔案落去「檔案」App。
+# ─────────────────────────────────────────────────────────────
+def test_pdf_dl_mode_sends_octet_stream():
+    """?dl=1 一定要送 application/octet-stream + nosniff(否則 iOS 開預覽)。"""
+    src = _src(WEB)
+    assert 'dl_mode = (request.args.get("dl")' in src
+    assert 'content_type="application/octet-stream"' in src
+    assert '"X-Content-Type-Options": "nosniff"' in src
+    # dl 模式一定要喺 pdf 模式之前 return(唔可以兩樣都送)
+    assert src.index('if dl_mode:') < src.index('mimetype="application/pdf"')
+
+
+def test_pdf_dl_mode_content_disposition_quoted():
+    """filename 一定要有引號 + filename*(RFC 5987),iOS 先識得個名。"""
+    src = _src(WEB)
+    assert 'attachment; filename="{download_name}"' in src
+    assert "filename*=UTF-8''{download_name}" in src
+
+
+def test_pdf_inline_mode_still_serves_pdf():
+    """冇 ?dl=1 照舊送 application/pdf(前端 blob 分享 / 預覽靠佢)。"""
+    src = _src(WEB)
+    assert 'mimetype="application/pdf"' in src
+
+
+def test_frontend_download_anchor_uses_dl_mode():
+    """前端下載掣一定要指去 ?dl=1,唔係淨 pdf URL。"""
+    tpl = _src(TPL)
+    assert ":href=\"foodCardPdfDownloadUrl()\"" in tpl
+    assert "foodCardPdfDownloadUrl()" in tpl
+    assert "&dl=1" in tpl
+    # 下載掣唔可以再指住裸 pdf URL(要睇 <a ...> 個 opening tag)
+    m = re.search(r'<a[^>]*data-testid="food-card-pdf-download"[^>]*>', tpl, re.S)
+    assert m, "搵唔到下載掣"
+    assert "foodCardPdfDownloadUrl()" in m.group(0)
+    assert "foodCardPdfUrl()" not in m.group(0)
+
+
+def test_frontend_has_native_share_button():
+    """要有原生分享掣(navigator.share + canShare)—— 即係 Jim 講嘅 share 功能。"""
+    tpl = _src(TPL)
+    assert 'data-testid="food-card-pdf-share"' in tpl
+    assert "navigator.canShare" in tpl
+    assert "navigator.share(" in tpl
+    assert "shareFoodCardPdf()" in tpl
+    assert "new File([blob]" in tpl
+
+
+def test_share_button_does_not_break_pdf_inline_url():
+    """分享流程要攞 inline PDF(唔係 dl=1),先可以砌出 File 嚟 share。"""
+    tpl = _src(TPL)
+    i = tpl.find("async shareFoodCardPdf()")
+    seg = tpl[i:i + 1200]
+    assert "/api/nutrition/pdf?date=" in seg
+    assert "&dl=1" not in seg
+
+
+def test_live_pdf_dl_headers():
+    """實測:?dl=1 → octet-stream + attachment + nosniff。"""
+    out = subprocess.run(
+        ["curl", "-s", "-m", "180", "-D", "-", "-o", "/dev/null",
+         BASE + "/api/nutrition/pdf?date=2026-10-27&dl=1"],
+        capture_output=True, text=True).stdout
+    if not out.strip():
+        pytest.skip("server 未行")
+    low = out.lower()
+    assert "content-type: application/octet-stream" in low
+    assert "content-disposition: attachment" in low
+    assert "x-content-type-options: nosniff" in low
+    assert "gymbro_foodlog_2026-10-27.pdf" in out
+
+
+def test_live_pdf_inline_still_pdf():
+    """冇 dl=1 → 照舊 application/pdf(唔可以整爛預覽)。"""
+    out = subprocess.run(
+        ["curl", "-s", "-m", "180", "-D", "-", "-o", "/dev/null",
+         BASE + "/api/nutrition/pdf?date=2026-10-27"],
+        capture_output=True, text=True).stdout
+    if not out.strip():
+        pytest.skip("server 未行")
+    low = out.lower()
+    assert "content-type: application/pdf" in low
+    assert "content-disposition: attachment" in low

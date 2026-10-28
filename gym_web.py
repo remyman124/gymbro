@@ -1012,7 +1012,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.62"
+__version__ = "3.3.63"
 
 
 def _recovery_pct():
@@ -3072,6 +3072,12 @@ def api_nutrition_pdf():
         "1", "true", "yes", "on")
     allow_ai = (request.args.get("ai") or "1").strip().lower() not in (
         "0", "false", "no", "off")
+    # v3.3.63 (Jim OOB 2026-10-28「The pdf download button is not really
+    # download. It is wrongly showing a pop up that does not have a share
+    # feature. Pls make it download to local」):
+    #   dl=1 → 真・落本機模式(見下面 Response 嘅註解)
+    dl_mode = (request.args.get("dl") or "").strip().lower() in (
+        "1", "true", "yes", "on")
 
     PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf"
@@ -3108,6 +3114,32 @@ def api_nutrition_pdf():
         return jsonify({"ok": True, "date": target_date,
                         "size_kb": int(len(cached) / 1024), "warmed": True,
                         "generating": False})
+
+    # v3.3.63 (Jim OOB 2026-10-28「The pdf download button is not really
+    # download. It is wrongly showing a pop up that does not have a share
+    # feature. Pls make it download to local」):
+    #
+    # iOS Safari / iOS PWA 對 `Content-Type: application/pdf` + attachment
+    # **唔會**落去本機 —— 佢會直接開 Quick Look 預覽(pop-up),而且嗰個
+    # pop-up 冇「分享 / 儲存到檔案」掣,所以 Jim 撳完只見到一個空殼
+    # 視窗,完全唔似下載。
+    #
+    # 修法:加 `?dl=1` → 改送 `application/octet-stream` + `nosniff`。
+    # iOS 見到未知二進位型別就會當普通檔案下載 → 落去「檔案」App。
+    # 冇 `?dl=1` 照舊送 application/pdf(前端 blob 分享 + 預覽要用)。
+    if dl_mode:
+        return Response(
+            cached,
+            content_type="application/octet-stream",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{download_name}"; '
+                    f"filename*=UTF-8''{download_name}"
+                ),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, max-age=60",
+            },
+        )
 
     return Response(
         cached,
@@ -17656,7 +17688,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v166';
+const CACHE = 'gym-web-v167';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1

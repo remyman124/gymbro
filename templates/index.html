@@ -5823,7 +5823,7 @@ function gymApp() {
           this.foodCardPreview.pdfPreviewUrl =
             `/nutrition_pdf/gymbro_foodlog_${date}_p1.png?t=${Date.now()}`;
           this.foodCardPreview.pdfHint =
-            `${d.size_kb} KB · ${d.meal_count} 餐 · 撳上面個掣落檔`;
+            `${d.size_kb} KB · ${d.meal_count} 餐 · 撳「⬇ 下載」落去「檔案」App`;
         } else {
           this.foodCardPreview.pdfPreviewUrl = '';
           this.foodCardPreview.pdfHint =
@@ -5850,6 +5850,44 @@ function gymApp() {
       return `/api/nutrition/pdf?date=${encodeURIComponent(date)}`;
     },
 
+    // v3.3.63 (Jim OOB 2026-10-28「Pls make it download to local」):
+    // 真・落本機下載 URL。`?dl=1` → server 送 `application/octet-stream`
+    // + `X-Content-Type-Options: nosniff` → iOS 當普通檔案落去「檔案」App。
+    // (冇 `?dl=1` 送 `application/pdf` → iOS 會開 Quick Look pop-up 預覽,
+    //  嗰個 pop-up 冇分享掣 → Jim 話「唔係真下載」。)
+    foodCardPdfDownloadUrl() {
+      const date = this.foodCardPreview.date;
+      if (!date) return '#';
+      return `/api/nutrition/pdf?date=${encodeURIComponent(date)}&dl=1`;
+    },
+
+    // v3.3.63:原生分享掣(iOS 15+ `navigator.share({files})`)。
+    // 會開真正嘅 native share sheet —— 入面有「儲存到檔案」/ WhatsApp /
+    // 郵件 / AirDrop,即係 Jim 想要嗰個「有 share 功能」嘅流程。
+    async shareFoodCardPdf() {
+      try { this.haptic(12); } catch (e) {}
+      const date = this.foodCardPreview.date;
+      if (!date) return;
+      try {
+        const res = await fetch(`/api/nutrition/pdf?date=${encodeURIComponent(date)}`,
+                               {cache: 'force-cache'});
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        const file = new File([blob], this.foodCardPdfFileName(),
+                              {type: 'application/pdf'});
+        if (navigator.canShare && navigator.canShare({files: [file]})) {
+          await navigator.share({files: [file],
+                                title: `Gymbro 食物日結 ${date}`});
+          this.flash('📤 分享掣已開 · 撳「儲存到檔案」就落咗本機', 3500);
+        } else {
+          this.flash('呢部機唔支援分享檔案 · 請用「⬇ 下載 PDF」', 3500);
+        }
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;   // 用戶自己收埋個 sheet
+        this.flash('分享失敗: ' + ((e && e.message) || e), 3500);
+      }
+    },
+
     foodCardPdfFileName() {
       const date = this.foodCardPreview.date;
       return date ? `gymbro_foodlog_${date}.pdf` : 'gymbro_foodlog.pdf';
@@ -5858,10 +5896,12 @@ function gymApp() {
     // v3.3.62:落完自動閂 modal → Jim 撳「關閉」iOS share sheet 就直接返主介面
     onFoodCardPdfDownload() {
       try { this.haptic(12); } catch (e) {}
-      this.flash('⬇ 下載緊 ' + this.foodCardPdfFileName() +
-                 ' · 落完撳右上角「關閉」返去', 3000);
+      this.flash('⬇ 落緊 ' + this.foodCardPdfFileName() +
+                 ' 去「檔案」App · 落完撳右上角「關閉」返去', 3500);
       clearTimeout(this._pdfCloseTimer);
-      this._pdfCloseTimer = setTimeout(() => this.closeFoodCardPreview(), 900);
+      // v3.3.63:等耐少少先閂 modal —— iOS 收到 octet-stream 會彈
+      // 下載確認,太早閂會連個 <a> 一齊拎走(有可能中断下載)。
+      this._pdfCloseTimer = setTimeout(() => this.closeFoodCardPreview(), 1600);
     },
 
     // v3.3.23ax: navigate between pages in multi-page preview
@@ -6993,16 +7033,40 @@ setTimeout(checkLandscapeFood, 500);
                Jim 撳「關閉」iOS 個 share sheet 就直接返返 GymBro 主介面。 -->
           <div class="px-4 pt-3 pb-1 flex-shrink-0"
                style="background: rgba(28, 25, 46, 0.95);">
-            <!-- 單一下載掣 -->
-            <a x-show="foodCardPreview.pdfReady"
-               :href="foodCardPdfUrl()"
-               :download="foodCardPdfFileName()"
-               @click="onFoodCardPdfDownload()"
-               data-testid="food-card-pdf-download"
-               class="block rounded-2xl text-center text-base font-black active:scale-95 no-underline"
-               style="padding: 15px 16px; background: linear-gradient(135deg, rgb(167,139,250) 0%, rgb(251,191,36) 100%); color: rgb(20,18,32);">
-              ⬇ 下載 PDF
-            </a>
+            <!-- 單一下載掣 + 分享掣 -->
+            <!-- v3.3.63 (Jim OOB 2026-10-28「The pdf download button is not
+                 really download. It is wrongly showing a pop up that does not
+                 have a share feature. Pls make it download to local」):
+
+                 1. 下載掣改指 `?dl=1` → server 送 `application/octet-stream`
+                    + `X-Content-Type-Options: nosniff`。iOS 見到呢種
+                    未知二進位就會當普通檔案落去「檔案」App;
+                    之前送 `application/pdf` 嘅話,iOS 會開 Quick Look
+                    預覽 pop-up(冇分享掣)—— 就係 Jim 見到嗰個「唔似下載」嘅
+                    視窗。
+                 2. 加「📤 分享」掣 → `navigator.share({files:[...]})`
+                    (iOS 15+ 支援)→ 開真正嘅 native share sheet,入面有
+                    「儲存到檔案」/ WhatsApp / 郵件。
+
+                 兩個掣同一行(唔會加高,短屏一樣見到)。 -->
+            <div class="flex gap-2 items-stretch">
+              <a x-show="foodCardPreview.pdfReady"
+                 :href="foodCardPdfDownloadUrl()"
+                 :download="foodCardPdfFileName()"
+                 @click="onFoodCardPdfDownload()"
+                 data-testid="food-card-pdf-download"
+                 class="flex-1 rounded-2xl text-center text-base font-black active:scale-95 no-underline"
+                 style="padding: 15px 16px; background: linear-gradient(135deg, rgb(167,139,250) 0%, rgb(251,191,36) 100%); color: rgb(20,18,32);">
+                ⬇ 下載 PDF
+              </a>
+              <button x-show="foodCardPreview.pdfReady"
+                      @click="shareFoodCardPdf()"
+                      data-testid="food-card-pdf-share"
+                      class="rounded-2xl text-sm font-black active:scale-95"
+                      style="padding: 15px 12px; background: rgba(255,255,255,0.10); color: rgb(235,235,245); white-space: nowrap;">
+                📤 分享
+              </button>
+            </div>
             <div x-show="!foodCardPreview.pdfReady"
                  data-testid="food-card-pdf-generating"
                  class="w-full rounded-2xl text-center text-sm font-black"

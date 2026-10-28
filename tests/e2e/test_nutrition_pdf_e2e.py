@@ -1,4 +1,11 @@
-"""E2E — v3.3.62 營養日結 PDF:單一下載掣 + 落完自動閂返主介面。
+"""E2E — v3.3.62/63 營養日結 PDF:單一下載掣 + 落完自動閂返主介面。
+
+v3.3.63 (Jim OOB 2026-10-28「The pdf download button is not really download.
+It is wrongly showing a pop up that does not have a share feature. Pls make
+it download to local」):
+  8.  下載掣 href 要有 &dl=1(→ server 送 octet-stream → iOS 落本機)
+  9.  ?dl=1 回應 header = octet-stream + attachment + nosniff
+  10. 有原生「📤 分享」掣 → navigator.share({files:[File]})
 
 Jim OOB 2026-10-27:
   「As we use pdf. Just one click download pdf and allow me to close the share
@@ -100,6 +107,10 @@ def main():
         jpgs = page.locator("text=⬇ 下載 JPG").count()
         check("冇殘留逐頁 JPG 下載掣", jpgs == 0, f"count={jpgs}")
 
+        # ── v3.3.63:下載掣一定要指 ?dl=1(真・落本機)──────────────
+        href = dl_btn.first.get_attribute("href") or ""
+        check("下載掣指向 ?dl=1(唔係裸 pdf URL)", "&dl=1" in href, href)
+
         # 掣喺 preview 上面
         try:
             btn_box = dl_btn.first.bounding_box()
@@ -148,6 +159,28 @@ def main():
         check("淨係一個下載事件", len(downloads) - n_before == 1,
               f"n={len(downloads) - n_before}")
 
+        # ── v3.3.63:?dl=1 嘅 response 一定要係 octet-stream ────────
+        #   iOS 收 application/pdf 會開 Quick Look pop-up(冇分享掣)→
+        #   Jim 話「唔係真下載」。octet-stream + nosniff → 落去「檔案」App。
+        try:
+            resp_info = page.evaluate("""async (u) => {
+                const r = await fetch(u, {cache: 'no-store'});
+                return {ct: r.headers.get('content-type'),
+                        cd: r.headers.get('content-disposition'),
+                        ns: r.headers.get('x-content-type-options')};
+            }""", href)
+            check("?dl=1 回應係 application/octet-stream",
+                  "application/octet-stream" in (resp_info.get("ct") or ""),
+                  json.dumps(resp_info))
+            check("?dl=1 有 Content-Disposition: attachment",
+                  "attachment" in (resp_info.get("cd") or ""),
+                  resp_info.get("cd") or "")
+            check("?dl=1 有 X-Content-Type-Options: nosniff",
+                  "nosniff" in (resp_info.get("ns") or ""),
+                  resp_info.get("ns") or "")
+        except Exception as e:
+            check("?dl=1 回應 header 檢查", False, str(e))
+
         # 落完自動閂 modal
         page.wait_for_timeout(1600)
         try:
@@ -161,6 +194,49 @@ def main():
         try:
             page.evaluate("(d) => Alpine.$data(document.body).showFoodCardPreview(d)", d)
             page.wait_for_timeout(1500)
+            # ── v3.3.63:原生分享掣(navigator.share with files)──────
+            share_btn = page.locator('[data-testid="food-card-pdf-share"]')
+            check("有原生分享掣", share_btn.count() == 1,
+                  f"count={share_btn.count()}")
+            page.evaluate("""() => {
+                window.__shareCalls = [];
+                Object.defineProperty(navigator, 'canShare', {
+                    configurable: true,
+                    value: (d) => !!(d && d.files && d.files.length)
+                });
+                Object.defineProperty(navigator, 'share', {
+                    configurable: true,
+                    value: async (data) => {
+                        window.__shareCalls.push({
+                            files: ((data && data.files) || []).map(f => ({
+                                name: f.name, type: f.type, size: f.size
+                            })),
+                            title: (data && data.title) || ''
+                        });
+                    }
+                });
+            }""")
+            if share_btn.count():
+                try:
+                    share_btn.first.click(timeout=6000)
+                    page.wait_for_timeout(1800)
+                    calls = page.evaluate("() => window.__shareCalls")
+                    check("分享掣叫咗 navigator.share", len(calls) == 1,
+                          json.dumps(calls)[:220])
+                    if calls:
+                        f0 = (calls[0].get("files") or [{}])[0]
+                        check("share 嘅 File 名係 gymbro_foodlog_<date>.pdf",
+                              str(f0.get("name", "")).startswith("gymbro_foodlog_")
+                              and str(f0.get("name", "")).endswith(".pdf"),
+                              str(f0.get("name")))
+                        check("share 嘅 File type 係 application/pdf",
+                              f0.get("type") == "application/pdf",
+                              str(f0.get("type")))
+                        check("share 嘅 File 有內容(唔係空檔)",
+                              (f0.get("size") or 0) > 1000, str(f0.get("size")))
+                except Exception as e:
+                    check("分享掣叫咗 navigator.share", False, str(e))
+
             close_btn = page.locator("[data-testid='food-card-close']").first
             cb_text = (close_btn.inner_text() or "").strip()
             check("右上角「✕ 關閉」仲喺度",
