@@ -203,3 +203,124 @@ def test_version_pins():
     web = _src(WEB)
     assert '__version__ = "3.3.62"' in web
     assert "gym-web-v166" in web
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. PDF 版面:文字唔准重疊(Jim OOB 2026-10-28「Some text in pdf is
+#    overlapping with each other.」)
+# ─────────────────────────────────────────────────────────────
+def _bbox_overlaps(pdf_path):
+    """用 pdftotext -bbox 逐頁比對 → 回傳重疊字組數 + 出界字組數。"""
+    import subprocess
+    import tempfile
+    xml = tempfile.mktemp(suffix=".xml")
+    try:
+        subprocess.run(["pdftotext", "-bbox", pdf_path, xml], check=True,
+                       capture_output=True)
+        with open(xml, encoding="utf-8") as f:
+            x = f.read()
+    finally:
+        if os.path.exists(xml):
+            os.unlink(xml)
+
+    import re
+    pages = re.findall(r'<page width="([\d.]+)" height="([\d.]+)">(.*?)</page>',
+                       x, re.S)
+
+    def ov(a, b):
+        ix = min(a[2], b[2]) - max(a[0], b[0])
+        iy = min(a[3], b[3]) - max(a[1], b[1])
+        if ix <= 0 or iy <= 0:
+            return 0
+        return (ix * iy) / min((a[2] - a[0]) * (a[3] - a[1]),
+                               (b[2] - b[0]) * (b[3] - b[1]))
+
+    bad = 0
+    oob = 0
+    for W, H, body in pages:
+        ws = []
+        for m in re.finditer(
+                r'<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" '
+                r'yMax="([\d.]+)">(.*?)</word>', body, re.S):
+            ws.append((float(m.group(1)), float(m.group(2)), float(m.group(3)),
+                       float(m.group(4)), m.group(5)))
+        for i in range(len(ws)):
+            for j in range(i + 1, len(ws)):
+                a, b = ws[i], ws[j]
+                if abs(a[1] - b[1]) > 12:
+                    continue
+                if ov(a, b) > 0.02:
+                    bad += 1
+        oob += sum(1 for w in ws if w[0] < -0.5 or w[1] < -0.5
+                   or w[2] > float(W) + 0.5 or w[3] > float(H) + 0.5)
+    return bad, oob, len(pages)
+
+
+def test_rendered_pdf_has_no_text_overlap():
+    """真正 render 一份 PDF(合成 data)→ 逐頁驗零重疊、零出界。
+
+    v3.3.62 捉到嘅兩個真 bug:
+      1. 餐別徽章(「晚餐」)壓住餐名開頭 —— 藥丸行同餐名字形縱向撞 8pt
+      2. 描述段落 wrap 闊度用錯(用右欄窄闊度)→ 行數比高度估算多
+         → 判詞撞落「佔全日熱量」bar
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pdf_report_under_test", os.path.join(ROOT, "gym_web", "pdf_report.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    meals = []
+    for i, (t, name, kcal) in enumerate([
+            ("08:30", "燕麥粥加藍莓", 320),
+            ("13:41", "三文魚刺身配紅洋蔥絲", 250),
+            ("13:42", "牛油果炒蛋碗", 330),
+            ("20:00", "腸粉", 450),
+            ("20:01", "鹹肉糭", 850),
+            ("20:02", "滑雞粥", 280),
+            ("21:10", "黑咖啡（無糖無奶）", 2)]):
+        meals.append({
+            "time": t, "name": name, "kcal": kcal, "p": 20, "c": 30, "f": 8,
+            "meal_type": "晚餐" if t >= "16:00" else "午餐",
+            "restaurant": "測試餐廳", "grade": "B",
+            "description": ("呢碟嘢睇落有一層油光，份量屬於細碟，"
+                            "顏色偏黃，應該用咗少少油。"),
+            "verdict": ("呢餐有唔少蛋白質，不過份量可能唔夠，"
+                        "建議下一餐加多一碟菜。"),
+        })
+    totals = {"kcal": sum(m["kcal"] for m in meals), "P": 140, "C": 210, "F": 56}
+    data = mod.render_nutrition_pdf("2026-10-28", meals, totals,
+                                    {"generated_at": "2026-10-28 12:00 HKT"})
+    assert data[:4] == b"%PDF", "應該係真 PDF"
+    tmp = os.path.join("/home/work/.hermes/cache/scratch",
+                       "qa_pdf_layout_test.pdf")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    bad, oob, pages = _bbox_overlaps(tmp)
+    assert bad == 0, f"PDF 有 {bad} 組文字重疊"
+    assert oob == 0, f"PDF 有 {oob} 個字組出界"
+    assert pages >= 2, f"頁數太少: {pages}"
+
+
+def test_timeline_labels_staggered():
+    """同一時間(或差 1 分鐘)嘅多餐 → 時間線標籤唔可以疊埋一齊。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pdf_report_under_test2", os.path.join(ROOT, "gym_web", "pdf_report.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    src = _src(os.path.join(ROOT, "gym_web", "pdf_report.py"))
+    # 一定要用「標籤實際 x 範圍」做碰撞(唔係圓點位置)
+    assert "placed = []" in src
+    assert "stringWidth(lbl, font, 7.5)" in src
+    assert "left = cx - lw / 2.0" in src
+    assert "right = cx + lw / 2.0" in src
+
+
+def test_meal_card_height_matches_draw():
+    """高度函數同繪製函數一定要用同一個段落寬度。"""
+    src = _src(os.path.join(ROOT, "gym_web", "pdf_report.py"))
+    assert src.count("para_w = CONTENT_W - 32") >= 2, \
+        "繪製同高度函數都要用同一個段落闊度"
+    # 唔准再用右欄窄闊度 wrap 段落
+    assert "font, tw - 0," not in src

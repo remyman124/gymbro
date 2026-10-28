@@ -396,6 +396,11 @@ def _cover_page(c, font, date_iso, meals, totals, meta):
     y -= 26
     tl_y = y
     _rrect(c, MARGIN, tl_y, CONTENT_W, 4, 2, fill=(0.22, 0.20, 0.34))
+    # v3.3.62:同一時間(或者時間好接近)有多餐 → 標籤會疊埋一齊。
+    # → 用「標籤實際佔據嘅 x 範圍」做碰撞偵測(唔係用圓點位置,圓點之間
+    #    可以只差 20pt 但標籤各佔 36pt → 一定重疊)。
+    from reportlab.pdfbase import pdfmetrics
+    placed = []          # [(x_left, x_right, row)]
     for m in meals:
         hh, mm = _hhmm(m.get("time", ""))
         frac = (hh * 60 + mm) / (24 * 60.0)
@@ -406,7 +411,15 @@ def _cover_page(c, font, date_iso, meals, totals, meta):
         c.setFillColorRGB(0.11, 0.10, 0.20)
         c.circle(cx, tl_y + 2, 2, stroke=0, fill=1)
         lbl = "%s %d" % (m.get("time", "")[:5], int(m.get("kcal", 0) or 0))
-        _draw(c, cx, tl_y + 12, lbl, 7.5, TEXT_DIM, font, align="c")
+        lw = pdfmetrics.stringWidth(lbl, font, 7.5)
+        left = cx - lw / 2.0
+        right = cx + lw / 2.0
+        row = 0
+        for (pl, pr, prow) in placed:
+            if not (right < pl - 2 or left > pr + 2):   # 真係有重疊
+                row = max(row, prow + 1)
+        placed.append((left, right, row))
+        _draw(c, cx, tl_y + 12 - row * 9, lbl, 7.5, TEXT_DIM, font, align="c")
 
     # footer
     _draw(c, MARGIN, 46, "gymbro · AI 視覺描述 + 私人教練判詞", 8.5,
@@ -426,22 +439,44 @@ def _hhmm(t: str):
 
 
 def _meal_card_height(meal, font):
-    """Estimate the card height (needed for page flow)."""
-    h = 96.0  # header + image block
+    """Estimate the card height (needed for page flow).
+
+    v3.3.62 重新編排過每張卡嘅垂直分帶(見 _draw_meal_card 嘅註解):
+      band 1 pills      [top-30, top-10]
+      band 2 圖+文字     圖 [top-106, top-30] · 名 top-46 · 副題 top-64 · 巨量 [top-88, top-70]
+      band 3 描述        標籤 top-112,段落由 top-126
+      band 4 判詞        緊接描述
+      band 5 佔全日熱量  bar [bot+12, bot+19]
+    呢個高度函數**必須同 _draw_meal_card 一致**,唔好淨係改一個。
+    """
+    h = 112.0  # band 1 + band 2 + 描述標籤
     desc = (meal.get("description") or "").strip()
     verdict = (meal.get("verdict") or "").strip()
+    para_w = CONTENT_W - 32        # ⚠️ 一定要同 _draw_meal_card 一致
     if desc:
-        lines = _wrap(desc, font, 9, CONTENT_W - 40, 6)
-        h += 16 + len(lines) * 13
+        lines = _wrap(desc, font, 9, para_w, 6)
+        h += 14 + len(lines) * 13 + 2
     if verdict:
-        lines = _wrap(verdict, font, 9.5, CONTENT_W - 40, 7)
-        h += 18 + len(lines) * 14
-    h += 26  # share bar
+        lines = _wrap(verdict, font, 9.5, para_w, 7)
+        h += 4 + 14 + len(lines) * 14 + 2
+    h += 18  # 判詞最後一行 ↔「佔全日熱量」bar 嘅距離 + 底部留白
     return h
 
 
 def _draw_meal_card(c, font, meal, y_top, totals_kcal):
-    """Draw one meal card. y_top = top edge. Returns the new y (bottom)."""
+    """Draw one meal card. y_top = top edge. Returns the new y (bottom).
+
+    v3.3.62 重新編排咗垂直分帶(修 Jim 報嘅「文字重疊」):
+      band 1  藥丸行     [top-30, top-10]  時間 + 餐別 + 評級
+      band 2  圖 + 文字   圖 [top-106, top-30] · 餐名 top-46 · 副題 top-64
+                            巨量丸 [top-88, top-70]
+      band 3  描述       標籤 top-112,段落由 top-126
+      band 4  判詞       緊接描述之下
+      band 5  佔全日熱量 bar [bot+12, bot+19]
+
+    ⚠️ 呢個函數同 `_meal_card_height()` **必須同步改**,唔好淨係改一個:
+    高度估細咗 → 下一張卡會蓋住上一張嘅判詞 / bar。
+    """
     desc = (meal.get("description") or "").strip()
     verdict = (meal.get("verdict") or "").strip()
     h = _meal_card_height(meal, font)
@@ -449,28 +484,29 @@ def _draw_meal_card(c, font, meal, y_top, totals_kcal):
     bot = y_top - h
     _rrect(c, MARGIN, bot, CONTENT_W, h, 12, fill=CARD_BG, stroke=BORDER)
 
-    # header row
-    hy = top - 24
-    _pill(c, MARGIN + 16, hy - 6, meal.get("time", "") or "--:--", 11,
-          TEXT, (0.22, 0.20, 0.34), font, pad=8, h=20)
+    # ── band 1:藥丸行(時間 / 餐別 / 評級)────────────────────
+    pill_y = top - 30          # 藥丸底
+    tw_pill = _pill(c, MARGIN + 16, pill_y, meal.get("time", "") or "--:--",
+                    11, TEXT, (0.22, 0.20, 0.34), font, pad=8, h=20)
     mtype = (meal.get("meal_type") or "").strip()
     if mtype:
-        _pill(c, MARGIN + 84, hy - 6, mtype, 9, TEXT_DIM, (0.20, 0.19, 0.30),
-              font, pad=7, h=20)
+        # 動態接喺時間藥丸後面(唔好固定 x → 會撞到餐名)
+        _pill(c, MARGIN + 16 + tw_pill + 8, pill_y, mtype, 9, TEXT_DIM,
+              (0.20, 0.19, 0.30), font, pad=7, h=20)
     grade = (meal.get("grade") or "").strip()
     if grade and grade != "—":
         gcol = GRADE_COLORS.get(grade, TEXT_DIM)
         from reportlab.pdfbase import pdfmetrics
         gw = pdfmetrics.stringWidth(grade, font, 13) + 16
-        _rrect(c, MARGIN + CONTENT_W - 16 - gw, hy - 9, gw, 26, 8, fill=gcol)
-        _draw(c, MARGIN + CONTENT_W - 16 - gw / 2.0, hy - 1, grade, 13,
+        _rrect(c, MARGIN + CONTENT_W - 16 - gw, pill_y, gw, 26, 8, fill=gcol)
+        _draw(c, MARGIN + CONTENT_W - 16 - gw / 2.0, pill_y + 7, grade, 13,
               (0.08, 0.07, 0.13), font, bold=True, align="c")
 
-    # image
-    img = meal.get("image_bytes")
+    # ── band 2:相 + 餐名 / 餐廳 / 巨量──────────────────────
     ix = MARGIN + 16
-    iy = top - 96
+    iy = top - 106
     iw = 76
+    img = meal.get("image_bytes")
     if img:
         try:
             from reportlab.lib.utils import ImageReader
@@ -485,39 +521,42 @@ def _draw_meal_card(c, font, meal, y_top, totals_kcal):
         _draw(c, ix + iw / 2.0, iy + iw / 2.0 - 4, "無圖", 10, TEXT_DIM, font,
               align="c")
 
-    # name / restaurant / macros
     tx = ix + iw + 14
     tw = MARGIN + CONTENT_W - 16 - tx
     name = (meal.get("name") or "").strip() or "未命名"
-    _draw(c, tx, top - 32, name, 13.5, TEXT, font, bold=True, max_w=tw)
+    _draw(c, tx, top - 46, name, 13.5, TEXT, font, bold=True, max_w=tw)
     sub = meal.get("restaurant") or ""
     kcal = int(round(meal.get("kcal", 0) or 0))
     sub_txt = ("%s · " % sub) if sub else ""
     sub_txt += "%d kcal" % kcal
-    _draw(c, tx, top - 50, sub_txt, 10, ACCENT, font, bold=True, max_w=tw)
+    _draw(c, tx, top - 64, sub_txt, 10, ACCENT, font, bold=True, max_w=tw)
     mx = tx
     for label, val, color in (("蛋白", meal.get("p", 0) or 0, PROTEIN),
                               ("碳水", meal.get("c", 0) or 0, CARBS),
                               ("脂肪", meal.get("f", 0) or 0, FAT)):
-        _rrect(c, mx, top - 74, 62, 18, 6, fill=(0.21, 0.19, 0.32))
+        _rrect(c, mx, top - 88, 62, 18, 6, fill=(0.21, 0.19, 0.32))
         c.setFillColorRGB(*color)
-        c.rect(mx + 4, top - 70, 3, 10, stroke=0, fill=1)
-        _draw(c, mx + 11, top - 68, "%s %.0f" % (label, val), 8.5, TEXT, font)
+        c.rect(mx + 4, top - 84, 3, 10, stroke=0, fill=1)
+        _draw(c, mx + 11, top - 82, "%s %.0f" % (label, val), 8.5, TEXT, font)
         mx += 66
 
-    # description
-    cy = top - 100
+    # ── band 3/4:描述 + 判詞───────────────────────────────
+    cy = top - 112
+    # ⚠️ v3.3.62:段落喺 MARGIN+16 開始、行足成卡闊 → wrap 闊度一定要用
+    #    CONTENT_W - 32。舊 code 用咗 `tw`(右欄相片旁嘅窄闊度)→
+    #    實際行數比 _meal_card_height() 估嘅多 → 判詞撞落「佔全日熱量」。
+    para_w = CONTENT_W - 32
     if desc:
         _draw(c, MARGIN + 16, cy, "描述", 9.5, ACCENT, font, bold=True)
-        cy = _para(c, MARGIN + 16, cy - 14, desc, 9, TEXT, font, tw - 0,
+        cy = _para(c, MARGIN + 16, cy - 14, desc, 9, TEXT, font, para_w,
                    leading=13, max_lines=6) - 2
     if verdict:
         cy -= 4
         _draw(c, MARGIN + 16, cy, "判詞", 9.5, WARN, font, bold=True)
         cy = _para(c, MARGIN + 16, cy - 14, verdict, 9.5, TEXT, font,
-                   CONTENT_W - 40, leading=14, max_lines=7) - 2
+                   para_w, leading=14, max_lines=7) - 2
 
-    # share of day
+    # ── band 5:佔全日熱量──────────────────────────────────
     total_k = totals_kcal or 1
     share = (meal.get("kcal", 0) or 0) / total_k * 100
     by = bot + 12
@@ -526,10 +565,6 @@ def _draw_meal_card(c, font, meal, y_top, totals_kcal):
 
     return bot
 
-
-# ---------------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------------
 
 def render_nutrition_pdf(date_iso: str, meals: list, totals: dict,
                          meta: dict | None = None) -> bytes:
