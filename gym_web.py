@@ -2816,6 +2816,27 @@ def _pdf_cache_invalidate(date_iso: str) -> None:
         pass
 
 
+def _meal_type_label(raw: str, time_str: str) -> str:
+    """Sheet 餐別欄對掃描 row 淨係得 "scan" → 用時間推返出嚟。"""
+    raw = (raw or "").strip()
+    if raw and raw.lower() not in ("scan", "scanned", "scan_food", "-"):
+        return raw
+    t = (time_str or "").strip()
+    try:
+        hh = int(t.split(":")[0])
+    except (ValueError, IndexError):
+        return "正餐"
+    if hh < 10:
+        return "早餐"
+    if hh < 14:
+        return "午餐"
+    if hh < 17:
+        return "下午茶"
+    if hh < 21:
+        return "晚餐"
+    return "宵夜"
+
+
 def _build_nutrition_meals(target_date: str):
     """Build the meal list for a date. Shared by the JPG card + the PDF.
 
@@ -2855,7 +2876,11 @@ def _build_nutrition_meals(target_date: str):
                 "time": getattr(r, "time", "") or "",
                 "name": getattr(r, "name", "") or "",
                 "meal_name": getattr(r, "name", "") or "",
-                "meal_type": getattr(r, "meal", "") or "",
+                # Sheet 嘅「餐別」欄對掃描出嚟嘅 row 一律係 "scan"
+                # → 用時間推返出嚟(早餐/午餐/下午茶/晚餐/宵夜)，
+                #   PDF 睇落先有營養師咁嘅感覺
+                "meal_type": _meal_type_label(getattr(r, "meal", "") or "",
+                                             getattr(r, "time", "") or ""),
                 "restaurant": getattr(r, "restaurant", "") or "",
                 "restaurant_chain": getattr(r, "restaurant", "") or "",
                 "calories": getattr(r, "kcal", 0) or 0,
