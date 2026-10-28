@@ -463,6 +463,40 @@ def scan_img(row_index: int) -> Response:
     return resp
 
 
+def thumb_bytes(row_index: int) -> Optional[bytes]:
+    """Same as scan_thumb() but returns raw JPEG bytes and needs NO request
+    context.
+
+    v3.3.62 (2026-10-28): `scan_thumb()` 讀 `request.args`(v3.3.38 內容定址)
+    → 喺 ThreadPoolExecutor worker thread 入面行會 raise
+    "Working outside of request context" → PDF 嘅相片全部畫唔到。
+    `copy_current_request_context` 都救唔到(Flask 3 contextvar 跨 Context)。
+
+    呢個版本淨係做「攞 bytes」,唔掂 request → 邊度都行得。
+    """
+    drive_url = _resolve_drive_url(row_index)
+    if not drive_url:
+        return None
+    cached = _thumb_cache.get(row_index)
+    if cached is not None and _thumb_src_get(row_index) == drive_url:
+        return cached
+    if _drive_file_trashed(drive_url) is True:
+        log.info("thumb_bytes row=%s: drive file trashed — skip", row_index)
+        return None
+    try:
+        raw = _DRIVE_FETCH_POOL.submit(_fetch_drive_bytes, drive_url).result(timeout=8)
+        thumb = _make_thumbnail(raw)
+    except concurrent.futures.TimeoutError:
+        log.warning("drive fetch timeout (thumb_bytes) row=%s", row_index)
+        return None
+    except Exception as e:
+        log.warning("drive fetch failed (thumb_bytes) row=%s: %s", row_index, e)
+        return None
+    _thumb_cache.put(row_index, thumb)
+    _thumb_src_put(row_index, drive_url)
+    return thumb
+
+
 @bp.route("/scan_thumb/<int:row_index>")
 def scan_thumb(row_index: int) -> Response:
     # v3.3.36: 先解 Drive URL,再決定用唔用 cache —— 同一個 row_index 嘅

@@ -1189,7 +1189,7 @@
               <button @click="showFoodCardPreview(group.date)"
                       class="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-bold transition-all active:scale-95"
                       style="background: linear-gradient(135deg, rgba(251,191,36,0.20), rgba(251,191,36,0.08)); border: 1px solid rgba(251,191,36,0.50); color: rgb(251,191,36);"
-                      title="預覽 + 下載當日食物日結 JPG">
+                      title="預覽 + 下載當日食物日結 PDF">
                 <span>📸</span><span>下載日結</span>
               </button>
             </div>
@@ -1476,174 +1476,6 @@
                iOS PWA blob URL issues).
            (5) Replaced single x-show chain with explicit onerror handler
                so if image fails, we surface the error immediately. -->
-    <div x-show="foodCardPreview.visible"
-         class="fixed inset-0 flex items-center justify-center p-4"
-         style="z-index: 10000; background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(6px);"
-         @click.self="closeFoodCardPreview()"
-         @keydown.escape.window="closeFoodCardPreview()">
-      <!-- v3.3.58 (2026-10-27, Jim OOB「My screen height is very short.
-           Can't see the download buttons」):
-
-           **舊做法有真 bug**:`max-h-[90dvh]` + preview 區寫死
-           `max-height: calc(90dvh - 56px - 76px)` —— 個 76px 係假設
-           footer 只有一行。但實際 footer 有「檔案細啲」toggle + 下載掣
-           ≈ 114px(加埋 chip row 更到 ~166px)。
-           → 短屏(iPhone SE 667pt)時:56 + preview + 114 > 90dvh(600)
-           → modal 撞上限、`overflow:hidden` → **下載掣被裁走**,Jim 撳唔到。
-
-           **正確做法**:modal 用**確定高度** `h-[90dvh]`,preview 用
-           `flex-1 min-h-0`(可以縮細)→ flexbox 自動將剩餘空間分俾
-           preview,footer 永遠完整可見。圖用 `object-fit: contain` +
-           `max-height:100%` → 高度唔夠就等比縮細,唔會爆。
-           (`max-h-[90dvh]` 唔夠 —— auto 高度嘅 flex container 冇
-           「剩餘空間」可以分配,preview 會 collapse 成 0 高。) -->
-      <div class="w-full max-w-md h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
-           style="background: linear-gradient(180deg, rgb(28, 25, 46) 0%, rgb(12, 10, 24) 100%); border: 1.5px solid rgba(251, 191, 36, 0.45); box-shadow: 0 0 40px rgba(251, 191, 36, 0.18);">
-        <!-- Header (fixed alignment via inline-block + line-height) -->
-        <div class="flex items-center justify-between px-4 flex-shrink-0"
-             style="height: 56px; background: rgba(251, 191, 36, 0.08); border-bottom: 1px solid rgba(251, 191, 36, 0.25);">
-          <div style="line-height: 1.2;">
-            <div class="text-sm font-black" style="color: rgb(251, 191, 36); letter-spacing: 0.02em;">📸 食物日結</div>
-            <div class="text-[10px] text-gray-400"
-                 x-text="`${foodCardPreview.date || ''} · ${foodCardPreview.sizeKb} KB`"></div>
-          </div>
-          <!-- v3.3.61 (Jim OOB「Problem when finish download. No way to go
-               back. Should there be a close button?」):
-               細 ✕ 圈改成**有文字**嘅「✕ 關閉」掣 —— 唔加高度(喺 header
-               最上面,短屏都必見到),但一眼就睇得出可以返回。 -->
-          <button @click="closeFoodCardPreview()"
-                  class="flex items-center gap-1 rounded-full active:scale-95"
-                  style="padding: 0 12px; height: 34px; line-height: 1; background: rgba(255, 255, 255, 0.14); font-size: 13px; font-weight: 700; color: rgb(240, 240, 245); flex-shrink: 0;"
-                  aria-label="關閉食物日結"
-                  data-testid="food-card-close">
-            <span style="font-size: 16px; line-height: 1;">✕</span><span>關閉</span>
-          </button>
-        </div>
-        <!-- v3.3.59 (2026-10-27, Jim OOB「Still too long. ... such that I can
-             see the button download button」):
-
-             **下載掣由 modal 底部搬到 header 正下面。**
-             量測發現:喺 375x667 / 320x568 呢啲 viewport,掣嘅 bottom
-             (621 / 527)其實**喺 viewport 之內** —— 即係話 Jim 實際部機嘅
-             可見 app 視窗比 Playwright 嘅 viewport 更矮(iOS Safari 底條 /
-             home indicator / Slide Over 都會食高度)。
-             → 掣擺喺底部就**唔保證**見到;擺喺最上面就**保證**見到。
-
-             順帶:preview 變成最後一個 flex item(`flex-1 min-h-0`),
-             圖嘅 `object-fit:contain` + `max-height:100%` 會**自動縮細**
-             去填滿剩餘空間 —— 所以「太長」嘅問題自動消失,唔使再靠改餐數。 -->
-        <div class="px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); color: rgb(180, 180, 195);">
-          逐頁下載 ——
-          <span class="font-normal text-gray-400"
-                x-text="`全部 ${foodCardPreview.pageTotal || 1} 頁,撳一個落一張(唔會一次過落晒)`"></span>
-        </div>
-        <div class="px-4 pb-2 flex flex-wrap gap-2 flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
-          <template x-for="pn in (foodCardPreview.pageTotal || 1)" :key="'dl' + pn">
-            <!-- v3.3.60 (Jim OOB「The download buttons. Can they trigger
-                 download immediately?」):
-                 由 `<button>` + JS(fetch→blob→objectURL→click)改成**直接
-                 `<a href>`**。server 本身已經送 `Content-Disposition:
-                 attachment` → 瀏覽器直接落檔,零 JS、零 blob、零多餘 round trip。
-                 撳落去即刻開始下載(唔再要等 fetch + blob convert)。 -->
-            <!-- ⚠️ 唔好加 target="_blank":iOS 會開一個新分頁蓋住個 App,
-                 落完檔之後用戶就返唔到 PWA(Jim OOB「Problem when finish
-                 download. No way to go back」)。同一分頁落檔 + server 送
-                 Content-Disposition: attachment → 瀏覽器根本唔會 navigate,
-                 App 一直喺度。 -->
-            <a :href="foodCardPageUrl(pn)"
-               :download="foodCardFileName(pn)"
-               @click="onFoodCardDownloadClick(pn)"
-               :style="foodCardDlStyle(pn)"
-               class="rounded-xl text-sm font-bold transition-all active:scale-95 text-center no-underline block">
-              <span x-show="(foodCardPreview.pageTotal || 1) <= 1">⬇ 下載 JPG</span>
-              <span x-show="(foodCardPreview.pageTotal || 1) > 1" x-text="'⬇ 第 ' + pn + ' 頁'"></span>
-            </a>
-          </template>
-        </div>
-        <!-- v3.3.59:頁碼導航同樣搬上來(原本喺 modal 最底,短屏會被視窗切走)。
-             目標:**所有操作掣都喺上半部**,圖喺下面自動縮細。 -->
-        <!-- v3.3.23ax: page navigation (only shown for multi-page days) -->
-        <div x-show="foodCardPreview.pageTotal > 1"
-             class="flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0"
-             style="background: rgba(28, 25, 46, 0.95); border-top: 1px solid rgba(255, 255, 255, 0.08);">
-          <button @click="switchFoodCardPage(-1)"
-                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum <= 1"
-                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
-                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
-            ‹ 上一頁
-          </button>
-          <div class="text-xs text-gray-300"
-               x-text="`第 ${foodCardPreview.pageNum} / ${foodCardPreview.pageTotal} 頁`"></div>
-          <button @click="switchFoodCardPage(1)"
-                  :disabled="foodCardPreview.loading || foodCardPreview.pageNum >= foodCardPreview.pageTotal"
-                  class="rounded-lg text-xs font-bold transition-all active:scale-95 disabled:opacity-30"
-                  style="padding: 8px 14px; background: rgba(255, 255, 255, 0.08); color: rgb(240, 240, 245);">
-            下一頁 ›
-          </button>
-        </div>
-        <!-- JPG preview (v3.3.23q: max-height + object-fit contain
-             so the JPG scales down to fit modal — no more button overlap) -->
-        <!-- v3.3.58:min-h-0 令 preview 可以喺 footer 變高時縮細;
-             拎走舊嘅 `max-height: calc(90dvh - 56px - 76px)`
-             (個 76px 係錯嘅假設,短屏就係因此裁走下載掣)。 -->
-        <div class="flex-1 min-h-0 overflow-y-auto"
-             style="background: rgba(0, 0, 0, 0.4);">
-          <!-- Loading spinner -->
-          <div x-show="foodCardPreview.loading"
-               class="flex flex-col items-center justify-center"
-               style="min-height: 240px; padding: 48px 0;">
-            <div style="font-size: 36px; margin-bottom: 12px; animation: spin 1.2s linear infinite; display: inline-block;">⏳</div>
-            <div class="text-xs text-gray-300">生成緊食物日結 JPG...</div>
-          </div>
-          <!-- Image preview — server-side URL. v3.3.23q: object-fit:contain
-               so JPG shrinks to fit, never overflows the modal. -->
-          <img x-show="!foodCardPreview.loading && foodCardPreview.url"
-               :src="foodCardPreview.url"
-               :alt="foodCardPreview.fileName"
-               @error="if (foodCardPreview.date) foodCardPreview.fallbackUrl = '/nutrition_card/nutrition_' + foodCardPreview.date + (foodCardPreview.compact ? '_compact' : '') + _cardPpSuffix(foodCardPreview.perPage) + '.jpg?v=2'"
-               @load="foodCardPreview.imageLoaded = true"
-               style="display: block; width: 100%; max-width: 100%; height: auto; max-height: 100%; object-fit: contain; background: rgba(0, 0, 0, 0.6); padding: 12px; box-sizing: border-box; -webkit-appearance: none; appearance: none;" />
-          <!-- Fallback (v3.3.23g): alternate server URL with cache-buster -->
-          <img x-show="!foodCardPreview.loading && foodCardPreview.fallbackUrl && !foodCardPreview.imageLoaded"
-               :src="foodCardPreview.fallbackUrl"
-               :alt="foodCardPreview.fileName + ' (fallback)'"
-               style="display: block; width: 100%; max-width: 100%; height: auto; min-height: 200px; background: rgba(0, 0, 0, 0.6); padding: 12px; box-sizing: border-box; -webkit-appearance: none; appearance: none;" />
-          <!-- Error fallback (shouldn't happen given showFoodCardPreview
-               closes the modal on error) -->
-          <div x-show="!foodCardPreview.loading && !foodCardPreview.url"
-               class="text-center text-xs text-red-300"
-               style="padding: 32px 0;">
-            ❌ JPG 唔見咗 — 撳「關閉」再試過
-          </div>
-        </div>
-        <!-- v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」):
-             「每頁餐數」選擇器(6/4/3 chip)已移除 —— 每頁固定 **5 餐**
-             (v3.3.57 嘅「Make it 5 meals max per screen」)。
-             順帶慳返 ~52pt 嘅 footer 高度,短屏終於見到下載掣。
-
-             v3.3.55 嘅洞察仍然成立(留低做參考):
-             等比縮細(1080x1736 → 796x1280)比例一樣(1.607)→ 喺 iPhone
-             上面一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。真正令圖
-             變短嘅係改**比例**(即係每頁少啲餐),唔係縮細。
-
-        <!-- v3.3.59:「檔案細啲(高度 ≤ 1280px)」toggle row 已移除
-             (Jim OOB「Remove the toggle row ... such that I can see the
-             button download button」)—— 佢喺 modal 底部佔咗 ~42pt,
-             而且喺真機短屏會將下載掣推落視窗外。
-             後端 `?compact=1` 仍然支援(舊 URL 唔會壞),只係唔再有 UI 開關。 -->
-
-        <!-- v3.3.54 (2026-10-27, Jim OOB「Don't download multiple image at the
-             same time. Show multiple download button to download. Remove
-             second button」):
-             ① 之前一個「⬇ 下載全部 N 頁」掣 → 一次過發 N 個 download。
-                iOS Safari 會當成「多檔下載」(要逐個撳「允許」),而且撞
-                瀏覽器同時下載限制 → 改為**每頁一個掣,撳一個只落一張**。
-             ② 第二個「✕ 關閉」掣已移除 —— 右上角 ✕ / Esc / 點背景一樣
-                可以閂 modal,唔需要喺 footer 佔位。 -->
-      </div>
-    </div>
 
 
     <!-- END TAB -->
@@ -2623,8 +2455,8 @@ function gymApp() {
     foodCardPreview: {
       visible: false,
       date: null,
-      url: '',         // blob: URL of generated JPG
-      fileName: '',    // gymbro_foodlog_YYYY-MM-DD.jpg
+      url: '',         // blob: URL of generated JPG(legacy)
+      fileName: '',    // gymbro_foodlog_YYYY-MM-DD.pdf
       sizeKb: 0,
       loading: false,
       // v3.3.54: 下載中鎖(防連撳造成重複下載)
@@ -2639,6 +2471,16 @@ function gymApp() {
       // which is a regular HTTP URL and works reliably everywhere.
       fallbackUrl: '',
       imageLoaded: false,
+      // ── v3.3.62:營養日結改成 PDF ─────────────────────────────
+      pdfReady: false,        // PDF 已經生成好(可以即落)
+      pdfMealCount: 0,       // 當日餐數
+      pdfPages: 1,            // 預計頁數
+      pdfSizeKb: 0,          // 檔案大小
+      pdfHint: '',            // 掣下面嘅一行提示
+      pdfPreviewUrl: '',      // PDF 第 1 頁 PNG
+      pdfTotals: { kcal: 0, P: 0, C: 0, F: 0 },
+      aiDescRows: 0,         // 有 AI 視覺描述嘅餐數
+      aiVerdictRows: 0,      // 有教練判詞嘅餐數
     },
     scanTextUploading: false,  // prevent double-tap on AI estimate
     scanTextPreview: null,     // last preview object (same shape as image preview)
@@ -5932,134 +5774,97 @@ function gymApp() {
       this.foodCardPreview.visible = wasVisible;
     },
 
+    // v3.3.62 (Jim OOB 2026-10-27「As we use pdf. Just one click download
+    // pdf and allow me to close the share such that I can be back to gymbro
+    // interface after download.」):
+    // 營養日結由「逐頁 JPG」改成「**單一 PDF**」。
+    // PDF 頁面流動 → 唔使 5 餐上限,而且每餐寫得落 AI 視覺描述 + 教練判詞。
     async showFoodCardPreview(date) {
       if (!date) return;
-      // v3.3.55: 收埋 PWA install banner。
-      // 佢係 position:fixed; bottom:80px; z-index:9999 → 會蓋住 modal
-      // 底部嗰行(每頁餐數 chip + 檔案細啲 toggle + ⬇ 下載掣)。
-      // modal 本身已經改成 z-index:10000 高過佢,但個 banner 仲會
-      // 喺半透明 overlay 底下若隱若現 → 索性收埋。
+      // v3.3.55: 收埋 PWA install banner(佢 z-index 9998 會攔截 modal 撳擊)
       try {
         const _pb = document.getElementById('pwa-install-banner');
         if (_pb) _pb.remove();
       } catch (e) { /* noop */ }
-      // v3.3.23ax (Jim OOB 2026-10-07 'The download jpg cannot view all
-      // record. Make it multiple jpg if overflow'): query /card_url
-      // first to detect whether the day spans multiple pages. If so,
-      // show the first page + a page indicator, and let user download
-      // each page separately. For single-page days, behavior is
-      // unchanged.
-      const fileName = `gymbro_foodlog_${date}.jpg`;
-      // v3.3.53: 保留目前嘅矮身版 toggle 狀態(撳完「關閉」再開都記得)
-      const _keepCompact = this.foodCardPreview.compact === true;
-      // v3.3.55: 保留每頁餐數選擇
-      const _keepPP = this.foodCardPreview.perPage || 5;
       this.foodCardPreview = {
-        visible: true, date, url: '', fileName,
+        visible: true, date,
+        url: '', fileName: `gymbro_foodlog_${date}.pdf`,
         sizeKb: 0, loading: true, downloading: false,
         fallbackUrl: '', imageLoaded: false,
         pageNum: 1, pageTotal: 1, pages: [],
-        compact: _keepCompact, perPage: _keepPP,
+        compact: false, perPage: 5,
+        pdfReady: false, pdfMealCount: 0, pdfPages: 1, pdfSizeKb: 0,
+        pdfHint: '準備緊…', pdfPreviewUrl: '',
+        pdfTotals: { kcal: 0, P: 0, C: 0, F: 0 },
+        aiDescRows: 0, aiVerdictRows: 0,
       };
-      try {
-        // First check page count
-        // v3.3.55: 每頁餐數 → 兩個 endpoint 要用同一個值
-        const _pp = _keepPP || 6;
-        const _ppQ = `&per_page=${_pp}`;
-        const meta = await fetch(`/api/nutrition/card_url?date=${encodeURIComponent(date)}${_ppQ}`, {
-          cache: 'no-store',
-        });
-        const metaData = meta.ok ? await meta.json() : { page_total: 1, pages: [] };
-        const pageTotal = metaData.page_total || 1;
-        const pages = metaData.pages || [];
+      await this.refreshFoodCardPdfInfo(true);
+    },
 
-        // Fetch page 1 (or the only page) for preview
-        // v3.3.53: 矮身版 → &compact=1(高度 ≤ 1280px,iPhone 友好)
-        const _cq = _keepCompact ? '&compact=1' : '';
-        const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(date)}&page=1${_ppQ}${_cq}`, {
-          headers: { 'Accept': 'image/jpeg' },
+    // 查 PDF 狀態;未 ready 就叫 server 背景生成,再輪詢
+    async refreshFoodCardPdfInfo(warm = false) {
+      const date = this.foodCardPreview.date;
+      if (!date) return;
+      try {
+        const r = await fetch(`/api/nutrition/pdf_info?date=${encodeURIComponent(date)}`, {
           cache: 'no-store',
         });
-        if (!r.ok) {
-          this.flash('生成失敗：' + r.status);
-          this.closeFoodCardPreview();
-          return;
-        }
-        const blob = await r.blob();
-        if ((r.headers.get('Content-Type') || 'image/jpeg').indexOf('html') !== -1) {
-          this.flash('Server returned HTML instead of JPG — check endpoint');
-          this.closeFoodCardPreview();
-          return;
-        }
-        const cacheBuster = Date.now();
-        // v3.3.23ax: URL pattern depends on page count
-        // single page: nutrition_{date}.jpg (legacy compat)
-        // multi page: nutrition_{date}_p1.jpg
-        // v3.3.53: 矮身版嘅 server 檔名多一個 _compact
-        const _cSfx = _keepCompact ? '_compact' : '';
-        // v3.3.55: 檔名要同 server 一致(加 _pp<N>)
-        const _ppSfx = this._cardPpSuffix(_pp);
-        const page1File = pageTotal > 1
-          ? `nutrition_${date}${_cSfx}${_ppSfx}_p1.jpg`
-          : `nutrition_${date}${_cSfx}${_ppSfx}.jpg`;
-        const serverUrl = `/nutrition_card/${page1File}?t=${cacheBuster}`;
-        this.foodCardPreview = {
-          visible: true, date, url: serverUrl, fileName,
-          sizeKb: Math.round(blob.size / 1024),
-          loading: false, downloading: false,
-          fallbackUrl: '', imageLoaded: false,
-          pageNum: 1, pageTotal, pages,
-          compact: _keepCompact, perPage: _pp,
-        };
-        // v3.3.60:預熱所有頁 —— 令 server 早就 render 好 + 記入 cache,
-        // 撳下載掣就係 pure cache hit(唔使等 PIL render)。
-        this.prewarmFoodCardPages();
-        if (pageTotal > 1) {
-          // v3.3.54: 冇咗「下載全部」掣 → 提示改成「逐頁下載」
-          this.flash(`✓ ${pageTotal} 頁 (${this.foodCardPreview.sizeKb} KB 第 1 頁) · 下面逐頁下載`);
+        const d = r.ok ? await r.json() : {};
+        this.foodCardPreview.pdfMealCount = d.meal_count || 0;
+        this.foodCardPreview.pdfPages = d.est_pages || 1;
+        this.foodCardPreview.pdfSizeKb = d.size_kb || 0;
+        this.foodCardPreview.pdfTotals = d.totals || { kcal: 0, P: 0, C: 0, F: 0 };
+        this.foodCardPreview.aiDescRows = d.ai_description_rows || 0;
+        this.foodCardPreview.aiVerdictRows = d.ai_verdict_rows || 0;
+        const ready = !!d.ready;
+        this.foodCardPreview.pdfReady = ready;
+        this.foodCardPreview.loading = false;
+        if (ready) {
+          this.foodCardPreview.pdfPreviewUrl =
+            `/nutrition_pdf/gymbro_foodlog_${date}_p1.png?t=${Date.now()}`;
+          this.foodCardPreview.pdfHint =
+            `${d.size_kb} KB · ${d.meal_count} 餐 · 撳上面個掣落檔`;
         } else {
-          this.flash(`✓ JPG ready — ${this.foodCardPreview.sizeKb} KB · 撳「下載」或「關閉」`);
+          this.foodCardPreview.pdfPreviewUrl = '';
+          this.foodCardPreview.pdfHint =
+            '第一次生成要用 AI 分析(約 20 秒),之後就即落';
+          if (warm) {
+            try {
+              await fetch(`/api/nutrition/pdf?date=${encodeURIComponent(date)}&warm=1`,
+                          { cache: 'no-store' });
+            } catch (e) { /* 預熱失敗唔阻手 */ }
+            clearTimeout(this._pdfPollTimer);
+            this._pdfPollTimer = setTimeout(() => this.refreshFoodCardPdfInfo(false), 6000);
+          }
         }
       } catch (e) {
-        this.flash('生成失敗：' + e.message);
-        this.closeFoodCardPreview();
+        this.foodCardPreview.loading = false;
+        this.foodCardPreview.pdfHint = '取唔到 PDF 狀態: ' + e.message;
       }
+    },
+
+    // 直接下載 URL(server 送 Content-Disposition: attachment → 瀏覽器即刻落檔)
+    foodCardPdfUrl() {
+      const date = this.foodCardPreview.date;
+      if (!date) return '#';
+      return `/api/nutrition/pdf?date=${encodeURIComponent(date)}`;
+    },
+
+    foodCardPdfFileName() {
+      const date = this.foodCardPreview.date;
+      return date ? `gymbro_foodlog_${date}.pdf` : 'gymbro_foodlog.pdf';
+    },
+
+    // v3.3.62:落完自動閂 modal → Jim 撳「關閉」iOS share sheet 就直接返主介面
+    onFoodCardPdfDownload() {
+      try { this.haptic(12); } catch (e) {}
+      this.flash('⬇ 下載緊 ' + this.foodCardPdfFileName() +
+                 ' · 落完撳右上角「關閉」返去', 3000);
+      clearTimeout(this._pdfCloseTimer);
+      this._pdfCloseTimer = setTimeout(() => this.closeFoodCardPreview(), 900);
     },
 
     // v3.3.23ax: navigate between pages in multi-page preview
-    async switchFoodCardPage(delta) {
-      const p = this.foodCardPreview;
-      if (!p || p.pageTotal <= 1) return;
-      const newPage = (p.pageNum || 1) + delta;
-      if (newPage < 1 || newPage > p.pageTotal) return;
-      p.loading = true;
-      p.imageLoaded = false;
-      // v3.3.54: 矮身版切頁都要帶 compact,否則會跳返原尺寸
-      // v3.3.55: 切頁都要帶 per_page(每頁餐數)
-      const _cq = p.compact === true ? '&compact=1' : '';
-      const _cSfx = p.compact === true ? '_compact' : '';
-      const _pp = p.perPage || 5;
-      const _ppSfx = this._cardPpSuffix(_pp);
-      try {
-        const r = await fetch(`/api/nutrition/card?date=${encodeURIComponent(p.date)}&page=${newPage}&per_page=${_pp}${_cq}`, {
-          headers: { 'Accept': 'image/jpeg' },
-          cache: 'no-store',
-        });
-        if (!r.ok) return;
-        const blob = await r.blob();
-        const cacheBuster = Date.now();
-        const fname = `nutrition_${p.date}${_cSfx}${_ppSfx}_p${newPage}.jpg`;
-        p.url = `/nutrition_card/${fname}?t=${cacheBuster}`;
-        p.sizeKb = Math.round(blob.size / 1024);
-        p.pageNum = newPage;
-        p.fileName = `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${newPage}.jpg`;
-        p.loading = false;
-      } catch (e) {
-        this.flash('切頁失敗：' + e.message);
-        p.loading = false;
-      }
-    },
-
     // v3.3.54 (Jim OOB「Don't download multiple image at the same time.
     // Show multiple download button to download. Remove second button」):
     // 一次只下載**一頁**。
@@ -6068,68 +5873,11 @@ function gymApp() {
     // 「允許」,而且撞瀏覽器同時下載限制。所以改成每頁一個掣,
     // 撳邊個掣就只落嗰一頁。
     // v3.3.60:直接下載 URL(server 會送 Content-Disposition: attachment)
-    foodCardPageUrl(pn) {
-      const p = this.foodCardPreview;
-      if (!p || !p.date) return '#';
-      const total = p.pageTotal || 1;
-      const t = Math.min(Math.max(parseInt(pn, 10) || 1, 1), total);
-      const _pp = p.perPage || 5;
-      const _cq = p.compact === true ? '&compact=1' : '';
-      return `/api/nutrition/card?date=${encodeURIComponent(p.date)}&page=${t}&per_page=${_pp}${_cq}`;
-    },
-
     // v3.3.60:下載檔名(要同 server 嘅 Content-Disposition 一致)
-    foodCardFileName(pn) {
-      const p = this.foodCardPreview;
-      if (!p || !p.date) return '';
-      const total = p.pageTotal || 1;
-      const t = Math.min(Math.max(parseInt(pn, 10) || 1, 1), total);
-      const _ppSfx = this._cardPpSuffix(p.perPage || 5);
-      const _cSfx = p.compact === true ? '_compact' : '';
-      return total > 1
-        ? `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${t}.jpg`
-        : `gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg`;
-    },
-
     // v3.3.60:撳落去即刻提示(下載本身由 <a href> 觸發,唔經 JS)
-    onFoodCardDownloadClick(pn) {
-      try { this.haptic(12); } catch (e) {}
-      this.flash('⬇ 下載緊 ' + this.foodCardFileName(pn) + ' · 落完可以撳右上角「關閉」', 3000);
-    },
-
     // v3.3.60:預熱所有頁 —— 令 server 早就 render 好 + 記入 cache,
     // 撳下載掣就係 pure cache hit(server 端 10ms,唔使等 PIL render)。
-    prewarmFoodCardPages() {
-      const p = this.foodCardPreview;
-      if (!p || !p.date) return;
-      const total = p.pageTotal || 1;
-      for (let n = 1; n <= total; n++) {
-        try {
-          fetch(this.foodCardPageUrl(n), {
-            headers: { 'Accept': 'image/jpeg' },
-            cache: 'force-cache',
-          }).catch(() => {});
-        } catch (e) { /* 預熱失敗唔影響下載 */ }
-      }
-    },
-
     // v3.3.54: 每頁下載掣嘅樣式(目前頁高亮,單頁日就係一個闊掣)
-    foodCardDlStyle(pn) {
-      const total = this.foodCardPreview.pageTotal || 1;
-      if (total <= 1) {
-        return 'flex: 1 1 100%; padding: 14px 0; line-height: 1.2;'
-          + 'background: linear-gradient(135deg, rgba(251,191,36,0.45), rgba(251,191,36,0.20));'
-          + 'border: 1.5px solid rgba(251,191,36,0.55); color: rgb(28,25,46);';
-      }
-      const active = this.foodCardPreview.pageNum === pn;
-      return 'flex: 1 1 0; min-width: 92px; padding: 14px 8px; line-height: 1.2;'
-        + (active
-          ? 'background: linear-gradient(135deg, rgba(251,191,36,0.55), rgba(251,191,36,0.30));'
-            + 'border: 1.5px solid rgba(251,191,36,0.85); color: rgb(28,25,46);'
-          : 'background: rgba(255,255,255,0.10);'
-            + 'border: 1.5px solid rgba(251,191,36,0.30); color: rgb(251,191,36);');
-    },
-
     // v3.3.23b: close the modal and release the blob URL. User is back
     // in the main PWA UI (no browser navigation involved, so no stuck
     // blank page).
@@ -6137,6 +5885,9 @@ function gymApp() {
       if (this.foodCardPreview.url) {
         try { URL.revokeObjectURL(this.foodCardPreview.url); } catch (e) {}
       }
+      // v3.3.62:清埋 PDF 輪詢 / 自動閂嘅 timer(唔好留 orphan timer)
+      clearTimeout(this._pdfPollTimer);
+      clearTimeout(this._pdfCloseTimer);
       this.foodCardPreview = {
         visible: false, date: null, url: '', fileName: '',
         sizeKb: 0, loading: false, downloading: false,
@@ -6145,6 +5896,11 @@ function gymApp() {
         compact: this.foodCardPreview.compact === true,
         // v3.3.55: 保留每頁餐數選擇
         perPage: this.foodCardPreview.perPage || 5,
+        // v3.3.62: PDF state
+        pdfReady: false, pdfMealCount: 0, pdfPages: 1, pdfSizeKb: 0,
+        pdfHint: '', pdfPreviewUrl: '',
+        pdfTotals: { kcal: 0, P: 0, C: 0, F: 0 },
+        aiDescRows: 0, aiVerdictRows: 0,
       };
     },
 
@@ -7157,5 +6913,174 @@ setTimeout(checkLandscapeFood, 500);
 <!-- SCAN TAB (v2.1 — MiniMax M3 vision + pplx enrichment) -->
 </div>
 
+
+  <!-- v3.3.62 (Jim OOB 2026-10-27「allow me to close the share such that I
+       can be back to gymbro interface after download.」):
+
+       **營養日結 modal 由 <main> 入面搬到 <body> 直接子元素。**
+       原因:<main> 係 `position: relative; z-index: 1` → 會**建立
+       stacking context**,modal 個 `z-index: 10000` 只喺 main 內部有效,
+       根層嘅 app <header>(sticky top-0 z-50)反而蓋喺 modal 上面 →
+       右上角「✕ 關閉」掣撳唔到(Playwright elementFromPoint 實測攔截)。
+       搬去 <body> 直接子元素 → z-10000 喺根 stacking context 生效,
+       一定蓋過 header。 -->
+      <div x-show="foodCardPreview.visible"
+           class="fixed inset-0 flex items-center justify-center p-4"
+           style="z-index: 10000; background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(6px);"
+           @click.self="closeFoodCardPreview()"
+           @keydown.escape.window="closeFoodCardPreview()">
+        <!-- v3.3.58 (2026-10-27, Jim OOB「My screen height is very short.
+             Can't see the download buttons」):
+  
+             **舊做法有真 bug**:`max-h-[90dvh]` + preview 區寫死
+             `max-height: calc(90dvh - 56px - 76px)` —— 個 76px 係假設
+             footer 只有一行。但實際 footer 有「檔案細啲」toggle + 下載掣
+             ≈ 114px(加埋 chip row 更到 ~166px)。
+             → 短屏(iPhone SE 667pt)時:56 + preview + 114 > 90dvh(600)
+             → modal 撞上限、`overflow:hidden` → **下載掣被裁走**,Jim 撳唔到。
+  
+             **正確做法**:modal 用**確定高度** `h-[90dvh]`,preview 用
+             `flex-1 min-h-0`(可以縮細)→ flexbox 自動將剩餘空間分俾
+             preview,footer 永遠完整可見。圖用 `object-fit: contain` +
+             `max-height:100%` → 高度唔夠就等比縮細,唔會爆。
+             (`max-h-[90dvh]` 唔夠 —— auto 高度嘅 flex container 冇
+             「剩餘空間」可以分配,preview 會 collapse 成 0 高。) -->
+        <div class="w-full max-w-md h-[90dvh] flex flex-col rounded-3xl overflow-hidden"
+             style="background: linear-gradient(180deg, rgb(28, 25, 46) 0%, rgb(12, 10, 24) 100%); border: 1.5px solid rgba(251, 191, 36, 0.45); box-shadow: 0 0 40px rgba(251, 191, 36, 0.18);">
+          <!-- Header (fixed alignment via inline-block + line-height) -->
+          <div class="flex items-center justify-between px-4 flex-shrink-0"
+               style="height: 56px; background: rgba(251, 191, 36, 0.08); border-bottom: 1px solid rgba(251, 191, 36, 0.25);">
+            <div style="line-height: 1.2;">
+              <div class="text-sm font-black" style="color: rgb(251, 191, 36); letter-spacing: 0.02em;">📸 食物日結</div>
+              <div class="text-[10px] text-gray-400"
+                   x-text="`${foodCardPreview.date || ''} · ${foodCardPreview.sizeKb} KB`"></div>
+            </div>
+            <!-- v3.3.61 (Jim OOB「Problem when finish download. No way to go
+                 back. Should there be a close button?」):
+                 細 ✕ 圈改成**有文字**嘅「✕ 關閉」掣 —— 唔加高度(喺 header
+                 最上面,短屏都必見到),但一眼就睇得出可以返回。 -->
+            <button @click="closeFoodCardPreview()"
+                    class="flex items-center gap-1 rounded-full active:scale-95"
+                    style="padding: 0 12px; height: 34px; line-height: 1; background: rgba(255, 255, 255, 0.14); font-size: 13px; font-weight: 700; color: rgb(240, 240, 245); flex-shrink: 0;"
+                    aria-label="關閉食物日結"
+                    data-testid="food-card-close">
+              <span style="font-size: 16px; line-height: 1;">✕</span><span>關閉</span>
+            </button>
+          </div>
+          <!-- v3.3.59 (2026-10-27, Jim OOB「Still too long. ... such that I can
+               see the button download button」):
+  
+               **下載掣由 modal 底部搬到 header 正下面。**
+               量測發現:喺 375x667 / 320x568 呢啲 viewport,掣嘅 bottom
+               (621 / 527)其實**喺 viewport 之內** —— 即係話 Jim 實際部機嘅
+               可見 app 視窗比 Playwright 嘅 viewport 更矮(iOS Safari 底條 /
+               home indicator / Slide Over 都會食高度)。
+               → 掣擺喺底部就**唔保證**見到;擺喺最上面就**保證**見到。
+  
+               順帶:preview 變成最後一個 flex item(`flex-1 min-h-0`),
+               圖嘅 `object-fit:contain` + `max-height:100%` 會**自動縮細**
+               去填滿剩餘空間 —— 所以「太長」嘅問題自動消失,唔使再靠改餐數。 -->
+          <!-- v3.3.62 (Jim OOB 2026-10-27「As we use pdf. Just one click
+               download pdf and allow me to close the share such that I can
+               be back to gymbro interface after download.」):
+  
+               **由「逐頁 JPG」改成「單一 PDF」。**
+               PDF 嘅頁係流動嘅 → 唔使 5 餐上限,而且每餐可以寫齊
+               AI 視覺描述 + 教練判詞(之前張 JPG 只有 240px 高,
+               塞唔落,淨係得返 grade 字母同 kcal 丸)。
+  
+               掣喺**最上面**(短屏一見到),落完自動閂 modal →
+               Jim 撳「關閉」iOS 個 share sheet 就直接返返 GymBro 主介面。 -->
+          <div class="px-4 pt-3 pb-1 flex-shrink-0"
+               style="background: rgba(28, 25, 46, 0.95);">
+            <!-- 單一下載掣 -->
+            <a x-show="foodCardPreview.pdfReady"
+               :href="foodCardPdfUrl()"
+               :download="foodCardPdfFileName()"
+               @click="onFoodCardPdfDownload()"
+               data-testid="food-card-pdf-download"
+               class="block rounded-2xl text-center text-base font-black active:scale-95 no-underline"
+               style="padding: 15px 16px; background: linear-gradient(135deg, rgb(167,139,250) 0%, rgb(251,191,36) 100%); color: rgb(20,18,32);">
+              ⬇ 下載 PDF
+            </a>
+            <div x-show="!foodCardPreview.pdfReady"
+                 data-testid="food-card-pdf-generating"
+                 class="w-full rounded-2xl text-center text-sm font-black"
+                 style="padding: 15px 16px; background: rgba(255,255,255,0.07); color: rgb(180,180,195);">
+              ⏳ 生成緊 PDF…
+            </div>
+            <div class="text-[10px] text-center mt-2"
+                 style="color: rgb(150,150,170);"
+                 x-text="foodCardPreview.pdfHint"></div>
+          </div>
+          <!-- PDF 內容預覽(第 1 頁 PNG)+ 摘要 -->
+          <div class="flex-1 min-h-0 overflow-y-auto"
+               style="background: rgba(0, 0, 0, 0.45);">
+            <div x-show="foodCardPreview.loading"
+                 class="flex flex-col items-center justify-center"
+                 style="min-height: 200px; padding: 40px 0;">
+              <div style="font-size: 32px; margin-bottom: 10px; animation: spin 1.2s linear infinite; display: inline-block;">⏳</div>
+              <div class="text-xs text-gray-300">生成緊營養日結 PDF…</div>
+            </div>
+            <!-- 第 1 頁預覽 -->
+            <img x-show="!foodCardPreview.loading && foodCardPreview.pdfPreviewUrl"
+                 :src="foodCardPreview.pdfPreviewUrl"
+                 :alt="'營養日結 PDF 第 1 頁'"
+                 style="display: block; width: 100%; max-width: 100%; height: auto; max-height: 100%; object-fit: contain; background: rgba(0,0,0,0.6); padding: 10px; box-sizing: border-box;" />
+            <!-- 摘要(冇預覽圖時都見到) -->
+            <div x-show="!foodCardPreview.loading"
+                 class="px-4 py-3 text-xs"
+                 style="color: rgb(200,200,215);">
+              <div class="flex flex-wrap gap-x-4 gap-y-1 mb-2"
+                   style="font-weight: 700; color: rgb(240,240,245);">
+                <span x-text="`${foodCardPreview.pdfMealCount || 0} 餐`"></span>
+                <span x-text="`${foodCardPreview.pdfPages || 1} 頁`"></span>
+                <span x-text="`${foodCardPreview.pdfSizeKb || 0} KB`"></span>
+                <span x-text="`${foodCardPreview.pdfTotals.kcal || 0} kcal`"></span>
+              </div>
+              <div class="flex flex-wrap gap-x-4 gap-y-1 mb-2"
+                   style="color: rgb(160,160,180);">
+                <span x-text="`蛋白 ${foodCardPreview.pdfTotals.P || 0}g`"></span>
+                <span x-text="`碳水 ${foodCardPreview.pdfTotals.C || 0}g`"></span>
+                <span x-text="`脂肪 ${foodCardPreview.pdfTotals.F || 0}g`"></span>
+              </div>
+              <div x-show="foodCardPreview.aiDescRows > 0"
+                   style="color: rgb(74,222,128);"
+                   x-text="`✓ ${foodCardPreview.aiDescRows}/${foodCardPreview.pdfMealCount || 0} 餐有 AI 視覺描述`"></div>
+              <div x-show="foodCardPreview.aiVerdictRows > 0"
+                   style="color: rgb(251,191,36);"
+                   x-text="`✓ ${foodCardPreview.aiVerdictRows}/${foodCardPreview.pdfMealCount || 0} 餐有教練判詞`"></div>
+              <div class="mt-2" style="color: rgb(120,120,140); line-height: 1.6;">
+                PDF 內含封面摘要 + 逐餐詳情(相、AI 描述、教練判詞、佔全日熱量%)。
+                落完檔之後撳右上角「關閉」就返返 GymBro。
+              </div>
+            </div>
+          </div>
+          <!-- v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」):
+               「每頁餐數」選擇器(6/4/3 chip)已移除 —— 每頁固定 **5 餐**
+               (v3.3.57 嘅「Make it 5 meals max per screen」)。
+               順帶慳返 ~52pt 嘅 footer 高度,短屏終於見到下載掣。
+  
+               v3.3.55 嘅洞察仍然成立(留低做參考):
+               等比縮細(1080x1736 → 796x1280)比例一樣(1.607)→ 喺 iPhone
+               上面一樣撐滿闊度 → 顯示高度**完全一樣**,唔算短。真正令圖
+               變短嘅係改**比例**(即係每頁少啲餐),唔係縮細。
+  
+          <!-- v3.3.59:「檔案細啲(高度 ≤ 1280px)」toggle row 已移除
+               (Jim OOB「Remove the toggle row ... such that I can see the
+               button download button」)—— 佢喺 modal 底部佔咗 ~42pt,
+               而且喺真機短屏會將下載掣推落視窗外。
+               後端 `?compact=1` 仍然支援(舊 URL 唔會壞),只係唔再有 UI 開關。 -->
+  
+          <!-- v3.3.54 (2026-10-27, Jim OOB「Don't download multiple image at the
+               same time. Show multiple download button to download. Remove
+               second button」):
+               ① 之前一個「⬇ 下載全部 N 頁」掣 → 一次過發 N 個 download。
+                  iOS Safari 會當成「多檔下載」(要逐個撳「允許」),而且撞
+                  瀏覽器同時下載限制 → 改為**每頁一個掣,撳一個只落一張**。
+               ② 第二個「✕ 關閉」掣已移除 —— 右上角 ✕ / Esc / 點背景一樣
+                  可以閂 modal,唔需要喺 footer 佔位。 -->
+        </div>
+      </div>
 </body>
 </html>

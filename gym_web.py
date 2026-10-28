@@ -21,6 +21,7 @@ import time
 import urllib.request
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta, date
 from datetime import datetime as _dt
@@ -1011,7 +1012,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.61"
+__version__ = "3.3.62"
 
 
 def _recovery_pct():
@@ -2767,6 +2768,372 @@ def api_nutrition_card_url():
         # v3.3.55: 回傳每頁餐數,前端 preview / download 要用同一個值
         "per_page": MEALS_PER_PAGE,
         "pages": pages,
+    })
+
+
+# ===========================================================================
+# v3.3.62 — 營養日結 PDF 報表
+# Jim OOB 2026-10-27:「I think you change gymbro jpg download to pdf download.
+# An overhaul. Make the pdf more informative as we have more spaces now.
+# For food description and verdict, don't just comment the percentage.
+# The ai visual info has more useful info. Don't drop it down the road」
+#
+# PDF 嘅頁係流動嘅 → 唔使 5 餐上限,而且每餐可以寫齊
+# 「描述」(AI 視覺描述) + 「判詞」(教練判詞)。
+# ===========================================================================
+
+PDF_CACHE_DIR = Path("/home/work/.hermes/nutrition_pdf_cache")
+_pdf_cache_lock = threading.Lock()
+_pdf_cache: "OrderedDict[str, bytes]" = OrderedDict()
+PDF_CACHE_MAX = 14
+
+
+def _pdf_cache_get(key: str):
+    with _pdf_cache_lock:
+        b = _pdf_cache.get(key)
+        if b is not None:
+            _pdf_cache.move_to_end(key)
+        return b
+
+
+def _pdf_cache_put(key: str, data: bytes) -> None:
+    with _pdf_cache_lock:
+        _pdf_cache[key] = data
+        _pdf_cache.move_to_end(key)
+        while len(_pdf_cache) > PDF_CACHE_MAX:
+            _pdf_cache.popitem(last=False)
+
+
+def _pdf_cache_invalidate(date_iso: str) -> None:
+    """掃描 / 改名 / 刪除之後要清走當日 PDF(內容變咗)。"""
+    with _pdf_cache_lock:
+        for k in [k for k in _pdf_cache if k.startswith(date_iso)]:
+            _pdf_cache.pop(k, None)
+    try:
+        for f in PDF_CACHE_DIR.glob(f"*{date_iso}*.pdf"):
+            f.unlink()
+    except Exception:
+        pass
+
+
+def _build_nutrition_meals(target_date: str):
+    """Build the meal list for a date. Shared by the JPG card + the PDF.
+
+    Returns (meals, totals). Each meal carries row_index / grade /
+    coach_comment so the PDF can pull the AI profile per row.
+    """
+    data = {"meals": [], "totals": {"kcal": 0, "P": 0, "C": 0, "F": 0},
+            "meal_count": 0, "date": target_date}
+    cache = get_cache()
+    meals = []
+    total_kcal = total_p = total_c = total_f = 0.0
+    if cache.is_ready():
+        rows = cache.get_by_date(target_date) or []
+
+        def _sort_key(r):
+            t = (r.time or "0:0").strip()
+            parts = t.split(":")
+            try:
+                return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+            except (ValueError, IndexError):
+                return (99, 99)
+
+        rows.sort(key=_sort_key, reverse=False)
+        for r in rows:
+            row_idx = getattr(r, "row_index", None)
+            if row_idx is not None:
+                row_thumb = f"/scan_thumb/{row_idx}"
+            else:
+                row_thumb = (getattr(r, "thumbnail_url", None)
+                             or getattr(r, "image_url_for_pwa", None) or "")
+            cc = r.get_or_compute_coach_comment(
+                lambda row: _coach_comment_keyword(
+                    row.name, row.kcal, row.p, row.c, row.f, row.restaurant)
+            )
+            meal = {
+                "date": getattr(r, "date", target_date),
+                "time": getattr(r, "time", "") or "",
+                "name": getattr(r, "name", "") or "",
+                "meal_name": getattr(r, "name", "") or "",
+                "meal_type": getattr(r, "meal", "") or "",
+                "restaurant": getattr(r, "restaurant", "") or "",
+                "restaurant_chain": getattr(r, "restaurant", "") or "",
+                "calories": getattr(r, "kcal", 0) or 0,
+                "protein": getattr(r, "p", 0) or 0,
+                "carbs": getattr(r, "c", 0) or 0,
+                "fat": getattr(r, "f", 0) or 0,
+                "kcal": getattr(r, "kcal", 0) or 0,
+                "p": getattr(r, "p", 0) or 0,
+                "c": getattr(r, "c", 0) or 0,
+                "f": getattr(r, "f", 0) or 0,
+                "notes": getattr(r, "notes", "") or "",
+                "row_index": row_idx,
+                "image_path": getattr(r, "image_path", "") or "",
+                "image_url": row_thumb,
+                "thumbnail_url": row_thumb,
+                "drive_image_url": getattr(r, "drive_image_url", "") or "",
+                "coach_comment": {
+                    "grade": cc.get("grade", "—"),
+                    "comment": cc.get("comment", ""),
+                },
+            }
+            meals.append(meal)
+            total_kcal += meal["calories"]
+            total_p += meal["protein"]
+            total_c += meal["carbs"]
+            total_f += meal["fat"]
+    totals = {"kcal": total_kcal, "P": total_p, "C": total_c, "F": total_f}
+    return meals, totals
+
+
+def _pdf_fetch_thumbs(meals: list) -> None:
+    """Fetch every meal thumbnail in parallel and stick the bytes on the meal.
+
+    ⚠️ `scan_thumb()` 會讀 `request.args`(v3.3.38 內容定址)→ **一定要有
+    request context**。ThreadPoolExecutor 嘅 worker thread 冇 context
+    (Flask 係 thread-local)→ 2026-10-28 實測全部 "Working outside of
+    request context",相片全部畫唔到。
+    修法:`copy_current_request_context` 把 context 抄入 worker。
+    """
+    import concurrent.futures as _cf
+    from gym_web.image_proxy import thumb_bytes as _thumb_bytes_func
+
+    def _do_fetch(ridx):
+        # v3.3.62: 用 image_proxy.thumb_bytes()(唔需要 request context)
+        return _thumb_bytes_func(int(ridx))
+
+    if not meals:
+        return
+    idx_map = {id(m): m for m in meals}
+    ridxs = [(id(m), m.get("row_index")) for m in meals
+             if m.get("row_index") is not None]
+    if not ridxs:
+        return
+    def _one(pair):
+        mid, ridx = pair
+        try:
+            return mid, _do_fetch(ridx)
+        except Exception as e:
+            print(f"[pdf] thumb fetch failed row={ridx}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return mid, None
+    with _cf.ThreadPoolExecutor(max_workers=min(8, len(ridxs))) as ex:
+        for mid, data in ex.map(_one, ridxs):
+            if data and mid in idx_map:
+                idx_map[mid]["image_bytes"] = data
+
+
+_pdf_gen_locks: dict = {}
+
+
+def _generate_pdf_bytes(target_date: str, allow_ai: bool = True):
+    """Build (or rebuild) the day's PDF. Returns bytes or None."""
+    meals, totals = _build_nutrition_meals(target_date)
+    if not meals:
+        return None
+    # ⚠️ 順序好緊要:先攞縮圖,再跑 AI —— AI 嗰邊會用返同一批 bytes。
+    _pdf_fetch_thumbs(meals)
+    try:
+        from gym_web import ai_profile as _ai_prof
+        profiles = _ai_prof.ensure_profiles(meals, allow_ai=allow_ai)
+    except Exception as e:
+        print(f"[pdf] ensure_profiles failed: {type(e).__name__}: {e}",
+              flush=True)
+        profiles = {}
+    for m in meals:
+        prof = profiles.get(m.get("row_index")) or {}
+        m["description"] = prof.get("description", "") or ""
+        m["verdict"] = prof.get("verdict", "") or ""
+        m["grade"] = (m.get("coach_comment") or {}).get("grade", "—")
+    try:
+        from gym_web.pdf_report import render_nutrition_pdf
+        meta = {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M HKT")}
+        data = render_nutrition_pdf(target_date, meals, totals, meta)
+    except Exception as e:
+        print(f"[pdf] render failed: {type(e).__name__}: {e}", flush=True)
+        return None
+    try:
+        PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = (PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf").with_suffix(".pdf.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf")
+    except Exception as e:
+        print(f"[pdf] disk cache write failed: {type(e).__name__}: {e}", flush=True)
+    _pdf_cache_put(target_date, data)
+    try:
+        _pdf_render_preview(target_date)
+    except Exception as e:
+        print(f"[pdf] preview render skipped: {type(e).__name__}: {e}",
+              flush=True)
+    return data
+
+
+def _pdf_warm_async(target_date: str, allow_ai: bool = True) -> bool:
+    """Kick off PDF generation in the background. Returns True if started."""
+    with _pdf_cache_lock:
+        lock = _pdf_gen_locks.get(target_date)
+        if lock is None:
+            lock = threading.Lock()
+            _pdf_gen_locks[target_date] = lock
+
+    def _worker():
+        try:
+            with lock:
+                if _pdf_cache_get(target_date) is not None:
+                    return
+                t0 = time.time()
+                data = _generate_pdf_bytes(target_date, allow_ai)
+                print(f"[pdf] warm done date={target_date} "
+                      f"ok={bool(data)} {time.time() - t0:.1f}s", flush=True)
+        except Exception as e:
+            print(f"[pdf] warm failed date={target_date}: {type(e).__name__}: {e}",
+                  flush=True)
+
+    th = threading.Thread(target=_worker, daemon=True,
+                          name=f"pdf-warm-{target_date}")
+    th.start()
+    return True
+
+
+def _pdf_render_preview(target_date: str) -> str:
+    """Render page 1 of the day's PDF to PNG so the modal can preview it.
+
+    v3.3.62: 用 poppler 嘅 pdftoppm(機器有裝)。失敗唔會阻手 ——
+    modal 會退回顯示文字摘要。
+    """
+    pdf = PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf"
+    if not pdf.exists():
+        return ""
+    out_base = PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}_p1"
+    png = out_base.with_suffix(".png")
+    try:
+        if png.exists() and png.stat().st_mtime >= pdf.stat().st_mtime:
+            return png.name
+    except Exception:
+        pass
+    try:
+        import subprocess
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", "72", "-f", "1", "-l", "1",
+             "-singlefile", str(pdf), str(out_base)],
+            timeout=45, capture_output=True, check=False)
+    except Exception as e:
+        print(f"[pdf] preview render failed: {type(e).__name__}: {e}", flush=True)
+        return ""
+    return png.name if png.exists() else ""
+
+
+@app.route("/nutrition_pdf/<filename>", methods=["GET"])
+def serve_nutrition_pdf_preview(filename):
+    """Serve the PDF (or its page-1 PNG preview) from the cache dir.
+
+    ⚠️ 唔可以加 as_attachment —— modal 預覽要用 <img> 直接載入。
+    真正下載行嘅 /api/nutrition/pdf  先送 attachment。
+    """
+    from flask import send_from_directory
+    return send_from_directory("/home/work/.hermes/nutrition_pdf_cache", filename)
+
+
+@app.route("/api/nutrition/pdf", methods=["GET"])
+def api_nutrition_pdf():
+    """v3.3.62: 營養日結 PDF(單一檔案,一個掣下載)。
+
+    ?date=YYYY-MM-DD  → 嗰日嘅 PDF
+    ?warm=1            → 只生成唔落載(前端預熱用,避免第一次撳要等 AI)
+    """
+    from flask import Response
+    target_date = (request.args.get("date") or today_iso()).strip()
+    warm_only = (request.args.get("warm") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    allow_ai = (request.args.get("ai") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+    PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf"
+    download_name = out_path.name
+
+    cached = _pdf_cache_get(target_date)
+    if cached is None and out_path.exists():
+        try:
+            age = (datetime.now().timestamp() - out_path.stat().st_mtime)
+            # 6 個鐘(改咗內容會由 _pdf_cache_invalidate 主動清走,
+            # 所以 TTL 可以長啲,唔使每次都重 render)
+            if age < 21600:
+                cached = out_path.read_bytes()
+                _pdf_cache_put(target_date, cached)
+                try:
+                    _pdf_render_preview(target_date)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if cached is None:
+        if warm_only:
+            # 背景生成(唔阻塞 request)—— 前端預熱用
+            _pdf_warm_async(target_date, allow_ai)
+            return jsonify({"ok": True, "date": target_date,
+                            "generating": True, "size_kb": 0})
+        cached = _generate_pdf_bytes(target_date, allow_ai)
+        if cached is None:
+            return jsonify({"ok": False, "error": "render_failed",
+                            "date": target_date}), 500
+
+    if warm_only:
+        return jsonify({"ok": True, "date": target_date,
+                        "size_kb": int(len(cached) / 1024), "warmed": True,
+                        "generating": False})
+
+    return Response(
+        cached,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename={download_name}",
+            "Cache-Control": "public, max-age=300",
+        },
+    )
+
+
+@app.route("/api/nutrition/pdf_info", methods=["GET"])
+def api_nutrition_pdf_info():
+    """v3.3.62: PDF 嘅 meta(餐數 / 頁數 / 大小 / AI 描述覆蓋率)俾 modal 顯示。"""
+    target_date = (request.args.get("date") or today_iso()).strip()
+    meals, totals = _build_nutrition_meals(target_date)
+    out_path = PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}.pdf"
+    size_kb = 0
+    ready = False
+    if out_path.exists():
+        try:
+            size_kb = int(out_path.stat().st_size / 1024)
+            ready = True
+        except Exception:
+            pass
+    from gym_web import ai_profile as _ai_prof
+    with_desc = 0
+    with_verdict = 0
+    for m in meals:
+        prof = _ai_prof.get_profile(m.get("row_index")) or {}
+        if prof.get("description"):
+            with_desc += 1
+        if prof.get("verdict"):
+            with_verdict += 1
+    # 頁數估算(每頁 2-3 餐)
+    est_pages = max(1, (len(meals) + 2) // 3) if meals else 0
+    return jsonify({
+        "ok": True,
+        "date": target_date,
+        "meal_count": len(meals),
+        "totals": totals,
+        "est_pages": est_pages,
+        "size_kb": size_kb,
+        "ready": ready,
+        "preview_png": (
+            f"/nutrition_pdf/gymbro_foodlog_{target_date}_p1.png"
+            if (PDF_CACHE_DIR / f"gymbro_foodlog_{target_date}_p1.png").exists()
+            else ""),
+        "ai_description_rows": with_desc,
+        "ai_verdict_rows": with_verdict,
+        "pdf_url": f"/api/nutrition/pdf?date={target_date}",
     })
 
 
@@ -7336,6 +7703,47 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
             _get_nutrition_cache().insert_row(new_row)
         except Exception:
             pass  # cache update is best-effort; background refresh will catch up
+        # v3.3.62 (Jim OOB 2026-10-27 "The ai visual info has more useful
+        # info. Don't drop it down the road"): 持久化 AI 視覺描述。
+        # 之前 vision_desc 只喺呢個 function 嘅 local variable 度,commit
+        # 完就冇晒 —— Sheet 備註欄只寫住 'scan_food' 標記,所以下游
+        # (PDF / 語音 / 卡片) 淨係剩返 macro 百分比評論。
+        # ⚠️ 純本地 JSON cache,唔改 Sheet 任何嘢(唔會影響生產數據)。
+        try:
+            from gym_web import ai_profile as _ai_prof
+            _vd = (entry.get("vision_raw_desc") or entry.get("vision_desc") or "").strip()
+            if appended_row_index and _vd:
+                _ai_prof.put_profile(appended_row_index, description=_vd,
+                                     source="scan")
+                # 順手喺背景生成「判詞」→ PDF 隨時都 ready,
+                # 唔使等落 PDF 先做 AI(第一次會慢 40 秒)。
+                _row_idx = appended_row_index
+                _name = entry.get("name", "")
+                _rest = entry.get("restaurant_chain") or entry.get("restaurant") or ""
+                _kcal = entry.get("calories", 0) or 0
+                _p = entry.get("protein", 0) or 0
+                _c = entry.get("carbs", 0) or 0
+                _f = entry.get("fat", 0) or 0
+
+                def _bg_verdict():
+                    try:
+                        _prof = _ai_prof.get_profile(_row_idx) or {}
+                        if _prof.get("verdict"):
+                            return
+                        _v = _ai_prof._verdict_only(_name, _rest, _kcal, _p,
+                                                    _c, _f, _vd)
+                        if _v:
+                            _ai_prof.put_profile(_row_idx, verdict=_v,
+                                                 source="scan")
+                    except Exception as _e2:
+                        print(f"[sheet] bg verdict failed row={_row_idx}: "
+                              f"{type(_e2).__name__}: {_e2}", flush=True)
+
+                threading.Thread(target=_bg_verdict, daemon=True,
+                                 name=f"verdict-{_row_idx}").start()
+        except Exception as _e:
+            print(f"[sheet] ai_profile persist failed: {type(_e).__name__}: {_e}",
+                  flush=True)
         try:
             header_check_url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Nutrition!K1"
             req_h = urllib.request.Request(header_check_url, headers={"Authorization": f"Bearer {access}"})
@@ -7778,6 +8186,10 @@ def api_scan_correct():
         row = cache.get_by_row(scan_index)
         if row and row.date:
             _jpg_cache_invalidate(row.date)
+            try:
+                _pdf_cache_invalidate(row.date)
+            except Exception:
+                pass
             # Delete ALL page variants (p1, p2, ...) for this date
             cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
             for f in cache_dir.glob(f"nutrition_{row.date}*.jpg"):
@@ -7896,6 +8308,10 @@ def api_scan_replace_image():
         invalidate_drive_url(scan_index)  # drop cached Drive URL too
         invalidate_thumb(scan_index)      # drop cached thumb bytes
         _jpg_cache_invalidate(row.date)
+        try:
+            _pdf_cache_invalidate(row.date)
+        except Exception:
+            pass
     except Exception as e:
         print(f"[scan_replace_image] thumb cache invalidate failed: {e}", flush=True)
 
@@ -8117,6 +8533,10 @@ def api_scan_rename():
         row_now = cache.get_by_row(scan_index)
         if row_now and row_now.date:
             _jpg_cache_invalidate(row_now.date)
+            try:
+                _pdf_cache_invalidate(row_now.date)
+            except Exception:
+                pass
             cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
             for f in cache_dir.glob(f"nutrition_{row_now.date}*.jpg"):
                 f.unlink()
@@ -10407,6 +10827,10 @@ def api_scan_edit_datetime():
         row = cache.get_by_row(scan_index)
         if row and row.date:
             _jpg_cache_invalidate(row.date)
+            try:
+                _pdf_cache_invalidate(row.date)
+            except Exception:
+                pass
             cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
             for f in cache_dir.glob(f"nutrition_{row.date}*.jpg"):
                 f.unlink()
@@ -10499,6 +10923,10 @@ def api_scan_delete():
         from pathlib import Path as _P
         if 'date' in dir() and date:
             _jpg_cache_invalidate(date)
+            try:
+                _pdf_cache_invalidate(date)
+            except Exception:
+                pass
             cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
             for f in cache_dir.glob(f"nutrition_{date}*.jpg"):
                 f.unlink()
@@ -11122,6 +11550,10 @@ def api_scan_commit():
         from gym_web.image_proxy import _jpg_cache_invalidate
         commit_date = (entries_in[0].get("date") if entries_in and isinstance(entries_in[0], dict) else None) or today_iso()
         _jpg_cache_invalidate(commit_date)
+        try:
+            _pdf_cache_invalidate(commit_date)
+        except Exception:
+            pass
         disk_path = Path("/home/work/.hermes/nutrition_card_cache") / f"nutrition_{commit_date}.jpg"
         if disk_path.exists():
             disk_path.unlink()
@@ -11236,6 +11668,10 @@ def api_scan_backfill_image():
     try:
         from gym_web.image_proxy import _jpg_cache_invalidate
         _jpg_cache_invalidate(row.date)
+        try:
+            _pdf_cache_invalidate(row.date)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -11402,6 +11838,10 @@ def api_scan_re_enrich():
         row = cache.get_by_row(scan_index)
         if row and row.date:
             _jpg_cache_invalidate(row.date)
+            try:
+                _pdf_cache_invalidate(row.date)
+            except Exception:
+                pass
             cache_dir = _P("/home/work/.hermes/nutrition_card_cache")
             for f in cache_dir.glob(f"nutrition_{row.date}*.jpg"):
                 f.unlink()
@@ -17191,7 +17631,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v165';
+const CACHE = 'gym-web-v166';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1

@@ -177,16 +177,6 @@ def test_frontend_compact_toggle_removed():
     assert "檔案細啲" not in tpl, "仲有「檔案細啲」toggle row(應該移除)"
 
 
-def test_frontend_compact_state_still_exists():
-    """state 同參數邏輯要留(後端仲支援 compact=1,舊 URL 要 work)。"""
-    tpl = _tpl()
-    assert "compact: false" in tpl, "state 要保留 compact"
-    assert "&compact=1" in tpl, "前端仲要識送 &compact=1(後端仍然支援)"
-    # v3.3.60:downloadFoodCardPage() 已剷走(改直接 <a href>),
-    # 而家 compact 參數由 foodCardPageUrl() 負責
-    assert "const _cq = p.compact === true ? '&compact=1' : ''" in tpl, (
-        "foodCardPageUrl 要帶 compact 參數"
-    )
 
 
 def test_frontend_reload_method_exists():
@@ -196,53 +186,14 @@ def test_frontend_reload_method_exists():
     assert "reloadFoodCardPreview()" in tpl, "toggle 要叫 reloadFoodCardPreview()"
 
 
-def test_frontend_sends_compact_param():
-    """前端要送 compact=1 俾 server。"""
-    tpl = _tpl()
-    assert "&compact=1" in tpl, "前端要送 &compact=1"
-    assert re.search(r"const\s+_cq\s*=\s*p\.compact\s*===\s*true\s*\?\s*'&compact=1'\s*:\s*''", tpl), (
-        "要用 _cq 變數統一帶參數(預覽 + 切頁 + 下載 URL 三條路徑都要)"
-    )
 
 
-def test_frontend_preview_and_download_both_use_compact():
-    """預覽同下載都要支援矮身版(唔可以得一個)。"""
-    tpl = _tpl()
-    # 預覽 fetch
-    # v3.3.55: preview fetch 變成 `&page=1${_ppQ}${_cq}`(加咗 per_page)
-    assert re.search(
-        r"/api/nutrition/card\?date=\$\{encodeURIComponent\(date\)\}&page=1\$\{_ppQ\}\$\{_cq\}",
-        tpl,
-    ), "預覽 fetch 要帶 _cq"
-    # 下載 fetch(單頁 + 多頁)
-    assert tpl.count("${_cq}") >= 3, (
-        "compact 參數要出現喺:預覽 fetch、單頁下載、多頁下載(3 處)"
-    )
 
 
-def test_frontend_compact_state_persists():
-    """關閉再打開,toggle 狀態要保留(唔好每次都要重新撳)。"""
-    tpl = _tpl()
-    assert "_keepCompact" in tpl, "重新開啟時要保留 compact 狀態"
-    assert "compact: this.foodCardPreview.compact === true" in tpl, (
-        "closeFoodCardPreview 要保留 compact 狀態"
-    )
 
 
-def test_frontend_compact_server_url():
-    """預覽嘅 server URL 要指向矮身版檔名。"""
-    tpl = _tpl()
-    assert re.search(r"const\s+_cSfx\s*=\s*_keepCompact\s*\?\s*'_compact'\s*:\s*''", tpl), (
-        "預覽 URL 要按 compact 狀態揀檔名"
-    )
 
 
-def test_frontend_fallback_url_respects_compact():
-    """fallback URL 都要跟 compact。"""
-    tpl = _tpl()
-    assert "foodCardPreview.compact ? '_compact' : ''" in tpl, (
-        "fallback URL 要跟 compact 狀態"
-    )
 
 
 # ---------------------------------------------------------------------------

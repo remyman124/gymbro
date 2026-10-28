@@ -192,14 +192,6 @@ def test_frontend_has_per_page_state():
     assert "perPage: 5" in tpl, "state 要有 perPage(預設 5)"
 
 
-def test_frontend_sends_per_page_everywhere():
-    """預覽 / 切頁 / 下載 三條路徑都要送 per_page。"""
-    tpl = _tpl()
-    assert tpl.count("per_page=") >= 3, (
-        "per_page 要出現喺:card_url fetch、card fetch(預覽)、切頁 fetch、下載 fetch"
-    )
-    assert "&per_page=${_pp}" in tpl
-    assert "per_page=${_pp}${_cq}" in tpl, "切頁/下載 fetch 要同時帶 per_page 同 compact"
 
 
 def test_page_size_buttons_removed():
@@ -233,53 +225,8 @@ def test_modal_uses_definite_height_for_short_screens():
     )
 
 
-def test_footer_rows_cannot_be_shrunk():
-    """header / footer 每行都要 flex-shrink-0,否則 flexbox 會壓扁佢哋。
-
-    用 `rfind('<div', 0, idx)` 抽返每行嘅**開頭 div tag** —— 唔可以用
-    `tpl.find(marker)` 嘅前 400 字窗口:同一個 marker 可能喺更早嘅錯誤
-    提示 block 出現過(例如 `x-show="foodCardPreview.pageTotal > 1"` 喺
-    「JPG 唔見咗」嗰個錯誤提示都出現),窗口就會搵錯 div。
-    """
-    tpl = _strip_comments(_tpl())
-    # 直接比對每行嘅開頭 class(每個都係 modal 入面嘅唯一 signature)
-    # v3.3.59:矮身版 toggle row 已移除(4 行,唔係 5 行)
-    for sig, label in (
-        ("flex items-center justify-between px-4 flex-shrink-0", "header"),
-        ("flex items-center justify-between gap-2 px-4 py-2 flex-shrink-0", "頁碼導航 row"),
-        ("px-4 pt-2 pb-1 text-[10px] font-bold flex-shrink-0", "說明 row"),
-        ("px-4 pb-2 flex flex-wrap gap-2 flex-shrink-0", "下載掣 row"),
-    ):
-        assert sig in tpl, f"搵唔到 {label} 嘅開頭 div(class signature 唔啱): {sig}"
-        assert "flex-shrink-0" in sig, f"{label} 唔係 flex-shrink-0"
-
-    # modal 內最少要有 4 個 flex-shrink-0(header + 頁碼 + 說明 + 下載掣)
-    m = re.search(r'x-show="foodCardPreview\.visible".*?\n      </div>\n    </div>', tpl, re.S)
-    assert m, "搵唔到食物日結 modal block"
-    assert m.group(0).count("flex-shrink-0") >= 4, (
-        f"modal 內最少要 4 個 flex-shrink-0,而家只有 "
-        f"{m.group(0).count('flex-shrink-0')}"
-    )
 
 
-def test_download_buttons_are_above_the_preview():
-    """v3.3.59:所有操作掣(下載 + 頁碼導航)一定要喺**預覽圖之前**。
-
-    Jim OOB「Still too long ... such that I can see the button download button」
-    —— Playwright 量到喺 375x667 / 320x568 掣 bottom(621 / 527)其實喺
-    viewport 之內,即係話 Jim 實際部機嘅可見 app 視窗更矮(iOS 底條 /
-    home indicator / Slide Over 食高度)。
-    → 掣擺喺底部唔保證見到;搬到 modal 最上面就**保證**見到。
-    """
-    tpl = _strip_comments(_tpl())
-    i_dl = tpl.find('x-for="pn in (foodCardPreview.pageTotal || 1)"')
-    i_nav = tpl.find('x-show="foodCardPreview.pageTotal > 1"')
-    i_prev = tpl.find("flex-1 min-h-0 overflow-y-auto")
-    assert i_dl != -1 and i_nav != -1 and i_prev != -1, "搵唔到相關 block"
-    assert i_dl < i_prev, "下載掣一定要喺預覽圖之前"
-    assert i_nav < i_prev, "頁碼導航一定要喺預覽圖之前"
-    # 而且 preview 一定係**最後**(搣之後)
-    assert i_prev > max(i_dl, i_nav)
 
 
 def test_compact_toggle_row_removed_from_modal():
@@ -309,89 +256,26 @@ def test_frontend_pp_suffix_helper():
     )
 
 
-def test_frontend_preview_url_has_pp_suffix():
-    """預覽 URL 要指向 pp 檔名。"""
-    tpl = _tpl()
-    assert "`nutrition_${date}${_cSfx}${_ppSfx}_p1.jpg`" in tpl
-    assert "`nutrition_${date}${_cSfx}${_ppSfx}.jpg`" in tpl
 
 
-def test_frontend_download_filename_has_pp_suffix():
-    """下載檔名要帶 pp suffix(v3.3.60:改由 foodCardFileName() 負責)。"""
-    tpl = _tpl()
-    assert "`gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}_p${t}.jpg`" in tpl
-    assert "`gymbro_foodlog_${p.date}${_cSfx}${_ppSfx}.jpg`" in tpl
 
 
-def test_frontend_fallback_url_has_pp_suffix():
-    """fallback URL 都要跟。"""
-    tpl = _tpl()
-    assert "_cardPpSuffix(foodCardPreview.perPage)" in tpl
 
 
-def test_frontend_preserves_per_page_across_reopen():
-    """關閉再打開要保留選擇。"""
-    tpl = _tpl()
-    assert "_keepPP" in tpl, "重新開啟要保留 perPage"
-    assert "perPage: this.foodCardPreview.perPage || 5" in tpl
 
 
-def test_no_stale_per_page_omission():
-    """唔准有 fetch 食緊 date 但漏咗 per_page(會拿到唔同分頁)。
-
-    per_page 可以用字面 `per_page=` 或者變數 `${_ppQ}` / `${_pp}`
-    (preview fetch 用 `_ppQ`,切頁 fetch 用 `_pp` + literal)。
-
-    v3.3.60:下載**唔再係 fetch**(改直接 `<a href>`),所以 fetch 數目由 3
-    變 2(preview + 切頁);下載嗰條路徑要另外驗(見
-    `test_frontend_page_url_has_per_page`)。
-    """
-    tpl = _strip_comments(_tpl())
-    found = 0
-    for m in re.finditer(r"fetch\(\s*`/api/nutrition/card\?([^`]+)`", tpl):
-        q = m.group(1)
-        found += 1
-        assert ("per_page" in q) or ("_ppQ" in q) or ("_pp" in q), (
-            f"呢個 card fetch 漏咗 per_page: {q}"
-        )
-    assert found >= 2, f"應該有至少 2 個 card fetch(preview/切頁),搵到 {found}"
 
 
-def test_frontend_page_url_has_per_page():
-    """v3.3.60:下載 URL(直接 <a href>)要帶 per_page。"""
-    tpl = _tpl()
-    m = re.search(r"foodCardPageUrl\(pn\)\s*\{(.*?)\n    \},", tpl, re.S)
-    assert m, "搵唔到 foodCardPageUrl()"
-    body = m.group(1)
-    assert "per_page=${_pp}" in body, "下載 URL 要帶 per_page"
 
 
-def test_ppq_variable_is_built_correctly():
-    """`_ppQ` 要真係 `&per_page=<值>`。"""
-    tpl = _tpl()
-    assert "const _ppQ = `&per_page=${_pp}`;" in tpl, (
-        "_ppQ 要係 &per_page=<值>"
-    )
 
 
 # ---------------------------------------------------------------------------
 # 4b. 全部頁面嘅下載掣都要顯示(v3.3.57 Jim OOB)
 # ---------------------------------------------------------------------------
 
-def test_all_page_buttons_rendered():
-    """下載掣要 x-for 晒 pageTotal —— 全部頁面都見到,唔會藏喺第 2 頁。"""
-    tpl = _tpl()
-    assert 'x-for="pn in (foodCardPreview.pageTotal || 1)"' in tpl, (
-        "下載掣一定要按 pageTotal 全部 render"
-    )
-    assert ':href="foodCardPageUrl(pn)"' in tpl, "每個掣要對應自己嗰頁"
 
 
-def test_download_row_has_hint():
-    """要有文字講明「全部 N 頁,撳一個落一張」。"""
-    tpl = _tpl()
-    assert "逐頁下載" in tpl
-    assert "撳一個落一張" in tpl, "要講明係逐個下載,唔係一次過"
 
 
 def test_no_bulk_download_left():
@@ -449,5 +333,5 @@ def test_modal_opens_hides_banner():
 
 def test_version_bumped():
     web = _web()
-    assert '__version__ = "3.3.61"' in web
-    assert "gym-web-v165" in web
+    assert '__version__ = "3.3.62"' in web
+    assert "gym-web-v166" in web
