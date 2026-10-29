@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +36,7 @@ except ImportError:
 
 from flask import Flask, Response, jsonify, request, render_template_string, send_from_directory
 from workout_formatter import render as _render_text
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 from gym_web.core import safe_read_json as _safe_read_json
 from gym_web.core import safe_write_json as _safe_write_json
 from gym_web.idempotency import check_and_remember as _idempotency_check
@@ -64,6 +65,9 @@ from gym_web import push as _push
 from gym_web import geo as _geo
 # v3.3.46: 出站訊息紀錄(Gymbro 自己推出去嘅訊息;見 gym_web/outbox.py)。
 from gym_web import outbox as _outbox
+# v3.3.65: 廣東話口語守門員(Jim OOB 2026-10-29「The cheer you generated contains
+# mandarin」)。prompt 硬規則 + 客觀驗證器 + retry + 決定式重寫。
+from gym_web import cheer_cantonese as _canto
 
 # Load MiniMax keys from hermes-torres first, then hermes — preserves existing
 # dual-location behavior (hermes-torres wins, hermes fills gaps).
@@ -1012,7 +1016,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.64"
+__version__ = "3.3.66"
 
 
 def _recovery_pct():
@@ -5358,10 +5362,113 @@ def _vision_second_opinion(img_b64: str, prompt: str) -> str:
     return _minimax_vision(img_b64, prompt, exclude=skip, record_2nd=True)
 
 
+# ─────────────────────────────────────────────────────────────
+# v3.3.65 (2026-10-29) — Brave API key 陰影 bug
+#
+# 成因:gym_web.py 啟動時依次 load_dotenv 兩份 .env:
+#   load_dotenv("/home/work/.hermes-torres/.env")   ← 先
+#   load_dotenv("/home/work/.hermes/.env")          ← 後
+# python-dotenv 預設 override=False → **先載入嗰個贏**。
+# .hermes-torres/.env 嗰條 BRAVE_API_KEY 已經失效(22 字元),
+# 長期遮住 .hermes/.env 嗰條有效嘅(31 字元)→
+# 每次 /res/v1/web/search 都 422 SUBSCRIPTION_TOKEN_INVALID,
+# cheer 嘅新聞 / 基金 / 利物浦賽程三樣 context 全部變空。
+#
+# 修法:唔再單靠 os.environ(已經被陰影)。集齊所有候選 key,
+# 401/403/422 就自動跳去下一把,並記低成功嗰把(下次直接用)。
+# ─────────────────────────────────────────────────────────────
+_BRAVE_KEY_CACHE = {"key": "", "src": ""}
+
+
+def _brave_env_key(path: str) -> str:
+    """讀 BRAVE_API_KEY from a .env file —— **唔會**改動 os.environ。
+
+    (dotenv_values 只解析唔注入,所以可以喺唔影響其它 code 嘅情況下
+    攞到被 load_dotenv 陰影咗嘅原始值。)
+    """
+    if not os.path.exists(path):
+        return ""
+    try:
+        return (dotenv_values(path).get("BRAVE_API_KEY") or "").strip()
+    except Exception as e:
+        print(f"[brave_env_key] {path} failed: {type(e).__name__}: {e}", flush=True)
+        return ""
+
+
+def _brave_api_key_candidates() -> list:
+    """所有候選 Brave API key,[(key, 來源)] —— 按可信度排序、去重。
+
+    v3.3.65:見上面「陰影 bug」註解 —— os.environ 一把唔夠,
+    要連 .env 檔入面嘅原始值一齊試。
+    """
+    out = []
+
+    def _add(k, src):
+        k = (k or "").strip()
+        if k and all(k != existing for existing, _ in out):
+            out.append((k, src))
+
+    _add(_BRAVE_KEY_CACHE.get("key"), _BRAVE_KEY_CACHE.get("src") or "cache")
+    _add(os.environ.get("BRAVE_API_KEY", ""), "env")
+    for p in (
+        "/home/work/.hermes/.env",
+        "/home/work/.hermes-torres/.env",
+        "/home/work/.hermes/profiles/frimpong/.env",
+        "/home/work/.hermes/profiles/torres/.env",
+    ):
+        _add(_brave_env_key(p), p)
+    return out
+
+
 def _brave_api_key() -> str:
     """Brave Search API key for image lookup. Separate from BRAVE_ANSWER_KEY
-    (which is for the LLM-grounded answer endpoint, not raw image search)."""
-    return os.environ.get("BRAVE_API_KEY", "")
+    (which is for the LLM-grounded answer endpoint, not raw image search).
+
+    v3.3.65:回傳候選清單第一把(實際用邊把由 _brave_get_json 試出嚟)。
+    """
+    cands = _brave_api_key_candidates()
+    return cands[0][0] if cands else ""
+
+
+def _brave_get_json(url: str) -> dict:
+    """打 Brave Search API,逐把候選 key 試到通為止。
+
+    401 / 403 / 422 = 嗰把 key 唔得(認證失敗)→ 跳去下一把;
+    其他 HTTP 錯 = 唔關 key 事,直接返回 None。
+    成功嗰把會記落 _BRAVE_KEY_CACHE,下次唔使再試錯。
+    """
+    last_err = ""
+    for idx, (key, src) in enumerate(_brave_api_key_candidates()):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": key,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            _BRAVE_KEY_CACHE["key"] = key
+            _BRAVE_KEY_CACHE["src"] = src
+            if idx > 0:
+                print(f"[brave] key #{idx} ({src}) 有效,已記住", flush=True)
+            return data
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}"
+            if e.code in (401, 403, 422):
+                # 認證失敗 = 呢把 key 壞咗/過期 → 試下一把
+                print(f"[brave] key #{idx} ({src}) 被拒 ({e.code}),試下一把",
+                      flush=True)
+                continue
+            print(f"[brave] HTTPError {e.code}: {e}", flush=True)
+            return {}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            print(f"[brave] {last_err}", flush=True)
+            return {}
+    print(f"[brave] 所有候選 key 都唔得: {last_err}", flush=True)
+    return {}
 
 
 def _brave_image_search(query: str, count: int = 3) -> list:
@@ -5372,37 +5479,26 @@ def _brave_image_search(query: str, count: int = 3) -> list:
     Used to backfill a representative image for text-only food entries
     in /api/scan_preview_text (Jim OOB 2026-09-10).
     """
-    api_key = _brave_api_key()
-    if not api_key:
-        return []
     if not query or not query.strip():
         return []
-    try:
-        req = urllib.request.Request(
-            "https://api.search.brave.com/res/v1/images/search"
-            + "?q=" + urllib.parse.quote(query.strip())
-            + f"&count={min(count, 10)}&safesearch=off",
-            headers={
-                "Accept": "application/json",
-                "X-Subscription-Token": api_key,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-        out = []
-        for r in (data.get("results") or []):
-            props = r.get("properties") or {}
-            out.append({
-                "title": r.get("title", ""),
-                "url": props.get("url", "") or r.get("url", ""),
-                "thumbnail_url": (r.get("thumbnail") or {}).get("src", ""),
-                "source": r.get("source", ""),
-                "confidence": r.get("confidence", "low"),
-            })
-        return out
-    except Exception as e:
-        print(f"[brave_image_search] {type(e).__name__}: {e}", flush=True)
+    if not _brave_api_key():
         return []
+    data = _brave_get_json(
+        "https://api.search.brave.com/res/v1/images/search"
+        + "?q=" + urllib.parse.quote(query.strip())
+        + f"&count={min(count, 10)}&safesearch=off"
+    )
+    out = []
+    for r in (data.get("results") or []):
+        props = r.get("properties") or {}
+        out.append({
+            "title": r.get("title", ""),
+            "url": props.get("url", "") or r.get("url", ""),
+            "thumbnail_url": (r.get("thumbnail") or {}).get("src", ""),
+            "source": r.get("source", ""),
+            "confidence": r.get("confidence", "low"),
+        })
+    return out
 
 
 def _brave_web_search(query: str, count: int = 5) -> list:
@@ -5414,31 +5510,22 @@ def _brave_web_search(query: str, count: int = 5) -> list:
     否則呢三個 context 全部變空(cheer 會少咗三樣料)。
     Returns [] on no key / auth failure / network error.
     """
-    api_key = _brave_api_key()
-    if not api_key or not query or not query.strip():
+    if not query or not query.strip():
         return []
-    try:
-        req = urllib.request.Request(
-            "https://api.search.brave.com/res/v1/web/search"
-            + "?q=" + urllib.parse.quote(query.strip())
-            + f"&count={min(count, 10)}&safesearch=off",
-            headers={
-                "Accept": "application/json",
-                "X-Subscription-Token": api_key,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-        out = []
-        for r in ((data.get("web") or {}).get("results") or []):
-            t = (r.get("title") or "").strip()
-            d = (r.get("description") or "").strip()
-            if t:
-                out.append(f"{t} — {d}" if d else t)
-        return out
-    except Exception as e:
-        print(f"[brave_web_search] {type(e).__name__}: {e}", flush=True)
+    if not _brave_api_key():
         return []
+    data = _brave_get_json(
+        "https://api.search.brave.com/res/v1/web/search"
+        + "?q=" + urllib.parse.quote(query.strip())
+        + f"&count={min(count, 10)}&safesearch=off"
+    )
+    out = []
+    for r in ((data.get("web") or {}).get("results") or []):
+        t = (r.get("title") or "").strip()
+        d = (r.get("description") or "").strip()
+        if t:
+            out.append(f"{t} — {d}" if d else t)
+    return out
 
 
 def _cheer_web_fact(search_query: str, ask: str, max_tokens: int = 250,
@@ -5570,29 +5657,46 @@ def _minimax_nutrition_enrich(dish_desc: str) -> str:
         "max_tokens": 1500,  # v3.3.22: bumped from 400 — JSON got truncated mid-block
         "temperature": 0.1,
         "response_format": {"type": "json_object"},  # v3.3.22: enforce JSON if provider supports
+        # v3.3.65: 關 reasoning —— M3 開 thinking 會燒晒 token 變慢,
+        # 30s timeout 就係咁死咗(改名時營養重估靜靜哋失敗 → 舊值)。
+        "thinking": {"type": "disabled"},
     }
-    try:
-        req = urllib.request.Request(
-            "https://api.minimax.io/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "".join(["Bearer ", api_key]),
-            },
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        raw_content = resp["choices"][0]["message"]["content"]
-        # v3.3.23ah (Jim OOB 2026-09-16 'Why the estimation was wrong. Pls
-        # fix the systemic problem'): MiniMax M3 with reasoning enabled
-        # emits a `<think>...</think>` reasoning block BEFORE the actual
-        # JSON object. Naive `startswith("{")` checks at every call site
-        # would skip parsing. Fix at the SOURCE — strip the thinking
-        # block here so ALL callers automatically get a clean response.
-        # Belt-and-suspenders: also strip markdown code fences.
-        return _strip_thinking_block(raw_content)
-    except Exception as e:
-        return f"（MiniMax enrichment 失敗：{type(e).__name__}）"
+    # v3.3.65 (Jim OOB 2026-10-29「改名之後營養唔更新」):
+    # 舊版 timeout=30s + 冇 retry + 冇關 thinking → MiniMax M3 跑 reasoning
+    # tokens 慢到爆 → TimeoutError → 改名時 AI 層靜靜哋死咗 → fallback 去
+    # history 攞返**同一行嘅舊值** → Jim 見到「營養冇更新」。
+    # 修:(1) 關 thinking(同 cheer 一致,快好多)(2) timeout 30→75s
+    #     (3) 3 次 retry(每次 + 指數退避)
+    last_err = ""
+    for _attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                "https://api.minimax.io/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "".join(["Bearer ", api_key]),
+                },
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=75).read())
+            raw_content = resp["choices"][0]["message"]["content"]
+            # v3.3.23ah (Jim OOB 2026-09-16 'Why the estimation was wrong. Pls
+            # fix the systemic problem'): MiniMax M3 with reasoning enabled
+            # emits a `<think>...</think>` reasoning block BEFORE the actual
+            # JSON object. Naive `startswith("{")` checks at every call site
+            # would skip parsing. Fix at the SOURCE — strip the thinking
+            # block here so ALL callers automatically get a clean response.
+            # Belt-and-suspenders: also strip markdown code fences.
+            return _strip_thinking_block(raw_content)
+        except Exception as e:
+            last_err = f"{type(e).__name__}"
+            print(f"[minimax_enrich] attempt {_attempt + 1}/3 failed for {dish_desc!r}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            if _attempt < 2:
+                import time as _t
+                _t.sleep(1.5 * (_attempt + 1))
+    return f"（MiniMax enrichment 失敗：{last_err}）"
 
 
 # v3.3.22 (Jim OOB 2026-09-11 'No food nutritional info'): MiniMax M3 with
@@ -8465,7 +8569,8 @@ def api_scan_replace_image():
 # 修法:由 0 開始行 4 層鏈(explicit → brand → AI → history),
 #      全部失敗先回落舊值(唔會把一行變 0)。
 # ---------------------------------------------------------------------------
-def _reestimate_macros_for_name(dish_name: str, restaurant: str = "") -> dict:
+def _reestimate_macros_for_name(dish_name: str, restaurant: str = "",
+                                exclude_row: int = 0) -> dict:
     """4 層營養重估鏈(純文字,唔使相):explicit → brand → AI → history。
 
     Returns {"kcal","protein","carbs","fat","source"}。source 係邊一層贏:
@@ -8510,9 +8615,13 @@ def _reestimate_macros_for_name(dish_name: str, restaurant: str = "") -> dict:
                 if a_kcal > 0:
                     out["kcal"] = a_kcal
                     out["source"] = "ai"
-                if a_p > 0: out["protein"] = a_p
-                if a_c > 0: out["carbs"] = a_c
-                if a_f > 0: out["fat"] = a_f
+                # v3.3.65: explicit(名裡面寫明嘅數)優先過 AI 估算 ——
+                # 之前 AI 會直接蓋走 explicit,docstring 講明嘅優先規則冇實現。
+                # 例:「朱古力蛋白粉，27 Gram蛋白質」→ explicit P=27,
+                #     AI 只係估 25g → 唔應該蓋走 27。
+                if a_p > 0 and out["protein"] <= 0: out["protein"] = a_p
+                if a_c > 0 and out["carbs"] <= 0: out["carbs"] = a_c
+                if a_f > 0 and out["fat"] <= 0: out["fat"] = a_f
                 print(f"[macro-reestimate] AI → {a_kcal} kcal / P{a_p} C{a_c} F{a_f} for {name!r}",
                       flush=True)
             else:
@@ -8522,7 +8631,7 @@ def _reestimate_macros_for_name(dish_name: str, restaurant: str = "") -> dict:
 
     # Layer 4: Sheet 歷史(最後 fallback,只喺仍然 0 嘅時候用)
     if out["kcal"] <= 0:
-        looked = _lookup_known_macros(name)
+        looked = _lookup_known_macros(name, exclude_row=exclude_row)
         if looked:
             out["kcal"] = int(looked.get("kcal", 0) or 0)
             out["protein"] = looked.get("protein", 0) or 0
@@ -8532,7 +8641,7 @@ def _reestimate_macros_for_name(dish_name: str, restaurant: str = "") -> dict:
             print(f"[macro-reestimate] history → {out['kcal']} kcal for {name!r}", flush=True)
     # Layer 4b: 有部分 macro(brand/explicit)但 kcal 仲係 0 → 只補 kcal
     if out["kcal"] <= 0 and (out["protein"] > 0 or out["carbs"] > 0 or out["fat"] > 0):
-        looked = _lookup_known_macros(name)
+        looked = _lookup_known_macros(name, exclude_row=exclude_row)
         if looked and int(looked.get("kcal", 0) or 0) > 0:
             out["kcal"] = int(looked["kcal"])
             print(f"[macro-reestimate] partial backfill kcal={out['kcal']} for {name!r}", flush=True)
@@ -8581,7 +8690,7 @@ def api_scan_rename():
     #         → 舊值 > 0 → AI 重新估算**永遠唔生效**(名改咗,數字一樣)。
     # 而家:由 0 起步行 4 層鏈(explicit → brand → AI → history),
     #       全部層都失敗先回落舊值(唔會把一行變 0)。
-    re_est = _reestimate_macros_for_name(new_name, restaurant)
+    re_est = _reestimate_macros_for_name(new_name, restaurant, exclude_row=scan_index)
     new_kcal = int(re_est.get("kcal", 0) or 0)
     new_p = re_est.get("protein", 0) or 0
     new_c = re_est.get("carbs", 0) or 0
@@ -8589,11 +8698,19 @@ def api_scan_rename():
     macros_source = re_est.get("source", "none")
     enrich_failed = (macros_source == "none")
     if new_kcal <= 0:
-        # 所有層都失敗 → 保留原本嘅 macros(唔好把一行變 0)
-        new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
-        macros_source = "kept_previous"
-        print(f"[scan_rename] re-estimate failed for {new_name!r}; kept previous macros",
-              flush=True)
+        if (new_p or new_c or new_f):
+            # v3.3.65: 名裡面有明確數字(例「27 Gram蛋白質」→ P=27)但 kcal
+            # 估唔到 → 保留呢啲明確數字,只係 kcal 沿用舊值(唔好成行照舊)
+            new_kcal = old_kcal
+            macros_source = "explicit_partial"
+            print(f"[scan_rename] partial re-estimate for {new_name!r}: "
+                  f"P{new_p} C{new_c} F{new_f}, kcal kept {new_kcal}", flush=True)
+        else:
+            # 所有層都失敗 → 保留原本嘅 macros(唔好把一行變 0)
+            new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f
+            macros_source = "kept_previous"
+            print(f"[scan_rename] re-estimate failed for {new_name!r}; kept previous macros",
+                  flush=True)
     # Apply share ratio (Jim 60% / 小寶 40% if shared)
     shared = _detect_shared_meal(re_text)
     jim_ratio = 0.60 if shared else 1.00
@@ -8610,6 +8727,10 @@ def api_scan_rename():
         "from_macros": {"calories": old_kcal, "protein": old_p, "carbs": old_c, "fat": old_f},
         "to_macros": {"calories": jim_kcal, "protein": jim_p, "carbs": jim_c, "fat": jim_f},
         "macros_source": macros_source,
+        "macros_warning": (
+            "AI 重新估算失敗,保留原本營養" if macros_source == "kept_previous"
+            else ("只更新咗名裡面寫明嘅營養,kcal 沿用原本數字"
+                  if macros_source == "explicit_partial" else "")),
     }
     # Overwrite name + macros fields on the Sheet row
     sheet_entry = {
@@ -11225,21 +11346,30 @@ def _extract_explicit_macros(text: str) -> dict:
     t = text.lower()
     # Map: keyword (lowercase) → output field name
     # Order matters - try longer matches first
+    # v3.3.65 (Jim OOB 2026-10-29「改名之後營養唔更新」):
+    # Jim 改名寫咗「朱古力蛋白粉，27 Gram蛋白質」→ 舊版只識 "27g protein"
+    # (g 單位 + 英文名)→ 呢個寫法捉唔到 → 落去 AI 層 → AI 又 timeout
+    # → history 攞返舊值 → 「營養冇更新」。
+    # 而家支援:gram/grams/克/冇單位 + 英文名 或 中文名(蛋白質/碳水/脂肪…)。
+    _U = r"(?:\s*g(?![a-z])|\s*grams?(?![a-z])|\s*克)?"
     patterns = [
         # kcal patterns (try first to avoid confusion with other g values)
-        (r"(\d+(?:\.\d+)?)\s*(?:kcal|cal|kilo[\s-]?calorie)", "calories"),
+        (r"(\d+(?:\.\d+)?)\s*(?:kcal|cal|kilo[\s-]?calorie|千卡)", "calories"),
         # P (protein)
-        (r"(\d+(?:\.\d+)?)\s*g\s*(?:protein|proteins?|p\b)", "protein"),
+        (rf"(\d+(?:\.\d+)?){_U}\s*(?:protein|proteins?|蛋白質|蛋白|奶蛋白)", "protein"),
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:p\b)", "protein"),
         # C (carbs) - avoid matching "calories" prefix
-        (r"(\d+(?:\.\d+)?)\s*g\s*(?:carb|carbs|c\b)", "carbs"),
+        (rf"(\d+(?:\.\d+)?){_U}\s*(?:carb|carbs|碳水化合物|碳水)", "carbs"),
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:c\b)", "carbs"),
         # F (fat) - be careful with "fiber" too
-        (r"(\d+(?:\.\d+)?)\s*g\s*(?:fat|fats|f\b)(?!\w)", "fat"),
+        (rf"(\d+(?:\.\d+)?){_U}\s*(?:fat|fats|脂肪)(?![a-z])", "fat"),
+        (r"(\d+(?:\.\d+)?)\s*g\s*(?:f\b)(?!\w)", "fat"),
         # Sugar
-        (r"(\d+(?:\.\d+)?)\s*g\s*(?:sugar|sugars)", "sugar"),
+        (rf"(\d+(?:\.\d+)?){_U}\s*(?:sugar|sugars|糖)(?![a-z])", "sugar"),
         # Fiber / Fibre
-        (r"(\d+(?:\.\d+)?)\s*g\s*(?:fiber|fibre)", "fiber"),
+        (rf"(\d+(?:\.\d+)?){_U}\s*(?:fiber|fibre|纖維|膳食纖維)", "fiber"),
         # Sodium (mg)
-        (r"(\d+(?:\.\d+)?)\s*(?:mg|milligram)\s*(?:sodium|salt|na)", "sodium"),
+        (r"(\d+(?:\.\d+)?)\s*(?:mg|milligram|毫克)\s*(?:sodium|salt|na|鈉)", "sodium"),
     ]
     for pattern, field in patterns:
         m = re.search(pattern, t)
@@ -11294,7 +11424,7 @@ def _lookup_brand_macros(dish_name: str) -> dict:
     return {}
 
 
-def _lookup_known_macros(dish_name: str) -> dict:
+def _lookup_known_macros(dish_name: str, exclude_row: int = 0) -> dict:
     """v3.3.7: when vision AI returns empty nutrition, backfill from
     Sheet history of similar dish names (Jim OOB 2026-08-16 'why today
     egg tarts have nutrient info?' — should NOT be 0).
@@ -11305,6 +11435,10 @@ def _lookup_known_macros(dish_name: str) -> dict:
     if not dish_name or len(dish_name.strip()) < 2:
         return {}
     rows = get_cache().find_similar_by_name(dish_name.strip(), min_matches=2)
+    # v3.3.65: 排除「正在改名嗰一行」自己 —— 唔係咁 history 層會攞返
+    # 同一行嘅舊 macros,睇落就似「改名完全冇更新營養」。
+    if exclude_row:
+        rows = [r for r in rows if getattr(r, "row_index", 0) != exclude_row]
     if len(rows) < 2:
         return {}
     kcals = [r.kcal for r in rows]
@@ -14212,6 +14346,14 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
         "skin_temp_c": _r1(score.get('skin_temp_celsius')),
         "sleep_id": (latest_sleep or {}).get('id'),
         "sleep_bed_hr": round(sleep_ss.get('total_in_bed_time_milli', 0) / 3600000, 2),
+        # v3.3.65 (Jim OOB 2026-10-29「cheer 話噉晚瞓咗 9.82 個鐘」但實瞓得
+        # 5.35h):sleep_bed_hr = **在床時間**,唔等於實瞓。補兩個真值欄位,
+        # 令 prompt 可以講「在床 9.82h / 實瞓 5.35h / 醒 4.45h」。
+        "sleep_awake_hr": round(sleep_ss.get('total_awake_time_milli', 0) / 3600000, 2),
+        "sleep_actual_hr": round((
+            sleep_ss.get('total_light_sleep_time_milli', 0)
+            + sleep_ss.get('total_slow_wave_sleep_time_milli', 0)
+            + sleep_ss.get('total_rem_sleep_time_milli', 0)) / 3600000, 2) or None,
         "sleep_rem_min": round(sleep_ss.get('total_rem_sleep_time_milli', 0) / 60000, 1),
         "sleep_sws_min": round(sleep_ss.get('total_slow_wave_sleep_time_milli', 0) / 60000, 1),
         "sleep_perf_pct": ((latest_sleep or {}).get('score') or {}).get('sleep_performance_percentage'),
@@ -14709,6 +14851,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
                     "    - ✅ 「九月二十七號」、「十月一號」、「二零二六年八月二十七號」\n"
                     "    - 包括「前晚 (10/1) gym」、「噉晚 (8/27) workout」呢種括號內標日期都要轉中文\n"
                     "    - \"今日 / 昨日 / 前日 / 噉晚\" 之類嘅相對時間詞 OK, 但跟住嘅具體日期必須中文\n"
+                    + _canto.system_block() + "\n"
                 ),
             },
             {"role": "user", "content": prompt},
@@ -14755,6 +14898,18 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
             r"Sure[\s,]+|Below is[\s\S]{0,100}?:|以下是[\s\S]{0,100}?:)\s*",
             "", text, flags=re.IGNORECASE
         ).strip()
+        # v3.3.65: 廣東話守門員(呢條係 fallback path,一樣要守)
+        try:
+            _au = _canto.audit(text)
+            if not _au["ok"]:
+                _fx = _canto.rewrite(text)
+                _af = _canto.audit(_fx)
+                if len(_af["issues"]) <= len(_au["issues"]):
+                    text = _fx
+                print(f"[cheer_canto] fallback-path guard: {_au['issues']} → {_af['issues']}",
+                      flush=True)
+        except Exception as e:
+            print(f"[cheer_canto] fallback-path guard failed: {e}", flush=True)
         return text
     except Exception:
         # v3.2.7.40: pplx is gone — fall through to local template fallback.
@@ -14762,26 +14917,34 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
 
 
 def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
-    """Pure-local fallback cheer text (no AI call). Used when pplx unavailable."""
+    """Pure-local fallback cheer text (no AI call). Used when pplx unavailable.
+
+    v3.3.65 (Jim OOB 2026-10-29「I can only listen cantonese not mandarin」):
+    呢個模板以前有英文(Google Sheet / session / Whoop)而且用咗在床時間
+    當實瞓時間。而家:全繁體 + 粵語口語 + 只留 Jim/HKT 兩個英文字,
+    並且用 sleep_actual_hr(實瞓)而唔係 sleep_bed_hr(在床)。
+    """
     rec = metrics.get("recovery_pct") or 0
     rec_state = metrics.get("recovery_state") or "PENDING"
     hrv = metrics.get("hrv_ms") or 0
     rhr = metrics.get("rhr_bpm") or 0
-    sleep_hr = metrics.get("sleep_bed_hr") or 0
+    sleep_bed_hr = metrics.get("sleep_bed_hr") or 0
+    sleep_actual_hr = metrics.get("sleep_actual_hr") or sleep_bed_hr
+    sleep_awake_hr = metrics.get("sleep_awake_hr") or 0
     workout_n = metrics.get("today_workout_count") or 0
     zh_state = {"SCORED": "已計分", "PENDING_SCORE": "等緊計分"}.get(rec_state, "未更新")
     color_zh = "綠燈" if rec >= 67 else ("黃燈" if rec >= 34 else "紅燈")
     hkt = datetime.now(timezone(timedelta(hours=8)))
     greet = "早晨" if hkt.hour < 12 else ("下午好" if hkt.hour < 18 else "晚安")
     return (
-        f"{greet}占姆，今日 HKT {hkt.strftime('%H:%M')} 嘅健康摘要啦。"
-        f"Whoop 復原指數 {rec}% （{zh_state}），屬於{color_zh}範圍；"
-        f"心跳變異 {hrv} 毫秒、靜止心跳 {rhr}，數字見到身體慢慢上力。\n\n"
-        f"噉晚瞓咗 {sleep_hr} 個鐘頭，深層瞓嘅表現指數 {metrics.get('sleep_perf_pct') or 0}%，"
-        f"雖然未到頂級但穩定。"
-        f"今日已經做完 {workout_n} 個 session，紀錄全部入咗 Google Sheet 嗰度。\n\n"
-        f"教練建議呢個鐘數繼續飲多兩杯水，蛋白質嗰餐目標 40 克以上。"
-        f"噉晚瞓前做十分鐘伸展就夠。祝你今早日順，旅途愉快。"
+        f"{greet}Jim，今日 HKT {hkt.strftime('%H:%M')} 嘅健康摘要啦。\n\n"
+        f"復原指數 {rec}%（{zh_state}），屬於{color_zh}範圍；"
+        f"心跳變異 {hrv} 毫秒、靜止心跳 {rhr}，睇住個數就知身體慢慢上緊力。\n\n"
+        f"噉晚喺床 {sleep_bed_hr} 個鐘，實際瞓咗 {sleep_actual_hr} 個鐘"
+        f"（中間醒咗 {sleep_awake_hr} 個鐘），深層瞓嘅表現指數 {metrics.get('sleep_perf_pct') or 0}%。\n\n"
+        f"今日做咗 {workout_n} 節運動，記錄全部入咗運動記錄表。\n\n"
+        f"教練建議呢個鐘數繼續飲多兩杯水，蛋白質嗰餐爭取 40 克以上；"
+        f"瞓之前做十分鐘伸展就夠。祝你今早日順。"
     )
 
 
@@ -15029,9 +15192,15 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
     rec = whoop.get("recovery_pct")
     hrv = whoop.get("hrv_ms")
     rhr = whoop.get("rhr_bpm")
-    sleep_hr = whoop.get("sleep_bed_hr")
+    sleep_bed_hr = whoop.get("sleep_bed_hr")
+    # v3.3.65: 在床時間 ≠ 實瞓時間(10/29 晨間 cheer 話「瞓咗 9.82 個鐘」,
+    # 實際只瞓咗 5.35h,因為 4.45h 係醒嘅)。三個數都俾 LLM,免得講錯。
+    sleep_actual_hr = whoop.get("sleep_actual_hr") or sleep_bed_hr
+    sleep_awake_hr = whoop.get("sleep_awake_hr")
     sleep_perf = whoop.get("sleep_perf_pct") or whoop.get("sleep_eff_pct")
     strain = whoop.get("strain")
+    # v3.3.65: raw float(0.33847734)讀出嚟好怪 → 四捨五入
+    strain_r = round(float(strain), 2) if isinstance(strain, (int, float)) else strain
     steps = (w.get("steps") or {}).get("steps") if isinstance(w.get("steps"), dict) else w.get("steps")
     weight = w.get("weight_kg")
     fat = w.get("fat_pct")
@@ -15078,7 +15247,7 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f = m.get("F", 0)
         meals_lines.append(f"  - {t} {name} ~{kcal} kcal / P{p:g} / C{c:g} / F{f:g}")
 
-    meals_block = "\n".join(meals_lines) if meals_lines else f"  ({nutrition_day_label}未 log 食物)"
+    meals_block = "\n".join(meals_lines) if meals_lines else f"  ({nutrition_day_label}未記錄食物)"
 
     return (
         f"{fire_type_zh} 嘅 daily narrative 嚟喇，目標：俾 cheer voice 讀 + "
@@ -15089,18 +15258,18 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"- 復原指數：{rec}% ({rec_state})\n"
         f"- 心跳變異：{hrv} 毫秒\n"
         f"- 靜止心跳：{rhr} 下/分鐘\n"
-        f"- 噉晚瞓：{sleep_hr} 個鐘頭（表現 {sleep_perf}%）\n"
-        f"- 疲勞度：{strain}\n"
+        f"- 噉晚喺床：{sleep_bed_hr} 個鐘，實際瞓咗 {sleep_actual_hr} 個鐘，中途醒咗 {sleep_awake_hr} 個鐘（表現 {sleep_perf}%）\n"
+        f"- 今日負荷指數：{strain_r}\n"
         f"- 體重（WHOOP）：{weight} 公斤 / 體脂 {fat} %\n"
         f"- 今日步數：{steps} 步\n"
-        f"- 最後進食：{ctx.get('last_food_ts') or '今日未 log'}\n"
-        f"- 最後 gym：{ctx.get('last_gym_ts') or '今日未做 gym'}\n\n"
+        f"- 最後進食：{ctx.get('last_food_ts') or '今日未食嘢'}\n"
+        f"- 最後運動：{ctx.get('last_gym_ts') or '今日未做運動'}\n\n"
         f"**{nutrition_day_label}飲食記錄（Jim OOB 2026-09-27: cheer 要引用, 唔好 generic）**：\n"
         f"- 記錄日期：{nutrition_date}（{nutrition_day_label}）\n"
-        f"- 已 log {meal_count} 餐\n"
+        f"- 已記錄 {meal_count} 餐\n"
         f"- 累計 ~{int(totals.get('kcal', 0))} kcal / P{int(totals.get('P', 0))}g / C{int(totals.get('C', 0))}g / F{int(totals.get('F', 0))}g\n"
         f"{meals_block}\n\n"
-        f"**過去 3 日 workout 趨勢（Jim OOB 2026-09-27: 加埋 latest whoop activity）**：\n"
+        f"**過去 3 日運動趨勢（Jim OOB 2026-09-27: 加埋 latest whoop activity）**：\n"
         f"{recent_workouts_zh}\n\n"
         f"**本週熱話 news fact (pplx 30 min 內, 隨機 4 類 — 明星/體育/AI/黑客)**：\n"
         f"{ctx.get('news') or '(本週未有確認熱話)'}\n\n"
@@ -15118,6 +15287,60 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"\n**數字寫法**：kcal / 克數 / 步數 / 鐘數一律用阿拉伯數字(如 2 kcal、250 kcal、3140 步),"
         f"唔好轉中文數字(「2 kcal」唔係「兩千卡」❗)。"
     )
+
+
+def _cheer_mandarin_judge(text: str) -> str:
+    """用 MiniMax 做語言判定:呢段係廣東話口語,定普通話書面中文?
+
+    v3.3.65 (Jim OOB 2026-10-29 09:5x HKT「I can only listen cantonese not
+    mandarin! this is serious」)—— 決定式規則有盲點:普通話書面語**有時完全
+    唔會出現黑名單詞**(例:「連日做嘢要保留」「時間其實夠,但表現只有
+    39.0%」「光線慢慢照亮睡房」)。所以加多一層 LLM 裁判,客觀判語言種類。
+
+    只回覆「粵語」或「普通話」兩個字,max_tokens 極細 → 成本近乎零。
+    裁判掛咗唔好阻住出稿(回傳「粵語」)。
+    """
+    api_key = _minimax_api_key()
+    if not api_key or not text:
+        return "粵語"
+    sys_p = (
+        "你係語言學家,專門判斷中文文本係「香港廣東話口語」定「普通話書面中文」。\n"
+        "判斷準則:睇句式同詞彙,唔係單睇有冇「嘅/咗/係/喺」。\n"
+        "普通話書面中文例子:「今日的復原指數有所提升,整體狀態趨於穩定,建議保持規律作息,"
+        "需要注意的是今日尚未記錄訓練。」\n"
+        "廣東話口語例子:「今日復原指數好返咗少少,成個人穩定咗好多,照咁樣保持早瞓嘅習慣就得,"
+        "講真今日仲未做過運動。」\n"
+        "判斷錯誤嘅典型情況:用咗「嘅/咗」但句式仍然係書面普通話 → 算普通話。\n"
+        "只回覆兩個字之一:粵語 或 普通話。唔好解釋。"
+    )
+    payload = {
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "system", "content": sys_p},
+            {"role": "user", "content": (text or "")[:4000]},
+        ],
+        "max_tokens": 6,
+        "temperature": 0,
+        "thinking": {"type": "disabled"},
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.minimax.io/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "".join(["Bearer ", api_key]),
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        out = (resp["choices"][0]["message"]["content"] or "").strip()
+        if "普通話" in out:
+            return "普通話"
+        return "粵語"
+    except Exception as e:
+        print(f"[cheer_canto] judge failed: {e}", flush=True)
+        return "粵語"
 
 
 def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
@@ -15162,7 +15385,8 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
         "   - ❌ 「而家就同你 update」 / 「而家嚟同你講」 / 「先同你 update」\n"
         "   - ❌ 「哈嘍 Jim」 / 「Hey Jim」 / 「Hi Jim」 / 「Hello Jim」\n"
         "   第一句直接寫具體內容: e.g. 「噉晚瞓咗七個鐘, 深層瞓差唔多兩個鐘」/ "
-        "「HRV 跌到廿四, 你個自律神經而家係攤喺度抖緊嘅狀態」/ 「今日零 workout, 紅燈復原, 你個 body 喺度維修中」。\n"
+        "「心跳變異跌到廿四, 你個自律神經而家係攤喺度抖緊嘅狀態」/ 「今日零運動, 紅燈復原, 你個身體喺度維修中」。\n"
+        + _canto.system_block() + "\n"
     )
     payload = {
         "model": "MiniMax-M3",
@@ -15174,11 +15398,16 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
         "temperature": 0.7,
         "thinking": {"type": "disabled"},
     }
-    text = ""
-    try:
+
+    def _call_minimax(pmsg: str) -> str:
+        p = dict(payload)
+        p["messages"] = [
+            {"role": "system", "content": cheer_sys},
+            {"role": "user", "content": pmsg},
+        ]
         req = urllib.request.Request(
             "https://api.minimax.io/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
+            data=json.dumps(p).encode("utf-8"),
             method="POST",
             headers={
                 "Content-Type": "application/json",
@@ -15186,16 +15415,22 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
             },
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
-        text = resp["choices"][0]["message"]["content"].strip()
+        t = resp["choices"][0]["message"]["content"].strip()
         # Strip think + opener prefixes (same regex as cheer)
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
-        text = re.sub(
+        t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL)
+        t = re.sub(r"<think>.*$", "", t, flags=re.DOTALL)
+        t = re.sub(
             r"^(Here[ ']s the cheer[\s\S]{0,200}?:|Let me think[\s\S]{0,200}?:|"
             r"Sure[\s,]+|Below is[\s\S]{0,100}?:|以下是[\s\S]{0,100}?:)\s*",
-            "", text, flags=re.IGNORECASE
+            "", t, flags=re.IGNORECASE
         ).strip()
+        return t
+
+    text = ""
+    try:
+        text = _call_minimax(user_prompt)
     except Exception as e:
+        print(f"[cheer_canto] narrative call failed: {e}", flush=True)
         metrics = {
             "recovery_pct": ctx.get("recovery_pct"),
             "hrv_ms": ctx.get("whoop", {}).get("hrv_ms"),
@@ -15205,6 +15440,71 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
             "today_workout_count": 0,
         }
         text = _cheer_fallback_text(metrics, fire_type)
+
+    # ─────────────────────────────────────────────────────────
+    # v3.3.65 — 廣東話口語守門員(Jim OOB 2026-10-29「The cheer you
+    # generated contains mandarin」)
+    #
+    # 問題:MiniMax M3 預設寫標準書面中文,只係偶爾用「嘅/咗」→
+    #       整段其實係普通話書面語(「連日做嘢要保留」「時間其實夠」
+    #       「光線慢慢照亮睡房」)。
+    # 對策:客觀驗證(嘅/的、咗/了、係/是、喺/在 比例 + 書面詞黑名單
+    #       + 英文字 token)→ 唔過就帶住問題重問(最多 2 次)→
+    #       仲唔過就決定式重寫 → 再驗。
+    #       prompt 規則係軟約束(2026-08-11 已經有「唔好讀數字」,
+    #       模型照樣寫晒 61.0%),所以一定要有硬驗證 + retry。
+    # ─────────────────────────────────────────────────────────
+    audit_log = []
+    for attempt in range(3):
+        if not text:
+            break
+        au = _canto.audit(text)
+        issues = list(au["issues"])
+        if au["ok"]:
+            # 決定式規則過咗,但書面普通話有時完全唔會撞黑名單 → 叫 LLM 裁判
+            # 判一次語言種類(Jim「I can only listen cantonese not mandarin」)
+            verdict = _cheer_mandarin_judge(text)
+            if verdict == "普通話":
+                issues.append("語言裁判判定呢段似普通話書面語(要改寫成香港人講嘅口語)")
+        audit_log.append({"attempt": attempt, "ok": not issues, "issues": issues})
+        if not issues:
+            break
+        print(f"[cheer_canto] attempt {attempt} 未過關: {issues}", flush=True)
+        if attempt < 2:
+            fb = ("\n\n【上一稿有問題,一定要改】\n"
+                  + "\n".join(f"- {x}" for x in issues)
+                  + "\n請重寫全段:一定要係香港人講嘅口語(用「嘅/咗/係/喺/唔/咁」嘅語氣同句式),"
+                    "唔好普通話書面語,唔好任何英文字(只可以 Jim / CIO / HKT)。")
+            try:
+                text = _call_minimax(user_prompt + fb)
+            except Exception as e:
+                print(f"[cheer_canto] retry {attempt} failed: {e}", flush=True)
+                break
+    # 最後防線:決定式把普通話書面詞 / 英文字換成廣東話
+    if text:
+        before = _canto.audit(text)
+        fixed = _canto.rewrite(text)
+        if fixed != text:
+            after = _canto.audit(fixed)
+            print(f"[cheer_canto] rewrite: before_ok={before['ok']} after_ok={after['ok']} "
+                  f"after_issues={after['issues']}", flush=True)
+            # 只有重寫之後明顯更好(issues 變少)先採用
+            if len(after["issues"]) <= len(before["issues"]):
+                text = fixed
+            audit_log.append({"rewrite": True, "before": before["issues"], "after": after["issues"]})
+    try:
+        os.makedirs("/home/work/.hermes/logs", exist_ok=True)
+        with open("/home/work/.hermes/logs/cheer_cantonese_audit.log", "a") as _f:
+            _f.write(f"{now_iso()} | fire_type={fire_type} | "
+                     f"{json.dumps(audit_log, ensure_ascii=False)}\n")
+    except Exception as e:
+        print(f"[cheer_canto] audit log write failed: {e}", flush=True)
+    # v3.3.65: 數字整理(app 文字同語音都乾淨:0.33847734 → 0.34、
+    # 61.0% → 61%、日期用中文)
+    try:
+        text = _canto.tidy_numbers(text)
+    except Exception as e:
+        print(f"[cheer_canto] tidy_numbers failed: {e}", flush=True)
     if not text:
         return {"narrative": "", "theme": "", "video_seed": "", "food_seed": ""}
     # Split into pieces the downstream consumers use
@@ -15439,6 +15739,34 @@ def _synthesize_cheer_voice(text: str) -> str:
 
     Returns file path or '' on failure.
     """
+    # ─────────────────────────────────────────────────────────
+    # v3.3.65 — 廣東話語音最後防線
+    # (Jim OOB 2026-10-29「I can only listen cantonese not mandarin!
+    #  this is serious」)
+    #
+    # 聲線本身係粵語(MiniMax Cantonese_crisp_news_anchor_vv2 / edge
+    # zh-HK-HiuMaanNeural),但**如果稿係書面普通話,粵語聲線讀出嚟
+    # 一樣係普通話** —— Jim 聽唔明。所以 TTS 入面嘅文字一定要係
+    # 廣東話口語。呢度係 pipeline 最後一道閘:audit → rewrite。
+    # ─────────────────────────────────────────────────────────
+    try:
+        _au = _canto.audit(text or "")
+        if not _au["ok"]:
+            _fx = _canto.rewrite(text or "")
+            _af = _canto.audit(_fx)
+            if len(_af["issues"]) <= len(_au["issues"]):
+                text = _fx
+            print(f"[cheer_canto] voice guard: issues={_au['issues']} → "
+                  f"after={_af['issues']}", flush=True)
+    except Exception as e:
+        print(f"[cheer_canto] voice guard failed: {e}", flush=True)
+    # v3.3.65: 數字整理 —— 0.33847734 → 0.34、61.0% → 61%、
+    # 「10 月 27 日」→「十月廿七號」。之前呢啲會被 TTS 讀成
+    # 「零點三三八四七七三四」「十月二十七日」→ 又機械又似普通話。
+    try:
+        text = _canto.tidy_numbers(text or "")
+    except Exception as e:
+        print(f"[cheer_canto] tidy_numbers failed: {e}", flush=True)
     try:
         # Step 0a (v3.3.6 NEW 2026-08-27, Jim OOB 「Never use slash in voice.
         # Spell out the date if applicable」): strip slash + symbol characters
@@ -16453,6 +16781,13 @@ def _background_cheer_job(job_id: str, fire_type: str):
         artifact_dir = CHEER_ARTIFACT_DIR / f"cheer_{today_iso_str}_{context}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / "cheer_text.txt").write_text(text, encoding="utf-8")
+        # v3.3.65: 存低廣東話守門員嘅驗證結果(客觀證據,唔係「我覺得」)
+        try:
+            _au = _canto.audit(text)
+            (artifact_dir / "cheer_audit.json").write_text(
+                json.dumps(_au, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as _e:
+            print(f"[cheer_canto] audit artifact write failed: {_e}", flush=True)
         if voice_path:
             shutil.copy2(voice_path, artifact_dir / "cheer_voice.mp3")
         if image_path:
@@ -17744,7 +18079,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v168';
+const CACHE = 'gym-web-v170';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1

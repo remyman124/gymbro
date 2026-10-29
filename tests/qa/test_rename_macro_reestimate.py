@@ -47,7 +47,7 @@ def _load_helper():
         ns["_lookup_brand_macros"] = lambda _n: (brand or {})
         ns["_minimax_nutrition_enrich"] = lambda _t: (ai or "")
         ns["_safe_parse_nutrition_json"] = lambda s: (json.loads(s) if s else None)
-        ns["_lookup_known_macros"] = lambda _n: (history or {})
+        ns["_lookup_known_macros"] = lambda _n, **_kw: (history or {})
 
     return fn, _install
 
@@ -136,11 +136,13 @@ def test_rename_no_longer_seeds_new_macros_from_old_values():
     seed = "new_kcal, new_p, new_c, new_f = old_kcal, old_p, old_c, old_f"
     assert src.count(seed) == 1, \
         "舊 seed 行出現多過一次(如果 > 1,起手嗰次又會鎖死 AI 層)"
-    helper_pos = src.index("_reestimate_macros_for_name(new_name, restaurant)")
+    helper_pos = src.index("_reestimate_macros_for_name(new_name, restaurant")
     seed_pos = src.index(seed)
     assert seed_pos > helper_pos, "seed 行仲喺 helper 之前 → 仍然由舊值起步"
     # 唯一嗰次必須喺「全部層失敗 → 回落舊值」嘅 guard 入面
-    guard = "    if new_kcal <= 0:\n        # 所有層都失敗 → 保留原本嘅 macros(唔好把一行變 0)\n"
+    # v3.3.66:fallback 改成兩層(partial / 全失敗)—— seed 行只可以出現喺
+    # 「全部層都失敗」嗰個 else 入面。
+    guard = "    if new_kcal <= 0:\n        if (new_p or new_c or new_f):"
     assert guard in src, "fallback guard 唔見咗"
     assert src.index(guard) < seed_pos, "seed 行唔喺 fallback guard 入面"
 

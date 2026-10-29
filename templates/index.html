@@ -1388,7 +1388,7 @@
                   </div>
                 </div>
                 <div x-show="renameSubmitMsg" class="mt-1.5 text-[10px]" x-text="renameSubmitMsg"
-                     :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'"></div>
+                     :class="renameSubmitMsg.startsWith('✓') ? 'text-emerald-300' : (renameSubmitMsg.startsWith('⚠️') ? 'text-amber-300' : 'text-red-300')"></div>
                 <div class="text-[9px] text-gray-500 mt-1">舊名會保留喺 audit trail（永久）</div>
               </div>
               <!-- v2.7.42: delete confirm popover (cascade food_scan_log + nutrition_log + Sheet) -->
@@ -6126,9 +6126,15 @@ function gymApp() {
         if (data.ok) {
           // v3.3.37:講真話 —— 重新估算成功定係失敗(保留原本營養)
           const _src = (data.correction && data.correction.macros_source) || '';
-          this.renameSubmitMsg = (_src === 'kept_previous' || _src === 'none')
-            ? '✓ 改名成功（AI 重新估算失敗，保留原本營養）'
-            : '✓ 改名 + 重新估算成功';
+          const _failed = (_src === 'kept_previous' || _src === 'none');
+          const _partial = (_src === 'explicit_partial');
+          // v3.3.65: 之前用 ✓ 綠色講「改名成功」但其實營養冇更新 →
+          // Jim 見到以為搞掂。改成 ⚠️ 警告色。
+          this.renameSubmitMsg = _failed
+            ? '⚠️ 改名成功，但 AI 重新估算失敗（保留原本營養）— 可以再撳一次試'
+            : (_partial
+              ? '⚠️ 改名成功，已更新名裡面寫明嘅營養，但 kcal 未能重新估算'
+              : '✓ 改名 + 重新估算成功');
           this.haptic(40);
           // Reload scans to reflect new name + macros
           await this.loadRecentScans();

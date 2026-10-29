@@ -682,59 +682,17 @@ def log_meal_text(food_desc: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-# v3.2.7.49 (Jim 2026-08-20): generate_music + get_recent_music tools removed —
-# MiniMax Music API returns 2153 for Token Plan keys and self-host isn't
-# feasible on this machine.
-
-
-@mcp.tool()
-def trigger_cheer_pipeline(fire_type: str = "manual", quick: bool = False) -> str:
-    """Orchestrate the full cheer routine in one call.
-
-    Phase B: this is the SINGLE entry point that replaces all hard-coded
-    cheer pipeline steps in Alonso's agent. Does:
-      1. Pull Whoop cache (via get_health_overlay shape)
-      2. Pull Withings (weight/steps)
-      3. Pull today's workout + nutrition
-      4. Pull Jim context (favourite team, eczema, share ratio, etc.)
-      5. Pull weekly schedule
-      6. Build a structured payload that the agent (Alonso) uses to write
-         the 8-section cheer text, generate voice, generate image, and
-         send via Telegram.
-
-    Returns a JSON payload (not the cheer text itself) — Alonso then writes
-    the cheer using its coach + butler persona following all rules
-    (text-coach-summary-voice + cheer-routine).
-
-    fire_type: 'manual' | 'morning' | 'evening' | 'post_gym' | 'hike_prep'
-    quick: if True, skip voice + image (text-only summary for chat reply)
-    """
-    out = {
-        "fire_type": fire_type,
-        "fetched_at": _hkt_now_iso(),
-        "health": json.loads(get_health_overlay()),
-        "workout": json.loads(get_today_workout()),
-        "nutrition": json.loads(get_today_nutrition()),
-        "jim_context": json.loads(get_jim_context()),
-        "schedule": json.loads(get_weekly_schedule(7)),
-        "latest_cheer": json.loads(get_latest_cheer()),
-        "quick_mode": quick,
-    }
-    out["next_steps"] = [
-        "1. Write 8-section cheer text (per cheer-routine SKILL.md) using persona + jim_context",
-        "2. Generate voice via edge-tts zh-HK-WanLungNeural (雲龍, Jim preferred) (if !quick)",
-        "3. Generate image via MiniMax hailuo (if !quick)",
-        "4. Send Telegram voice + image + text",
-        "5. Log to cheer_artifacts/cheer_<ts>_<fire_type>/",
-    ]
-    return json.dumps(out, ensure_ascii=False)
-
-
 # ── Phase D 2026-10-16: expose gym_web POST endpoints as MCP tools ──
 # Jim OOB "make sure gymbro have all the mcp for both update and read".
 # 15 new write wrappers — Alonso now has full read+write MCP coverage
 # without curl/HTTP roundtrips. Gym_web binds 0.0.0.0:7000 with no auth
 # (local trust model) so direct POST is safe.
+#
+# v3.3.66 (2026-10-29):呢一塊之前喺改寫 trigger_cheer_pipeline 嗰陣被
+# 意外刪走 —— GYM_WEB_BASE / _post_gym_web / _get_gym_web 全部唔見咗,
+# 但 log_meal_text 同 trigger_cheer_pipeline 仍然用緊佢哋 → 一 call 就
+# NameError(只係因為 MCP process 未重啟所以未爆)。
+# tests/qa/test_set_logging.py::test_mcp_has_no_dead_port 捉到,現在補返。
 from typing import Optional
 
 GYM_WEB_BASE = "http://127.0.0.1:7000"
@@ -785,7 +743,87 @@ def _get_gym_web(path: str, params: Optional[dict] = None,
                           ensure_ascii=False)
 
 
-# --- Workout session writes ---
+# v3.2.7.49 (Jim 2026-08-20): generate_music + get_recent_music tools removed —
+# MiniMax Music API returns 2153 for Token Plan keys and self-host isn't
+# feasible on this machine.
+
+
+@mcp.tool()
+def trigger_cheer_pipeline(fire_type: str = "manual", quick: bool = False) -> str:
+    """觸發 gymbro 自己嘅 cheer pipeline(唔再叫 Alonso 自己寫稿)。
+
+    v3.3.65 (Jim OOB 2026-10-29「And always refer to gymbro to generate」+
+    「I can only listen cantonese not mandarin! this is serious」):
+
+    **舊版呢個 tool 係錯嘅** —— 佢只係拎一個 payload 返嚟,跟住叫
+    Alonso(我)自己寫 8 段 cheer text。自己寫嘅稿**唔會**經過
+    gym_web 嘅廣東話守門員(gym_web/cheer_cantonese.py),於是普通話書面語
+    就咁樣漏咗出嚟(「照亮」「準備好」「兌現成力量」⋯⋯)。
+
+    **而家**:一律行 gymbro 端到端 pipeline ——
+    Whoop pull → daily narrative(MiniMax M3)→ **廣東話守門員**
+    (客觀驗證 + 帶住問題重問 + 決定式重寫)→ 粵語 TTS
+    (Cantonese_crisp_news_anchor_vv2)→ 圖 → artifact 目錄。
+    MCP 只負責觸發同攞結果,唔會再自己生成文字。
+
+    fire_type: 'manual' | 'morning' | 'evening' | 'post_gym' | 'post_meal' | ...
+    quick:    True = 只觸發文字層(唔等語音/圖);預設等齊全套。
+    """
+    import time as _t
+    # 1. 觸發 gymbro pipeline(background job)
+    trig = json.loads(_post_gym_web("/api/cheer", {"fire_type": fire_type}))
+    job_id = trig.get("job_id")
+    if not job_id:
+        return json.dumps({"ok": False, "stage": "trigger", "trigger": trig},
+                          ensure_ascii=False)
+
+    # 2. Poll(有上限,唔會死等)
+    deadline = _t.time() + (120 if quick else 300)
+    last = {}
+    while _t.time() < deadline:
+        try:
+            last = json.loads(_get_gym_web("/api/cheer/status", {"job_id": job_id}))
+        except Exception as e:
+            last = {"ok": False, "error": str(e)}
+        st = (last or {}).get("status")
+        if st in ("done", "failed", "error"):
+            break
+        _t.sleep(3)
+
+    # 3. 攞廣東話守門員嘅客觀驗證結果
+    audit = None
+    tp = (last or {}).get("text_path")
+    if tp:
+        try:
+            ap = os.path.join(os.path.dirname(tp), "cheer_audit.json")
+            if os.path.exists(ap):
+                audit = json.loads(open(ap, encoding="utf-8").read())
+        except Exception as e:
+            audit = {"error": str(e)}
+    if audit is None:
+        try:
+            audit = json.loads(_get_gym_web("/api/daily_coaching",
+                                            {"fire_type": fire_type}))
+        except Exception:
+            pass
+
+    out = {
+        "ok": (last or {}).get("status") == "done",
+        "stage": "gymbro_pipeline",
+        "job_id": job_id,
+        "fire_type": fire_type,
+        "status": (last or {}).get("status"),
+        "text": (last or {}).get("text") or (last or {}).get("clean_text"),
+        "text_path": tp,
+        "voice_path": (last or {}).get("voice_path"),
+        "image_path": (last or {}).get("image_path"),
+        "has_voice": (last or {}).get("has_voice"),
+        "has_image": (last or {}).get("has_image"),
+        "cantonese_audit": audit,
+        "note": "文字由 gymbro 生成並經廣東話守門員驗證;唔好自行改寫文字稿。",
+    }
+    return json.dumps(out, ensure_ascii=False)
+
 
 @mcp.tool()
 def log_set(exercise: str,
