@@ -418,6 +418,11 @@ def rewrite(text: str) -> str:
     t = re.sub(r"(嘅){2,}", "嘅", t)
     t = re.sub(r"(咗){2,}", "咗", t)
     t = re.sub(r"(係){2,}", "係", t)
+    # ── v3.3.68 (2026-10-30)第四層:剝走結構旁白 ──
+    # 2026-10-30 10:07 出嘅稿寫咗「第二段講返你嘅身體狀態,」「今朝第一句
+    # 就想同你講」——模型喺度自爆稿嘅結構,TTS 讀出嚟好核突。
+    t = re.sub(r"第[一二三四五六七八九十]+段(?:講返)?[^，。\n]{0,14}[，,]\s*", "", t)
+    t = re.sub(r"第[一二三四五六七八九十]+句", "", t)
     # ── v3.3.67 (2026-10-30) 第三層防線:剝走殘留英文 token ──
     # 之前 rewrite() 淨係換普通話詞,完全冇處理英文字 → 模型一旦漏咗
     # 一個英文名(2026-10-30 嘅 "Hugging Face"),retry 用盡都清唔走,
@@ -500,6 +505,32 @@ def tidy_numbers(text: str) -> str:
     t = re.sub(r"\b(\d+)\.(\d{3,})\b",
                 lambda m: f"{round(float(m.group(0)), 2):g}", t)
     t = re.sub(r"(\d+)\.0+%", r"\1%", t)
+    # v3.3.68 (2026-10-30):Rule 74 —— 唔准符號入 voice。
+    # 「4:30」→「四點半」、「12:12」→「十二點十二分」(唔係「3:30」)。
+    def _cn_small(n: int) -> str:
+        d = "零一二三四五六七八九"
+        if n < 10:
+            return d[n]
+        if n == 10:
+            return "十"
+        if n < 20:
+            return "十" + d[n % 10]
+        tens, ones = divmod(n, 10)
+        return d[tens] + "十" + (d[ones] if ones else "")
+
+    def _time(m: re.Match) -> str:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if mi == 0:
+            return f"{_cn_small(h)}點正"
+        if mi == 30:
+            return f"{_cn_small(h)}點半"
+        return f"{_cn_small(h)}點{_cn_small(mi)}分"
+
+    t = re.sub(r"\b(\d{1,2}):(\d{2})\b", _time, t)
+    # 負數:「-0.40%」→「負 0.4%」(負號唔可以直接讀出嚟)
+    t = re.sub(r"(?<![\d.])-(\d+(?:\.\d+)?)", r"負 \1", t)
+    # 小數尾零:「0.40%」→「0.4%」(唔讀「零點四零」)
+    t = re.sub(r"(\d+\.\d*?)0+(?![\d])", r"\1", t)
     def _cn_digit(n: int) -> str:
         return "零一二三四五六七八九"[n] if 0 <= n <= 9 else str(n)
 

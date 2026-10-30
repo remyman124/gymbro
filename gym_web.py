@@ -1016,7 +1016,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.67"
+__version__ = "3.3.68"
 
 
 def _recovery_pct():
@@ -14827,6 +14827,10 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
                     "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
                     "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
                     "6. (v3.3.67) 全篇 780-960 字, 8 段, 用 \\n\\n 分隔段落, 每段 90-130 字。\n"
+                    "6b. (v3.3.68) 唔准自爆稿嘅結構:唔准寫「第一段」「第二段」「第三段」"
+                    "「第一句」呢類講稿自身架構嘅說話,直接淨係講內容。\n"
+                    "6c. (v3.3.68) 時間唔准用冒號:寫「四點半」「十二點十二分」,"
+                    "唔准寫「4:30」「12:12」。\n"
                     "7. **(v3.2.7.42) 開頭第一句必須直入內容, 唔可以做 role-intro meta 自我介紹。** "
                     "即係唔可以寫以下呢啲 mechanical opener:\n"
                     "   - ❌ 「管家同你報數先」 / 「管家即刻同你 update」 / 「管家嚟喇」\n"
@@ -15398,7 +15402,11 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
         "3. **唔好用 markdown**: 唔好用 **bold**、唔好用 *italic*、唔好用 [n] citation、唔好用 ```code```。文字純文字。\n"
         "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
         "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
-        "6. (v3.3.67) 全篇 780-960 字, 8 段, 用 \\n\\n 分隔段落, 每段 90-130 字。\n"
+                    "6. (v3.3.67) 全篇 780-960 字, 8 段, 用 \\n\\n 分隔段落, 每段 90-130 字。\n"
+                    "6b. (v3.3.68) 唔准自爆稿嘅結構:唔准寫「第一段」「第二段」「第三段」"
+                    "「第一句」呢類講稿自身架構嘅說話,直接淨係講內容。\n"
+                    "6c. (v3.3.68) 時間唔准用冒號:寫「四點半」「十二點十二分」,"
+                    "唔准寫「4:30」「12:12」。\n"
         "7. **(v3.2.7.42) 開頭第一句必須直入內容, 唔可以做 role-intro meta 自我介紹。** "
         "即係唔可以寫以下呢啲 mechanical opener:\n"
         "   - ❌ 「管家同你報數先」 / 「管家即刻同你 update」 / 「管家嚟喇」\n"
@@ -18127,7 +18135,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v171';
+const CACHE = 'gym-web-v172';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1
