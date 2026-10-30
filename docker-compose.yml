@@ -25,13 +25,30 @@ services:
     container_name: gymbro
     restart: unless-stopped
     network_mode: host
+    # 2026-10-31:行 host 嘅 work(1001:1002),避免 container 寫出 root-owned 檔
+    user: "1001:1002"
     environment:
       GYMBRO_PORT: "7000"
       TZ: Asia/Hong_Kong
-      # GYMBRO_WRITE_MODE=dryrun  ← 試跑時加,唔會寫入 production Sheet
+      PYTHONPATH: ""
+      HOME: /home/work/.cache/gymbro
+      XDG_CACHE_HOME: /home/work/.cache/gymbro
+      HF_HOME: /home/work/.cache/huggingface
+      # 生產 = 真寫 Jim 個 Nutrition Sheet。要 QA 就用 docker-compose.qa.yml
+      # override 成 dryrun(唔好喺 production 容器度試寫)。
+      GYMBRO_WRITE_MODE: "${GYMBRO_WRITE_MODE:-production}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
-      # ── 憑證 / 設定(唯讀)──
-      - /home/work/.hermes/google_token.json:/home/work/.hermes/google_token.json:ro
+      # ── source code(host 目錄 = 唯一真相;改完 restart container 就生效)──
+      - /home/work/projects/gymbro:/app:ro
+      # ── 憑證 / 設定 ──
+      # 2026-10-31 (Alonso):唔可以 :ro —— Google OAuth token 會 refresh,
+      # app 會寫返入去;:ro 會令 Google API 靜默失敗(Frimpong P0 #2)。
+      - /home/work/.hermes/google_token.json:/home/work/.hermes/google_token.json
       - /home/work/.hermes/.env:/home/work/.hermes/.env:ro
       - /home/work/.hermes-torres/.env:/home/work/.hermes-torres/.env:ro
       - /home/work/.whoop_tokens.json:/home/work/.whoop_tokens.json:ro
@@ -41,6 +58,8 @@ services:
       - /home/work/.jim_context.json:/home/work/.jim_context.json
       # ── 圖片 / 音頻 / 掃描快取(可寫)──
       - /home/work/.hermes/image_cache:/home/work/.hermes/image_cache
+      # v3.3.70:app 啟動時會 mkdir VIDEO_CACHE_DIR(唔 mount 會 PermissionError)
+      - /home/work/.hermes/video_cache:/home/work/.hermes/video_cache
       - /home/work/.hermes/audio_cache:/home/work/.hermes/audio_cache
       - /home/work/.hermes/scan_cache:/home/work/.hermes/scan_cache
       - /home/work/.hermes/scan_thumb_cache:/home/work/.hermes/scan_thumb_cache
@@ -54,5 +73,16 @@ services:
       - /home/work/.hermes/food_scan_log.json:/home/work/.hermes/food_scan_log.json
       - /home/work/.hermes/photostream_classify_cache.json:/home/work/.hermes/photostream_classify_cache.json
       - /home/work/.hermes/drive_pending_uploads.json:/home/work/.hermes/drive_pending_uploads.json
+      # ── 補齊(Isak QA §A1 揪出:16 個 state 檔只有 8 個 mount,
+      #    缺咗 push 通知 / inbox 歷史 / geo 記錄 / commit dedup 安全線)──
+      - /home/work/.hermes/gymbro_geo.json:/home/work/.hermes/gymbro_geo.json
+      - /home/work/.hermes/gymbro_outbox.json:/home/work/.hermes/gymbro_outbox.json
+      - /home/work/.hermes/gymbro_push_subs.json:/home/work/.hermes/gymbro_push_subs.json
+      - /home/work/.hermes/gymbro_vapid.json:/home/work/.hermes/gymbro_vapid.json
+      - /home/work/.hermes/nutrition_desc_cache.json:/home/work/.hermes/nutrition_desc_cache.json
+      - /home/work/.hermes/nutrition_log.json:/home/work/.hermes/nutrition_log.json:ro
+      # ⚠️ commit_idempotency.json = 防重覆寫安全線(唔 mount 會令 dedup 失效)
+      - /home/work/.hermes/commit_idempotency.json:/home/work/.hermes/commit_idempotency.json
       # ── STT 模型快取(faster-whisper 第一次用會下載模型)──
       - /home/work/.cache/huggingface:/home/work/.cache/huggingface
+      - /home/work/.cache/gymbro:/home/work/.cache/gymbro

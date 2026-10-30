@@ -176,5 +176,5 @@ def test_version_bumped():
 
 def test_service_worker_cache_bumped():
     src = GW_PATH.read_text(encoding="utf-8")
-    assert "gym-web-v173" in src, "SW cache 要 bump 到 gym-web-v173"
+    assert "gym-web-v174" in src, "SW cache 要 bump 到 gym-web-v174"
     assert "gym-web-v170" not in src, "舊 cache 名仲喺度"

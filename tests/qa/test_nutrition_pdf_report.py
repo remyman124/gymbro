@@ -228,8 +228,8 @@ def test_live_pdf_download_headers():
 # ─────────────────────────────────────────────────────────────
 def test_version_pins():
     web = _src(WEB)
-    assert '__version__ = "3.3.69"' in web
-    assert "gym-web-v173" in web
+    assert '__version__ = "3.3.70"' in web
+    assert "gym-web-v174" in web
 
 
 # ─────────────────────────────────────────────────────────────

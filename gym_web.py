@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta, date
 from datetime import datetime as _dt
 from pathlib import Path
+from typing import Optional
 
 try:
     from PIL import Image, ImageOps
@@ -182,8 +183,20 @@ def save_log(log):
     """
     tmp = f"{WORKOUT_LOG}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
-        Path(tmp).write_text(json.dumps(log, indent=2, ensure_ascii=False))
-        os.replace(tmp, WORKOUT_LOG)
+        _payload = json.dumps(log, indent=2, ensure_ascii=False)
+        Path(tmp).write_text(_payload)
+        try:
+            os.replace(tmp, WORKOUT_LOG)
+        except OSError as _replace_err:
+            # 2026-10-31 (Alonso):單檔 bind mount 令 os.replace() 跨 mount 邊界
+            # (EXDEV / EBUSY)→ container 版 atomic write 必失敗(Frimpong P0 #1)。
+            # Fallback:直接覆寫目標檔(唔原子,但好過完全寫唔入)。
+            print(f"[save-log] atomic replace failed ({_replace_err}); direct-write fallback", flush=True)
+            Path(WORKOUT_LOG).write_text(_payload)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     except Exception as e:
         print(f"[save-log] atomic write failed: {type(e).__name__}: {e}", flush=True)
         try:
@@ -373,6 +386,36 @@ def _workout_log_gym_dates():
     return out
 
 
+def _sleep_actual_hr(sleep_ss) -> Optional[float]:
+    """v3.3.70:實瞓時間(light + SWS + REM)。計唔到就回 None。
+
+    2026-10-31 (Alonso):之前呢個值直接喺 dict literal 計,冇做上限檢查。
+    Whoop 分項缺失 → 0 → `or None` → 之後 `or sleep_bed_hr` 靜靜哋攞咗
+    在床時間冒充實瞓(Isak QA §A2)。而家:
+      - 分項缺失 / 全部 0 → None(唔講數字)
+      - 計出嚟大過在床時間(資料異常)→ None
+    """
+    if not isinstance(sleep_ss, dict):
+        return None
+    try:
+        total = (sleep_ss.get("total_light_sleep_time_milli", 0)
+                 + sleep_ss.get("total_slow_wave_sleep_time_milli", 0)
+                 + sleep_ss.get("total_rem_sleep_time_milli", 0))
+        hr = round(total / 3600000, 2)
+    except (TypeError, ValueError):
+        return None
+    if not hr or hr <= 0:
+        return None
+    bed = sleep_ss.get("total_in_bed_time_milli")
+    try:
+        bed_hr = (bed or 0) / 3600000
+        if bed_hr and hr > bed_hr + 0.05:
+            return None  # 異常:實瞓唔可能多過在床
+    except (TypeError, ValueError):
+        pass
+    return hr
+
+
 def _schedule_enrichment():
     """v3.2.7: enrich calendar days with workout-log + Whoop recovery + sleep.
 
@@ -389,6 +432,12 @@ def _schedule_enrichment():
         except Exception:
             log = {}
         for date_iso, entry in log.items():
+            # 2026-10-31 (Alonso):workout log 有一個污染 key('p' → int 1),
+            # 之前冇 type check 就 `entry.get()` → AttributeError
+            # → `/api/whoop_activities_calendar` production live 500
+            # (由 Isak QA 報告 §A3 揪出)。skip 唔係 dict 嘅 entry。
+            if not isinstance(entry, dict):
+                continue
             exercises = entry.get("exercises") or []
             if not isinstance(exercises, list):
                 continue
@@ -1018,7 +1067,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.69"
+__version__ = "3.3.70"
 
 
 def _recovery_pct():
@@ -1715,9 +1764,20 @@ def _load_jim_context() -> dict:
 def _save_jim_context(ctx: dict) -> bool:
     """Atomic write to JIM_CONTEXT."""
     try:
+        _payload = json.dumps(ctx, indent=2, ensure_ascii=False)
         tmp = str(JIM_CONTEXT) + ".tmp"
-        Path(tmp).write_text(json.dumps(ctx, indent=2, ensure_ascii=False))
-        os.replace(tmp, str(JIM_CONTEXT))
+        Path(tmp).write_text(_payload)
+        try:
+            os.replace(tmp, str(JIM_CONTEXT))
+        except OSError as _replace_err:
+            # 2026-10-31 (Alonso):單檔 bind mount → 跨 mount atomic replace 失敗
+            # (Frimpong P0 #3)。Fallback:直接寫。
+            print(f"[jim-context] atomic replace failed ({_replace_err}); direct-write fallback", flush=True)
+            Path(JIM_CONTEXT).write_text(_payload)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         return True
     except Exception:
         return False
@@ -3723,8 +3783,15 @@ def _get_google_access_token():
             tok["expires_at"] = time.time() + float(body["expires_in"])
         tok["refreshed_at"] = time.time()
         tmp = GOOGLE_TOKEN_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(tok, indent=2))
-        tmp.replace(GOOGLE_TOKEN_PATH)
+        try:
+            tmp.write_text(json.dumps(tok, indent=2))
+            tmp.replace(GOOGLE_TOKEN_PATH)
+        except OSError as _tmp_err:
+            # v3.3.70:單檔 bind mount 令 container 開唔到同目錄嘅 .tmp 檔
+            # (PermissionError)→ 直接覆寫目標檔(唔原子,但 token 唔會卡喺舊值)。
+            print(f"[google] atomic token write failed ({_tmp_err}); direct write",
+                  flush=True)
+            GOOGLE_TOKEN_PATH.write_text(json.dumps(tok, indent=2))
     except Exception as e:
         print(f"[google] token persist failed (access still valid in memory): "
               f"{type(e).__name__}: {e}", flush=True)
@@ -14364,10 +14431,9 @@ def _extract_whoop_metrics(whoop: dict) -> dict:
         # 5.35h):sleep_bed_hr = **在床時間**,唔等於實瞓。補兩個真值欄位,
         # 令 prompt 可以講「在床 9.82h / 實瞓 5.35h / 醒 4.45h」。
         "sleep_awake_hr": round(sleep_ss.get('total_awake_time_milli', 0) / 3600000, 2),
-        "sleep_actual_hr": round((
-            sleep_ss.get('total_light_sleep_time_milli', 0)
-            + sleep_ss.get('total_slow_wave_sleep_time_milli', 0)
-            + sleep_ss.get('total_rem_sleep_time_milli', 0)) / 3600000, 2) or None,
+        # v3.3.70:計唔到(分項缺失)→ None;數值大過在床(資料異常)→ 當未知,
+        # 唔好攞在床時間冒充實瞓(Isak QA §A2)。
+        "sleep_actual_hr": _sleep_actual_hr(sleep_ss),
         "sleep_rem_min": round(sleep_ss.get('total_rem_sleep_time_milli', 0) / 60000, 1),
         "sleep_sws_min": round(sleep_ss.get('total_slow_wave_sleep_time_milli', 0) / 60000, 1),
         "sleep_perf_pct": ((latest_sleep or {}).get('score') or {}).get('sleep_performance_percentage'),
@@ -14947,7 +15013,9 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
     hrv = metrics.get("hrv_ms") or 0
     rhr = metrics.get("rhr_bpm") or 0
     sleep_bed_hr = metrics.get("sleep_bed_hr") or 0
-    sleep_actual_hr = metrics.get("sleep_actual_hr") or sleep_bed_hr
+    # v3.3.70:計唔到實瞓就唔講數字(原本 `or sleep_bed_hr` 會冒充在床時間)
+    sleep_actual_hr = metrics.get("sleep_actual_hr")
+    sleep_actual_known = isinstance(sleep_actual_hr, (int, float)) and sleep_actual_hr > 0
     sleep_awake_hr = metrics.get("sleep_awake_hr") or 0
     workout_n = metrics.get("today_workout_count") or 0
     zh_state = {"SCORED": "已計分", "PENDING_SCORE": "等緊計分"}.get(rec_state, "未更新")
@@ -14958,8 +15026,10 @@ def _cheer_fallback_text(metrics: dict, fire_type: str) -> str:
         f"{greet}Jim，今日 HKT {hkt.strftime('%H:%M')} 嘅健康摘要啦。\n\n"
         f"復原指數 {rec}%（{zh_state}），屬於{color_zh}範圍；"
         f"心跳變異 {hrv} 毫秒、靜止心跳 {rhr}，睇住個數就知身體慢慢上緊力。\n\n"
-        f"噉晚喺床 {sleep_bed_hr} 個鐘，實際瞓咗 {sleep_actual_hr} 個鐘"
-        f"（中間醒咗 {sleep_awake_hr} 個鐘），深層瞓嘅表現指數 {metrics.get('sleep_perf_pct') or 0}%。\n\n"
+        f"噉晚喺床 {sleep_bed_hr} 個鐘，"
+        + (f"實際瞓咗 {sleep_actual_hr} 個鐘" if sleep_actual_known
+           else "實瞓分項今次冇數目，就唔亂講")
+        + f"（中間醒咗 {sleep_awake_hr} 個鐘），深層瞓嘅表現指數 {metrics.get('sleep_perf_pct') or 0}%。\n\n"
         f"今日做咗 {workout_n} 節運動，記錄全部入咗運動記錄表。\n\n"
         f"教練建議呢個鐘數繼續飲多兩杯水，蛋白質嗰餐爭取 40 克以上；"
         f"瞓之前做十分鐘伸展就夠。祝你今早日順。"
@@ -15213,7 +15283,10 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
     sleep_bed_hr = whoop.get("sleep_bed_hr")
     # v3.3.65: 在床時間 ≠ 實瞓時間(10/29 晨間 cheer 話「瞓咗 9.82 個鐘」,
     # 實際只瞓咗 5.35h,因為 4.45h 係醒嘅)。三個數都俾 LLM,免得講錯。
-    sleep_actual_hr = whoop.get("sleep_actual_hr") or sleep_bed_hr
+    # v3.3.70:計唔到實瞓 → None,並且明確叫 LLM 唔好亂報數字
+    sleep_actual_hr = whoop.get("sleep_actual_hr")
+    if not (isinstance(sleep_actual_hr, (int, float)) and sleep_actual_hr > 0):
+        sleep_actual_hr = None
     sleep_awake_hr = whoop.get("sleep_awake_hr")
     sleep_perf = whoop.get("sleep_perf_pct") or whoop.get("sleep_eff_pct")
     strain = whoop.get("strain")
@@ -15276,7 +15349,10 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"- 復原指數：{rec}% ({rec_state})\n"
         f"- 心跳變異：{hrv} 毫秒\n"
         f"- 靜止心跳：{rhr} 下/分鐘\n"
-        f"- 噉晚喺床：{sleep_bed_hr} 個鐘，實際瞓咗 {sleep_actual_hr} 個鐘，中途醒咗 {sleep_awake_hr} 個鐘（表現 {sleep_perf}%）\n"
+        f"- 噉晚喺床：{sleep_bed_hr} 個鐘，"
+        + (f"實際瞓咗 {sleep_actual_hr} 個鐘，" if sleep_actual_hr is not None
+           else "實瞓分項今次冇數目（唔准亂報數字，只可以講在床時間），")
+        + f"中途醒咗 {sleep_awake_hr} 個鐘（表現 {sleep_perf}%）\n"
         f"- 今日負荷指數：{strain_r}\n"
         f"- 體重（WHOOP）：{weight} 公斤 / 體脂 {fat} %\n"
         f"- 今日步數：{steps} 步\n"
@@ -18137,7 +18213,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v173';
+const CACHE = 'gym-web-v174';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1

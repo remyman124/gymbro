@@ -78,7 +78,7 @@ def test_version_and_cache():
     m = re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', src)
     assert m
     assert tuple(int(x) for x in m.groups()) >= (3, 3, 69)
-    assert "gym-web-v173" in src
+    assert "gym-web-v174" in src
     assert "gym-web-v171" not in src
 
 

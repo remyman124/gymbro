@@ -1,0 +1,15 @@
+# GymBro — QA override(行 7001,唔寫 production Sheet)
+#
+# 用法:
+#   docker compose -f docker-compose.yml -f docker-compose.qa.yml up -d
+#   curl -s http://127.0.0.1:7001/api/health
+#
+# ⚠️ 呢個 stack 唔好同 production 同時行同一個 container_name。
+#    所以要用 `docker compose -p gymbro-qa ...`(project name 分開),
+#    或者 production 停咗先跑 QA。
+services:
+  gymbro:
+    container_name: gymbro-qa
+    environment:
+      GYMBRO_PORT: "7001"
+      GYMBRO_WRITE_MODE: "dryrun"

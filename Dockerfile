@@ -1,4 +1,4 @@
-# GymBro — 營養/訓練 PWA(v3.3.69)
+# GymBro — 營養/訓練 PWA(v3.3.70)
 #
 # 用途:令 gymbro 成為「6 個 sub-agent 共用嘅 Docker Catalog」入面一份
 #       真實 entry(之前 gymbro 淨係靠 tmux + 系統 Python 行,冇 image)。
@@ -52,7 +52,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
         redis \
         ddgs \
         opencc-python-reimplemented \
-        faster-whisper
+        faster-whisper\
+        py-vapid \
+        pywebpush \
+        duckduckgo_search
 
 COPY . .
 
