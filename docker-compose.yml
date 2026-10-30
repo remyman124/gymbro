@@ -1,0 +1,58 @@
+# GymBro — docker compose(生產切換定義)
+#
+# ⚠️ 本機 production 而家係 tmux 行緊:
+#      tmux new-session -d -s gymbro -c /home/work/projects/gymbro \
+#        env PYTHONPATH= /usr/bin/python3 gym_web.py
+#    tmux 版同 container 版都 bind 7000,唔可以同時行。
+#
+#    切換(container 版):
+#      tmux kill-session -t gymbro
+#      docker compose -f /home/work/projects/gymbro/docker-compose.yml up -d
+#    切返(tmux 版):
+#      docker compose -f /home/work/projects/gymbro/docker-compose.yml down
+#      tmux new-session -d -s gymbro -c /home/work/projects/gymbro \
+#        env PYTHONPATH= /usr/bin/python3 gym_web.py
+#
+# network_mode: host —— 因為要連 host 嘅 Redis(127.0.0.1:6379),
+#                同埋 Tailscale(手機 PWA 要 https + push/定位)。
+#
+services:
+  gymbro:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gymbro:local
+    container_name: gymbro
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      GYMBRO_PORT: "7000"
+      TZ: Asia/Hong_Kong
+      # GYMBRO_WRITE_MODE=dryrun  ← 試跑時加,唔會寫入 production Sheet
+    volumes:
+      # ── 憑證 / 設定(唯讀)──
+      - /home/work/.hermes/google_token.json:/home/work/.hermes/google_token.json:ro
+      - /home/work/.hermes/.env:/home/work/.hermes/.env:ro
+      - /home/work/.hermes-torres/.env:/home/work/.hermes-torres/.env:ro
+      - /home/work/.whoop_tokens.json:/home/work/.whoop_tokens.json:ro
+      # ── WHOOP 資料(唯讀)──
+      - /home/work/.whoop_data_latest.json:/home/work/.whoop_data_latest.json:ro
+      - /home/work/.whoop_workout_log.json:/home/work/.whoop_workout_log.json
+      - /home/work/.jim_context.json:/home/work/.jim_context.json
+      # ── 圖片 / 音頻 / 掃描快取(可寫)──
+      - /home/work/.hermes/image_cache:/home/work/.hermes/image_cache
+      - /home/work/.hermes/audio_cache:/home/work/.hermes/audio_cache
+      - /home/work/.hermes/scan_cache:/home/work/.hermes/scan_cache
+      - /home/work/.hermes/scan_thumb_cache:/home/work/.hermes/scan_thumb_cache
+      - /home/work/.hermes/nutrition_card_cache:/home/work/.hermes/nutrition_card_cache
+      - /home/work/.hermes/nutrition_pdf_cache:/home/work/.hermes/nutrition_pdf_cache
+      - /home/work/.hermes/cheer_artifacts:/home/work/.hermes/cheer_artifacts
+      - /home/work/.hermes/logs:/home/work/.hermes/logs
+      # ── 狀態檔(可寫)──
+      - /home/work/.hermes/cheer_log.json:/home/work/.hermes/cheer_log.json
+      - /home/work/.hermes/coachtips_cache.json:/home/work/.hermes/coachtips_cache.json
+      - /home/work/.hermes/food_scan_log.json:/home/work/.hermes/food_scan_log.json
+      - /home/work/.hermes/photostream_classify_cache.json:/home/work/.hermes/photostream_classify_cache.json
+      - /home/work/.hermes/drive_pending_uploads.json:/home/work/.hermes/drive_pending_uploads.json
+      # ── STT 模型快取(faster-whisper 第一次用會下載模型)──
+      - /home/work/.cache/huggingface:/home/work/.cache/huggingface

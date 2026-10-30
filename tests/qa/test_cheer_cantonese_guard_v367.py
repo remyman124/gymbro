@@ -171,10 +171,10 @@ def test_version_bumped():
     m = re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', src)
     assert m, "搵唔到 __version__"
     ver = tuple(int(x) for x in m.groups())
-    assert ver >= (3, 3, 68), f"版本要 >= 3.3.67, 而家 {ver}"
+    assert ver >= (3, 3, 69), f"版本要 >= 3.3.67, 而家 {ver}"
 
 
 def test_service_worker_cache_bumped():
     src = GW_PATH.read_text(encoding="utf-8")
-    assert "gym-web-v172" in src, "SW cache 要 bump 到 gym-web-v172"
+    assert "gym-web-v173" in src, "SW cache 要 bump 到 gym-web-v173"
     assert "gym-web-v170" not in src, "舊 cache 名仲喺度"

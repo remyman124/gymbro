@@ -77,7 +77,9 @@ load_dotenv("/home/work/.hermes/.env")
 # ---------- Constants ----------
 WORKOUT_LOG = Path("/home/work/.whoop_workout_log.json")
 HKT = timezone(timedelta(hours=8))
-PORT = 7000
+# v3.3.69 (2026-10-30):PORT 支援 env(容器化 / 藍綠切換用)
+# 預設 7000 —— 行為同之前一模一樣,production 唔受影響。
+PORT = int(os.environ.get("GYMBRO_PORT", "7000"))
 HOST = "0.0.0.0"
 
 app = Flask(__name__, static_folder="/home/work/.hermes/image_cache", static_url_path="/img")
@@ -1016,7 +1018,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.68"
+__version__ = "3.3.69"
 
 
 def _recovery_pct():
@@ -18135,7 +18137,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v172';
+const CACHE = 'gym-web-v173';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1

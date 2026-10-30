@@ -188,5 +188,5 @@ def test_frontend_amber_style():
 # 7. Version
 # ─────────────────────────────────────────────────────────────
 def test_version_bumped(src):
-    assert '__version__ = "3.3.68"' in src
-    assert "gym-web-v172" in src
+    assert '__version__ = "3.3.69"' in src
+    assert "gym-web-v173" in src

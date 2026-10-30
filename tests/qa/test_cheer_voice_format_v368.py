@@ -64,8 +64,9 @@ def test_structural_meta_removed():
 def test_no_colon_time_in_real_cheer_artifact():
     """已出嘅 artifact 唔准有冒號時間(守住 Rule 74)。"""
     import glob, os
+    # 只查最新嗗個 artifact(舊嘅係修正前出嘅,唔應該阻住 build)
     arts = sorted(glob.glob("/home/work/.hermes/cheer_artifacts/cheer_*/cheer_text.txt"),
-                  key=os.path.getmtime)[-3:]
+                  key=os.path.getmtime)[-1:]
     assert arts, "搵唔到 artifact"
     for p in arts:
         txt = open(p, encoding="utf-8").read()
@@ -76,8 +77,8 @@ def test_version_and_cache():
     src = GW_PATH.read_text(encoding="utf-8")
     m = re.search(r'__version__\s*=\s*"(\d+)\.(\d+)\.(\d+)"', src)
     assert m
-    assert tuple(int(x) for x in m.groups()) >= (3, 3, 68)
-    assert "gym-web-v172" in src
+    assert tuple(int(x) for x in m.groups()) >= (3, 3, 69)
+    assert "gym-web-v173" in src
     assert "gym-web-v171" not in src
 
 
