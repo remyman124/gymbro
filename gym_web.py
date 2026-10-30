@@ -1016,7 +1016,7 @@ WHOOP_CACHE = Path("/home/work/.whoop_data_latest.json")
 # v3.3.2: removed food_scan_log.json + nutrition_log.json + scan_cache +
 # scan_thumb_cache from the WRITE path. Sheet + Drive are the only
 # persistent store; cache hydrates from Sheet on boot.
-__version__ = "3.3.66"
+__version__ = "3.3.67"
 
 
 def _recovery_pct():
@@ -5548,6 +5548,13 @@ def _cheer_web_fact(search_query: str, ask: str, max_tokens: int = 250,
                       "數字 / 對手 / 日期。冇就答「未確認」。"}],
         "max_tokens": max_tokens,
         "temperature": temperature,
+        # v3.3.67 (2026-10-30): MUST disable thinking here.
+        # MiniMax-M3 defaults to thinking ON. With max_tokens=250 the whole
+        # budget was burned by the <think> reasoning block, so the returned
+        # "fact" was ENGLISH REASONING TEXT (not the answer) — e.g. the
+        # "Hugging Face" leak + a truncated final answer on 2026-10-30.
+        # Fix: disable thinking + strip any residual <think> block.
+        "thinking": {"type": "disabled"},
     }
     try:
         req = urllib.request.Request(
@@ -5558,8 +5565,13 @@ def _cheer_web_fact(search_query: str, ask: str, max_tokens: int = 250,
                      "Authorization": "Bearer " + _minimax_api_key()},
         )
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-        return (resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                or "").strip()
+        out = (resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+               or "").strip()
+        # Belt-and-braces: strip a residual <think> block if the model
+        # emitted one anyway (never let English reasoning reach the prompt).
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
+        out = re.sub(r"<think>.*$", "", out, flags=re.DOTALL)
+        return out.strip()
     except Exception as e:
         print(f"[cheer_web_fact] {type(e).__name__}: {e}", flush=True)
         return ""
@@ -14814,7 +14826,7 @@ def _synthesize_cheer_text(metrics: dict, fire_type: str = "manual") -> str:
                     "3. **唔好用 markdown**: 唔好用 **bold**、唔好用 *italic*、唔好用 [n] citation、唔好用 ```code```。文字純文字。\n"
                     "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
                     "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
-                    "6. 150-200 字, 6-8 段, 用 \\n\\n 分隔段落, 每段 50-110 字。\n"
+                    "6. (v3.3.67) 全篇 780-960 字, 8 段, 用 \\n\\n 分隔段落, 每段 90-130 字。\n"
                     "7. **(v3.2.7.42) 開頭第一句必須直入內容, 唔可以做 role-intro meta 自我介紹。** "
                     "即係唔可以寫以下呢啲 mechanical opener:\n"
                     "   - ❌ 「管家同你報數先」 / 「管家即刻同你 update」 / 「管家嚟喇」\n"
@@ -15275,7 +15287,12 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"{ctx.get('news') or '(本週未有確認熱話)'}\n\n"
         f"**最新 fund fact (pplx 30 min 內 — 港股/匯率/利率/金融/商品)**：\n"
         f"{ctx.get('fund_fact') or '(本週未確認)'}\n\n"
-        f"**寫作要求**：news fact 同 fund fact 要用「啱啱睇到⋯⋯」/「今朝睇新聞⋯⋯」呢類口語自然嵌入 cheer 內, "
+        + (f"**利物浦賽事預覽（7 日內 Big 6 match — 必須寫入「明日預覽」段）**：\n"
+           f"{_get_liverpool_fixture_for_cheer()}\n\n"
+           if _get_liverpool_fixture_for_cheer() else "")
+        + f"**Jim 自己 push 落 context 嘅資料（最權威,自然咁引用,唔好當背景噪音）**：\n"
+          f"{_get_jim_context_for_cheer()}\n\n"
+        + f"**寫作要求**：news fact 同 fund fact 要用「啱啱睇到⋯⋯」/「今朝睇新聞⋯⋯」呢類口語自然嵌入 cheer 內, "
         f"唔好直接 quote 原文, 唔好用 markdown, 唔好逐個字讀出嚟。\n"
         f"**強制**要喺營養 section 引用具體 meal 名 + kcal/P/C/F 數字 (例: 「你 lunch 食咗半個 pizza 加芝士通心粉, 兩餐合共八百幾 kcal, P 落咗四十二克, 蛋白質追 PT 仲差幾十」)。**唔好 generic 寫「食嘢方面建議清淡啲」就帶過**, 要 actionable 建議。"
         + (f"\n**極重要**:呢 {meal_count} 餐嘅日期係 **{nutrition_date}（{nutrition_day_label}）**,唔係今日。"
@@ -15286,6 +15303,13 @@ def _daily_coaching_narrative_prompt(ctx: dict, fire_type: str) -> str:
         f"冇 markdown, 全繁體中文)。"
         f"\n**數字寫法**：kcal / 克數 / 步數 / 鐘數一律用阿拉伯數字(如 2 kcal、250 kcal、3140 步),"
         f"唔好轉中文數字(「2 kcal」唔係「兩千卡」❗)。"
+        f"\n**長度硬規定（Rule 57）**：全篇 **780-960 字**, 唔好少過 780 字, 唔好超過 960 字。"
+        f"少過 780 字當唔合格(內容太空泛);超過 960 字要收短。"
+        f"用 `\\n\\n` 分成 **8 段**, 8 段內容順序固定: "
+        f"(1) 招呼+今日重點 (2) WHOOP 復原(恢復指數/HRV/靜止心跳/血氧) (3) 睡眠(實瞓幾個鐘/中途醒/表現%) "
+        f"(4) 訓練活動(具體做咗咩運動/燒咗幾多 kcal/行咗幾多公里) (5) 營養(具體餐名+kcal/P/C/F) "
+        f"(6) 今晚 routine 同食策略 (7) 明日預覽(要提上面嘅利物浦賽事/聽日安排) (8) 收尾打氣。"
+        f"每段 90-130 字, 唔好用 markdown / 唔好 bullet / 唔好編號, 段落之間用 `\\n\\n` 分隔。"
     )
 
 
@@ -15374,7 +15398,7 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
         "3. **唔好用 markdown**: 唔好用 **bold**、唔好用 *italic*、唔好用 [n] citation、唔好用 ```code```。文字純文字。\n"
         "4. **唔好解釋點寫** cheer text — 唔好列出 rule、唔好 comment 自己。Output ONLY the cheer text.\n"
         "5. 唯一可以出現嘅英文字: 'Jim' (個名) 同 'CIO' (個 title) 同 'HKT' (時區)。其他全部唔可以。\n"
-        "6. 150-200 字, 6-8 段, 用 \\n\\n 分隔段落, 每段 50-110 字。\n"
+        "6. (v3.3.67) 全篇 780-960 字, 8 段, 用 \\n\\n 分隔段落, 每段 90-130 字。\n"
         "7. **(v3.2.7.42) 開頭第一句必須直入內容, 唔可以做 role-intro meta 自我介紹。** "
         "即係唔可以寫以下呢啲 mechanical opener:\n"
         "   - ❌ 「管家同你報數先」 / 「管家即刻同你 update」 / 「管家嚟喇」\n"
@@ -15460,6 +15484,14 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
             break
         au = _canto.audit(text)
         issues = list(au["issues"])
+        # v3.3.67 (2026-10-30): Rule 57 長度硬規定 780-960 字。
+        # 之前淨係驗語言,冇驗長度 → 2026-10-30 出一篇 644 字嘅短稿,
+        # 內容太空泛但 audit 完全唔覺。加入同一個 retry loop。
+        _n = len(re.sub(r"\s", "", text or ""))
+        if _n < 780:
+            issues.append(f"全篇只有 {_n} 字,太短(要 780-960 字)—— 每段要寫足,唔好淨係提兩句就收")
+        elif _n > 960:
+            issues.append(f"全篇有 {_n} 字,太長(要 780-960 字)—— 收短啲,刪走重複嘅內容")
         if au["ok"]:
             # 決定式規則過咗,但書面普通話有時完全唔會撞黑名單 → 叫 LLM 裁判
             # 判一次語言種類(Jim「I can only listen cantonese not mandarin」)
@@ -15492,6 +15524,22 @@ def _generate_daily_narrative(ctx: dict, fire_type: str) -> dict:
             if len(after["issues"]) <= len(before["issues"]):
                 text = fixed
             audit_log.append({"rewrite": True, "before": before["issues"], "after": after["issues"]})
+    # ── v3.3.67c (2026-10-30):審核唔過就唔准出稿 ──
+    # Jim OOB 2026-08/10「I can only listen cantonese not mandarin! this is serious」
+    # 之前呢度:即使 audit ok=False,重寫完照樣 publish → 09:34 出嘅稿帶住
+    # 普通話詞「對齊」。而家用本地決定式廣東話模板頂上 —— 語言正確性
+    # 優先過篇幅(寧願短,唔好讀普通話)。
+    if text:
+        _final_au = _canto.audit(text)
+        if not _final_au["ok"]:
+            _fb_text = _cheer_fallback_text(metrics, fire_type)
+            _fb_au = _canto.audit(_fb_text)
+            print(f"[cheer_canto] FINAL AUDIT FAILED {_final_au['issues']} → "
+                  f"改用本地廣東話模板(fallback_ok={_fb_au['ok']})", flush=True)
+            if _fb_au["ok"]:
+                text = _fb_text
+            audit_log.append({"final_fallback": True, "issues": _final_au["issues"],
+                              "fallback_ok": _fb_au["ok"]})
     try:
         os.makedirs("/home/work/.hermes/logs", exist_ok=True)
         with open("/home/work/.hermes/logs/cheer_cantonese_audit.log", "a") as _f:
@@ -18079,7 +18127,7 @@ SERVICE_WORKER = """
 // deleted (returns 404). state.scheduleWeek + scheduleView removed.
 // (Jim OOB 2026-08-07 23:30 HKT 'Fix gymbro calendar view. Remove its
 // list view and weekly view'.)
-const CACHE = 'gym-web-v170';
+const CACHE = 'gym-web-v171';
 // v3.3.58 (2026-10-27, Jim OOB「Remove page size buttons」+「My screen height
 // is very short. Can't see the download buttons」):
 //   移除「每頁餐數」chip row,每頁固定 5 餐;modal 改用 h-[90dvh] + flex-1
