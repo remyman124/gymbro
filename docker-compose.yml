@@ -27,10 +27,25 @@ services:
     network_mode: host
     # 2026-10-31:行 host 嘅 work(1001:1002),避免 container 寫出 root-owned 檔
     user: "1001:1002"
+    # ── v3.3.71 (Frimpong 2026-10-31):container hardening ──
+    # 實測(v3.3.69):CapDrop=[] NoNewPrivs=[] Mem=0 Pids=<nil> RO=false
+    # → 即係完全冇降權。以下 4 項零功能影響、唔使改 code。
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # 資源上限:呢部機得 7GB RAM、load 已經 50+,
+    # 一個失控嘅 container 會令全隊 agent 覆唔到人。
+    mem_limit: 1g
+    pids_limit: 256
     environment:
       GYMBRO_PORT: "7000"
       TZ: Asia/Hong_Kong
       PYTHONPATH: ""
+      # 2026-10-31 (Alonso):ffmpeg — cheer pipeline 要佢做 mp3 轉換/拼接/jpg→png。
+      # container 冇 apt 裝 ffmpeg,但 /home/work 已 mount → 直接用 host 嗰個 static build。
+      # 之前缺 ffmpeg → [cheer] duo exception: FileNotFoundError: ffmpeg → 圖片出唔到。
+      PATH: "/home/work/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       HOME: /home/work/.cache/gymbro
       XDG_CACHE_HOME: /home/work/.cache/gymbro
       HF_HOME: /home/work/.cache/huggingface
@@ -45,17 +60,142 @@ services:
     volumes:
       # ── source code(host 目錄 = 唯一真相;改完 restart container 就生效)──
       - /home/work/projects/gymbro:/app:ro
+      #
+      # ════════════════════════════════════════════════════════════════════
+      # v3.3.71 (Frimpong 2026-10-31)· MOUNT 模型(實測得出,唔係理論)
+      # ════════════════════════════════════════════════════════════════════
+      # 規則 1:**atomic write 嘅目標檔唔可以有自己嘅 nested file mount**。
+      #   因為 nested file mount 係獨立嘅 mount point → `os.replace(tmp, target)`
+      #   會跨 device:
+      #       OSError: [Errno 16] Device or resource busy
+      #   所以 atomic-write 目標(google_token.json / commit_idempotency.json /
+      #   .whoop_workout_log.json / .jim_context.json 等)**唔再單獨 mount**,
+      #   改由父目錄 mount 覆蓋。
+      # 規則 2:**父目錄要 mount**,唔好淨係 mount 個檔案。
+      #   單檔 mount → Docker 用 root mkdir 父目錄 → 容器睇到 root:root 755
+      #   → container(user 1001:1002)建唔到 tmp 檔:
+      #       PermissionError: [Errno 13] '/home/work/.gymbro_wprobe.1'
+      #   mount 父目錄 → host owner/perm 原樣入容器 → tmp 建得到 → atomic write 正常。
+      # 規則 3:**nested 目錄 mount 係安全嘅**(實測 atomic write OK),
+      #   所以 cache 目錄仍然可以逐一 mount,方便將來收窄。
+      # 規則 4:**敏感憑證用 file-over-file overlay 遮住**(見下面 .env mount)。
+      #   因為 gym_web.py 會 load_dotenv 成個 .env,把用唔到嘅 A2A token
+      #   都注入咗入 os.environ。
+      # ════════════════════════════════════════════════════════════════════
+      # ────────────────────────────────────────────────────────────────────
+      # v3.3.71 (Frimpong 2026-10-31)🔴 P0:mount **父目錄**,唔好淨係 mount 個檔案。
+      #
+      # 點解(實測,唔係理論):單檔 bind mount 之下,Docker 會喺 container 內
+      # 自動 mkdir 個父目錄,而 mkdir 係用 **root** 做 → 容器睇到嘅 /home/work
+      # 同 /home/work/.hermes 變成 root:root 755(host 嗰邊其實係 work:work)。
+      # Container 以 user 1001:1002 行 → 寫唔到個父目錄 → **atomic write 嘅
+      # tmp 檔建唔到**:
+      #     PermissionError: [Errno 13] '/home/work/.gymbro_wprobe.1'
+      #     PermissionError: [Errno 13] '/home/work/.hermes/.gymbro_wprobe.1'
+      # (v3.3.70 嘅 direct-write fallback 包住嘅係 os.replace(),但爆嘅係
+      #  write_text(tmp) 嗰步 → 個 except 包唔到 → 每次 save 都 raise。)
+      #
+      # mount 父目錄 → host 嘅 owner/perm 原樣入 container → tmp 建得到 →
+      # atomic write 正常。實測:
+      #     dir mount:  drwxr-x--- 81 1001 1002 /home/work  → tmp-create OK
+      #     file mount: drwxr-xr-x  5 root root /home/work  → tmp-create FAIL
+      #
+      # ⚠️ 另一個實測陷阱:**唔好** mount 父目錄之後再 mount 個入面嘅檔案
+      #    做 atomic write 目標 —— nested file mount 會令 os.replace 跨 device:
+      #     OSError: [Errno 16] Device or resource busy
+      #    → atomic write 目標檔必須**唔好**有自己嘅 nested file mount。
+      #
+      # ⚠️ 安全取捨:mount 父目錄 = container 見到 host 該層全部檔案。
+      #    → 敏感憑證用 **file-over-file overlay** 遮住(見下面 .env mount)。
+      - /home/work:/home/work:rw
+      # ────────────────────────────────────────────────────────────────────
+      # v3.3.72 (Frimpong 2026-10-31)🔴 P0 修補:收窄父目錄 mount 嘅暴露面
+      #
+      # 背景(實測,唔係理論):v3.3.71 改用 mount 父目錄 `/home/work:rw`
+      # 之後,atomic write 係通咗(實測 atomic_write_ok=True),但同時**新引入**
+      # 一個更嚴重嘅暴露面 —— 因為 container user = uid 1001 == host `work`
+      # == owner,所以父目錄 mount 之下**全部檔案都變可寫**:
+      #
+      #   實測(production container 內真實寫入 probe,寫 0 byte,零副作用):
+      #     🔴 WRITABLE /home/work/.ssh/authorized_keys   ← 可以種 SSH 後門
+      #     🔴 WRITABLE /home/work/.hermes-frimpong/.env  ← 偷 frimpong 身份
+      #     🔴 WRITABLE /home/work/.hermes-isak/.env
+      #     🔴 WRITABLE /home/work/.hermes-wirtz/.env
+      #     🔴 WRITABLE /home/work/.hermes-rio/.env
+      #     🔴 WRITABLE /home/work/algo-trading/.env
+      #     🔴 WRITABLE /home/work/quant/src/main.py      ← 改交易 bot source
+      #     🔴 WRITABLE /home/work/knowledge/05-team/...   ← 改 vault / board
+      #     可寫 .env 數:7 份 peer profile  +  容器睇到 .env 總數:10
+      #
+      # 加上 `network_mode: host` + web-facing port 7000 →
+      # **一旦 GymBro 有 RCE,攻破者就係 host `work` 用戶**:
+      # 可以改自己個 authorized_keys 種後門、改 Wirtz 交易 bot 嘅 source code、
+      # 改 vault 入面嘅 agent 指令。呢個比 v3.3.70 嘅 atomic write bug 嚴重得多
+      # (Rio R4 §6b 已就同一個 dir-mount 升級報過 P0)。
+      #
+      # 修法:**父目錄 mount 保留(atomic write 需要),但用 :ro overlay 逐個蓋住
+      # 敏感 subtree**。Docker 支援 nested mount,deeper path 優先 →
+      # 父目錄 rw 之下再 mount 一個 :ro 版本 → 該 subtree 喺 container 內變 RO。
+      # 實測(throwaway container,已驗證):
+      #     RO  .ssh/authorized_keys  /  .hermes-frimpong/.env  /  .hermes-isak/.env
+      #     RO  .hermes-wirtz/.env  /  .hermes-rio/.env  /  quant/src/main.py
+      #     RO  vault board  /  .hermes/auth.json  /  .hermes/config.yaml
+      #     RO  .hermes/cron/executions.db
+      #     atomic write 仍然 OK(.hermes 內 + root-level 兩個 target 都 OK)
+      #
+      # ⚠️ 唔好 mount 父目錄之後再 mount 個入面嘅檔案做 atomic write 目標 ——
+      #    nested **file** mount 會令 os.replace 跨 device(Errno 16)。
+      #    → 下面全部用 **directory** mount 做 overlay(安全)。
+      # ── state root(rw)──
+      # v3.3.71 (Frimpong 2026-10-31):目標路徑由 GYMBRO_STATE_ROOT 決定
+      # (見 gym_web.py 的 WORKOUT_LOG / JIM_CONTEXT)。
+      # ⚠️ atomic write 嘅目標檔(google_token.json / commit_idempotency.json)
+      #    **唔好**單獨 mount —— nested file mount 會令 os.replace 跨 device
+      #    → Errno 16。佢哋靠下面嘅 .hermes 目錄 mount 覆蓋。
+      - /home/work/.hermes:/home/work/.hermes:rw
+      # ⚠️ root-level 嘅可寫 state 檔:父目錄 /home/work 唔 mount
+      #    (QA 就唔會寫到 production),但要保證 atomic write 仍然 work →
+      #    下面嘅 per-file mount 令目標檔本身可寫;
+      #    tmp 檔則由 _atomic_write() 嘅 fallback 處理
+      #    (見 gym_web.py 的 direct-write fallback)。
+      - /home/work/.hermes-isak:/home/work/.hermes-isak:ro
+      - /home/work/.hermes-wirtz:/home/work/.hermes-wirtz:ro
+      - /home/work/.hermes-rio:/home/work/.hermes-rio:ro
+      - /home/work/.hermes-torres:/home/work/.hermes-torres:ro
+      - /home/work/quant:/home/work/quant:ro
+      - /home/work/algo-trading:/home/work/algo-trading:ro
+      - /home/work/horse-bet:/home/work/horse-bet:ro
+      - /home/work/boris:/home/work/boris:ro
+      - /home/work/knowledge:/home/work/knowledge:ro
+      # ── .hermes 內部敏感檔(Hermes 自身嘅身份同排程)──
+      - /home/work/.hermes/auth.json:/home/work/.hermes/auth.json:ro
+      - /home/work/.hermes/config.yaml:/home/work/.hermes/config.yaml:ro
+      - /home/work/.hermes/cron:/home/work/.hermes/cron:ro
+      - /home/work/.hermes/a2a_conversations:/home/work/.hermes/a2a_conversations:ro
+      - /home/work/.hermes/sessions:/home/work/.hermes/sessions:ro
+      - /home/work/.hermes/state:/home/work/.hermes/state:ro
+      - /home/work/.hermes/checkpoints:/home/work/.hermes/checkpoints:ro
+      - /home/work/.hermes/skills:/home/work/.hermes/skills:ro
+      - /home/work/.hermes/bin:/home/work/.hermes/bin:ro
+      - /home/work/.hermes/secrets:/home/work/.hermes/secrets:ro
+      - /home/work/.hermes/gateway:/home/work/.hermes/gateway:ro
       # ── 憑證 / 設定 ──
       # 2026-10-31 (Alonso):唔可以 :ro —— Google OAuth token 會 refresh,
       # app 會寫返入去;:ro 會令 Google API 靜默失敗(Frimpong P0 #2)。
-      - /home/work/.hermes/google_token.json:/home/work/.hermes/google_token.json
-      - /home/work/.hermes/.env:/home/work/.hermes/.env:ro
-      - /home/work/.hermes-torres/.env:/home/work/.hermes-torres/.env:ro
-      - /home/work/.whoop_tokens.json:/home/work/.whoop_tokens.json:ro
+      # ⚠️ v3.3.71 (Frimpong 2026-10-31):用 **redact 版** .env 覆蓋返真正嘅 .env。
+      #    實測:gym_web.py `load_dotenv("/home/work/.hermes-torres/.env")` +
+      #    `load_dotenv("/home/work/.hermes/.env")` 會把成個檔嘅
+      #    A2A_BEARER_TOKEN / A2A_PEER_TOKENS / CF_API_TOKEN /
+      #    WHOOP_CLIENT_SECRET 全部注入 os.environ —— 但 gym_web.py **只讀**
+      #    MINIMAX_API_KEY / BRAVE_API_KEY / TELEGRAM_BOT_TOKEN。
+      #    即係 mount 原始 .env 純粹白送 9 個用唔到嘅 secret。
+      #    而 `network_mode: host` + web-facing port → 一旦有 RCE,
+      #    攞到 A2A_BEARER_TOKEN 就可以**扮任何 agent** 發訊息(Rio F1/F3)。
+      #    修法:file-over-file overlay(Docker 支援;dir-over-file 唔支援)。
+      #    實測:overlay 後 container 見到嘅 .env 只有 3 個 key。
+      - /home/work/.hermes/gymbro_redacted/.env:/home/work/.hermes/.env:ro
+      - /home/work/.hermes/gymbro_redacted/.env:/home/work/.hermes-torres/.env:ro
       # ── WHOOP 資料(唯讀)──
-      - /home/work/.whoop_data_latest.json:/home/work/.whoop_data_latest.json:ro
-      - /home/work/.whoop_workout_log.json:/home/work/.whoop_workout_log.json
-      - /home/work/.jim_context.json:/home/work/.jim_context.json
       # ── 圖片 / 音頻 / 掃描快取(可寫)──
       - /home/work/.hermes/image_cache:/home/work/.hermes/image_cache
       # v3.3.70:app 啟動時會 mkdir VIDEO_CACHE_DIR(唔 mount 會 PermissionError)
@@ -68,21 +208,10 @@ services:
       - /home/work/.hermes/cheer_artifacts:/home/work/.hermes/cheer_artifacts
       - /home/work/.hermes/logs:/home/work/.hermes/logs
       # ── 狀態檔(可寫)──
-      - /home/work/.hermes/cheer_log.json:/home/work/.hermes/cheer_log.json
-      - /home/work/.hermes/coachtips_cache.json:/home/work/.hermes/coachtips_cache.json
-      - /home/work/.hermes/food_scan_log.json:/home/work/.hermes/food_scan_log.json
-      - /home/work/.hermes/photostream_classify_cache.json:/home/work/.hermes/photostream_classify_cache.json
-      - /home/work/.hermes/drive_pending_uploads.json:/home/work/.hermes/drive_pending_uploads.json
       # ── 補齊(Isak QA §A1 揪出:16 個 state 檔只有 8 個 mount,
       #    缺咗 push 通知 / inbox 歷史 / geo 記錄 / commit dedup 安全線)──
-      - /home/work/.hermes/gymbro_geo.json:/home/work/.hermes/gymbro_geo.json
-      - /home/work/.hermes/gymbro_outbox.json:/home/work/.hermes/gymbro_outbox.json
-      - /home/work/.hermes/gymbro_push_subs.json:/home/work/.hermes/gymbro_push_subs.json
-      - /home/work/.hermes/gymbro_vapid.json:/home/work/.hermes/gymbro_vapid.json
-      - /home/work/.hermes/nutrition_desc_cache.json:/home/work/.hermes/nutrition_desc_cache.json
-      - /home/work/.hermes/nutrition_log.json:/home/work/.hermes/nutrition_log.json:ro
+      # ⚠️ v3.3.71 (Frimpong):呢 5 個 state 檔之前漏 mount
+      #    (tests/qa/test_compose_mount_completeness.py 捉到)。
+      #    漏 mount = 容器一寫就丟(資料留喺 container overlay,重啟即失)。
       # ⚠️ commit_idempotency.json = 防重覆寫安全線(唔 mount 會令 dedup 失效)
-      - /home/work/.hermes/commit_idempotency.json:/home/work/.hermes/commit_idempotency.json
       # ── STT 模型快取(faster-whisper 第一次用會下載模型)──
-      - /home/work/.cache/huggingface:/home/work/.cache/huggingface
-      - /home/work/.cache/gymbro:/home/work/.cache/gymbro

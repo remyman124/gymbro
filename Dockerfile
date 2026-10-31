@@ -61,7 +61,28 @@ COPY . .
 
 EXPOSE 7000
 
-HEALTHCHECK --interval=30s --timeout=6s --start-period=30s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${GYMBRO_PORT}/api/health" || exit 1
+# v3.3.71 (Frimpong 2026-10-31):health check 收緊。
+# 原本淨係 `curl -fsS /api/health` —— curl -f 只檢查 HTTP status,
+# 而 /api/health 永遠回 200(就算 ok:false),所以呢個 check 永遠 pass。
+# 而家 assert 埋 body 嘅 "ok":true + startup_check 通過 + 版本一致。
+# ⚠️ 唔好淨係 grep '"ok":true' —— body 內 "startup_check_ok" 都係 true 字串,
+#    要用 python 解析 JSON 先准。
+#
+# ⚠️ v3.3.71 修正:version_match 唔可以係 hard requirement。
+#    `_ver_img` 由 Dockerfile 嘅第一個 `vX.Y.Z` regex 抽 —— 而個 regex 會
+#    撞 Dockerfile 註釋入面嘅版本號(例如 "v3.3.71 (Frimpong 2026-10-31)" 呢句
+#    註釋,而唔係真正嘅 image 版本)。一 bump 版本就會 mismatch → 呢個 check
+#    永久 exit 1 → container 永久 unhealthy → restart loop 風險。
+#    所以:版本一致性係「資訊」,唔係「生死」—— 真正嘅生死判斷係
+#    (a) /api/health 自己 ok:true(b) startup_check 冇 failed check。
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python3 -c "import json,os,sys,urllib.request; \
+|u='http://127.0.0.1:'+os.environ.get('GYMBRO_PORT','7000')+'/api/health'; \
+|d=json.load(urllib.request.urlopen(u,timeout=8)); \
+|c=d.get('checks',{}); \
+|sc=d.get('startup_check') or {}; \
+|bad=[k for k in sc.get('failed_checks',[]) if k]; \
+|sys.stderr.write('healthcheck failed_checks=%r version=%r version_match=%r\n'%(bad,d.get('version'),c.get('version_match'))); \
+|sys.exit(0 if (d.get('ok') is True and not bad) else 1)" || exit 1
 
 CMD ["python3", "gym_web.py"]

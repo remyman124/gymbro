@@ -40,6 +40,12 @@ from workout_formatter import render as _render_text
 from dotenv import load_dotenv, dotenv_values
 from gym_web.core import safe_read_json as _safe_read_json
 from gym_web.core import safe_write_json as _safe_write_json
+# v3.3.71 (Frimpong 2026-10-31):per-path 寫入鎖(防 read-modify-write race)。
+# 詳見 gym_web/filelock.py 嘅 docstring —— 實測 8 thread 同 key → 8 個都返 True
+# (會產生重複 Sheet row);8 thread read-modify-write → 走失 4 個 entry。
+from gym_web.filelock import lock_for as _filelock_lock_for
+from gym_web.filelock import locked_json_update as _filelock_locked_update
+from gym_web.filelock import unique_tmp_path as _filelock_unique_tmp_path
 from gym_web.idempotency import check_and_remember as _idempotency_check
 from gym_web.cache import NutritionCache, NutritionRow, get_cache, get_cache as _get_nutrition_cache
 from gym_web import image_proxy
@@ -70,13 +76,56 @@ from gym_web import outbox as _outbox
 # mandarin」)。prompt 硬規則 + 客觀驗證器 + retry + 決定式重寫。
 from gym_web import cheer_cantonese as _canto
 
-# Load MiniMax keys from hermes-torres first, then hermes — preserves existing
-# dual-location behavior (hermes-torres wins, hermes fills gaps).
-load_dotenv("/home/work/.hermes-torres/.env")
+# ─────────────────────────────────────────────────────────────────────────────
+# v3.3.72 (Frimpong 2026-10-31) — P0-4:拆憑證粒度(唔再 load peer profile 嘅 .env)
+#
+# 之前(v3.3.44 起):
+#     load_dotenv("/home/work/.hermes-torres/.env")   ← 先載入者贏(override=False)
+#     load_dotenv("/home/work/.hermes/.env")          ← 後載入,填唔到已有 key
+#
+# 兩個問題(實測,唔係推測):
+#
+# 1) 🔴 **跨 agent 憑證注入**:`.hermes-torres/.env` 係 Torres 個 profile 嘅
+#    完整憑證檔(A2A_BEARER_TOKEN / A2A_PEER_TOKENS / TELEGRAM_BOT_TOKEN /
+#    MINIMAX_API_KEY …)。GymBro 一個 web-facing app 根本唔需要 A2A 身份證,
+#    但 load_dotenv 會把成個檔嘅每一個 key 注入 os.environ →
+#    **container 一旦有 RCE 就拎到全 fleet 嘅 A2A 身份**。
+#    (Rio R2 F2/F3:network_mode: host + web port 7000 → 攻破 = 扮任何 agent。)
+#
+# 2) 🔴 **v3.3.65 陰影 bug 嘅根因**:`.hermes-torres/.env` 嗰條 BRAVE_API_KEY
+#    已經失效(22 字元),但因為佢**先**載入 → 長期遮住 `.hermes/.env` 嗰條
+#    有效嘅(31 字元)→ /res/v1/web/search 422 SUBSCRIPTION_TOKEN_INVALID。
+#    (實測:sha256 前 12 位 → torres=a4066825bc89[22字元] vs
+#     .hermes=73043d8fb08e[31字元];gymbro.env 已經係有效嗰條。)
+#
+# 修法:**只 load gymbro 自己嘅專用憑證檔**,唔再碰任何 peer profile 嘅 .env。
+#     - `/home/work/.hermes/gymbro.env`      ← gymbro 專用,只有 3 個 key
+#                                            (MINIMAX / BRAVE / TELEGRAM),
+#                                            BRAVE 係有效嗰條(31 字元)。
+#     - `/home/work/.hermes/.env`            ← 僅作 fallback(host/tmux 模式);
+#                                            container 內呢個路徑被 compose
+#                                            用 redacted 版 overlay 蓋住,
+#                                            所以 container 永遠只見 3 個 key。
+#
+# 註:python-dotenv 嘅 `load_dotenv` 預設 `override=False` → **先載入者贏**。
+#    所以 gymbro.env 一定要喺最前,先可以攞到有效嗰條 BRAVE key。
+#    (_brave_api_key_candidates() 嘅檔案級 fallback 保留 —— 嗰個係 v3.3.65
+#     為咗救陰影 bug 加嘅多候選鏈,唔受影響。)
+load_dotenv("/home/work/.hermes/gymbro.env")
 load_dotenv("/home/work/.hermes/.env")
 
 # ---------- Constants ----------
-WORKOUT_LOG = Path("/home/work/.whoop_workout_log.json")
+# v3.3.71 (Frimpong 2026-10-31):root-level 可寫 state 檔嘅根目錄可以用
+# env 改。預設 "/home/work"(production 行為完全不變)。
+# 點解要呢個:atomic write 需要「目標檔嘅父目錄」可寫(要喺同一個 dir 建
+# tmp 檔先可以 os.replace)。如果 compose mount 咗成個 /home/work,
+# QA container 就可以寫入任何 production state 檔 —— 包括將來新加嘅、
+# mount 清單未更新嘅。
+# 改成:production mount /home/work(需要 atomic write),
+# QA 就用 GYMBRO_STATE_ROOT=/gymbro_state + 專屬 mount,
+# 目標路徑跟住 root 走 → 唔會再掂 production。
+_STATE_ROOT = os.environ.get("GYMBRO_STATE_ROOT", "/home/work")
+WORKOUT_LOG = Path(_STATE_ROOT) / ".whoop_workout_log.json"
 HKT = timezone(timedelta(hours=8))
 # v3.3.69 (2026-10-30):PORT 支援 env(容器化 / 藍綠切換用)
 # 預設 7000 —— 行為同之前一模一樣,production 唔受影響。
@@ -148,6 +197,9 @@ def now_hkt():
     return datetime.now(HKT)
 
 
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def today_iso():
     return now_hkt().strftime("%Y-%m-%d")
 
@@ -158,8 +210,126 @@ def now_iso():
 
 def load_log():
     if WORKOUT_LOG.exists():
-        return json.loads(WORKOUT_LOG.read_text())
+        try:
+            raw = json.loads(WORKOUT_LOG.read_text())
+        except Exception as e:
+            print(f"[load-log] workout log unreadable: {type(e).__name__}: {e}", flush=True)
+            return {}
+        # v3.3.71: 統一喺 chokepoint 過濾污染 entry(見 _sanitize_log_entries)
+        return _sanitize_log_entries(raw)
     return {}
+
+
+def _sanitize_log_entries(log):
+    """v3.3.71: 把 workout log 嘅壞 entry 過濾/正規化。
+
+    2026-10-31 (Isak QA §A3 + Alonso 全面盤點):production log 出現過
+    污染 key `'p' → 1`(非 dict value)。所有下游都做 `entry.get(...)` →
+    AttributeError → endpoint 500。v3.3.70 只喺 `_schedule_enrichment()`
+    加咗 `isinstance` guard,但**另外 8 個讀取點未補**:
+
+      - `api_history()`          → `s.get("exercises")`          500
+      - `api_streak()`           → `session.get("completed")`    500
+      - `get_or_create_session()`→ `log[today]["exercises"]`     500
+      - `_flatten_sessions()`    → `ex.get(...)`                 500
+      - `_session_to_sheet_rows()`→ `ex.get(...)`                500
+      - `api_sync_sheet()`       → `ex.get(...)`                 500
+      - `_format_workout_detail_for_cheer()` → `e.get(...)`      500
+      - `api_state()`            → `session.get("end_time")`     500
+
+    唔喺呢度逐個 caller 加 guard(會漏 —— 缺口 R 嘅教訓),而係喺 **chokepoint**
+    統一過濾:任何 `load_log()` 嘅結果都經過呢度,壞 entry 直接唔見。
+
+    行為:
+      - value 唔係 dict → 丟棄(污染 key)
+      - value 係 dict 但 `exercises` 唔係 list → 當空 list
+      - `exercises` 入面有非 dict 元素 → 剔走
+      - key 唔係 YYYY-MM-DD → 丟棄(唔係日期 key 嘅嘢唔應該喺 workout log)
+
+    ⚠️ 呢個只影響**讀取**路徑。寫入路徑(`save_log`)另有 key 過濾,
+       見 `save_log()` 嘅 v3.3.71 註解。
+    """
+    if not isinstance(log, dict):
+        return {}
+    clean = {}
+    for k, v in log.items():
+        if not isinstance(k, str) or not _ISO_DATE_RE.fullmatch(k):
+            continue
+        if not isinstance(v, dict):
+            continue
+        entry = dict(v)
+        exs = entry.get("exercises")
+        if isinstance(exs, list):
+            entry["exercises"] = [e for e in exs if isinstance(e, dict)]
+        else:
+            entry["exercises"] = []
+        clean[k] = entry
+    return clean
+
+
+def _atomic_write(path, payload: str, tmp: str | None = None,
+                  label: str = "atomic-write") -> None:
+    """Write ``payload`` to ``path``, atomically when the runtime allows it.
+
+    v3.3.71 (Frimpong, 2026-10-31) — **real fix for the P0 the v3.3.70
+    fallback missed.**
+
+    The v3.3.70 fallback wrapped only ``os.replace()`` in ``except OSError``.
+    But in the container the failure happens **one step earlier**: the sibling
+    ``.tmp`` file cannot even be created, because a single-file bind mount
+    puts the target under a **root-owned parent dir** and the container runs
+    as ``user: 1001:1002``::
+
+        [save-log] atomic write failed: PermissionError: [Errno 13] Permission
+        denied: '/home/work/.whoop_workout_log.json.tmp.1.136184554583744'
+
+    So the ``except OSError`` around ``os.replace`` was never reached — the
+    ``PermissionError`` escaped from ``Path(tmp).write_text(...)`` and the
+    whole save **raised**. Result: every container-side ``save_log()`` lost
+    the workout log entirely (verified live in the running container).
+
+    Order of attempts now:
+      1. atomic: write sibling ``.tmp`` + ``os.replace``  (crash-safe)
+      2. direct: write the target file in place            (not atomic, but
+         the write *lands*; a crash mid-write can truncate — logged loudly)
+      3. re-raise if even the direct write fails
+
+    ``os.replace`` can also fail with ``EXDEV``/``EBUSY`` when the tmp file
+    lives on a different mount than the target — step 2 covers that too.
+
+    The direct write is deliberately **not** silent: it prints a WARN so the
+    log shows the degraded (non-atomic) mode instead of hiding it.
+    """
+    target = Path(path)
+    # v3.3.71 (Frimpong 2026-10-31):per-path lock —— 同一個檔案嘅寫入序列化。
+    # 之前同一個檔案可以由兩個 thread 同時寫(tmp 名雖然唔同,但
+    # read-modify-write 嘅「讀」同「寫」之間仍然有窗口 → 走失更新)。
+    # 實測:8 個 thread 同時做 read-modify-write → 最終只寫入 4/8 個 entry。
+    # 用 RLock(同一 thread 可重入),唔同 path 唔互相阻塞。
+    _fl_lock = _filelock_lock_for(target)
+    with _fl_lock:
+        tmp_path = tmp or f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
+        # 1) atomic attempt — tmp creation AND replace must both succeed.
+        try:
+            Path(tmp_path).write_text(payload)
+            os.replace(tmp_path, target)
+            return
+        except Exception as _atomic_err:
+            print(f"[{label}] atomic write failed ({type(_atomic_err).__name__}: "
+                  f"{_atomic_err}); trying direct write", flush=True)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        # 2) direct write — tmp could not be created, or os.replace failed.
+        try:
+            target.write_text(payload)
+            print(f"[{label}] direct write succeeded (NON-atomic; crash mid-write "
+                  f"could truncate the file)", flush=True)
+        except Exception as _direct_err:
+            print(f"[{label}] direct write ALSO failed: {type(_direct_err).__name__}: "
+                  f"{_direct_err}", flush=True)
+            raise
 
 
 def save_log(log):
@@ -181,61 +351,86 @@ def save_log(log):
     修法:tmp 名加 pid + thread ident(同 `_persist_scan_jobs_state()` 一致),
     每個 writer 用自己嘅 tmp,`os.replace()` 唔會再撞。
     """
-    tmp = f"{WORKOUT_LOG}.tmp.{os.getpid()}.{threading.get_ident()}"
-    try:
-        _payload = json.dumps(log, indent=2, ensure_ascii=False)
-        Path(tmp).write_text(_payload)
-        try:
-            os.replace(tmp, WORKOUT_LOG)
-        except OSError as _replace_err:
-            # 2026-10-31 (Alonso):單檔 bind mount 令 os.replace() 跨 mount 邊界
-            # (EXDEV / EBUSY)→ container 版 atomic write 必失敗(Frimpong P0 #1)。
-            # Fallback:直接覆寫目標檔(唔原子,但好過完全寫唔入)。
-            print(f"[save-log] atomic replace failed ({_replace_err}); direct-write fallback", flush=True)
-            Path(WORKOUT_LOG).write_text(_payload)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    except Exception as e:
-        print(f"[save-log] atomic write failed: {type(e).__name__}: {e}", flush=True)
-        try:
-            os.unlink(tmp)
-        except OSError as cleanup_err:
-            print(f"[save-log] tmp cleanup failed: {cleanup_err}", flush=True)
-        raise
+    # v3.3.71: 寫入前過濾壞 key —— 唔准將非 YYYY-MM-DD 嘅 key 寫落
+    # workout log。呢個係污染嘅**源頭閘**(production 曾出現過 `'p' → 1`)。
+    # 過濾後嘅 log 一定係「date key → dict」嘅乾淨形狀。
+    if isinstance(log, dict):
+        _bad = [k for k in log
+                if not isinstance(k, str) or not _ISO_DATE_RE.fullmatch(k)]
+        if _bad:
+            print(f"[save-log] dropped {len(_bad)} non-date key(s): {_bad[:10]}", flush=True)
+            log = {k: v for k, v in log.items()
+                   if isinstance(k, str) and _ISO_DATE_RE.fullmatch(k)}
+    _payload = json.dumps(log, indent=2, ensure_ascii=False)
+    # v3.3.71 (Frimpong):改用共用 _atomic_write()。
+    # 舊 code 嘅 direct-write fallback 包住嘅係 os.replace(),但 container
+    # 真正爆嘅係寫 .tmp 嗰步(PermissionError)→ 個 except 永遠行唔到,
+    # 結果每次 save 都 raise,workout log 完全寫唔入(已實測)。
+    _atomic_write(WORKOUT_LOG, _payload, label="save-log")
+
+
+def update_log(mutator):
+    """v3.3.71 (Frimpong 2026-10-31):原子嘅「讀 → 改 → 寫」workout log。
+
+    以前每個 caller 自己寫 `log = load_log(); log[k] = v; save_log(log)`。
+    呢個 pattern 嘅問題:**讀同寫之間有窗口**。Flask 係 threaded=True,
+    所以兩個 request 同時跑 →
+      甲 load_log() → 乙 load_log() → 甲 save_log() → 乙 save_log()
+    → 乙 嘅修改蓋住甲嘅(**走失更新**)。
+    實測:8 個 thread 同時做 read-modify-write → 最終只寫入 4/8 個 entry。
+
+    `mutator` 收到 log(dict),直接改佢,然後原子寫返。
+    整個 read-modify-write 喺同一把 per-path lock 入面 → 唔會有窗口。
+
+    回傳:(log, mutator 嘅回傳值)
+    """
+    with _filelock_lock_for(WORKOUT_LOG):
+        log = load_log()
+        result = mutator(log)
+        save_log(log)
+        return log, result
 
 
 def get_or_create_session(session_date=None):
     """Return the session dict for a date (default: today).
 
     v3.3.39: optional `session_date` (YYYY-MM-DD) so a past class can be
-    back-filled (Jim 補記 10/22 午市健身課嘅 set)。只寫本機 log,唔掂 Sheet。
+    back-filled (Jim 補記 10/22 午市健身課嘅 set)。只寫本機 log,唔掂 Sheet.
+
+    v3.3.71 (Frimpong):整個「讀 → 正規化 → 寫」收埋喺 `update_log()`
+    入面,避免同其他 thread 撞(之前 load 同 save 之間有窗口)。
     """
-    log = load_log()
     today = session_date or today_iso()
-    if today not in log:
-        log[today] = {
-            "date": today,
-            "start_time": now_iso(),
-            "end_time": None,
-            "completed": False,
-            "context": "Jim's gym session via :7000 web app",
-            "exercises": [],
-        }
-        save_log(log)
-    else:
-        if "exercises" not in log[today]:
-            log[today]["exercises"] = []
-        # v3.3.40: key 同 inner `date` 一定要一致。
-        # 寫入端用 `log[session.get("date")]` 做 key,所以 inner date 一旦
-        # 唔等於佢自己嘅 key,下次寫入就會寫去錯嘅 key —— 2026-10-23 就係
-        # 咁樣被一節 10/05 嘅 session 頂咗(見 tests/qa/test_workout_log_integrity.py)。
-        # 呢度強制 normalize,令 key ↔ inner date 永遠對齊。
-        if log[today].get("date") != today:
-            log[today]["date"] = today
-        save_log(log)
-    return log[today]
+
+    def _mutate(log):
+        # v3.3.71: 今日 key 如果被污染成非 dict(例如 int),要自癒 ——
+        # 唔好因為壞 entry 而令落 set 全部 500。
+        _existing = log.get(today)
+        if not isinstance(_existing, dict):
+            log[today] = {
+                "date": today,
+                "start_time": now_iso(),
+                "end_time": None,
+                "completed": False,
+                "context": "Jim's gym session via :7000 web app",
+                "exercises": [],
+            }
+            print(f"[session] replaced polluted entry for {today} "
+                  f"(was {type(_existing).__name__})", flush=True)
+        else:
+            if "exercises" not in log[today]:
+                log[today]["exercises"] = []
+            # v3.3.40: key 同 inner `date` 一定要一致。
+            # 寫入端用 `log[session.get("date")]` 做 key,所以 inner date 一旦
+            # 唔等於佢自己嘅 key,下次寫入就會寫去錯嘅 key —— 2026-10-23 就係
+            # 咁樣被一節 10/05 嘅 session 頂咗(見 tests/qa/test_workout_log_integrity.py)。
+            # 呢度強制 normalize,令 key ↔ inner date 永遠對齊。
+            if log[today].get("date") != today:
+                log[today]["date"] = today
+        return log[today]
+
+    _log, session = update_log(_mutate)
+    return session
 
 
 def detect_intensity(set_n, working_target=4):
@@ -381,7 +576,7 @@ def _workout_log_gym_dates():
         if not isinstance(entry, dict):
             continue
         exs = entry.get("exercises")
-        if isinstance(exs, list) and len(exs) > 0:
+        if isinstance(exs, list) and len([e for e in exs if isinstance(e, dict)]) > 0:
             out.add(date_iso)
     return out
 
@@ -445,6 +640,9 @@ def _schedule_enrichment():
             sets = 0
             seen, ordered = set(), []
             for ex in exercises:
+                # v3.3.71: 污染 element(非 dict)要剔走
+                if not isinstance(ex, dict):
+                    continue
                 try:
                     w = float(ex.get("weight_kg") or 0)
                     r = float(ex.get("reps") or 0)
@@ -745,12 +943,87 @@ def api_health():
         checks.get("whoop_body"),
         checks.get("google_token"),
     ])
+    # v3.3.71 (Frimpong 2026-10-31):health check 收緊。
+    # 原本 /api/health 只答「檔案存唔存在」—— 單檔 bind mount 令 Google token
+    # 寫唔到(Errno 13)、atomic write 壞、state 檔類型錯,呢啲全部照報 "ok": true。
+    # 而家加返「真係寫到嗎」同「版本一致嗎」,Docker HEALTHCHECK 有嘢可以 assert。
+    _sc_summary = None
+    try:
+        from gym_web.startup_check import run_startup_checks
+        _sc = run_startup_checks(include_network=False)
+        _sc_summary = {
+            "ok": _sc.get("ok"),
+            "failed_checks": _sc.get("failed_checks", []),
+            "degraded": _sc.get("degraded", []),
+            "write_paths": _sc.get("checks", {}).get("write_permissions", {}).get("targets", {}),
+            "atomic_write_capable": _sc.get("checks", {}).get("write_permissions", {}).get("atomic_write_capable"),
+            "atomic_write_total": _sc.get("checks", {}).get("write_permissions", {}).get("atomic_write_total"),
+            "state_files_ok": _sc.get("checks", {}).get("state_files", {}).get("ok"),
+            "state_files_wrong_type": _sc.get("checks", {}).get("state_files", {}).get("wrong_type", []),
+            "credentials_ok": _sc.get("checks", {}).get("credentials", {}).get("ok"),
+            "version_running": _sc.get("checks", {}).get("version_consistency", {}).get("running_version"),
+            "version_dockerfile": _sc.get("checks", {}).get("version_consistency", {}).get("dockerfile_version"),
+            "app_is_bind_mount": _sc.get("checks", {}).get("version_consistency", {}).get("app_is_bind_mount"),
+        }
+    except Exception as _sc_exc:
+        _sc_summary = {"ok": None, "error": f"{type(_sc_exc).__name__}: {_sc_exc}"}
+    # 版本一致性:Dockerfile header 版本 vs 行緊版本。
+    # ⚠️ 容器內 **冇** /home/work/projects/gymbro —— compose 只 mount
+    #    `/home/work/projects/gymbro:/app:ro`。所以要睇 /app/Dockerfile
+    #    (就係 host repo,同一個檔)。搵唔到就唔好當 mismatch(唔好誤殺 healthcheck)。
+    _ver_img = None
+    _ver_src = None
+    try:
+        import re as _re
+        for _dfp in (Path("/app/Dockerfile"), Path("/home/work/projects/gymbro/Dockerfile")):
+            if _dfp.is_file():
+                _m = _re.search(r"v(\d+\.\d+\.\d+)", _dfp.read_text(errors="ignore"))
+                if _m:
+                    _ver_img = _m.group(1)
+                    _ver_src = str(_dfp)
+                    break
+    except Exception:
+        _ver_img = None
+    checks["startup_check_ok"] = (_sc_summary or {}).get("ok")
+    checks["atomic_write_capable"] = (_sc_summary or {}).get("atomic_write_capable")
+    # version_match 搵唔到 Dockerfile 就係 None(唔知 ≠ 唔一致)
+    checks["version_match"] = (None if _ver_img is None else (_ver_img == __version__))
+    # 寫入路徑寫唔到 = 核心功能死(記錄 / Sheet commit / token refresh)
+    if _sc_summary and _sc_summary.get("ok") is False:
+        overall = False
     return jsonify({
         "ok": overall,
         "checks": checks,
         "version": __version__,
+        "version_image": _ver_img,
+        "version_source": _ver_src,
+        "startup_check": _sc_summary,
         "checked_at": now_iso(),
     })
+
+
+@app.route("/api/startup_check", methods=["GET"])
+def api_startup_check():
+    """v3.3.71 (Frimpong 2026-10-31):container 啟動自檢嘅完整結果。
+
+    一次過 check 寫入權限(atomic write 能力)/ state 檔類型 / 憑證 /
+    Redis / Google Sheet token / 版本一致性。
+
+    ⚠️ **唔會寫任何測試數據入 production Google Sheet** ——
+    Sheet token check 只做 refresh + **讀** Nutrition tab,唔會 append 任何 row。
+
+    Query args:
+      - ``fast=1`` 跳過對外 call(token refresh / Sheet 讀 / Redis)
+      - ``format=text`` 出 human-readable 文字報告
+    """
+    from gym_web.startup_check import run_startup_checks, format_report
+    _fast = (request.args.get("fast") or "").strip() in ("1", "true", "yes")
+    _rep = run_startup_checks(include_network=not _fast)
+    if request.args.get("format") == "text":
+        return Response(format_report(_rep), mimetype="text/plain")
+    # 503 令 container healthcheck / 監控可以分辨「自檢 fail」,
+    # 但 body 一定帶齊 detail,唔會只得一個 bool。
+    return jsonify(_rep), (200 if _rep.get("ok") else 503)
 
 
 # ---------- v3.3.45: 訊息收件箱 ----------
@@ -854,11 +1127,13 @@ def api_log_set():
         "source": source,
     }
     session["exercises"].append(entry)
-    log = load_log()
-    # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
-    # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
-    log[session.get("date") or today_iso()] = session
-    save_log(log)
+    # v3.3.71 (Frimpong):原子「讀 → 改 → 寫」—— 之前 load 同 save 之間
+    # 有窗口,兩個 request 同時落 set 會走失其中一個(實測 8 thread → 走失 4)。
+    def _put_session(log):
+        # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
+        # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
+        log[session.get("date") or today_iso()] = session
+    update_log(_put_session)
     return jsonify({"ok": True, "entry": entry, "total_sets": len(session["exercises"])})
 
 
@@ -888,11 +1163,13 @@ def api_end_session():
     session = get_or_create_session()
     session["end_time"] = now_iso()
     session["completed"] = True
-    log = load_log()
-    # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
-    # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
-    log[session.get("date") or today_iso()] = session
-    save_log(log)
+    # v3.3.71 (Frimpong):原子「讀 → 改 → 寫」—— 之前 load 同 save 之間
+    # 有窗口,兩個 request 同時落 set 會走失其中一個(實測 8 thread → 走失 4)。
+    def _put_session(log):
+        # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
+        # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
+        log[session.get("date") or today_iso()] = session
+    update_log(_put_session)
     # v3.3.8: invalidate daily coaching so the next cheer/video reflects
     # the freshly completed gym session.
     _invalidate_daily_coaching()
@@ -1035,6 +1312,9 @@ def api_streak():
     while True:
         key = cursor.strftime("%Y-%m-%d")
         session = log.get(key)
+        # v3.3.71: 壞 entry(非 dict)唔可以令 streak 500
+        if not isinstance(session, dict):
+            break
         if session and session.get("completed") and len(session.get("exercises", [])) >= 3:
             streak += 1
             last_workout_date = key
@@ -1052,11 +1332,13 @@ def api_cancel_last_set():
     if not session.get("exercises"):
         return jsonify({"error": "no sets to cancel"}), 400
     removed = session["exercises"].pop()
-    log = load_log()
-    # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
-    # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
-    log[session.get("date") or today_iso()] = session
-    save_log(log)
+    # v3.3.71 (Frimpong):原子「讀 → 改 → 寫」—— 之前 load 同 save 之間
+    # 有窗口,兩個 request 同時落 set 會走失其中一個(實測 8 thread → 走失 4)。
+    def _put_session(log):
+        # v3.3.39: 用 session 自己嘅日期做 key(支援補記過去一節),
+        # 唔可以硬寫 today_iso() —— 否則補記會覆蓋今日 session
+        log[session.get("date") or today_iso()] = session
+    update_log(_put_session)
     return jsonify({"ok": True, "removed": removed, "remaining": len(session["exercises"])})
 
 
@@ -1748,7 +2030,8 @@ def api_health_overlay():
 
 
 # ---------- Jim context store (cheer pipeline reads this to make text more personal) ----------
-JIM_CONTEXT = Path("/home/work/.jim_context.json")
+# v3.3.71 (Frimpong):同上,跟 GYMBRO_STATE_ROOT(預設 /home/work,行為不變)
+JIM_CONTEXT = Path(_STATE_ROOT) / ".jim_context.json"
 
 
 def _load_jim_context() -> dict:
@@ -1765,19 +2048,10 @@ def _save_jim_context(ctx: dict) -> bool:
     """Atomic write to JIM_CONTEXT."""
     try:
         _payload = json.dumps(ctx, indent=2, ensure_ascii=False)
-        tmp = str(JIM_CONTEXT) + ".tmp"
-        Path(tmp).write_text(_payload)
-        try:
-            os.replace(tmp, str(JIM_CONTEXT))
-        except OSError as _replace_err:
-            # 2026-10-31 (Alonso):單檔 bind mount → 跨 mount atomic replace 失敗
-            # (Frimpong P0 #3)。Fallback:直接寫。
-            print(f"[jim-context] atomic replace failed ({_replace_err}); direct-write fallback", flush=True)
-            Path(JIM_CONTEXT).write_text(_payload)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        # v3.3.71 (Frimpong):共用 _atomic_write() —— 舊 code 嘅 fallback 只包
+        # os.replace(),但 container 爆嘅係寫 .tmp 嗰步 → jim_context 寫唔入。
+        _atomic_write(JIM_CONTEXT, _payload, tmp=str(JIM_CONTEXT) + ".tmp",
+                      label="jim-context")
         return True
     except Exception:
         return False
@@ -3083,7 +3357,9 @@ def _generate_pdf_bytes(target_date: str, allow_ai: bool = True,
         out_name = (f"gymbro_foodlog_{target_date}_continuous.pdf" if continuous
                     else f"gymbro_foodlog_{target_date}.pdf")
         out_pdf = PDF_CACHE_DIR / out_name
-        tmp = out_pdf.with_suffix(".pdf.tmp")
+        # v3.3.71 (Frimpong):唯一 tmp 名(之前固定 `.pdf.tmp` → 兩個
+        # request 同時 render 同一日會互相覆蓋 / 截斷)。
+        tmp = _filelock_unique_tmp_path(out_pdf)
         tmp.write_bytes(data)
         tmp.replace(out_pdf)
     except Exception as e:
@@ -3332,7 +3608,14 @@ def api_history():
     history = []
     for date_key in sorted(log.keys(), reverse=True):
         s = log[date_key]
+        # v3.3.71: load_log() 已經過濾,但呢度再守一次(防禦性,
+        # 因為 log 可能係由其他路徑直接寫入嘅)
+        if not isinstance(s, dict):
+            continue
         exercises = s.get("exercises", []) or []
+        if not isinstance(exercises, list):
+            exercises = []
+        exercises = [e for e in exercises if isinstance(e, dict)]
         total_vol = sum((e.get("weight_kg") or 0) * (e.get("reps") or 0) for e in exercises)
         history.append({
             "date": date_key,
@@ -3381,10 +3664,14 @@ def api_delete_session():
         return jsonify({"error": "cannot delete today — use cancel button"}), 400
 
     local_deleted = False
-    log = load_log()
-    if date in log:
-        del log[date]
-        save_log(log)
+    # v3.3.71 (Frimpong):原子「讀 → 改 → 寫」
+    def _del_date(log):
+        if date in log:
+            del log[date]
+            return True
+        return False
+    _deleted = update_log(_del_date)[1]
+    if _deleted:
         local_deleted = True
 
     sheet_deleted = []
@@ -3782,16 +4069,20 @@ def _get_google_access_token():
             tok["expires_in"] = body["expires_in"]
             tok["expires_at"] = time.time() + float(body["expires_in"])
         tok["refreshed_at"] = time.time()
-        tmp = GOOGLE_TOKEN_PATH.with_suffix(".json.tmp")
-        try:
-            tmp.write_text(json.dumps(tok, indent=2))
-            tmp.replace(GOOGLE_TOKEN_PATH)
-        except OSError as _tmp_err:
-            # v3.3.70:單檔 bind mount 令 container 開唔到同目錄嘅 .tmp 檔
-            # (PermissionError)→ 直接覆寫目標檔(唔原子,但 token 唔會卡喺舊值)。
-            print(f"[google] atomic token write failed ({_tmp_err}); direct write",
-                  flush=True)
-            GOOGLE_TOKEN_PATH.write_text(json.dumps(tok, indent=2))
+        # v3.3.71 (Frimpong):tmp 名要唯一。
+        # 之前係 `GOOGLE_TOKEN_PATH.with_suffix(".json.tmp")` —— **固定**名,
+        # 而且明確傳入 _atomic_write(tmp=...) 令佢覆蓋咗內建嘅唯一 tmp 規則。
+        # 兩個 thread 同時 refresh(Google token 1 個鐘就過期,而
+        # background scan worker + healthcheck + 前台 request 都會叫)→
+        #   甲 write tmp → 乙 write tmp(蓋咗甲份,可能寫到一半)→
+        #   甲 os.replace(攞走 tmp)→ 乙 os.replace() FileNotFoundError
+        # → **token 檔可能變成 0 bytes(截斷)**,Google API 靜默全死。
+        # 實測(2026-10-31 01:06):host 嘅 google_token.json 係 **0 bytes**,
+        # 而旁邊嘅 google_token.json.tmp 有完整 1529 bytes(內容有效)——
+        # 即係真實發生過嘅截斷,唔係理論。已由 tmp 還原。
+        # 修法:唔傳 tmp → _atomic_write() 用自己嘅唯一名(pid+thread+time_ns)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                      label="google-token")
     except Exception as e:
         print(f"[google] token persist failed (access still valid in memory): "
               f"{type(e).__name__}: {e}", flush=True)
@@ -3950,7 +4241,12 @@ def _session_to_sheet_rows(date, session):
     """
     rows = []
     exercises = session.get("exercises", []) if isinstance(session, dict) else []
+    if not isinstance(exercises, list):
+        exercises = []
     for ex in exercises:
+        # v3.3.71: 污染 element(非 dict)要剔走,唔可以 AttributeError
+        if not isinstance(ex, dict):
+            continue
         ex_name = ex.get("name") or ex.get("exercise", "")
         muscle = ex.get("muscle_group", "")
         notes = f"{muscle}" if muscle else ""
@@ -3958,6 +4254,8 @@ def _session_to_sheet_rows(date, session):
         if sub_sets:
             # Legacy / telegram-text-mode shape
             for s in sub_sets:
+                if not isinstance(s, dict):
+                    continue
                 reps = s.get("reps", 0)
                 weight = s.get("weight_kg") or s.get("weight") or 0
                 volume = reps * weight if (reps and weight) else 0
@@ -4139,9 +4437,19 @@ def _flatten_sessions(log):
         if not isinstance(session, dict):
             continue
         exercises = session.get("exercises", [])
+        if not isinstance(exercises, list):
+            continue
         for ex in exercises:
+            # v3.3.71: exercises 入面嘅非 dict 元素(污染)要剔走
+            if not isinstance(ex, dict):
+                continue
             muscle = ex.get("muscle_group") or ex.get("muscle") or ""
-            for s in ex.get("sets", []):
+            sub = ex.get("sets", [])
+            if not isinstance(sub, list):
+                sub = []
+            for s in sub:
+                if not isinstance(s, dict):
+                    continue
                 flat.append({
                     "date": date,
                     "exercise": ex.get("name", ""),
@@ -4598,7 +4906,12 @@ def api_sync_sheet():
         if not isinstance(session, dict):
             continue
         rows_to_push = []
-        for ex in session.get("exercises", []):
+        _exs = session.get("exercises", [])
+        if not isinstance(_exs, list):
+            _exs = []
+        for ex in _exs:
+            if not isinstance(ex, dict):
+                continue
             sub_sets = ex.get("sets") if isinstance(ex.get("sets"), list) else None
             if sub_sets:
                 for s in sub_sets:
@@ -4672,7 +4985,12 @@ def api_repair_sheet():
         session = entry.get("session") if "session" in entry else entry
         if isinstance(session, dict):
             rows_to_push = []
-            for ex in session.get("exercises", []):
+            _exs = session.get("exercises", [])
+            if not isinstance(_exs, list):
+                _exs = []
+            for ex in _exs:
+                if not isinstance(ex, dict):
+                    continue
                 rows_to_push.extend(_session_to_sheet_rows(target_date, {"exercises": [ex]}))
             # Dedupe within local-source rows by (set_n, exercise) first
             seen = set()
@@ -7179,7 +7497,14 @@ def _refresh_google_access_token() -> str:
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
         access = resp["access_token"]
         tok["token"] = access
-        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # v3.3.72 (Frimpong 2026-10-31):改用共用 _atomic_write() ——
+        # 6 處裸 write_text() 會令 refresh 出嘅 token 喺寫到一半 crash 時
+        # 截斷成半個 JSON → Google API 靜默 401,而 healthcheck 只查
+        # .exists() → 報 healthy(v3.3.65 陰影 bug 嘅同一種形狀)。
+        # _atomic_write() 會寫 tmp → os.replace() 原子換入,
+        # 失敗時先 fallback 直接寫(並且大聲 log)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                     label="google-token")
         return access
     except Exception:
         return ""
@@ -7232,7 +7557,9 @@ def _record_pending_upload(local_path, reason: str) -> None:
             "local_path": str(local_path),
             "reason": reason,
         })
-        tmp = queue_path.with_suffix(".tmp")
+        # v3.3.71 (Frimpong):唯一 tmp 名(之前固定 `.tmp` → 兩個 thread
+        # 同時 queue 同一個 pending upload 會撞)。
+        tmp = _filelock_unique_tmp_path(queue_path)
         tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2))
         tmp.replace(queue_path)
     except Exception:
@@ -7761,7 +8088,14 @@ def _append_to_sheet_nutrition(entry: dict) -> dict:
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
         access = resp["access_token"]
         tok["token"] = access
-        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # v3.3.72 (Frimpong 2026-10-31):改用共用 _atomic_write() ——
+        # 6 處裸 write_text() 會令 refresh 出嘅 token 喺寫到一半 crash 時
+        # 截斷成半個 JSON → Google API 靜默 401,而 healthcheck 只查
+        # .exists() → 報 healthy(v3.3.65 陰影 bug 嘅同一種形狀)。
+        # _atomic_write() 會寫 tmp → os.replace() 原子換入,
+        # 失敗時先 fallback 直接寫(並且大聲 log)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                     label="google-token")
 
         # Dedup check: pull existing sheet rows + check if entry already exists
         # Jim OOB 2026-07-29: signature (date, time_short, calories) catches duplicates
@@ -10836,7 +11170,14 @@ def _sheet_delete_nutrition_rows(matcher_fn) -> dict:
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
         access = resp["access_token"]
         tok["token"] = access
-        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # v3.3.72 (Frimpong 2026-10-31):改用共用 _atomic_write() ——
+        # 6 處裸 write_text() 會令 refresh 出嘅 token 喺寫到一半 crash 時
+        # 截斷成半個 JSON → Google API 靜默 401,而 healthcheck 只查
+        # .exists() → 報 healthy(v3.3.65 陰影 bug 嘅同一種形狀)。
+        # _atomic_write() 會寫 tmp → os.replace() 原子換入,
+        # 失敗時先 fallback 直接寫(並且大聲 log)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                     label="google-token")
 
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
         NUTRITION_SHEET_ID = 474877075  # numeric sheetId, not tab name
@@ -10903,7 +11244,14 @@ def _sheet_delete_nutrition_rows_by_indices(row_indices: list) -> dict:
         )
         access = json.loads(urllib.request.urlopen(req, timeout=15).read())["access_token"]
         tok["token"] = access
-        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # v3.3.72 (Frimpong 2026-10-31):改用共用 _atomic_write() ——
+        # 6 處裸 write_text() 會令 refresh 出嘅 token 喺寫到一半 crash 時
+        # 截斷成半個 JSON → Google API 靜默 401,而 healthcheck 只查
+        # .exists() → 報 healthy(v3.3.65 陰影 bug 嘅同一種形狀)。
+        # _atomic_write() 會寫 tmp → os.replace() 原子換入,
+        # 失敗時先 fallback 直接寫(並且大聲 log)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                     label="google-token")
 
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
         NUTRITION_SHEET_ID = 474877075
@@ -10963,7 +11311,14 @@ def _sheet_update_nutrition_cells(row_idx: int, updates: list) -> dict:
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
         access = resp["access_token"]
         tok["token"] = access
-        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # v3.3.72 (Frimpong 2026-10-31):改用共用 _atomic_write() ——
+        # 6 處裸 write_text() 會令 refresh 出嘅 token 喺寫到一半 crash 時
+        # 截斷成半個 JSON → Google API 靜默 401,而 healthcheck 只查
+        # .exists() → 報 healthy(v3.3.65 陰影 bug 嘅同一種形狀)。
+        # _atomic_write() 會寫 tmp → os.replace() 原子換入,
+        # 失敗時先 fallback 直接寫(並且大聲 log)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                     label="google-token")
 
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
         # Build batchUpdate data array
@@ -11024,7 +11379,14 @@ def _sheet_update_nutrition_row(row_idx: int, entry: dict) -> dict:
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
         access = resp["access_token"]
         tok["token"] = access
-        Path("/home/work/.hermes/google_token.json").write_text(json.dumps(tok, indent=2))
+        # v3.3.72 (Frimpong 2026-10-31):改用共用 _atomic_write() ——
+        # 6 處裸 write_text() 會令 refresh 出嘅 token 喺寫到一半 crash 時
+        # 截斷成半個 JSON → Google API 靜默 401,而 healthcheck 只查
+        # .exists() → 報 healthy(v3.3.65 陰影 bug 嘅同一種形狀)。
+        # _atomic_write() 會寫 tmp → os.replace() 原子換入,
+        # 失敗時先 fallback 直接寫(並且大聲 log)。
+        _atomic_write(GOOGLE_TOKEN_PATH, json.dumps(tok, indent=2),
+                     label="google-token")
 
         SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
         # Build 11-column row from entry — mirror _append_to_sheet_nutrition shape
@@ -14590,7 +14952,13 @@ def _format_workout_detail_for_cheer(workouts: list) -> str:
                 # If the gym start_time on `today` falls inside this workout's
                 # time window, treat all of its exercises as belonging here.
                 today_log = local_log.get(today, {})
+                # v3.3.71: 污染 entry(非 dict)唔可以令 cheer 崩
+                if not isinstance(today_log, dict):
+                    today_log = {}
                 todays_exercises = today_log.get("exercises") or []
+                if not isinstance(todays_exercises, list):
+                    todays_exercises = []
+                todays_exercises = [e for e in todays_exercises if isinstance(e, dict)]
                 if todays_exercises:
                     # Aggregate by exercise: total sets, last weight, max weight,
                     # total reps.
@@ -15162,6 +15530,8 @@ def _build_daily_context() -> dict:
         log = load_log()
         today = today_iso()
         session = log.get(today, {})
+        if not isinstance(session, dict):
+            session = {}
         if session.get("end_time"):
             ctx["last_gym_ts"] = session["end_time"]
     except Exception:
@@ -17060,6 +17430,8 @@ def _decide_cheer_fire_type() -> str:
         log = load_log()
         today = today_iso()
         session = log.get(today, {})
+        if not isinstance(session, dict):
+            session = {}
         if session.get("end_time"):
             # last gym ended — check how long ago
             from datetime import datetime as _dt
@@ -18644,4 +19016,18 @@ if __name__ == "__main__":
                 pass
     _t = _threading.Thread(target=_lazy_hydrate, name="lazy-hydrate", daemon=True)
     _t.start()
+    # v3.3.71 (Frimpong 2026-10-31):container 啟動自檢。
+    # 搬上 Docker 之後最易出事嘅唔係「起唔到」,而係「起咗但某啲功能死咗,
+    # 而 /api/health 唔講」—— 單檔 bind mount 令 atomic write 失敗、
+    # 憑證 mount 咗但寫唔到、state 檔類型錯、Redis 唔通。
+    # 呢度喺 bind socket 之前做一次全面 check,唔通就喺 log 講清楚,
+    # 唔好等到第一個 user request 先爆。
+    # ⚠️ 失敗**唔會**阻止啟動 —— 呢個係診斷,唔係 gate。
+    try:
+        from gym_web.startup_check import run_startup_checks, format_report
+        _sc = run_startup_checks(include_network=True)
+        print(format_report(_sc), flush=True)
+    except Exception as _sc_err:
+        print(f"[startup-check] skipped: {type(_sc_err).__name__}: {_sc_err}",
+              flush=True)
     app.run(host=HOST, port=PORT, debug=False, threaded=True)

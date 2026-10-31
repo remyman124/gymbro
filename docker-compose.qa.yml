@@ -13,3 +13,48 @@ services:
     environment:
       GYMBRO_PORT: "7001"
       GYMBRO_WRITE_MODE: "dryrun"
+      # v3.3.71 (Frimpong):network_mode: host 之下 QA 同 production 共用
+      # host Redis,key prefix 唔隔離的話 QA 會污染 production cache
+      # (實測見過共用 key `gymbro:sheet:nutrition:all:A1:K`)。
+      GYMBRO_REDIS_NAMESPACE: "gymbro-qa"
+    # ────────────────────────────────────────────────────────────────────
+    # v3.3.71 (Frimpong 2026-10-31):QA 專用 state 隔離。
+    #
+    # Production base compose mount 咗 `/home/work`(因為 atomic write 需要
+    # 目標檔嘅**父目錄**可寫,見 base compose 嘅註解)。但 QA 如果照用,
+    # 就可以寫入任何 production state 檔 —— 包括將來新加嘅、
+    # mount 清單未更新嘅(最陰險嗰種:你以為 QA 唔會碰,但佢照寫)。
+    #
+    # 所以 QA 用**專屬 state 目錄**頂替 /home/work:
+    #   - 目標檔同 tmp 檔都喺同一個 mount → atomic write 正常
+    #   - QA 寫入只會留喺 QA 自己嘅目錄 → 唔會污染 production
+    #   - 需要讀 production 嘅憑證/唯讀資料就用 nested mount 明確掛入
+    #     (nested **dir** mount 實測安全;nested **file** mount 會令
+    #      os.replace 跨 device → Errno 16,唔好咁做)
+      # v3.3.71 (Frimpong):QA 用專屬 state root,目標路徑跟住 root 走
+      # (gym_web.py 嘅 WORKOUT_LOG / JIM_CONTEXT 讀 GYMBRO_STATE_ROOT)。
+      GYMBRO_STATE_ROOT: "/gymbro_state"
+    volumes:
+      # 專屬 state root(rw)—— QA 寫入只會留喺呢度,唔會污染 production
+      - /home/work/.hermes/gymbro_qa_state:/gymbro_state:rw
+      # QA 唔會 mount 整個 /home/work(唔需要,而且會令 QA 可以寫 production state)
+      # ── 需要讀嘅 production 資料(唯讀,明確掛入)──
+      - /home/work/.hermes/gymbro_redacted/.env:/home/work/.hermes/.env:ro
+      - /home/work/.hermes/gymbro_redacted/.env:/home/work/.hermes-torres/.env:ro
+      # google_token 用 QA 自己嘅 copy(唔好寫 production 嘅 credential 檔)
+      - /home/work/.hermes/gymbro_qa_state/.hermes/google_token.json:/home/work/.hermes/google_token.json
+      - /home/work/.whoop_tokens.json:/home/work/.whoop_tokens.json:ro
+      - /home/work/.whoop_data_latest.json:/home/work/.whoop_data_latest.json:ro
+      # ── QA 自己嘅 cache 目錄(唔好寫入 production)──
+      # ⚠️ base compose 嗰啲 cache dir mount 要喺度 override 返,
+      #    否則 compose merge 會保留 base 嘅 source(production cache 目錄)
+      #    → QA 寫入 production 嘅 scan_cache / cheer_artifacts 等。
+      - /home/work/.hermes/gymbro_qa_state/cache/scan_cache:/home/work/.hermes/scan_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/scan_thumb_cache:/home/work/.hermes/scan_thumb_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/image_cache:/home/work/.hermes/image_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/audio_cache:/home/work/.hermes/audio_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/video_cache:/home/work/.hermes/video_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/nutrition_card_cache:/home/work/.hermes/nutrition_card_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/nutrition_pdf_cache:/home/work/.hermes/nutrition_pdf_cache
+      - /home/work/.hermes/gymbro_qa_state/cache/cheer_artifacts:/home/work/.hermes/cheer_artifacts
+      - /home/work/.hermes/gymbro_qa_state/cache/logs:/home/work/.hermes/logs

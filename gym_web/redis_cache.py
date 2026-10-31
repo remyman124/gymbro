@@ -11,7 +11,7 @@ Provides:
 Falls back to in-memory dict if Redis is unreachable, so gymbro
 stays functional even if Redis goes down.
 """
-import sys, time, threading, json
+import os, sys, time, threading, json
 from typing import Optional, Any
 
 # Add system dist-packages to path for redis module
@@ -26,8 +26,18 @@ except ImportError:
 class _RedisCache:
     """Thin wrapper around redis with TTL + in-memory fallback."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 6379, namespace: str = "gymbro"):
-        self.namespace = namespace
+    def __init__(self, host: str = "127.0.0.1", port: int = 6379,
+                 namespace: str = "gymbro"):
+        # v3.3.71 (Frimpong 2026-10-31):namespace 要可以由 env 覆蓋。
+        # `network_mode: host` 之下 container 同 host 共用同一個 Redis,
+        # 如果 key prefix 硬編碼做 "gymbro",QA / trial container 會同
+        # production **共用同一批 cache key** → trial run 可以污染
+        # production 嘅 cache(2026-10-30 review 實測到共用 key
+        # `gymbro:sheet:nutrition:all:A1:K`)。
+        # 修法:env 優先 → 明確傳入 → 預設 "gymbro"(行為唔變)。
+        # QA compose override 做 GYMBRO_REDIS_NAMESPACE=gymbro-qa 就互唔干擾。
+        self.namespace = (os.environ.get("GYMBRO_REDIS_NAMESPACE")
+                          or namespace or "gymbro")
         self._mem: dict[str, tuple[float, Any]] = {}
         self._mem_lock = threading.Lock()
         self._client = None
