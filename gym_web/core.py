@@ -8,7 +8,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 import json
+import os
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -18,7 +20,8 @@ PORT = 7000
 HOST = "0.0.0.0"
 
 # File paths
-WORKOUT_LOG = Path("/home/work/.whoop_workout_log.json")
+# v3.3.71 (Frimpong):跟 GYMBRO_STATE_ROOT(預設 /home/work,行為不變)
+WORKOUT_LOG = Path(os.environ.get("GYMBRO_STATE_ROOT", "/home/work")) / ".whoop_workout_log.json"
 NUTRITION_LOG = Path("/home/work/.hermes/nutrition_log.json")
 FOOD_SCAN_LOG = Path("/home/work/.hermes/food_scan_log.json")
 NUTRITION_SHEET_ID = "1YKjsQbTa3nBN7ubmD-zXAQHcuhDlQ1QaqeN_Cog6Oag"
@@ -59,13 +62,28 @@ def safe_read_json(path: Path, default=None):
 
 
 def safe_write_json(path: Path, data) -> bool:
-    """Write JSON atomically — returns True on success."""
+    """Write JSON atomically — returns True on success.
+
+    v3.3.71 (Frimpong 2026-10-31):tmp 檔名要用**唯一**名(之前係固定
+    `path.suffix + ".tmp"`)。固定名嘅問題:兩個 thread 同時寫同一個檔 →
+    兩者都寫同一個 tmp → 一個 replace 咗之後另一個 replace 會
+    FileNotFoundError,或者寫入內容互相覆蓋。
+    實測(v3.3.45 已经喺 gym_web.save_log() 修過同款問題,但呢個 helper 漏咗)。
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        # 唯一 tmp 名:pid + thread ident + time_ns(三重保險)
+        tmp = path.with_name(
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+        )
         with open(tmp, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(path)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
         return True
     except Exception:
         return False

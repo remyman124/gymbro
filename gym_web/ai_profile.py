@@ -53,6 +53,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from gym_web.filelock import unique_tmp_path as _unique_tmp_path
+
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
@@ -98,7 +100,10 @@ def _ensure_loaded() -> None:
 def _flush() -> None:
     try:
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE_PATH.with_suffix(".json.tmp")
+        # v3.3.71 (Frimpong):tmp 名要唯一。之前用固定嘅 `.json.tmp` →
+        # 兩個 thread 同時 flush 會寫入同一個 tmp → 互相覆蓋 / 截斷。
+        # 實測過嘅同款事故:google_token.json 被截斷成 0 bytes。
+        tmp = _unique_tmp_path(CACHE_PATH)
         tmp.write_text(json.dumps(_cache, ensure_ascii=False, indent=1),
                        encoding="utf-8")
         tmp.replace(CACHE_PATH)

@@ -24,6 +24,15 @@ from typing import Dict
 # consistent with the rest of gym_web.
 from gym_web.core import safe_read_json as _safe_read_json
 from gym_web.core import safe_write_json as _safe_write_json
+# v3.3.71 (Frimpong 2026-10-31):read-modify-write 嘅跨 thread 鎖。
+# 之前 `check_and_remember()` 冇 lock → load → check → modify → persist
+# 四步之間可以畀另一個 thread 插隊。實測(8 thread 同一個 key):
+#     returned True (would commit) : 8   <-- 應該係 1
+#  即係 iOS PWA double-tap 會產生 8 個重複 Sheet row
+#  (Jim OOB 2026-08-14「audit found 30 duplicate rows」嗰類問題)。
+# 見 gym_web/filelock.py 嘅 docstring。
+from gym_web.filelock import atomic_write_json as _atomic_write_json
+from gym_web.filelock import lock_for as _lock_for
 
 _STORE_PATH = Path("/home/work/.hermes/commit_idempotency.json")
 _MAX_KEYS = 500
@@ -45,9 +54,12 @@ def _load() -> Dict[str, float]:
 
 
 def _persist(data: Dict[str, float]) -> None:
-    """Persist the store. Failures are intentionally swallowed at the
-    call site (see check_and_remember); we just no-op here."""
-    _safe_write_json(_STORE_PATH, data)
+    """Persist the store.
+
+    v3.3.71:用唯一 tmp 名(之前 `core.safe_write_json()` 用固定 `.tmp` 名,
+    兩個 writer 會互相覆蓋同一個 tmp)。
+    """
+    _atomic_write_json(_STORE_PATH, data)
 
 
 def _evict_oldest(data: Dict[str, float]) -> None:
@@ -65,6 +77,11 @@ def check_and_remember(key: str) -> bool:
     """Return True if the key is NEW (caller should proceed with the
     commit); False if it was already seen within the bounded window.
 
+    v3.3.71 (Frimpong):整個 load → check → modify → persist 喺 **同一把
+    per-path lock** 入面做。以前冇 lock,兩個 thread 可以同時見到
+    「key 未存在」→ 都返 True → 都 commit → 重複 Sheet row。
+    實測修正前:8 個 thread 同一 key → 8 個 True(應該 1 個)。
+
     NEVER raises. On any internal failure, returns True (fail OPEN) so
     a corrupt store cannot block a legitimate food log. The in-sheet
     dedup in _append_to_sheet_nutrition remains the authoritative
@@ -75,13 +92,14 @@ def check_and_remember(key: str) -> bool:
             # Empty key is never a legitimate identity — treat as new so
             # the caller proceeds and the in-sheet dedup can decide.
             return True
-        store = _load()
-        if key in store:
-            return False
-        store[key] = _now()
-        _evict_oldest(store)
-        _persist(store)
-        return True
+        with _lock_for(_STORE_PATH):
+            store = _load()
+            if key in store:
+                return False
+            store[key] = _now()
+            _evict_oldest(store)
+            _persist(store)
+            return True
     except Exception:
         # Fail OPEN — never block a food log on a store IO error.
         return True
@@ -101,9 +119,10 @@ def remember(key: str) -> None:
     try:
         if not key:
             return
-        store = _load()
-        store[key] = _now()
-        _evict_oldest(store)
-        _persist(store)
+        with _lock_for(_STORE_PATH):
+            store = _load()
+            store[key] = _now()
+            _evict_oldest(store)
+            _persist(store)
     except Exception:
         pass
